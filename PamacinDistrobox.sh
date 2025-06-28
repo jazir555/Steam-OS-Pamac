@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Enhanced Steam Deck Pamac Setup Script v2.2
+# Enhanced Steam Deck Pamac Setup Script v3.2
 # This script automates the setup of a persistent, GUI-based package management
 # system (Pamac with AUR) on SteamOS using Distrobox.
 # It is idempotent, fully automated, and requires no user input after execution.
@@ -9,20 +9,29 @@
 set -e
 
 # --- Configuration Variables ---
-SCRIPT_VERSION="2.2"
+SCRIPT_VERSION="3.2"
 CONTAINER_NAME="${CONTAINER_NAME:-arch-box}"
 CURRENT_USER=$(whoami)
 LOG_FILE="$HOME/distrobox-pamac-setup.log"
 SCRIPT_URL="https://raw.githubusercontent.com/user/repo/main/setup-pamac.sh"
 
 # Feature flags (can be set via environment variables)
-ENABLE_MULTILIB="${ENABLE_MULTILIB:-false}"
-ENABLE_BUILD_CACHE="${ENABLE_BUILD_CACHE:-true}"
-CONFIGURE_MIRRORS="${CONFIGURE_MIRRORS:-true}"
-AUTO_EXPORT_APPS="${AUTO_EXPORT_APPS:-true}"
-ENABLE_GAMING_PACKAGES="${ENABLE_GAMING_PACKAGES:-false}"
-CONFIGURE_LOCALE="${CONFIGURE_LOCALE:-false}"
-TARGET_LOCALE="${TARGET_LOCALE:-en_US.UTF-8}"
+ENABLE_MULTILIB="false"
+ENABLE_BUILD_CACHE="true"
+CONFIGURE_MIRRORS="true"
+AUTO_EXPORT_APPS="true"
+AUTO_EXPORT_FLATPAKS="false"
+ENABLE_GAMING_PACKAGES="false"
+CONFIGURE_LOCALE="false"
+TARGET_LOCALE="en_US.UTF-8"
+MIRROR_COUNTRIES="US,Canada"
+FORCE_REBUILD="false"
+
+# Operation mode flags
+DRY_RUN="false"
+LOG_LEVEL="normal" # quiet, normal, verbose
+EXPORTED_APPS=()
+CONTAINER_WAS_CREATED_BY_SCRIPT="false" # For trap cleanup
 
 # --- Color Codes for Output (with TTY detection) ---
 if [ -t 1 ]; then
@@ -36,7 +45,7 @@ else
   GREEN=''; YELLOW=''; BLUE=''; RED=''; BOLD=''; NC=''
 fi
 
-# --- Logging and Exit Handling ---
+# --- Logging and Output Functions ---
 initialize_logging() {
     echo "=== Steam Deck Pamac Setup v${SCRIPT_VERSION} - Run started at: $(date) ===" > "$LOG_FILE"
     echo "User: $CURRENT_USER" >> "$LOG_FILE"
@@ -47,744 +56,633 @@ initialize_logging() {
     echo "  ENABLE_BUILD_CACHE: $ENABLE_BUILD_CACHE" >> "$LOG_FILE"
     echo "  CONFIGURE_MIRRORS: $CONFIGURE_MIRRORS" >> "$LOG_FILE"
     echo "  AUTO_EXPORT_APPS: $AUTO_EXPORT_APPS" >> "$LOG_FILE"
+    echo "  AUTO_EXPORT_FLATPAKS: $AUTO_EXPORT_FLATPAKS" >> "$LOG_FILE"
+    echo "  ENABLE_GAMING_PACKAGES: $ENABLE_GAMING_PACKAGES" >> "$LOG_FILE"
+    echo "  CONFIGURE_LOCALE: $CONFIGURE_LOCALE" >> "$LOG_FILE"
+    echo "  FORCE_REBUILD: $FORCE_REBUILD" >> "$LOG_FILE"
     echo "===========================================" >> "$LOG_FILE"
     
-    # Ensure a final message is logged when the script exits
     trap 'echo "=== Run finished at: $(date) - Exit code: $? ===" >> "$LOG_FILE"' EXIT
 }
 
+_log() {
+    local level="$1"
+    local color="$2"
+    local message="$3"
+    echo -e "$message" >> "$LOG_FILE"
+    case "$LOG_LEVEL" in
+        "quiet")
+            [ "$level" = "ERROR" ] && echo -e "${color}${message}${NC}"
+            ;;
+        "normal"|"verbose")
+            echo -e "${color}${message}${NC}"
+            ;;
+    esac
+}
+
+log_step() { _log "INFO" "$BLUE" "\n${BOLD}==> $1${NC}"; }
+log_info() { [ "$LOG_LEVEL" != "quiet" ] && _log "INFO" "" "$1"; }
+log_success() { _log "SUCCESS" "$GREEN" "✓ $1"; }
+log_warn() { _log "WARN" "$YELLOW" "⚠️ $1"; }
+log_error() { _log "ERROR" "$RED" "❌ $1"; }
+
+run_command() {
+    log_info "    Executing: $@" >> "$LOG_FILE"
+    if [ "$DRY_RUN" = "true" ]; then
+        log_warn "[DRY RUN] Would execute: $@"
+        return 0
+    fi
+    if [ "$LOG_LEVEL" = "verbose" ]; then
+        "$@" 2>&1 | tee -a "$LOG_FILE"
+        return ${PIPESTATUS[0]}
+    else
+        "$@" &>> "$LOG_FILE"
+        return $?
+    fi
+}
+
 # --- Helper Functions ---
-log_and_echo() {
-    echo -e "$1" | tee -a "$LOG_FILE"
-}
-
-log_only() {
-    echo -e "$1" >> "$LOG_FILE"
-}
-
 show_usage() {
     echo -e "${BOLD}Usage: $0 [OPTIONS]${NC}"
     echo ""
-    echo "Options:"
+    echo "Primary Options:"
     echo "  --container-name NAME    Set container name (default: arch-box)"
-    echo "  --enable-multilib        Enable multilib repository for 32-bit apps"
-    echo "  --enable-gaming          Install gaming-related packages"
-    echo "  --configure-locale       Configure system locale"
-    echo "  --locale LOCALE          Set target locale (default: en_US.UTF-8)"
-    echo "  --disable-build-cache    Don't use persistent build cache"
-    echo "  --disable-mirrors        Don't configure fastest mirrors"
-    echo "  --disable-auto-export    Don't automatically export installed apps"
-    echo "  --update                 Update this script to latest version"
-    echo "  --uninstall             Remove container and exported apps"
-    echo "  --help, -h              Show this help message"
+    echo "  --force-rebuild          If container exists, remove and rebuild it"
+    echo "  --update                 Update this script to the latest version"
+    echo "  --uninstall              Remove container and all related files"
     echo ""
-    echo "Environment Variables:"
-    echo "  CONTAINER_NAME          Override container name"
-    echo "  ENABLE_MULTILIB         Enable multilib (true/false)"
-    echo "  ENABLE_BUILD_CACHE      Use build cache (true/false)"
-    echo "  CONFIGURE_MIRRORS       Configure mirrors (true/false)"
-    echo "  AUTO_EXPORT_APPS        Auto-export apps (true/false)"
+    echo "Feature Toggles:"
+    echo "  --enable-multilib        Enable multilib repository for 32-bit apps"
+    echo "  --enable-gaming          Install common gaming packages (Wine, Lutris, etc.)"
+    echo "  --enable-flatpak-export  Auto-export Flatpaks installed inside the container"
+    echo "  --disable-build-cache    Do not use a persistent build cache; clean cache on exit"
+    echo "  --disable-mirrors        Do not configure fastest mirrors"
+    echo "  --disable-auto-export    Do not automatically export newly installed GUI apps"
+    echo ""
+    echo "Customization:"
+    echo "  --locale LOCALE          Set target locale (e.g., 'de_DE.UTF-8'). Implies locale config."
+    echo "  --mirror-countries CODE  Comma-separated country codes for mirrors (e.g., 'DE,FR')"
+    echo ""
+    echo "Execution Control:"
+    echo "  --dry-run                Show what would be done without making changes"
+    echo "  --verbose                Enable detailed command output"
+    echo "  --quiet                  Suppress informational output (show only errors)"
+    echo "  -h, --help               Show this help message"
 }
 
 parse_arguments() {
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --container-name)
-                CONTAINER_NAME="$2"
-                shift 2
-                ;;
-            --enable-multilib)
-                ENABLE_MULTILIB="true"
-                shift
-                ;;
-            --enable-gaming)
-                ENABLE_GAMING_PACKAGES="true"
-                shift
-                ;;
-            --configure-locale)
-                CONFIGURE_LOCALE="true"
-                shift
-                ;;
-            --locale)
-                TARGET_LOCALE="$2"
-                CONFIGURE_LOCALE="true"
-                shift 2
-                ;;
-            --disable-build-cache)
-                ENABLE_BUILD_CACHE="false"
-                shift
-                ;;
-            --disable-mirrors)
-                CONFIGURE_MIRRORS="false"
-                shift
-                ;;
-            --disable-auto-export)
-                AUTO_EXPORT_APPS="false"
-                shift
-                ;;
-            --update)
-                update_script
-                exit 0
-                ;;
-            --uninstall)
-                uninstall_setup
-                exit 0
-                ;;
-            --help|-h)
-                show_usage
-                exit 0
-                ;;
-            *)
-                echo -e "${RED}Unknown option: $1${NC}"
-                show_usage
-                exit 1
-                ;;
+    local options
+    options=$(getopt -o h --long help,container-name:,locale:,mirror-countries:,enable-multilib,enable-gaming,enable-flatpak-export,disable-build-cache,disable-mirrors,disable-auto-export,update,uninstall,dry-run,verbose,quiet,force-rebuild -n "$0" -- "$@")
+    if [ $? -ne 0 ]; then
+        show_usage
+        exit 1
+    fi
+    eval set -- "$options"
+
+    while true; do
+        case "$1" in
+            --container-name) CONTAINER_NAME="$2"; shift 2 ;;
+            --locale) TARGET_LOCALE="$2"; CONFIGURE_LOCALE="true"; shift 2 ;;
+            --mirror-countries) MIRROR_COUNTRIES="$2"; shift 2 ;;
+            --enable-multilib) ENABLE_MULTILIB="true"; shift ;;
+            --enable-gaming) ENABLE_GAMING_PACKAGES="true"; shift ;;
+            --enable-flatpak-export) AUTO_EXPORT_FLATPAKS="true"; shift ;;
+            --disable-build-cache) ENABLE_BUILD_CACHE="false"; shift ;;
+            --disable-mirrors) CONFIGURE_MIRRORS="false"; shift ;;
+            --disable-auto-export) AUTO_EXPORT_APPS="false"; shift ;;
+            --force-rebuild) FORCE_REBUILD="true"; shift ;;
+            --dry-run) DRY_RUN="true"; shift ;;
+            --verbose) LOG_LEVEL="verbose"; shift ;;
+            --quiet) LOG_LEVEL="quiet"; shift ;;
+            --update) update_script; exit 0 ;;
+            --uninstall) uninstall_setup; exit 0 ;;
+            -h|--help) show_usage; exit 0 ;;
+            --) shift; break ;;
+            *) log_error "Internal error! Unrecognized option: $1"; exit 1 ;;
         esac
     done
 }
 
 update_script() {
-    echo -e "${BLUE}Updating script to latest version...${NC}"
-    
-    if command -v curl >/dev/null 2>&1; then
-        if curl -fsSL "$SCRIPT_URL" -o "/tmp/setup-pamac-new.sh"; then
-            chmod +x "/tmp/setup-pamac-new.sh"
-            mv "/tmp/setup-pamac-new.sh" "$0"
-            echo -e "${GREEN}✓ Script updated successfully. Please run it again.${NC}"
-        else
-            echo -e "${RED}Failed to download script update.${NC}"
+    log_step "Updating script to latest version..."
+    local temp_file
+    temp_file=$(mktemp)
+
+    log_info "Attempting to download with curl..."
+    if command -v curl &>/dev/null; then
+        if ! curl -fsSL "$SCRIPT_URL" -o "$temp_file"; then
+            log_error "curl failed to download the script."
+            rm -f "$temp_file"
+            exit 1
+        fi
+    elif command -v wget &>/dev/null; then
+        log_info "curl not found, falling back to wget..."
+        if ! wget -qO "$temp_file" "$SCRIPT_URL"; then
+            log_error "wget failed to download the script."
+            rm -f "$temp_file"
             exit 1
         fi
     else
-        echo -e "${RED}curl not found. Cannot update script.${NC}"
+        log_error "Neither curl nor wget found. Cannot update script."
         exit 1
     fi
+
+    if [ "$DRY_RUN" = "true" ]; then
+        log_warn "[DRY RUN] Would download from $SCRIPT_URL and replace $0"
+        rm -f "$temp_file"
+        exit 0
+    fi
+
+    local backup_file="$0.bak.$(date +%s)"
+    cp "$0" "$backup_file"
+    log_info "Backup of current script saved to: $backup_file"
+
+    chmod +x "$temp_file"
+    mv "$temp_file" "$0"
+    log_success "Script updated successfully. Please run it again."
 }
 
 uninstall_setup() {
-    echo -e "${YELLOW}Uninstalling Steam Deck Pamac setup...${NC}"
+    log_step "Uninstalling Steam Deck Pamac setup..."
     
-    # Remove container
     if distrobox list --no-color 2>/dev/null | grep -q " $CONTAINER_NAME "; then
-        echo -e "${YELLOW}Removing container '$CONTAINER_NAME'...${NC}"
-        distrobox rm "$CONTAINER_NAME" --force
-        echo -e "${GREEN}✓ Container removed.${NC}"
+        log_info "Removing container '$CONTAINER_NAME'..."
+        if run_command distrobox rm "$CONTAINER_NAME" --force; then
+            log_success "Container removed."
+        else
+            log_error "Failed to remove container."
+        fi
     fi
     
-    # Remove exported applications
     if [ -d "$HOME/.local/share/applications" ]; then
-        echo -e "${YELLOW}Removing exported applications...${NC}"
-        find "$HOME/.local/share/applications" -name "*pamac*distrobox*" -delete 2>/dev/null || true
-        find "$HOME/.local/share/applications" -name "*$CONTAINER_NAME*" -delete 2>/dev/null || true
-        update-desktop-database -q "$HOME/.local/share/applications" 2>/dev/null || true
-        echo -e "${GREEN}✓ Exported applications removed.${NC}"
+        log_info "Removing exported applications..."
+        if [ "$DRY_RUN" = "true" ]; then
+            log_warn "[DRY RUN] Would find and delete *pamac*distrobox* and *$CONTAINER_NAME* .desktop files."
+        else
+            find "$HOME/.local/share/applications" -name "*pamac*distrobox*" -delete 2>/dev/null || true
+            find "$HOME/.local/share/applications" -name "*$CONTAINER_NAME*" -delete 2>/dev/null || true
+            update-desktop-database -q "$HOME/.local/share/applications" 2>/dev/null || true
+            log_success "Exported applications removed."
+        fi
     fi
     
-    # Remove BoxBuddy if desired
-    read -p "Also remove BoxBuddy? (y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        flatpak uninstall --user -y io.github.dvlv.BoxBuddy 2>/dev/null || true
-        echo -e "${GREEN}✓ BoxBuddy removed.${NC}"
+    if [ "$DRY_RUN" != "true" ]; then
+        read -p "Also remove BoxBuddy? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            if flatpak info --user io.github.dvlv.BoxBuddy &>/dev/null; then
+                 if run_command flatpak uninstall --user -y io.github.dvlv.BoxBuddy; then
+                    log_success "BoxBuddy removed."
+                 else
+                    log_error "Failed to remove BoxBuddy."
+                 fi
+            fi
+        fi
+    else
+        log_warn "[DRY RUN] Would prompt to remove BoxBuddy."
     fi
     
-    echo -e "${GREEN}Uninstallation complete.${NC}"
+    log_success "Uninstallation complete."
+}
+
+cleanup_on_failure() {
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        log_error "Setup failed with exit code $exit_code. An error occurred on line $BASH_LINENO."
+        if [ "$CONTAINER_WAS_CREATED_BY_SCRIPT" = "true" ]; then
+            log_warn "Cleaning up partially created container '$CONTAINER_NAME'..."
+            run_command distrobox rm "$CONTAINER_NAME" --force
+            log_success "Cleanup complete."
+        else
+            log_warn "An error occurred, but the container existed before this script ran, so it was not removed."
+        fi
+        log_info "Check the log for details: ${LOG_FILE}"
+    fi
 }
 
 wait_for_container() {
     local container_name="$1"
     local max_attempts=60
     local attempt=1
-    
-    echo -e "${YELLOW}Waiting for container to be ready...${NC}"
+    log_info "Waiting for container to be ready..."
     while [ $attempt -le $max_attempts ]; do
-        if distrobox enter "$container_name" -- echo "Container ready" &>/dev/null; then
-            echo -e "${GREEN}Container is ready.${NC}"
+        if distrobox enter "$container_name" -- whoami &>/dev/null; then
+            log_success "Container is ready."
             return 0
         fi
-        echo -n "."
+        [ "$LOG_LEVEL" != "quiet" ] && echo -n "."
         sleep 2
         ((attempt++))
     done
-    
-    echo -e "\n${RED}Container failed to become ready after $max_attempts attempts.${NC}"
+    echo ""
+    log_error "Container failed to become ready after $max_attempts attempts."
     return 1
 }
 
 check_steamos_version() {
-    local version_file="/etc/os-release"
-    if [ -f "$version_file" ]; then
-        local version_id=$(grep "VERSION_ID" "$version_file" | cut -d'=' -f2 | tr -d '"')
-        log_only "Detected SteamOS version: $version_id"
-        
-        # Check if it's at least version 3.5
-        if [ -n "$version_id" ]; then
-            local major=$(echo "$version_id" | cut -d'.' -f1)
-            local minor=$(echo "$version_id" | cut -d'.' -f2)
-            if [ "$major" -ge 3 ] && [ "$minor" -ge 5 ]; then
-                return 0
+    if [ -f "/etc/os-release" ]; then
+        if grep -q "VERSION_ID" "/etc/os-release" && grep -q "ID=steamos"; then
+            local version_id
+            version_id=$(grep "VERSION_ID" "/etc/os-release" | cut -d'=' -f2 | tr -d '"')
+            local major minor
+            major=$(echo "$version_id" | cut -d'.' -f1)
+            minor=$(echo "$version_id" | cut -d'.' -f2)
+            if [ "$major" -lt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -lt 5 ]; }; then
+                log_warn "SteamOS version is older than 3.5. Some features may not work as expected."
             fi
         fi
     fi
-    return 1
 }
+
+# --- Core Logic Functions ---
+# Note on Modularity: For larger projects, the 'cat <<EOF' sections below would be ideal candidates
+# for refactoring into separate .sh files. For this self-contained script, keeping them inline
+# ensures simplicity of distribution and execution without external dependencies.
 
 configure_mirrors() {
     if [ "$CONFIGURE_MIRRORS" = "true" ]; then
-        echo -e "${BLUE}Configuring fastest mirrors...${NC}"
-        
-        TEMP_MIRROR_SCRIPT=$(mktemp)
-        cat > "$TEMP_MIRROR_SCRIPT" << 'MIRROR_SCRIPT_EOF'
+        log_step "Configuring fastest mirrors for countries: $MIRROR_COUNTRIES..."
+        local script_content
+        script_content=$(cat <<'EOF'
 #!/bin/bash
 set -e
-
-# Install reflector if not present
-if ! pacman -Qi reflector &>/dev/null; then
-    sudo pacman -S --noconfirm reflector
-fi
-
-# Get the fastest mirrors
-echo "Configuring fastest mirrors for your location..."
-sudo reflector --country US,Canada --age 12 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
-
-echo "Mirror configuration complete"
-MIRROR_SCRIPT_EOF
-
-        if distrobox enter "$CONTAINER_NAME" -- bash "$TEMP_MIRROR_SCRIPT" &>> "$LOG_FILE"; then
-            echo -e "${GREEN}✓ Mirrors configured successfully.${NC}"
+COUNTRIES="$1"
+sudo pacman -S --noconfirm --needed reflector
+sudo reflector --country "$COUNTRIES" --age 12 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
+EOF
+        )
+        if echo "$script_content" | run_command distrobox enter "$CONTAINER_NAME" -- bash -s "$MIRROR_COUNTRIES"; then
+            log_success "Mirrors configured."
         else
-            echo -e "${YELLOW}Warning: Mirror configuration failed, continuing...${NC}"
+            log_warn "Mirror configuration failed, continuing..."
         fi
-        rm -f "$TEMP_MIRROR_SCRIPT"
     fi
 }
 
 configure_locale() {
     if [ "$CONFIGURE_LOCALE" = "true" ]; then
-        echo -e "${BLUE}Configuring system locale to $TARGET_LOCALE...${NC}"
-        
-        TEMP_LOCALE_SCRIPT=$(mktemp)
-        cat > "$TEMP_LOCALE_SCRIPT" << LOCALE_SCRIPT_EOF
+        log_step "Configuring system locale to $TARGET_LOCALE..."
+        export TARGET_LOCALE
+        local script_content
+        script_content=$(cat <<'EOF'
 #!/bin/bash
 set -e
-
-TARGET_LOCALE="$1"
-
-# Uncomment the target locale in locale.gen
-sudo sed -i "s/^#\${TARGET_LOCALE}/\${TARGET_LOCALE}/" /etc/locale.gen
-
-# Generate locales
+sudo sed -i "s/^#\s*${TARGET_LOCALE}/${TARGET_LOCALE}/" /etc/locale.gen
 sudo locale-gen
-
-# Set system locale
-echo "LANG=\${TARGET_LOCALE}" | sudo tee /etc/locale.conf
-
-echo "Locale configuration complete: \${TARGET_LOCALE}"
-LOCALE_SCRIPT_EOF
-
-        if distrobox enter "$CONTAINER_NAME" -- bash "$TEMP_LOCALE_SCRIPT" "$TARGET_LOCALE" &>> "$LOG_FILE"; then
-            echo -e "${GREEN}✓ Locale configured to $TARGET_LOCALE.${NC}"
+echo "LANG=${TARGET_LOCALE}" | sudo tee /etc/locale.conf
+EOF
+        )
+        if echo "$script_content" | envsubst | run_command distrobox enter "$CONTAINER_NAME" -- bash -s; then
+            log_success "Locale configured to $TARGET_LOCALE."
         else
-            echo -e "${YELLOW}Warning: Locale configuration failed, continuing...${NC}"
+            log_warn "Locale configuration failed, continuing..."
         fi
-        rm -f "$TEMP_LOCALE_SCRIPT"
     fi
 }
 
-# FIX 1: configure_multilib is now its own function
 configure_multilib() {
     if [ "$ENABLE_MULTILIB" = "true" ]; then
-        echo -e "${BLUE}Enabling multilib repository...${NC}"
-        
-        TEMP_MULTILIB_SCRIPT=$(mktemp)
-        cat > "$TEMP_MULTILIB_SCRIPT" << 'MULTILIB_SCRIPT_EOF'
+        log_step "Enabling multilib repository..."
+        local script_content
+        script_content=$(cat <<'EOF'
 #!/bin/bash
 set -e
-
-# Check if multilib is already enabled
 if grep -q "^\[multilib\]" /etc/pacman.conf; then
-    echo "Multilib is already enabled"
+    echo "Multilib is already enabled."
     exit 0
 fi
-
-# Enable multilib repository
-echo "Enabling multilib repository..."
-sudo cp /etc/pacman.conf /etc/pacman.conf.bak
-
-# Add multilib section
-sudo bash -c 'cat >> /etc/pacman.conf << EOF
-
-[multilib]
-Include = /etc/pacman.d/mirrorlist
-EOF'
-
-# Update package database
+sudo bash -c 'printf "\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n" >> /etc/pacman.conf'
 sudo pacman -Sy
-
-echo "Multilib repository enabled"
-MULTILIB_SCRIPT_EOF
-
-        if distrobox enter "$CONTAINER_NAME" -- bash "$TEMP_MULTILIB_SCRIPT" &>> "$LOG_FILE"; then
-            echo -e "${GREEN}✓ Multilib repository enabled.${NC}"
+EOF
+        )
+        if echo "$script_content" | run_command distrobox enter "$CONTAINER_NAME" -- bash -s; then
+            log_success "Multilib repository enabled."
         else
-            echo -e "${YELLOW}Warning: Multilib configuration failed, continuing...${NC}"
+            log_warn "Multilib configuration failed, continuing..."
         fi
-        rm -f "$TEMP_MULTILIB_SCRIPT"
-    fi
-}
-
-install_gaming_packages() {
-    if [ "$ENABLE_GAMING_PACKAGES" = "true" ]; then
-        echo -e "${BLUE}Installing gaming-related packages...${NC}"
-        
-        TEMP_GAMING_SCRIPT=$(mktemp)
-        cat > "$TEMP_GAMING_SCRIPT" << 'GAMING_SCRIPT_EOF'
-#!/bin/bash
-set -e
-
-echo "Installing gaming utilities and libraries..."
-
-# Essential gaming packages
-GAMING_PACKAGES=(
-    "wine"
-    "winetricks" 
-    "lutris"
-    "steam"
-    "gamemode"
-    "lib32-gamemode"
-    "mangohud"
-    "lib32-mangohud"
-    "discord"
-    "obs-studio"
-)
-
-# Install packages that are available
-for package in "${GAMING_PACKAGES[@]}"; do
-    echo "Installing $package..."
-    if yay -S --noconfirm --needed "$package" 2>/dev/null; then
-        echo "✓ $package installed successfully"
-    else
-        echo "⚠ $package installation failed or not available"
-    fi
-done
-
-echo "Gaming packages installation complete"
-GAMING_SCRIPT_EOF
-
-        if distrobox enter "$CONTAINER_NAME" -- bash "$TEMP_GAMING_SCRIPT" &>> "$LOG_FILE"; then
-            echo -e "${GREEN}✓ Gaming packages installed.${NC}"
-        else
-            echo -e "${YELLOW}Warning: Some gaming packages may have failed to install.${NC}"
-        fi
-        rm -f "$TEMP_GAMING_SCRIPT"
     fi
 }
 
 setup_build_cache() {
     if [ "$ENABLE_BUILD_CACHE" = "true" ]; then
-        echo -e "${BLUE}Setting up persistent build cache...${NC}"
+        log_step "Setting up persistent build cache..."
+        run_command mkdir -p "$HOME/.cache/yay" "$HOME/.cache/pacman/pkg"
         
-        # Create cache directories on the host
-        mkdir -p "$HOME/.cache/yay"
-        mkdir -p "$HOME/.cache/pacman/pkg"
-        
-        TEMP_CACHE_SCRIPT=$(mktemp)
-        cat > "$TEMP_CACHE_SCRIPT" << 'CACHE_SCRIPT_EOF'
+        local script_content
+        script_content=$(cat <<'EOF'
 #!/bin/bash
 set -e
-
-# Configure yay to use persistent cache
 mkdir -p ~/.config/yay
-
-# FIX 2: Backup existing yay config before overwriting
-YAY_CONFIG_FILE=~/.config/yay/config.json
-if [ -f "$YAY_CONFIG_FILE" ]; then
-    echo "Backing up existing yay config to ${YAY_CONFIG_FILE}.bak"
-    cp "$YAY_CONFIG_FILE" "${YAY_CONFIG_FILE}.bak"
-fi
-
-cat > "$YAY_CONFIG_FILE" << EOF
-{
-    "buildDir": "/home/$(whoami)/.cache/yay",
-    "cleanAfter": false,
-    "cleanMenu": false
-}
+cat > ~/.config/yay/config.json << YAY_EOF
+{ "buildDir": "/home/$(whoami)/.cache/yay" }
+YAY_EOF
+sudo sed -i 's|^#CacheDir.*|CacheDir = /home/'$(whoami)'/.cache/pacman/pkg/|' /etc/pacman.conf
 EOF
-
-# Configure pacman cache
-sudo sed -i 's|^#CacheDir.*|CacheDir = /home/'$(whoami)'/.cache/pacman/pkg|' /etc/pacman.conf
-
-echo "Build cache configuration complete"
-CACHE_SCRIPT_EOF
-
-        if distrobox enter "$CONTAINER_NAME" -- bash "$TEMP_CACHE_SCRIPT" &>> "$LOG_FILE"; then
-            echo -e "${GREEN}✓ Build cache configured.${NC}"
+        )
+        if echo "$script_content" | run_command distrobox enter "$CONTAINER_NAME" -- bash -s; then
+            log_success "Build cache configured."
         else
-            echo -e "${YELLOW}Warning: Build cache configuration failed, continuing...${NC}"
+            log_warn "Build cache configuration failed, continuing..."
         fi
-        rm -f "$TEMP_CACHE_SCRIPT"
     fi
 }
 
-# FIX 3: Renamed function to reflect its actual purpose
-catalog_gui_apps() {
-    if [ "$AUTO_EXPORT_APPS" = "true" ]; then
-        echo -e "${BLUE}Cataloging installed GUI applications...${NC}"
-        
-        TEMP_EXPORT_SCRIPT=$(mktemp)
-        cat > "$TEMP_EXPORT_SCRIPT" << 'EXPORT_SCRIPT_EOF'
+install_gaming_packages() {
+    if [ "$ENABLE_GAMING_PACKAGES" = "true" ]; then
+        log_step "Installing gaming-related packages..."
+        local script_content
+        script_content=$(cat <<'EOF'
 #!/bin/bash
 set -e
+PACKAGES=( "wine" "winetricks" "lutris" "steam" "gamemode" "lib32-gamemode" "mangohud" "lib32-mangohud" "discord" "obs-studio" )
+yay -S --noconfirm --needed "${PACKAGES[@]}"
+EOF
+        )
+        if echo "$script_content" | run_command distrobox enter "$CONTAINER_NAME" -- bash -s; then
+            log_success "Gaming packages installed."
+        else
+            log_warn "Some gaming packages may have failed to install."
+        fi
+    fi
+}
 
-# Find all desktop files in the container
+export_additional_gui_apps() {
+    if [ "$AUTO_EXPORT_APPS" = "true" ]; then
+        log_step "Finding and exporting additional repository applications..."
+        local export_script
+        export_script=$(cat <<'EOF'
+#!/bin/bash
+APPLICATIONS_DIR="$HOME/.local/share/applications"
 find /usr/share/applications -name "*.desktop" -type f | while read -r desktop_file; do
     app_name=$(basename "$desktop_file" .desktop)
-    
-    # Skip certain system applications
+    if [ -f "${APPLICATIONS_DIR}/${app_name}.desktop" ] || [ -f "${APPLICATIONS_DIR}/${app_name}-distrobox.desktop" ]; then continue; fi
     case "$app_name" in
-        org.freedesktop.*|systemd-*|dbus-*|gparted|htop|pamac-manager|pamac-gtk)
-            continue
-            ;;
+        org.freedesktop.*|systemd-*|dbus-*|gparted|htop|pamac-manager|pamac-gtk|yad*|avahi-discover|bssh|bvnc) continue ;;
     esac
-    
-    # Check if it's a GUI application
-    if grep -q "^Type=Application" "$desktop_file" && ! grep -q "^Terminal=true" "$desktop_file"; then
-        # This step just logs the apps. To truly export them, you would run:
-        # distrobox-export --app "$app_name"
-        echo "Cataloging potential GUI app for export: $app_name"
+    if grep -q "^Type=Application" "$desktop_file" && ! grep -q -E "^Terminal=true|NoDisplay=true" "$desktop_file"; then
+        if distrobox-export --app "$app_name" --extra-flags "--no-sandbox"; then
+            echo "$app_name"
+        fi
     fi
 done
-EXPORT_SCRIPT_EOF
-
-        if distrobox enter "$CONTAINER_NAME" -- bash "$TEMP_EXPORT_SCRIPT" &>> "$LOG_FILE"; then
-            echo -e "${GREEN}✓ GUI applications catalogued. You can export them manually with 'distrobox-export'.${NC}"
-        else
-            echo -e "${YELLOW}Warning: App cataloguing failed, continuing...${NC}"
+EOF
+        )
+        if [ "$DRY_RUN" = "true" ]; then
+            log_warn "[DRY RUN] Would attempt to find and export additional GUI apps."
+            return
         fi
-        rm -f "$TEMP_EXPORT_SCRIPT"
+
+        local newly_exported
+        newly_exported=$(echo "$export_script" | distrobox enter "$CONTAINER_NAME" -- bash -s 2>>"$LOG_FILE")
+        if [ -n "$newly_exported" ]; then
+            log_success "Automatically exported additional repository apps."
+            while IFS= read -r app; do EXPORTED_APPS+=("$app"); done <<< "$newly_exported"
+        else
+            log_info "No new repository applications were found to export."
+        fi
     fi
 }
 
-cleanup_on_failure() {
-    local exit_code=$?
-    if [ $exit_code -ne 0 ]; then
-        log_and_echo "${RED}Setup failed with exit code $exit_code${NC}"
-        log_and_echo "${YELLOW}Cleaning up partial installation...${NC}"
-        
-        # Remove container if it exists and is incomplete
-        if distrobox list --no-color 2>/dev/null | grep -q " $CONTAINER_NAME "; then
-            log_and_echo "Removing incomplete container..."
-            distrobox rm "$CONTAINER_NAME" --force &>> "$LOG_FILE" || true
+export_flatpak_apps() {
+    if [ "$AUTO_EXPORT_FLATPAKS" = "true" ]; then
+        log_step "Finding and exporting additional Flatpak applications..."
+        local export_script
+        export_script=$(cat <<'EOF'
+#!/bin/bash
+APPLICATIONS_DIR="$HOME/.local/share/applications"
+if ! command -v flatpak &>/dev/null; then exit 0; fi
+flatpak list --app --columns=application | grep -vE '(\.Platform|\.Locale|\.Sources)$' | while read -r app_id; do
+    if [ -f "${APPLICATIONS_DIR}/${app_id}.desktop" ] || [ -f "${APPLICATIONS_DIR}/${app_id}-distrobox.desktop" ]; then continue; fi
+    if distrobox-export --app "$app_id" --extra-flags "--no-sandbox"; then
+        echo "$app_id"
+    fi
+done
+EOF
+        )
+        if [ "$DRY_RUN" = "true" ]; then
+            log_warn "[DRY RUN] Would attempt to find and export Flatpak apps."
+            return
         fi
-        
-        # Remove exported applications
-        if [ -d "$HOME/.local/share/applications" ]; then
-            find "$HOME/.local/share/applications" -name "*pamac*distrobox*" -delete 2>/dev/null || true
+
+        local newly_exported
+        newly_exported=$(echo "$export_script" | distrobox enter "$CONTAINER_NAME" -- bash -s 2>>"$LOG_FILE")
+        if [ -n "$newly_exported" ]; then
+            log_success "Automatically exported Flatpak apps."
+            while IFS= read -r app; do EXPORTED_APPS+=("$app"); done <<< "$newly_exported"
+        else
+            log_info "No new Flatpak applications were found to export."
         fi
-        
-        log_and_echo "${YELLOW}Cleanup complete. Check the log for details: ${LOG_FILE}${NC}"
+    fi
+}
+
+clean_caches() {
+    if [ "$ENABLE_BUILD_CACHE" = "false" ]; then
+        log_step "Cleaning package caches..."
+        if run_command distrobox enter "$CONTAINER_NAME" -- sudo pacman -Scc --noconfirm; then
+            log_success "Package caches cleaned to save space."
+        else
+            log_warn "Failed to clean package caches."
+        fi
     fi
 }
 
 # --- Main Execution ---
 main() {
-    # Initialize
     initialize_logging
     parse_arguments "$@"
-    trap cleanup_on_failure ERR
-    
-    # Header
+    trap 'cleanup_on_failure' ERR
+
     echo -e "${BOLD}${BLUE}🚀 Steam Deck Persistent AUR Package Manager Setup v${SCRIPT_VERSION}${NC}"
     echo -e "${YELLOW}Container: $CONTAINER_NAME${NC}"
-    echo -e "A detailed log will be saved to: ${LOG_FILE}\n"
-    
-    # Pre-flight checks
-    if [ "$CURRENT_USER" != "deck" ] && [ ! -f "/etc/steamos-release" ]; then
-        log_and_echo "${YELLOW}Warning: This script is designed for Steam Deck/SteamOS but will continue...${NC}"
+    log_info "A detailed log will be saved to: ${LOG_FILE}\n"
+    if [ "$DRY_RUN" = "true" ]; then
+        log_warn "[DRY RUN MODE ENABLED]: No changes will be made."
     fi
-    
-    if ! check_steamos_version; then
-        log_and_echo "${YELLOW}Warning: SteamOS version may be too old. Recommended: 3.5+${NC}"
-    fi
-    
-    # Step 1: Check dependencies
-    echo -e "${BLUE}Step 1: Checking for required host tools...${NC}"
-    missing_tools=()
+
+    check_steamos_version
+
+    log_step "Step 1: Checking for required host tools..."
     for cmd in distrobox podman flatpak; do
         if ! command -v "$cmd" &> /dev/null; then
-            missing_tools+=("$cmd")
+            log_error "Required tool not found: $cmd. Please ensure SteamOS is up to date."
+            exit 1
         fi
     done
-    
-    if [ ${#missing_tools[@]} -gt 0 ]; then
-        log_and_echo "${RED}Error: Required tools not found: ${missing_tools[*]}${NC}"
-        log_and_echo "Please ensure your Steam Deck is updated to SteamOS 3.6 or newer."
-        exit 1
-    fi
-    echo -e "${GREEN}✓ All required host tools are available.${NC}\n"
-    
-    # Step 1.5: Verify Podman
-    echo -e "${BLUE}Step 1.5: Verifying Podman functionality...${NC}"
-    if ! podman info &>> "$LOG_FILE"; then
-        log_and_echo "${YELLOW}Podman needs initialization. Setting up...${NC}"
-        
-        if ! podman machine list 2>/dev/null | grep -q "podman-machine-default"; then
-            podman machine init &>> "$LOG_FILE" || true
-        fi
-        
-        if ! podman machine list 2>/dev/null | grep -q "Currently running"; then
-            podman machine start &>> "$LOG_FILE" || true
-        fi
-        
-        if ! podman info &>> "$LOG_FILE"; then
-            log_and_echo "${RED}Podman is not functioning properly. Check the log for details.${NC}"
-            exit 1
+    log_success "All required host tools are available."
+
+    log_step "Step 2: Setting up '$CONTAINER_NAME' container..."
+    if distrobox list --no-color 2>/dev/null | grep -q " $CONTAINER_NAME "; then
+        if [ "$FORCE_REBUILD" = "true" ]; then
+            log_warn "Container '$CONTAINER_NAME' exists and --force-rebuild is set. Removing it now."
+            if run_command distrobox rm "$CONTAINER_NAME" --force; then
+                log_success "Existing container removed."
+            else
+                log_error "Failed to remove existing container. Aborting."
+                exit 1
+            fi
+        else
+            log_success "Container already exists. To rebuild it, use --force-rebuild."
         fi
     fi
-    echo -e "${GREEN}✓ Podman is working correctly.${NC}\n"
-    
-    # Step 2: Create/verify container
-    echo -e "${BLUE}Step 2: Setting up '$CONTAINER_NAME' container...${NC}"
-    
-    # Build volume mounts based on features
-    VOLUME_ARGS=""
-    if [ "$ENABLE_BUILD_CACHE" = "true" ]; then
-        mkdir -p "$HOME/.cache/yay" "$HOME/.cache/pacman/pkg"
-        VOLUME_ARGS="--volume $HOME/.cache/yay:/home/$CURRENT_USER/.cache/yay:rw --volume $HOME/.cache/pacman/pkg:/var/cache/pacman/pkg:rw"
-    fi
-    
+
     if ! distrobox list --no-color 2>/dev/null | grep -q " $CONTAINER_NAME "; then
-        log_and_echo "Container '$CONTAINER_NAME' not found. Creating it now..."
-        
-        if ! distrobox create \
-            --name "$CONTAINER_NAME" \
-            --image archlinux:latest \
-            --pull \
-            --yes \
-            --additional-packages "systemd" \
-            --home "$HOME" \
-            --volume /tmp:/tmp:rw \
-            --volume /dev:/dev:rw \
-            --volume /sys:/sys:ro \
-            --volume /run/user/$(id -u):/run/user/$(id -u):rw \
-            $VOLUME_ARGS &>> "$LOG_FILE"; then
-            log_and_echo "${RED}Failed to create container. Check the log for details.${NC}"
-            exit 1
+        log_info "Container '$CONTAINER_NAME' not found or was removed. Creating it now..."
+        VOLUME_ARGS=""
+        if [ "$ENABLE_BUILD_CACHE" = "true" ]; then
+            run_command mkdir -p "$HOME/.cache/yay" "$HOME/.cache/pacman/pkg"
+            VOLUME_ARGS="--volume $HOME/.cache/yay:/home/$CURRENT_USER/.cache/yay:rw --volume $HOME/.cache/pacman/pkg:/var/cache/pacman/pkg:rw"
         fi
         
-        if ! wait_for_container "$CONTAINER_NAME"; then
-            log_and_echo "${RED}Container creation failed or timed out.${NC}"
+        if ! run_command distrobox create --name "$CONTAINER_NAME" --image archlinux:latest --yes $VOLUME_ARGS; then
+            log_error "Failed to create container. Check the log for details."
             exit 1
         fi
-        
-        echo -e "${GREEN}✓ Container created successfully.${NC}"
-    else
-        echo -e "${GREEN}✓ Container already exists.${NC}"
+        CONTAINER_WAS_CREATED_BY_SCRIPT="true"
+        if ! wait_for_container "$CONTAINER_NAME"; then exit 1; fi
+        log_success "Container created successfully."
     fi
-    echo ""
     
-    # Step 3: Configure container
-    echo -e "${BLUE}Step 3: Configuring container...${NC}"
-    TEMP_CONFIG_SCRIPT=$(mktemp)
-    cat > "$TEMP_CONFIG_SCRIPT" << 'CONFIG_SCRIPT_EOF'
+    log_step "Step 3: Configuring container base environment..."
+    local config_script
+    config_script=$(cat << 'EOF'
 #!/bin/bash
 set -e
-
-CURRENT_USER="$1"
-
-# Configure sudo
 groupadd -f wheel
-usermod -aG wheel "$CURRENT_USER"
-echo '%wheel ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/99-wheel-nopasswd
-chmod 440 /etc/sudoers.d/99-wheel-nopasswd
-visudo -c -f /etc/sudoers.d/99-wheel-nopasswd
-
-# Initialize pacman
-pacman-key --init || true
-pacman-key --populate archlinux || true
-
-echo 'Container configuration complete'
-CONFIG_SCRIPT_EOF
-    
-    if ! distrobox enter "$CONTAINER_NAME" --root -- bash "$TEMP_CONFIG_SCRIPT" "$CURRENT_USER" &>> "$LOG_FILE"; then
-        log_and_echo "${RED}Failed to configure container.${NC}"
-        rm -f "$TEMP_CONFIG_SCRIPT"
+usermod -aG wheel "$(whoami)"
+echo '%wheel ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/99-wheel-nopasswd
+sudo chmod 440 /etc/sudoers.d/99-wheel-nopasswd
+sudo pacman-key --init && sudo pacman-key --populate archlinux
+EOF
+    )
+    if ! echo "$config_script" | run_command distrobox enter "$CONTAINER_NAME" -- bash -s; then
+        log_error "Failed to configure container base environment."
         exit 1
     fi
-    rm -f "$TEMP_CONFIG_SCRIPT"
-    echo -e "${GREEN}✓ Container configured.${NC}\n"
-    
-    # Step 4: Configure features
+    log_success "Container base environment configured."
+
+    log_step "Step 4: Applying feature configurations..."
     configure_mirrors
     configure_locale
     configure_multilib
     setup_build_cache
-    
-    # Step 5: Install Pamac
-    echo -e "${BLUE}Step 5: Installing Pamac inside '$CONTAINER_NAME'...${NC}"
-    TEMP_INSTALL_SCRIPT=$(mktemp)
-    cat > "$TEMP_INSTALL_SCRIPT" << 'INSTALL_SCRIPT_EOF'
+
+    log_step "Step 5: Installing Pamac inside '$CONTAINER_NAME'..."
+    local install_script
+    install_script=$(cat <<'EOF'
 #!/bin/bash
 set -e
-
-is_installed() {
-    pacman -Qi "$1" &>/dev/null
-}
-
-if is_installed pamac-aur || is_installed pamac-gtk; then
-    echo "Pamac is already installed."
-    if [ -f /etc/pamac.conf ]; then
-        sudo sed -i 's/^#EnableAUR/EnableAUR/' /etc/pamac.conf
-        sudo sed -i 's/^#CheckAURUpdates/CheckAURUpdates/' /etc/pamac.conf
-    fi
+if pacman -Qs pamac-aur &>/dev/null; then
+    echo "Pamac is already installed. Ensuring AUR is enabled."
+    sudo sed -i 's/^#EnableAUR/EnableAUR/' /etc/pamac.conf
     exit 0
 fi
-
-echo "Installing Pamac and dependencies..."
-# SUGGESTION APPLIED: Update system before installing AUR packages
-echo "Running full system upgrade to ensure keyring is up-to-date..."
-sudo pacman -Syu --noconfirm
-
-sudo pacman -S --needed --noconfirm git base-devel wget curl
-
+echo "Updating system and installing dependencies..."
+sudo pacman -Syu --noconfirm --needed git base-devel
 if ! command -v yay &>/dev/null; then
     echo "Installing yay AUR helper..."
-    TEMP_DIR=$(mktemp -d)
-    cd "$TEMP_DIR"
-    git clone https://aur.archlinux.org/yay-bin.git
-    cd yay-bin
-    makepkg -si --noconfirm --needed
-    cd /
-    rm -rf "$TEMP_DIR"
+    git clone https://aur.archlinux.org/yay-bin.git && cd yay-bin && makepkg -si --noconfirm && cd .. && rm -rf yay-bin
 fi
-
 echo "Installing Pamac GUI from AUR..."
 yay -S --noconfirm --needed pamac-aur
-
-if [ -f /etc/pamac.conf ]; then
-    sudo sed -i 's/^#EnableAUR/EnableAUR/' /etc/pamac.conf
-    sudo sed -i 's/^#CheckAURUpdates/CheckAURUpdates/' /etc/pamac.conf
-fi
-
-if command -v pamac-manager &>/dev/null; then
-    echo "Pamac installation verified successfully!"
-else
-    echo "Pamac installation verification failed"
-    exit 1
-fi
-INSTALL_SCRIPT_EOF
-    
-    if ! distrobox enter "$CONTAINER_NAME" -- bash "$TEMP_INSTALL_SCRIPT" 2>&1 | tee -a "$LOG_FILE"; then
-        log_and_echo "${RED}Pamac installation failed.${NC}"
-        rm -f "$TEMP_INSTALL_SCRIPT"
+sudo sed -i 's/^#EnableAUR/EnableAUR/' /etc/pamac.conf
+EOF
+    )
+    if ! echo "$install_script" | run_command distrobox enter "$CONTAINER_NAME" -- bash -s; then
+        log_error "Pamac installation failed."
         exit 1
     fi
-    rm -f "$TEMP_INSTALL_SCRIPT"
-    echo -e "${GREEN}✓ Pamac installation complete.${NC}\n"
+    log_success "Pamac installation complete."
     
-    # Step 5.5: Install gaming packages if requested
     install_gaming_packages
-    
-    # Step 6: Export applications
-    echo -e "${BLUE}Step 6: Exporting Pamac to the SteamOS menu...${NC}"
-    mkdir -p "$HOME/.local/share/applications"
-    
-    export_success=false
-    for app_name in pamac-manager pamac-gtk; do
-        if distrobox enter "$CONTAINER_NAME" -- which "$app_name" &>/dev/null; then
-            if distrobox-export --app "$app_name" --extra-flags "--no-sandbox" &>> "$LOG_FILE"; then
-                export_success=true
-                echo -e "${GREEN}✓ Successfully exported '$app_name'.${NC}"
-                break
-            fi
-        fi
-    done
-    
-    if [ "$export_success" = false ]; then
-        cat > "$HOME/.local/share/applications/pamac-manager-distrobox.desktop" << EOF
+
+    log_step "Step 6: Exporting Pamac to the SteamOS menu..."
+    if ! run_command distrobox-export --app pamac-manager --extra-flags "--no-sandbox"; then
+        log_warn "distrobox-export failed. Creating manual .desktop file."
+        export CONTAINER_NAME
+        echo | envsubst '$CONTAINER_NAME' > "$HOME/.local/share/applications/pamac-manager-distrobox.desktop" << EOF
 [Desktop Entry]
 Type=Application
 Name=Pamac Package Manager
-Comment=Add or remove software installed on your system
+Comment=Add or remove software installed in $CONTAINER_NAME
 Icon=pamac-manager
 Exec=distrobox enter $CONTAINER_NAME -- pamac-manager
 Terminal=false
 Categories=System;PackageManager;
 EOF
-        echo -e "${GREEN}✓ Manual desktop entry created.${NC}"
     fi
-    
-    update-desktop-database -q "$HOME/.local/share/applications" 2>/dev/null || true
-    echo ""
-    
-    # Step 7: Install BoxBuddy
-    echo -e "${BLUE}Step 7: Installing BoxBuddy for container management...${NC}"
-    if ! flatpak remotes --user | grep -q "flathub"; then
-        flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo &>> "$LOG_FILE" || true
-    fi
-    
-    if ! flatpak info --user "io.github.dvlv.BoxBuddy" &>/dev/null; then
-        if flatpak install --user -y flathub "io.github.dvlv.BoxBuddy" &>> "$LOG_FILE"; then
-            echo -e "${GREEN}✓ BoxBuddy installed.${NC}"
+    run_command update-desktop-database -q "$HOME/.local/share/applications"
+    log_success "Pamac is available in the application menu."
+
+    log_step "Step 7: Installing BoxBuddy for container management..."
+    if ! flatpak info --user io.github.dvlv.BoxBuddy &>/dev/null; then
+        run_command flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+        if run_command flatpak install --user -y flathub io.github.dvlv.BoxBuddy; then
+            log_success "BoxBuddy installed."
         else
-            echo -e "${YELLOW}BoxBuddy installation failed (optional).${NC}"
+            log_warn "BoxBuddy installation failed (this is optional)."
         fi
     else
-        echo -e "${GREEN}✓ BoxBuddy already installed.${NC}"
+        log_success "BoxBuddy is already installed."
     fi
-    echo ""
-    
-    # Step 8: Auto-export apps
-    catalog_gui_apps
-    
-    # Step 9: Final verification
-    echo -e "${BLUE}Step 9: Verifying installation...${NC}"
-    verification_issues=()
-    
-    if ! distrobox list --no-color 2>/dev/null | grep -q " $CONTAINER_NAME "; then
-        verification_issues+=("Container not found")
-    elif ! distrobox enter "$CONTAINER_NAME" -- echo "test" &>/dev/null; then
-        verification_issues+=("Container not responding")
-    fi
-    
-    if ! distrobox enter "$CONTAINER_NAME" -- which pamac-manager &>/dev/null; then
-        verification_issues+=("Pamac not found")
-    fi
-    
-    if [ ${#verification_issues[@]} -eq 0 ]; then
-        echo -e "${GREEN}✓ All components verified successfully!${NC}"
+
+    log_step "Step 8: Exporting additional applications..."
+    export_additional_gui_apps
+    export_flatpak_apps
+
+    log_step "Step 9: Final verification..."
+    local verify_script
+    verify_script=$(cat <<'EOF'
+#!/bin/bash
+errors=0
+check_cmd() { command -v "$1" &>/dev/null || { echo "❌ command '$1' not found."; ((errors++)); }; }
+check_pkg() { pacman -Qs "$1" &>/dev/null || { echo "❌ package '$1' not installed."; ((errors++)); }; }
+check_conf() { grep -q "^$2" "$1" && ! grep -q "^#$2" "$1" || { echo "❌ '$2' not enabled in $1."; ((errors++)); }; }
+check_cmd yay; check_cmd pamac-manager; check_pkg pamac-aur; check_conf /etc/pamac.conf EnableAUR
+exit $errors
+EOF
+    )
+    if echo "$verify_script" | run_command distrobox enter "$CONTAINER_NAME" -- bash -s; then
+        log_success "All components verified successfully!"
     else
-        log_and_echo "${YELLOW}Verification issues found:${NC}"
-        for issue in "${verification_issues[@]}"; do
-            log_and_echo "  - $issue"
-        done
+        log_error "Installation verification failed. Check the log for specific errors."
     fi
-    echo ""
     
-    # Success message
-    echo -e "${BOLD}${GREEN}🎉 SETUP COMPLETE! 🎉${NC}"
+    log_step "Step 10: Finalizing..."
+    clean_caches
+    
+    echo -e "\n${BOLD}${GREEN}🎉 SETUP COMPLETE! 🎉${NC}"
     echo -e "${GREEN}Enhanced Pamac with AUR support is now installed and ready to use.${NC}"
     echo ""
     echo -e "${BOLD}${YELLOW}FEATURES ENABLED:${NC}"
     [ "$ENABLE_MULTILIB" = "true" ] && echo -e "  ✓ ${GREEN}Multilib repository (32-bit app support)${NC}"
     [ "$ENABLE_BUILD_CACHE" = "true" ] && echo -e "  ✓ ${GREEN}Persistent build cache${NC}"
-    [ "$CONFIGURE_MIRRORS" = "true" ] && echo -e "  ✓ ${GREEN}Optimized mirror configuration${NC}"
-    [ "$AUTO_EXPORT_APPS" = "true" ] && echo -e "  ✓ ${GREEN}App cataloguing${NC}"
-    [ "$ENABLE_GAMING_PACKAGES" = "true" ] && echo -e "  ✓ ${GREEN}Gaming packages (Wine, Lutris, Steam, etc.)${NC}"
+    [ "$CONFIGURE_MIRRORS" = "true" ] && echo -e "  ✓ ${GREEN}Optimized mirror configuration ($MIRROR_COUNTRIES)${NC}"
+    [ "$AUTO_EXPORT_APPS" = "true" ] && echo -e "  ✓ ${GREEN}Repo App Auto-Export${NC}"
+    [ "$AUTO_EXPORT_FLATPAKS" = "true" ] && echo -e "  ✓ ${GREEN}Flatpak App Auto-Export${NC}"
+    [ "$ENABLE_GAMING_PACKAGES" = "true" ] && echo -e "  ✓ ${GREEN}Gaming packages installed${NC}"
     [ "$CONFIGURE_LOCALE" = "true" ] && echo -e "  ✓ ${GREEN}Locale configured ($TARGET_LOCALE)${NC}"
+    [ "$ENABLE_BUILD_CACHE" = "false" ] && echo -e "  ✓ ${GREEN}Build Cache Cleaning${NC}"
+    
+    if [ ${#EXPORTED_APPS[@]} -gt 0 ]; then
+        echo -e "\n${BOLD}${YELLOW}AUTO-EXPORTED APPS:${NC}"
+        for app in "${EXPORTED_APPS[@]}"; do
+            echo -e "  - $app"
+        done
+    fi
+
     echo ""
     echo -e "${BOLD}${YELLOW}ACCESS METHODS:${NC}"
     echo -e "  🖥️  Desktop Mode: Application Launcher → '${GREEN}Pamac Package Manager${NC}'"
-    echo -e "  🎮  Gaming Mode: STEAM → Library → '${GREEN}Non-Steam${NC}' collection"
     echo -e "  🛠️  Management: Use '${GREEN}BoxBuddy${NC}' for advanced container operations"
     echo ""
     echo -e "${BOLD}${YELLOW}USEFUL COMMANDS:${NC}"
-    echo -e "  Update script: ${GREEN}$0 --update${NC}"
-    echo -e "  Uninstall: ${GREEN}$0 --uninstall${NC}"
-    echo -e "  Container shell: ${GREEN}distrobox enter $CONTAINER_NAME${NC}"
-    echo -e "  Export app: ${GREEN}distrobox-export --app <app-name>${NC}"
+    echo -e "  Update script: ${GREEN}./$(basename "$0") --update${NC}"
+    echo -e "  Uninstall:     ${GREEN}./$(basename "$0") --uninstall${NC}"
     echo ""
-    echo -e "${BOLD}${BLUE}Your Steam Deck now has enhanced access to the Arch ecosystem! 🚀${NC}"
+    echo -e "${BOLD}${YELLOW}PRO-TIPS:${NC}"
+    echo -e "  To improve compatibility for some GUI apps (especially Flatpaks), you can"
+    echo -e "  give them access to the host display server with this command:"
+    echo -e "  ${GREEN}flatpak override --user --env=DISPLAY=:0 <app-id>${NC}"
 }
 
 # Run main function with all arguments

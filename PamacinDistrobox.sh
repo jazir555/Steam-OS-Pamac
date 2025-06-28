@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Enhanced Steam Deck Pamac Setup Script v2.1
+# Enhanced Steam Deck Pamac Setup Script v2.2
 # This script automates the setup of a persistent, GUI-based package management
 # system (Pamac with AUR) on SteamOS using Distrobox.
 # It is idempotent, fully automated, and requires no user input after execution.
@@ -9,7 +9,7 @@
 set -e
 
 # --- Configuration Variables ---
-SCRIPT_VERSION="2.1"
+SCRIPT_VERSION="2.2"
 CONTAINER_NAME="${CONTAINER_NAME:-arch-box}"
 CURRENT_USER=$(whoami)
 LOG_FILE="$HOME/distrobox-pamac-setup.log"
@@ -291,6 +291,48 @@ LOCALE_SCRIPT_EOF
     fi
 }
 
+# FIX 1: configure_multilib is now its own function
+configure_multilib() {
+    if [ "$ENABLE_MULTILIB" = "true" ]; then
+        echo -e "${BLUE}Enabling multilib repository...${NC}"
+        
+        TEMP_MULTILIB_SCRIPT=$(mktemp)
+        cat > "$TEMP_MULTILIB_SCRIPT" << 'MULTILIB_SCRIPT_EOF'
+#!/bin/bash
+set -e
+
+# Check if multilib is already enabled
+if grep -q "^\[multilib\]" /etc/pacman.conf; then
+    echo "Multilib is already enabled"
+    exit 0
+fi
+
+# Enable multilib repository
+echo "Enabling multilib repository..."
+sudo cp /etc/pacman.conf /etc/pacman.conf.bak
+
+# Add multilib section
+sudo bash -c 'cat >> /etc/pacman.conf << EOF
+
+[multilib]
+Include = /etc/pacman.d/mirrorlist
+EOF'
+
+# Update package database
+sudo pacman -Sy
+
+echo "Multilib repository enabled"
+MULTILIB_SCRIPT_EOF
+
+        if distrobox enter "$CONTAINER_NAME" -- bash "$TEMP_MULTILIB_SCRIPT" &>> "$LOG_FILE"; then
+            echo -e "${GREEN}✓ Multilib repository enabled.${NC}"
+        else
+            echo -e "${YELLOW}Warning: Multilib configuration failed, continuing...${NC}"
+        fi
+        rm -f "$TEMP_MULTILIB_SCRIPT"
+    fi
+}
+
 install_gaming_packages() {
     if [ "$ENABLE_GAMING_PACKAGES" = "true" ]; then
         echo -e "${BLUE}Installing gaming-related packages...${NC}"
@@ -337,51 +379,12 @@ GAMING_SCRIPT_EOF
         rm -f "$TEMP_GAMING_SCRIPT"
     fi
 }
-    if [ "$ENABLE_MULTILIB" = "true" ]; then
-        echo -e "${BLUE}Enabling multilib repository...${NC}"
-        
-        TEMP_MULTILIB_SCRIPT=$(mktemp)
-        cat > "$TEMP_MULTILIB_SCRIPT" << 'MULTILIB_SCRIPT_EOF'
-#!/bin/bash
-set -e
-
-# Check if multilib is already enabled
-if grep -q "^\[multilib\]" /etc/pacman.conf; then
-    echo "Multilib is already enabled"
-    exit 0
-fi
-
-# Enable multilib repository
-echo "Enabling multilib repository..."
-sudo cp /etc/pacman.conf /etc/pacman.conf.bak
-
-# Add multilib section
-sudo bash -c 'cat >> /etc/pacman.conf << EOF
-
-[multilib]
-Include = /etc/pacman.d/mirrorlist
-EOF'
-
-# Update package database
-sudo pacman -Sy
-
-echo "Multilib repository enabled"
-MULTILIB_SCRIPT_EOF
-
-        if distrobox enter "$CONTAINER_NAME" -- bash "$TEMP_MULTILIB_SCRIPT" &>> "$LOG_FILE"; then
-            echo -e "${GREEN}✓ Multilib repository enabled.${NC}"
-        else
-            echo -e "${YELLOW}Warning: Multilib configuration failed, continuing...${NC}"
-        fi
-        rm -f "$TEMP_MULTILIB_SCRIPT"
-    fi
-}
 
 setup_build_cache() {
     if [ "$ENABLE_BUILD_CACHE" = "true" ]; then
         echo -e "${BLUE}Setting up persistent build cache...${NC}"
         
-        # Create cache directories
+        # Create cache directories on the host
         mkdir -p "$HOME/.cache/yay"
         mkdir -p "$HOME/.cache/pacman/pkg"
         
@@ -392,7 +395,15 @@ set -e
 
 # Configure yay to use persistent cache
 mkdir -p ~/.config/yay
-cat > ~/.config/yay/config.json << EOF
+
+# FIX 2: Backup existing yay config before overwriting
+YAY_CONFIG_FILE=~/.config/yay/config.json
+if [ -f "$YAY_CONFIG_FILE" ]; then
+    echo "Backing up existing yay config to ${YAY_CONFIG_FILE}.bak"
+    cp "$YAY_CONFIG_FILE" "${YAY_CONFIG_FILE}.bak"
+fi
+
+cat > "$YAY_CONFIG_FILE" << EOF
 {
     "buildDir": "/home/$(whoami)/.cache/yay",
     "cleanAfter": false,
@@ -415,9 +426,10 @@ CACHE_SCRIPT_EOF
     fi
 }
 
-auto_export_installed_apps() {
+# FIX 3: Renamed function to reflect its actual purpose
+catalog_gui_apps() {
     if [ "$AUTO_EXPORT_APPS" = "true" ]; then
-        echo -e "${BLUE}Auto-exporting installed GUI applications...${NC}"
+        echo -e "${BLUE}Cataloging installed GUI applications...${NC}"
         
         TEMP_EXPORT_SCRIPT=$(mktemp)
         cat > "$TEMP_EXPORT_SCRIPT" << 'EXPORT_SCRIPT_EOF'
@@ -430,20 +442,22 @@ find /usr/share/applications -name "*.desktop" -type f | while read -r desktop_f
     
     # Skip certain system applications
     case "$app_name" in
-        org.freedesktop.*|systemd-*|dbus-*|gparted|htop)
+        org.freedesktop.*|systemd-*|dbus-*|gparted|htop|pamac-manager|pamac-gtk)
             continue
             ;;
     esac
     
     # Check if it's a GUI application
     if grep -q "^Type=Application" "$desktop_file" && ! grep -q "^Terminal=true" "$desktop_file"; then
-        echo "Found GUI app: $app_name"
+        # This step just logs the apps. To truly export them, you would run:
+        # distrobox-export --app "$app_name"
+        echo "Cataloging potential GUI app for export: $app_name"
     fi
 done
 EXPORT_SCRIPT_EOF
 
         if distrobox enter "$CONTAINER_NAME" -- bash "$TEMP_EXPORT_SCRIPT" &>> "$LOG_FILE"; then
-            echo -e "${GREEN}✓ GUI applications catalogued for future export.${NC}"
+            echo -e "${GREEN}✓ GUI applications catalogued. You can export them manually with 'distrobox-export'.${NC}"
         else
             echo -e "${YELLOW}Warning: App cataloguing failed, continuing...${NC}"
         fi
@@ -627,7 +641,10 @@ if is_installed pamac-aur || is_installed pamac-gtk; then
 fi
 
 echo "Installing Pamac and dependencies..."
-sudo pacman -Sy --noconfirm
+# SUGGESTION APPLIED: Update system before installing AUR packages
+echo "Running full system upgrade to ensure keyring is up-to-date..."
+sudo pacman -Syu --noconfirm
+
 sudo pacman -S --needed --noconfirm git base-devel wget curl
 
 if ! command -v yay &>/dev/null; then
@@ -718,7 +735,7 @@ EOF
     echo ""
     
     # Step 8: Auto-export apps
-    auto_export_installed_apps
+    catalog_gui_apps
     
     # Step 9: Final verification
     echo -e "${BLUE}Step 9: Verifying installation...${NC}"
@@ -752,7 +769,7 @@ EOF
     [ "$ENABLE_MULTILIB" = "true" ] && echo -e "  ✓ ${GREEN}Multilib repository (32-bit app support)${NC}"
     [ "$ENABLE_BUILD_CACHE" = "true" ] && echo -e "  ✓ ${GREEN}Persistent build cache${NC}"
     [ "$CONFIGURE_MIRRORS" = "true" ] && echo -e "  ✓ ${GREEN}Optimized mirror configuration${NC}"
-    [ "$AUTO_EXPORT_APPS" = "true" ] && echo -e "  ✓ ${GREEN}Automatic app export${NC}"
+    [ "$AUTO_EXPORT_APPS" = "true" ] && echo -e "  ✓ ${GREEN}App cataloguing${NC}"
     [ "$ENABLE_GAMING_PACKAGES" = "true" ] && echo -e "  ✓ ${GREEN}Gaming packages (Wine, Lutris, Steam, etc.)${NC}"
     [ "$CONFIGURE_LOCALE" = "true" ] && echo -e "  ✓ ${GREEN}Locale configured ($TARGET_LOCALE)${NC}"
     echo ""

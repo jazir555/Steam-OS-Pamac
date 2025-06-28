@@ -3,6 +3,12 @@
 # This script automates the setup of a persistent, GUI-based package management
 # system (Pamac with AUR) on SteamOS using Distrobox.
 # It is idempotent and fully automated, requiring no user input after execution.
+#
+# WHY THIS DOES NOT REQUIRE DEVELOPER MODE:
+# This script is carefully designed to work on a standard Steam Deck (SteamOS 3.5+).
+# 1. It checks for Podman/Distrobox, which are pre-installed by Valve. It does NOT try to install them on the host.
+# 2. All container files are stored in the user's home directory, which is always writable.
+# 3. App exports (.desktop files) and Flatpak installs are user-level operations that do not touch the read-only system root.
 
 # Stop on any error
 set -e
@@ -15,18 +21,16 @@ NC='\033[0m' # No Color
 
 # --- Variables ---
 CONTAINER_NAME="arch-box"
-# Get the current username (usually 'deck' on Steam Deck)
-# This makes the script more portable if run by a different user.
-CURRENT_USER=$(whoami)
+CURRENT_USER=$(whoami) # Usually 'deck' on Steam Deck
 
 echo -e "${BLUE}--- Steam Deck Persistent AUR Package Manager Setup ---${NC}"
 echo -e "${YELLOW}This script will set up an Arch Linux container, install and configure Pamac, and make it available on your Steam Deck.${NC}\n"
 
 # --- Step 1: Check for Distrobox and Podman ---
-echo -e "${BLUE}Step 1: Checking for Distrobox and Podman...${NC}"
+echo -e "${BLUE}Step 1: Checking for required tools (Distrobox and Podman)...${NC}"
 if ! command -v distrobox &> /dev/null || ! command -v podman &> /dev/null; then
-    echo -e "${YELLOW}Error: Distrobox or Podman not found. SteamOS 3.5+ should include them."
-    echo "Please ensure your Steam Deck is up to date before running this script."
+    echo -e "${YELLOW}Error: Distrobox or Podman not found."
+    echo "Please ensure your Steam Deck is updated to SteamOS 3.5 or newer before running this script."
     exit 1
 fi
 echo -e "${GREEN}Distrobox and Podman are available.${NC}\n"
@@ -80,20 +84,18 @@ NC_IN='\033[0m'
 echo -e "${BLUE_IN}--- Now running inside the container ---${NC_IN}"
 
 echo -e "${YELLOW_IN}Updating system and installing base dependencies...${NC_IN}"
-# Update repositories and install git, build tools, and a key pamac dependency in one go.
-sudo pacman -Syu --needed --noconfirm git base-devel appstream-glib
+# Update repositories and install git, build tools, and all Pamac/appstream dependencies.
+sudo pacman -Syu --needed --noconfirm git base-devel appstream appstream-glib
 
 echo -e "\n${YELLOW_IN}Checking for yay (AUR Helper)...${NC_IN}"
 if ! command -v yay &> /dev/null; then
     echo "yay not found. Cloning and installing from pre-compiled binary..."
-    # Create a temporary directory for the build to keep things clean
     temp_dir=$(mktemp -d)
     git clone https://aur.archlinux.org/yay-bin.git "$temp_dir"
     cd "$temp_dir"
     # Build and install the package. -s installs deps, -i installs package.
     # --noconfirm prevents all prompts. sudo is now passwordless.
     makepkg -si --noconfirm
-    # Clean up the temporary build files
     cd /
     rm -rf "$temp_dir"
     echo -e "${GREEN_IN}yay installed successfully.${NC_IN}"
@@ -102,15 +104,11 @@ else
 fi
 
 echo -e "\n${YELLOW_IN}Checking for Pamac GUI...${NC_IN}"
-# Check if the package is already installed to maintain idempotency
 if ! pacman -Qs pamac-aur > /dev/null; then
     echo "Pamac not found. Installing with yay (this may take a while)..."
-    # Use yay to install Pamac from the AUR. This is fully non-interactive.
-    # We are NOT running as root, so yay works correctly.
     yay -S --noconfirm pamac-aur
 
     echo -e "\n${YELLOW_IN}Enabling AUR support in Pamac configuration...${NC_IN}"
-    # Automatically uncomment the lines to enable AUR support in the Pamac GUI
     sudo sed -i 's/^#\(EnableAUR\)/\1/' /etc/pamac.conf
     sudo sed -i 's/^#\(CheckAURUpdates\)/\1/' /etc/pamac.conf
     echo -e "${GREEN_IN}Pamac installed and configured successfully.${NC_IN}"
@@ -124,13 +122,11 @@ echo ""
 
 # --- Step 5: Export Pamac to the Host Menu ---
 echo -e "${BLUE}Step 5: Exporting Pamac to the SteamOS menu...${NC}"
-# This MUST be run on the HOST, not inside the container.
 distrobox-export --app pamac-manager
 
 # Verify that the export was successful
 DESKTOP_FILE_PATH="$HOME/.local/share/applications/pamac-manager.desktop"
 if [ -f "$DESKTOP_FILE_PATH" ]; then
-    # Optional: Force an update to the application database to make the icon appear faster
     update-desktop-database -q "$HOME/.local/share/applications"
     echo -e "${GREEN}Successfully exported 'Pamac Manager' to your application launcher.${NC}"
 else
@@ -141,9 +137,11 @@ echo ""
 # --- Step 6: Install a GUI for Future App Management ---
 echo -e "${BLUE}Step 6: (Recommended) Installing BoxBuddy for easy app management...${NC}"
 FLATPAK_ID="io.github.dvlv.BoxBuddy"
-if ! flatpak info "$FLATPAK_ID" &> /dev/null; then
-    echo "BoxBuddy not found. Installing from Flathub..."
-    flatpak install -y flathub "$FLATPAK_ID"
+if ! flatpak info --user "$FLATPAK_ID" &> /dev/null; then
+    echo "BoxBuddy not found. Installing from Flathub for the current user..."
+    # The --user flag is critical to ensure installation happens in the home directory,
+    # avoiding the need for root access or Developer Mode.
+    flatpak install --user -y flathub "$FLATPAK_ID"
     echo -e "${GREEN}BoxBuddy installed successfully.${NC}"
 else
     echo -e "${GREEN}BoxBuddy is already installed.${NC}"

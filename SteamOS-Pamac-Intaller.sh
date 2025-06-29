@@ -9,7 +9,7 @@
 set -e
 
 # --- Configuration Variables ---
-SCRIPT_VERSION="3.3"
+SCRIPT_VERSION="3.4"  # Updated version
 CONTAINER_NAME="${CONTAINER_NAME:-arch-box}"
 CURRENT_USER=$(whoami)
 LOG_FILE="$HOME/distrobox-pamac-setup.log"
@@ -245,6 +245,56 @@ EOF
         log_error "Pamac installation failed"
         return 1
     }
+    
+    # NEW: Setup desktop entry cleanup hook
+    log_info "Setting up desktop entry cleanup hook..."
+    local hook_script=$(cat <<EOF
+#!/bin/bash
+# Create hook directory
+sudo mkdir -p /etc/pacman.d/hooks
+
+# Create cleanup script
+sudo tee /usr/local/bin/cleanup-desktop-entries.sh >/dev/null <<'CLEANUP_EOF'
+#!/bin/sh
+# Get container name from environment
+CONTAINER_NAME="$CONTAINER_NAME"
+
+# Remove desktop entries for uninstalled packages
+for pkg in "\$@"; do
+    # Find desktop files associated with the package
+    while read -r desktop_file; do
+        # Get base name without .desktop extension
+        entry_name=\$(basename "\$desktop_file" .desktop)
+        # Remove exported desktop entries
+        find "\$HOME/.local/share/applications" \
+            \( -name "*\${entry_name}*distrobox*.desktop" -o -name "*\${entry_name}*${CONTAINER_NAME}*.desktop" \) \
+            -delete
+    done < <(pacman -Ql "\$pkg" 2>/dev/null | grep -E '\.desktop$' | awk '{print \$2}')
+done
+
+# Update desktop database if available
+if command -v update-desktop-database &>/dev/null; then
+    update-desktop-database "\$HOME/.local/share/applications"
+fi
+CLEANUP_EOF
+
+sudo chmod +x /usr/local/bin/cleanup-desktop-entries.sh
+
+# Create pacman hook
+sudo tee /etc/pacman.d/hooks/cleanup-desktop-entries.hook >/dev/null <<'HOOK_EOF'
+[Trigger]
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Cleaning up desktop entries for uninstalled packages...
+When = PostTransaction
+Exec = /usr/local/bin/cleanup-desktop-entries.sh %o
+HOOK_EOF
+EOF
+)
+    echo "$hook_script" | run_command distrobox enter "$CONTAINER_NAME" -- bash -s
 }
 
 export_apps() {
@@ -298,6 +348,7 @@ main() {
     # Final report
     echo -e "\n${BOLD}${GREEN}Setup Complete!${NC}"
     echo -e "Access Pamac through your application menu"
+    echo -e "Desktop entries will be automatically cleaned up when packages are uninstalled"
     echo -e "Log file: ${LOG_FILE}"
 }
 

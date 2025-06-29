@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Enhanced Steam Deck Pamac Setup Script v3.3 (SteamOS-Optimized)
+# Steam Deck Pamac Setup Script
 # This script is specifically designed to work on SteamOS without Developer Mode
 # It automates the setup of a persistent, GUI-based package management system
 # using Distrobox containers with no host system modifications.

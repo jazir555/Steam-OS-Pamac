@@ -1,5 +1,10 @@
 # Steam-OS-Pamac
 
+Installation command (You will need to adjust the directory path if the script is not on the desktop)
+
+**chmod +x ~/Desktop/install-pamac.sh ~/Desktop/Install-Pamac.desktop**
+
+
 ### Core Functionality
 1. **Immutable Filesystem Preservation** ✅  
    - All package installations occur entirely within the Distrobox container

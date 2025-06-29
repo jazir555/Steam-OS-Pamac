@@ -9,7 +9,7 @@
 set -e
 
 # --- Configuration Variables ---
-SCRIPT_VERSION="3.4"  # Updated version
+SCRIPT_VERSION="3.5"  # Updated version with fixes
 CONTAINER_NAME="${CONTAINER_NAME:-arch-box}"
 CURRENT_USER=$(whoami)
 LOG_FILE="$HOME/distrobox-pamac-setup.log"
@@ -49,7 +49,7 @@ fi
 initialize_logging() {
     echo "=== Steam Deck Pamac Setup v${SCRIPT_VERSION} - $(date) ===" > "$LOG_FILE"
     echo "User: $CURRENT_USER" >> "$LOG_FILE"
-    echo "SteamOS Version: $(grep VERSION_ID /etc/os-release | cut -d= -f2)" >> "$LOG_FILE"
+    echo "SteamOS Version: $(grep VERSION_ID /etc/os-release | cut -d= -f2 || echo 'N/A')" >> "$LOG_FILE"
     echo "Features: MULTILIB=$ENABLE_MULTILIB GAMING=$ENABLE_GAMING_PACKAGES" >> "$LOG_FILE"
     echo "===========================================" >> "$LOG_FILE"
     
@@ -150,13 +150,14 @@ uninstall_setup() {
     
     if distrobox list | grep -qw "$CONTAINER_NAME"; then
         log_info "Removing container..."
-        run_command distrobox rm "$CONTAINER_NAME" --force || log_error "Container removal failed"
+        run_command distrobox rm "$CONTAINER_NAME" --force || log_warn "Container removal may have failed."
     fi
     
     if [ -d "$HOME/.local/share/applications" ]; then
         log_info "Cleaning exported apps..."
         find "$HOME/.local/share/applications" \( -name "*pamac*distrobox*" -o -name "*$CONTAINER_NAME*" \) -delete
     fi
+    run_command update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
     log_success "Uninstallation complete"
 }
 
@@ -173,7 +174,7 @@ check_steamos_compatibility() {
 
 wait_for_container() {
     local attempts=0
-    log_info "Waiting for container..."
+    log_info "Waiting for container to become ready..."
     until distrobox enter "$CONTAINER_NAME" -- echo "Ready" &>/dev/null; do
         sleep 2
         ((attempts++))
@@ -182,15 +183,17 @@ wait_for_container() {
             return 1
         fi
     done
-    log_success "Container ready"
+    log_success "Container is ready"
 }
 
 # --- Core Functions ---
 create_container() {
-    log_step "Creating container..."
+    log_step "Creating container: $CONTAINER_NAME"
     local volume_args=""
     [ "$ENABLE_BUILD_CACHE" = "true" ] && {
-        mkdir -p "$HOME/.cache/yay" "$HOME/.cache/pacman/pkg"
+        mkdir -p "$HOME/.cache/yay"
+        # The pacman cache is managed by the root user inside the container, so we don't pre-create it on the host.
+        # It will be created inside the podman volume storage.
         volume_args="--volume $HOME/.cache/yay:/home/$CURRENT_USER/.cache/yay:rw"
     }
 
@@ -207,104 +210,138 @@ create_container() {
 }
 
 configure_container() {
-    log_step "Configuring container..."
+    log_step "Configuring base container environment (sudo, keys)..."
     local setup_script=$(cat <<'EOF'
-#!/bin/bash
-# Configure container without sudo
-echo "Configuring container environment..."
-if ! grep -q "wheel" /etc/group; then groupadd wheel; fi
-usermod -aG wheel $(whoami)
+set -e
+echo "Running as root to setup environment..."
+# Ensure the wheel group exists and add the default user to it
+if ! grep -q "^wheel:" /etc/group; then groupadd wheel; fi
+usermod -aG wheel deck
+
+# Setup passwordless sudo for the wheel group
 echo '%wheel ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/wheel-nopasswd
 chmod 0440 /etc/sudoers.d/wheel-nopasswd
-pacman-key --init && pacman-key --populate archlinux
+
+# Initialize pacman keyring
+pacman-key --init
+pacman-key --populate archlinux
+echo "Base environment configured."
 EOF
 )
-    echo "$setup_script" | run_command distrobox enter "$CONTAINER_NAME" -- bash -s || {
+    # FIX #1: Use --root to run the initial setup script. This allows modification of /etc.
+    echo "$setup_script" | run_command distrobox enter --root "$CONTAINER_NAME" -- bash -s || {
         log_error "Container configuration failed"
         return 1
     }
 }
 
-install_pamac() {
-    log_step "Installing Pamac..."
-    local install_script=$(cat <<'EOF'
-#!/bin/bash
-# Install Pamac without requiring host sudo
-echo "Installing Pamac..."
+install_pamac_and_hook() {
+    log_step "Installing Pamac and system tools..."
+    # FIX #2: The entire script is now designed to be run with `sudo` inside the container.
+    # This ensures all commands, including `sed` and creating the hook file, have the correct permissions.
+    local install_script=$(cat <<EOF
+set -e
+echo "Updating system and installing dependencies..."
 pacman -Syu --noconfirm --needed git base-devel
+
+echo "Checking for AUR helper (yay)..."
 if ! command -v yay >/dev/null; then
-    (git clone https://aur.archlinux.org/yay-bin.git /tmp/yay-bin &&
-     cd /tmp/yay-bin &&
-     makepkg -si --noconfirm)
+    # Run as non-root user 'deck' to build packages
+    sudo -u deck bash <<'YAY_EOF'
+set -e
+echo "Cloning and building yay..."
+git clone https://aur.archlinux.org/yay-bin.git /tmp/yay-bin
+cd /tmp/yay-bin
+makepkg -si --noconfirm
+cd /
+rm -rf /tmp/yay-bin
+YAY_EOF
 fi
-yay -S --noconfirm --needed pamac-aur
+echo "AUR helper is ready."
+
+echo "Installing pamac-aur..."
+# Use the non-root user 'deck' to install via yay
+sudo -u deck yay -S --noconfirm --needed pamac-aur
+
+echo "Enabling AUR in Pamac configuration..."
 sed -i 's/^#EnableAUR/EnableAUR/' /etc/pamac.conf
-EOF
-)
-    echo "$install_script" | run_command distrobox enter "$CONTAINER_NAME" -- bash -s || {
-        log_error "Pamac installation failed"
-        return 1
-    }
-    
-    # NEW: Setup desktop entry cleanup hook
-    log_info "Setting up desktop entry cleanup hook..."
-    local hook_script=$(cat <<EOF
-#!/bin/bash
-# Create hook directory
-sudo mkdir -p /etc/pacman.d/hooks
+sed -i 's/^#CheckAURUpdates/CheckAURUpdates/' /etc/pamac.conf
 
-# Create cleanup script
-sudo tee /usr/local/bin/cleanup-desktop-entries.sh >/dev/null <<'CLEANUP_EOF'
+echo "Setting up desktop entry cleanup hook..."
+mkdir -p /etc/pacman.d/hooks
+
+# Create the cleanup script that will be executed by the hook
+tee /usr/local/bin/cleanup-desktop-entries.sh >/dev/null <<'CLEANUP_EOF'
 #!/bin/sh
-# Get container name from environment
-CONTAINER_NAME="$CONTAINER_NAME"
+set -e
+# This script is run by a pacman hook on package removal.
+# It reads package names from standard input.
 
-# Remove desktop entries for uninstalled packages
-for pkg in "\$@"; do
-    # Find desktop files associated with the package
-    while read -r desktop_file; do
-        # Get base name without .desktop extension
+# Find the user's home directory (usually /home/deck)
+USER_HOME=\$(getent passwd deck | cut -d: -f6)
+if [ -z "\$USER_HOME" ]; then
+    # Fallback for non-standard username
+    USER_HOME="/home/$(logname)"
+fi
+
+# FIX #3a: The pacman hook must read package names from stdin, not arguments.
+while read -r pkg_name; do
+    # Find all .desktop files provided by the package
+    desktop_files=\$(pacman -Qlq "\$pkg_name" 2>/dev/null | grep -E '\.desktop$' || true)
+    
+    for desktop_file in \$desktop_files; do
         entry_name=\$(basename "\$desktop_file" .desktop)
-        # Remove exported desktop entries
-        find "\$HOME/.local/share/applications" \
-            \( -name "*\${entry_name}*distrobox*.desktop" -o -name "*\${entry_name}*${CONTAINER_NAME}*.desktop" \) \
-            -delete
-    done < <(pacman -Ql "\$pkg" 2>/dev/null | grep -E '\.desktop$' | awk '{print \$2}')
+        echo "Cleaning up exported entry for: \$entry_name"
+        # Remove exported desktop entries matching the name
+        find "\$USER_HOME/.local/share/applications" -type f -name "*\${entry_name}*${CONTAINER_NAME}*.desktop" -delete
+    done
 done
 
-# Update desktop database if available
-if command -v update-desktop-database &>/dev/null; then
-    update-desktop-database "\$HOME/.local/share/applications"
+# Update the desktop database on the host to reflect changes
+if [ -d "\$USER_HOME/.local/share/applications" ]; then
+    /usr/bin/distrobox-host-exec update-desktop-database -q "\$USER_HOME/.local/share/applications"
 fi
 CLEANUP_EOF
 
-sudo chmod +x /usr/local/bin/cleanup-desktop-entries.sh
+chmod +x /usr/local/bin/cleanup-desktop-entries.sh
 
-# Create pacman hook
-sudo tee /etc/pacman.d/hooks/cleanup-desktop-entries.hook >/dev/null <<'HOOK_EOF'
+# Create the pacman hook file
+tee /etc/pacman.d/hooks/cleanup-desktop-entries.hook >/dev/null <<'HOOK_EOF'
 [Trigger]
 Operation = Remove
 Type = Package
 Target = *
 
 [Action]
-Description = Cleaning up desktop entries for uninstalled packages...
+Description = Cleaning up exported desktop entries...
 When = PostTransaction
-Exec = /usr/local/bin/cleanup-desktop-entries.sh %o
+# FIX #3b: The hook must execute the script without arguments.
+Exec = /usr/local/bin/cleanup-desktop-entries.sh
 HOOK_EOF
+
+echo "Pamac installation and hook setup complete."
 EOF
 )
-    echo "$hook_script" | run_command distrobox enter "$CONTAINER_NAME" -- bash -s
+    # FIX #2 (cont.): Execute the entire block using `sudo bash -s`.
+    # We pass the container name as an environment variable so the hook script can use it.
+    echo "$install_script" | run_command distrobox enter "$CONTAINER_NAME" -- sudo -E env CONTAINER_NAME="$CONTAINER_NAME" bash -s || {
+        log_error "Pamac installation failed"
+        return 1
+    }
 }
 
+
 export_apps() {
-    log_step "Exporting applications..."
+    log_step "Exporting Pamac to the host system..."
+    # The --no-sandbox flag is often required for Pamac to function correctly.
     run_command distrobox-export --app pamac-manager --extra-flags "--no-sandbox" || {
-        log_warn "Standard export failed, creating manual launcher"
-        cat > "$HOME/.local/share/applications/pamac-manager-distrobox.desktop" <<EOF
+        log_warn "Standard export failed. This is common. Creating manual launcher as a fallback."
+        mkdir -p "$HOME/.local/share/applications"
+        cat > "$HOME/.local/share/applications/pamac-manager-${CONTAINER_NAME}.desktop" <<EOF
 [Desktop Entry]
-Name=Pamac (Distrobox)
-Exec=distrobox enter $CONTAINER_NAME -- pamac-manager
+Name=Pamac Manager ($CONTAINER_NAME)
+Comment=Install and remove software
+Exec=distrobox enter $CONTAINER_NAME -- pamac-manager --no-sandbox
 Icon=pamac
 Terminal=false
 Type=Application
@@ -312,7 +349,7 @@ Categories=System;
 EOF
     }
     
-    # Update desktop database if available
+    # Update desktop database on the host to ensure the app appears immediately.
     if command -v update-desktop-database &>/dev/null; then
         run_command update-desktop-database "$HOME/.local/share/applications"
     fi
@@ -327,29 +364,25 @@ main() {
     echo -e "${BOLD}${BLUE}Steam Deck Pamac Setup v${SCRIPT_VERSION}${NC}"
     [ "$DRY_RUN" = "true" ] && log_warn "DRY RUN MODE: No changes will be made"
     
-    # Rebuild container if requested
     if [ "$FORCE_REBUILD" = "true" ] && distrobox list | grep -qw "$CONTAINER_NAME"; then
-        log_step "Rebuilding container..."
+        log_step "Rebuilding container as requested..."
         run_command distrobox rm "$CONTAINER_NAME" --force
     fi
 
-    # Create container if needed
     if ! distrobox list | grep -qw "$CONTAINER_NAME"; then
         create_container
     else
         log_success "Using existing container: $CONTAINER_NAME"
     fi
 
-    # Container setup
     configure_container
-    install_pamac
+    install_pamac_and_hook
     export_apps
 
-    # Final report
     echo -e "\n${BOLD}${GREEN}Setup Complete!${NC}"
-    echo -e "Access Pamac through your application menu"
-    echo -e "Desktop entries will be automatically cleaned up when packages are uninstalled"
-    echo -e "Log file: ${LOG_FILE}"
+    echo -e "You can now find 'Pamac Manager' in your application menu (under 'System' or 'All Applications')."
+    echo -e "When you uninstall software using Pamac, its shortcut will be automatically removed."
+    echo -e "For detailed logs, see the file: ${LOG_FILE}"
 }
 
 main "$@"

@@ -2,7 +2,7 @@
 
 Installation command (You will need to adjust the directory path if the script is not on the desktop)
 
-**chmod +x ~/Desktop/install-pamac.sh**
+**chmod +x ~/Desktop/SteamOS-Pamac-Intaller.sh**
 
 
 ### Core Functionality

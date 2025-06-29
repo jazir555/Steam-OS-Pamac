@@ -40,7 +40,7 @@ Yes, your understanding is absolutely correct. The script will function exactly 
 - **Proactive Error Handling** ✅  
   Comprehensive logging and recovery mechanisms
 
-### Technical Confirmation
+### Process
 ```mermaid
 graph LR
 A[SteamOS Host] --> B[Distrobox Container]

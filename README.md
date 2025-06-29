@@ -1,5 +1,4 @@
 # Steam-OS-Pamac
-Yes, your understanding is absolutely correct. The script will function exactly as you described, providing a complete solution for installing AUR packages on SteamOS without compromising the immutable filesystem. Here's the confirmation of all key aspects:
 
 ### Core Functionality
 1. **Immutable Filesystem Preservation** ✅  

@@ -7,10 +7,9 @@
 set -euo pipefail  # Stricter error handling
 
 # --- Configuration Variables ---
-readonly SCRIPT_VERSION="4.1" # Version incremented
+readonly SCRIPT_VERSION="4.2" # Version incremented
 readonly SCRIPT_URL="https://raw.githubusercontent.com/user/repo/main/setup-pamac.sh"
 readonly REQUIRED_TOOLS=("distrobox" "podman")
-# FIX: Moved DEFAULT_CONTAINER_NAME definition before its first use.
 readonly DEFAULT_CONTAINER_NAME="arch-pamac"
 readonly LOG_FILE="$HOME/distrobox-pamac-setup.log"
 
@@ -21,12 +20,7 @@ CURRENT_USER=$(whoami)
 # Feature flags with improved defaults
 ENABLE_MULTILIB="${ENABLE_MULTILIB:-true}"
 ENABLE_BUILD_CACHE="${ENABLE_BUILD_CACHE:-true}"
-CONFIGURE_MIRRORS="${CONFIGURE_MIRRORS:-true}" # Note: This variable is defined but not used in the script.
-AUTO_EXPORT_APPS="${AUTO_EXPORT_APPS:-true}" # Note: This variable is defined but not used in the script.
 ENABLE_GAMING_PACKAGES="${ENABLE_GAMING_PACKAGES:-false}"
-CONFIGURE_LOCALE="${CONFIGURE_LOCALE:-false}" # Note: This variable is defined but not used in the script.
-TARGET_LOCALE="${TARGET_LOCALE:-en_US.UTF-8}" # Note: This variable is defined but not used in the script.
-MIRROR_COUNTRIES="${MIRROR_COUNTRIES:-US,Canada}" # Note: This variable is defined but not used in the script.
 FORCE_REBUILD="${FORCE_REBUILD:-false}"
 
 # Operation mode flags
@@ -53,6 +47,7 @@ initialize_logging() {
     local steamos_version
     steamos_version=$(grep VERSION_ID /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo 'Unknown')
     
+    # Overwrite log file at the start of a new run
     {
         echo "=== Steam Deck Pamac Setup v${SCRIPT_VERSION} - $(date) ==="
         echo "User: $CURRENT_USER"
@@ -62,6 +57,7 @@ initialize_logging() {
         echo "=========================================="
     } > "$LOG_FILE"
     
+    # Append footer on exit
     trap 'echo "=== Run finished: $(date) - Exit: $? ===" >> "$LOG_FILE"' EXIT
 }
 
@@ -294,6 +290,7 @@ uninstall_setup() {
     if distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
         log_info "Stopping and removing container: $CONTAINER_NAME"
         if [[ "$DRY_RUN" != "true" ]]; then
+            # Use --yes to avoid interactive prompts
             distrobox stop "$CONTAINER_NAME" --yes 2>/dev/null || true
             distrobox rm "$CONTAINER_NAME" --force || log_warn "Failed to remove container. It may have already been removed."
         fi
@@ -305,14 +302,14 @@ uninstall_setup() {
     local app_dir="$HOME/.local/share/applications"
     if [[ -d "$app_dir" ]]; then
         log_info "Cleaning up exported application launchers (.desktop files)"
-        # FIX: Simplified and improved the find command. This reliably finds files
-        # created by `distrobox-export` or the script's manual fallback, which
-        # consistently append `-${CONTAINER_NAME}` to the filename.
         if [[ "$DRY_RUN" != "true" ]]; then
+            # Reliably find files created by `distrobox-export` or our manual fallback,
+            # which consistently append `-${CONTAINER_NAME}` to the filename.
             find "$app_dir" -type f -name "*-${CONTAINER_NAME}.desktop" -delete 2>/dev/null || true
             
             # As a safety net, also find any files that explicitly execute this container
-            grep -l "distrobox enter ${CONTAINER_NAME}" "$app_dir"/*.desktop 2>/dev/null | xargs rm -f 2>/dev/null || true
+            # The `|| true` prevents errors if no files are found by grep
+            grep -l "distrobox enter ${CONTAINER_NAME}" "$app_dir"/*.desktop 2>/dev/null | xargs -r rm -f 2>/dev/null || true
             
             # Update desktop database
             if command -v update-desktop-database >/dev/null 2>&1; then
@@ -393,6 +390,7 @@ configure_container_base() {
     log_step "Configuring container base environment (sudo, keyring)"
     
     local setup_script
+    # Quoted 'EOF' prevents variable expansion on the host
     read -r -d '' setup_script << 'EOF' || true
 set -euo pipefail
 
@@ -404,8 +402,7 @@ if ! getent group wheel >/dev/null 2>&1; then
     echo "Created 'wheel' group."
 fi
 
-# Add current user to wheel group to allow sudo
-# Sudo is installed by distrobox by default.
+# Add current user to wheel group to allow sudo. Sudo is installed by distrobox by default.
 current_user="${SUDO_USER:-${USER:-$(whoami)}}"
 if id "$current_user" >/dev/null 2>&1; then
     usermod -aG wheel "$current_user"
@@ -473,7 +470,7 @@ install_aur_helper() {
     read -r -d '' yay_script << 'EOF' || true
 set -euo pipefail
 
-# FIX: Added 'sudo' to pacman commands, as this script runs as the user.
+# Added 'sudo' to pacman commands, as this script runs as the user.
 # The user was previously added to the wheel group with passwordless sudo.
 echo "Updating system and installing build tools..."
 sudo pacman -Syu --noconfirm --needed git base-devel
@@ -546,7 +543,9 @@ setup_cleanup_hooks() {
     log_step "Setting up cleanup hooks (experimental)"
     
     local hook_script
-    read -r -d '' hook_script << 'EOF' || true
+    # Unquoted EOF allows host variable expansion for ${CONTAINER_NAME}
+    # while internal variables are escaped with \$.
+    read -r -d '' hook_script << EOF || true
 set -euo pipefail
 # This hook attempts to clean up exported .desktop files when a package is removed via pacman.
 # NOTE: This is a best-effort approach and may not cover all edge cases.
@@ -563,54 +562,54 @@ set -euo pipefail
 # home directory on the HOST, which is mounted inside the container.
 USER_HOME=""
 # On Steam Deck, the user is 'deck'
-for user in deck "$SUDO_USER" "$USER" "$(logname 2>/dev/null || true)"; do
-    if [[ -n "$user" ]]; then
-        user_home_candidate=$(getent passwd "$user" | cut -d: -f6)
-        if [[ -d "$user_home_candidate" ]]; then
-            USER_HOME="$user_home_candidate"
+for user in deck "\$SUDO_USER" "\$USER" "\$(logname 2>/dev/null || true)"; do
+    if [[ -n "\$user" ]]; then
+        user_home_candidate=\$(getent passwd "\$user" | cut -d: -f6)
+        if [[ -d "\$user_home_candidate" ]]; then
+            USER_HOME="\$user_home_candidate"
             break
         fi
     fi
 done
 
-if [[ -z "$USER_HOME" ]]; then
+if [[ -z "\$USER_HOME" ]]; then
     echo "Hook Warning: Could not determine user home directory. Cannot clean up desktop files." >&2
     exit 0
 fi
 
-HOST_APP_DIR="$USER_HOME/.local/share/applications"
-if [[ ! -d "$HOST_APP_DIR" ]]; then
+HOST_APP_DIR="\$USER_HOME/.local/share/applications"
+if [[ ! -d "\$HOST_APP_DIR" ]]; then
     exit 0
 fi
 
 # The container name is passed as the first argument to the script
-CONTAINER_NAME="${1:-}"
-if [[ -z "$CONTAINER_NAME" ]]; then
+CONTAINER_NAME="\${1:-}"
+if [[ -z "\$CONTAINER_NAME" ]]; then
     echo "Hook Warning: Container name not provided. Cannot clean up desktop files." >&2
     exit 0
 fi
 
 # Read removed package names from stdin
 while IFS= read -r pkg_name; do
-    if [[ -z "$pkg_name" ]]; then continue; fi
+    if [[ -z "\$pkg_name" ]]; then continue; fi
 
     # Find .desktop files installed by this package
-    pkg_desktop_files=$(pacman -Ql "$pkg_name" | awk '/\/usr\/share\/applications\/.*\.desktop$/ {print $2}')
+    pkg_desktop_files=\$(pacman -Ql "\$pkg_name" | awk '/\\/usr\\/share\\/applications\\/.*\\.desktop\$/ {print \$2}')
 
-    for desktop_file in $pkg_desktop_files; do
-        app_name=$(basename "$desktop_file" .desktop)
+    for desktop_file in \$pkg_desktop_files; do
+        app_name=\$(basename "\$desktop_file" .desktop)
         # The exported file is typically named app-name-container-name.desktop
-        exported_file="${HOST_APP_DIR}/${app_name}-${CONTAINER_NAME}.desktop"
-        if [[ -f "$exported_file" ]]; then
-            echo "Hook: Removing exported launcher: $exported_file"
-            rm -f "$exported_file"
+        exported_file="\${HOST_APP_DIR}/\${app_name}-\${CONTAINER_NAME}.desktop"
+        if [[ -f "\$exported_file" ]]; then
+            echo "Hook: Removing exported launcher: \$exported_file"
+            rm -f "\$exported_file"
         fi
     done
 done
 
-# Update the host's desktop database
+# Update the host's desktop database if the command exists
 if command -v update-desktop-database >/dev/null 2>&1; then
-    update-desktop-database "$HOST_APP_DIR" 2>/dev/null || true
+    update-desktop-database "\$HOST_APP_DIR" 2>/dev/null || true
 fi
 CLEANUP_SCRIPT
 
@@ -633,8 +632,7 @@ HOOK_CONFIG
 echo "Cleanup hooks configured."
 EOF
     
-    # Pass the container name into the script generator
-    if ! echo "CONTAINER_NAME=${CONTAINER_NAME}; ${hook_script}" | run_command distrobox enter --root "$CONTAINER_NAME" -- bash; then
+    if ! echo "$hook_script" | run_command distrobox enter --root "$CONTAINER_NAME" -- bash; then
         log_warn "Failed to set up cleanup hooks (non-critical)."
     fi
 }
@@ -643,9 +641,9 @@ install_gaming_packages() {
     if [[ "$ENABLE_GAMING_PACKAGES" == "true" ]]; then
         log_step "Installing optional gaming packages"
         
-        # FIX: Conditionally add 32-bit packages only if multilib is enabled
-        # to prevent installation failures.
         local gaming_script
+        # Unquoted EOF allows host-side expansion of ${ENABLE_MULTILIB}
+        # while internal variables for the container shell are escaped with \$.
         read -r -d '' gaming_script << EOF || true
 set -euo pipefail
 
@@ -660,7 +658,8 @@ gaming_packages=(
     "mangohud"
 )
 
-if [[ "$ENABLE_MULTILIB" == "true" ]]; then
+# Conditionally add 32-bit packages only if multilib is enabled
+if [[ "${ENABLE_MULTILIB}" == "true" ]]; then
     echo "Multilib is enabled, adding 32-bit gaming libraries..."
     gaming_packages+=(
         "lib32-gamemode"
@@ -684,9 +683,7 @@ else
 fi
 EOF
         
-        # Pass the ENABLE_MULTILIB variable into the container script
-        local script_to_run="ENABLE_MULTILIB=${ENABLE_MULTILIB}; ${gaming_script}"
-        if ! run_command distrobox enter "$CONTAINER_NAME" -- bash -c "$script_to_run"; then
+        if ! run_command distrobox enter "$CONTAINER_NAME" -- bash -c "$gaming_script"; then
             log_warn "Some gaming packages may have failed to install."
         fi
     fi
@@ -695,8 +692,7 @@ EOF
 export_pamac_to_host() {
     log_step "Exporting Pamac to the host application menu"
     
-    # FIX: Correctly run `distrobox-export` from *inside* the container,
-    # which is its intended usage.
+    # Correctly run `distrobox-export` from *inside* the container, which is its intended usage.
     log_info "Attempting to export using 'distrobox-export'..."
     if run_command distrobox enter "$CONTAINER_NAME" -- distrobox-export --app pamac-manager --extra-flags "--no-sandbox"; then
         log_success "Pamac exported successfully to the application menu."
@@ -777,8 +773,8 @@ show_completion_message() {
 main() {
     setup_colors
     
-    # FIX: Moved argument parsing to the beginning so that user-provided flags
-    # (like --container-name) are processed before any validation or setup steps.
+    # Moved argument parsing to the beginning so that user-provided flags
+    # (like --container-name or --quiet) are processed before any setup steps.
     parse_arguments "$@"
     
     # Initialize logging after parsing args to respect --quiet/--verbose

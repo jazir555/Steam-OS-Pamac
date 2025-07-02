@@ -7,7 +7,7 @@
 set -euo pipefail  # Stricter error handling
 
 # --- Configuration Variables ---
-readonly SCRIPT_VERSION="4.3" # Version incremented
+readonly SCRIPT_VERSION="4.3.1" # Version incremented
 readonly SCRIPT_URL="https://raw.githubusercontent.com/user/repo/main/setup-pamac.sh" # Assumed URL
 readonly REQUIRED_TOOLS=("distrobox" "podman")
 readonly DEFAULT_CONTAINER_NAME="arch-pamac"
@@ -88,6 +88,9 @@ log_warn() { _log "WARN" "$YELLOW" "⚠️  $1"; }
 log_error() { _log "ERROR" "$RED" "❌ $1"; }
 log_debug() { _log "DEBUG" "" "$1"; }
 
+# FIX: The original run_command function did not correctly handle exit codes in
+# non-verbose mode when 'set -e' was active. This version reliably captures
+# the exit code of the executed command in all modes.
 run_command() {
     log_debug "Executing: $*"
 
@@ -96,18 +99,20 @@ run_command() {
         return 0
     fi
 
-    # NOTE: Piping stderr/stdout can capture progress bar escape codes.
-    # We use --noprogressbar flags where possible to minimize this.
+    local status=0
     if [[ "$LOG_LEVEL" == "verbose" ]]; then
-        # FIX: When 'set -e' is active, a failing command in a pipeline would exit the script.
-        # The '|| true' ensures this line itself doesn't trigger 'set -e'. We then capture
-        # the true exit code from the executed command (the first in the pipeline) using
-        # the PIPESTATUS array, allowing the calling function to handle the error.
+        # When 'set -e' is active, a failing command in a pipeline would exit the script.
+        # The '|| true' prevents this line from triggering an exit. We then capture the
+        # true exit code from the executed command (the first in the pipeline) using PIPESTATUS.
         "$@" 2>&1 | tee -a "$LOG_FILE" || true
-        return "${PIPESTATUS[0]}"
+        status="${PIPESTATUS[0]}"
     else
-        "$@" >> "$LOG_FILE" 2>&1
+        # In non-verbose mode, we also need to prevent 'set -e' from exiting on failure
+        # so that the calling function can handle the error. The '|| status=$?' idiom
+        # captures the exit code without terminating the script.
+        "$@" >> "$LOG_FILE" 2>&1 || status=$?
     fi
+    return "$status"
 }
 
 # --- Validation Functions ---
@@ -369,7 +374,7 @@ uninstall_setup() {
         if [[ "$DRY_RUN" != "true" ]]; then
             # Reliably find files created by `distrobox-export` or our manual fallback
             find "$app_dir" -type f -name "*-${CONTAINER_NAME}.desktop" -delete 2>/dev/null || true
-            # FIX: Safety net using a robust find/grep/xargs pipeline instead of a fragile glob
+            # Safety net using a robust find/grep/xargs pipeline instead of a fragile glob
             find "$app_dir" -maxdepth 1 -type f -name "*.desktop" -exec grep -lq "distrobox enter ${CONTAINER_NAME}" {} + | xargs -r rm -f 2>/dev/null || true
             if command -v update-desktop-database >/dev/null 2>&1; then
                 update-desktop-database "$app_dir" 2>/dev/null || true
@@ -691,7 +696,7 @@ Target = *
 [Action]
 Description = Cleaning up exported desktop entries...
 When = PostTransaction
-# FIX: The hook runs inside the container, so we must provide paths that are valid
+# The hook runs inside the container, so we must provide paths that are valid
 # inside it. Distrobox mounts the host's home directory (e.g., /home/deck) at
 # the same path inside the container. We bake this path into the hook for robustness.
 Exec = /usr/local/bin/cleanup-exported-desktop-entries.sh "${CONTAINER_NAME}" "/home/${CURRENT_USER}"
@@ -733,7 +738,7 @@ for package in "${gaming_packages[@]}"; do
     fi
 done
 
-# FIX: Signal failure if any packages failed to install.
+# Signal failure if any packages failed to install.
 if [[ ${#failed_packages[@]} -gt 0 ]]; then
     echo "Error: The following packages failed to install: ${failed_packages[*]}" >&2
     exit 1
@@ -756,7 +761,6 @@ export_pamac_to_host() {
     if run_command sh -c "$export_cmd"; then
         log_success "Pamac exported successfully to the application menu."
     else
-        # FIX: Simplified warning message.
         log_warn "'distrobox-export' failed. The error has been logged. Creating a manual launcher as a fallback."
 
         local desktop_dir="$HOME/.local/share/applications"
@@ -855,7 +859,7 @@ main() {
     fi
 
     validate_container_name || exit 1
-    check_system_requirements || exit 1
+    run_pre_flight_checks # Also run checks before a full install
 
     echo -e "${BOLD}${BLUE}Starting Steam Deck Pamac Setup v${SCRIPT_VERSION}${NC}"
     if [[ "$DRY_RUN" == "true" ]]; then

@@ -154,8 +154,11 @@ USAGE:
 OPTIONS:
     --container-name NAME    Set container name (default: ${DEFAULT_CONTAINER_NAME})
     --force-rebuild          Rebuild existing container if it exists
-    --enable-multilib        Enable 32-bit package support (default: on)
-    --enable-gaming          Install gaming packages (Steam, Lutris, etc.)
+    --enable-multilib        Enable 32-bit package support (default)
+    --disable-multilib       Explicitly disable 32-bit package support
+    --enable-gaming          Install extra gaming packages (Steam, Lutris, etc.)
+    --disable-gaming         Do not install gaming packages (default)
+    --enable-build-cache     Enable persistent build cache for yay (default)
     --disable-build-cache    Disable persistent build cache for yay
     --update                 Update this script to the latest version
     --uninstall              Remove container and all related files
@@ -167,7 +170,7 @@ OPTIONS:
 
 EXAMPLES:
     $0                                    # Basic setup
-    $0 --enable-gaming --enable-multilib  # Gaming-focused setup
+    $0 --enable-gaming --disable-multilib # Gaming-focused setup without 32-bit support
     $0 --container-name my-arch           # Use a custom container name
     $0 --uninstall                        # Remove everything created by this script
 
@@ -195,8 +198,20 @@ parse_arguments() {
                 ENABLE_MULTILIB="true"
                 shift
                 ;;
+            --disable-multilib)
+                ENABLE_MULTILIB="false"
+                shift
+                ;;
             --enable-gaming)
                 ENABLE_GAMING_PACKAGES="true"
+                shift
+                ;;
+            --disable-gaming)
+                ENABLE_GAMING_PACKAGES="false"
+                shift
+                ;;
+            --enable-build-cache)
+                ENABLE_BUILD_CACHE="true"
                 shift
                 ;;
             --disable-build-cache)
@@ -249,9 +264,15 @@ update_script() {
         return
     fi
 
+    if [[ ! -w "$0" ]]; then
+        log_error "Cannot update: The script location '$0' is not writable."
+        log_info "Please download the script to a writable location and run it from there."
+        exit 1
+    fi
+
+    # Create a temporary file and ensure it's cleaned up on exit
     local temp_file
-    temp_file=$(mktemp)
-    # Use an EXIT trap to ensure cleanup even on script failure
+    temp_file=$(mktemp) || { log_error "Could not create temporary file."; exit 1; }
     trap 'rm -f "$temp_file"' EXIT
 
     local download_cmd
@@ -267,11 +288,16 @@ update_script() {
 
     if $download_cmd "$SCRIPT_URL" > "$temp_file"; then
         if [[ -s "$temp_file" ]] && head -1 "$temp_file" | grep -q "^#!/bin/bash"; then
-            # The original script path is in $0
             chmod +x "$temp_file"
-            mv -f "$temp_file" "$0"
-            log_success "Script updated successfully. Please run the new version again."
-            # The trap will clean up temp_file if mv fails
+            # Attempt to replace the current script file
+            if mv -f "$temp_file" "$0"; then
+                trap - EXIT # Success, so disable the cleanup trap.
+                log_success "Script updated successfully. Please run the new version again."
+            else
+                log_error "Failed to replace the script file at '$0'. Update aborted."
+                # The EXIT trap will clean up the temp file
+                exit 1
+            fi
         else
             log_error "Downloaded file appears to be invalid or empty."
             exit 1

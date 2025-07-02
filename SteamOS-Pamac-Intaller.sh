@@ -99,10 +99,10 @@ run_command() {
     # NOTE: Piping stderr/stdout can capture progress bar escape codes.
     # We use --noprogressbar flags where possible to minimize this.
     if [[ "$LOG_LEVEL" == "verbose" ]]; then
-        # FIX: Clarified comment. With 'set -o pipefail', the exit status of a pipeline
-        # is the status of the last command to fail. Using '|| true' ensures this
-        # line itself doesn't trigger 'set -e', while PIPESTATUS[0] captures the
-        # real exit code of the executed command.
+        # FIX: When 'set -e' is active, a failing command in a pipeline would exit the script.
+        # The '|| true' ensures this line itself doesn't trigger 'set -e'. We then capture
+        # the true exit code from the executed command (the first in the pipeline) using
+        # the PIPESTATUS array, allowing the calling function to handle the error.
         "$@" 2>&1 | tee -a "$LOG_FILE" || true
         return "${PIPESTATUS[0]}"
     else
@@ -369,8 +369,8 @@ uninstall_setup() {
         if [[ "$DRY_RUN" != "true" ]]; then
             # Reliably find files created by `distrobox-export` or our manual fallback
             find "$app_dir" -type f -name "*-${CONTAINER_NAME}.desktop" -delete 2>/dev/null || true
-            # Safety net: also find any files that explicitly execute this container
-            grep -l "distrobox enter ${CONTAINER_NAME}" "$app_dir"/*.desktop 2>/dev/null | xargs -r rm -f 2>/dev/null || true
+            # FIX: Safety net using a robust find/grep/xargs pipeline instead of a fragile glob
+            find "$app_dir" -maxdepth 1 -type f -name "*.desktop" -exec grep -lq "distrobox enter ${CONTAINER_NAME}" {} + | xargs -r rm -f 2>/dev/null || true
             if command -v update-desktop-database >/dev/null 2>&1; then
                 update-desktop-database "$app_dir" 2>/dev/null || true
             fi
@@ -636,10 +636,8 @@ setup_cleanup_hooks() {
     read -r -d '' hook_script << EOF || true
 set -euo pipefail
 # This hook attempts to clean up exported .desktop files when a package is removed via pacman.
-# NOTE: This is a best-effort approach.
-# - It only works for .desktop files that pacman knows about.
-# - It relies on the user's home directory path not changing after setup, as the
-#   path is hardcoded into the hook configuration.
+# NOTE: This is a best-effort approach. It relies on the host user's home directory
+# being mounted at the same path inside the container (standard distrobox behavior).
 
 echo "Setting up pacman hooks for desktop entry cleanup..."
 mkdir -p /etc/pacman.d/hooks
@@ -648,21 +646,22 @@ mkdir -p /etc/pacman.d/hooks
 cat > /usr/local/bin/cleanup-exported-desktop-entries.sh << 'CLEANUP_SCRIPT'
 #!/bin/bash
 set -euo pipefail
-# This script is run by pacman inside the container. It receives the container name
-# as \$1 and the host user's absolute home path as \$2.
+
+# This script is run by pacman inside the container.
+# $1: The name of the container (e.g., 'arch-pamac')
+# $2: The path to the host user's home directory AS MOUNTED inside the container (e.g., '/home/deck')
 if [[ -z "\${1:-}" || -z "\${2:-}" ]]; then exit 0; fi
 
 readonly CONTAINER_NAME="\$1"
-readonly USER_HOME="\$2" # Absolute path to the user's home on the host
-readonly HOST_APP_DIR="\$USER_HOME/.local/share/applications"
+readonly HOST_HOME_IN_CONTAINER="\$2"
+readonly HOST_APP_DIR="\$HOST_HOME_IN_CONTAINER/.local/share/applications"
 
 if [[ ! -d "\$HOST_APP_DIR" ]]; then exit 0; fi
 
 # Read removed package names from stdin
 while IFS= read -r pkg_name; do
     if [[ -z "\$pkg_name" ]]; then continue; fi
-    # Find .desktop files installed by this package. This correctly finds files
-    # in subdirectories of /usr/share/applications.
+    # Find .desktop files installed by this package.
     pkg_desktop_files=\$(pacman -Ql "\$pkg_name" | awk '/\\/usr\\/share\\/applications\\/.*\\.desktop\$/ {print \$2}' || true)
     for desktop_file in \$pkg_desktop_files; do
         app_name=\$(basename "\$desktop_file" .desktop)
@@ -674,6 +673,7 @@ while IFS= read -r pkg_name; do
     done
 done
 
+# This path is inside the container, but points to the host's directory structure.
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "\$HOST_APP_DIR" 2>/dev/null || true
 fi
@@ -691,8 +691,10 @@ Target = *
 [Action]
 Description = Cleaning up exported desktop entries...
 When = PostTransaction
-# FIX: Use an explicit home path for robustness instead of relying on the host's $HOME variable.
-Exec = /usr/local/bin/cleanup-exported-desktop-entries.sh ${CONTAINER_NAME} /home/${CURRENT_USER}
+# FIX: The hook runs inside the container, so we must provide paths that are valid
+# inside it. Distrobox mounts the host's home directory (e.g., /home/deck) at
+# the same path inside the container. We bake this path into the hook for robustness.
+Exec = /usr/local/bin/cleanup-exported-desktop-entries.sh "${CONTAINER_NAME}" "/home/${CURRENT_USER}"
 NeedsTargets
 HOOK_CONFIG
 echo "Cleanup hooks configured."
@@ -707,8 +709,6 @@ install_gaming_packages() {
     if [[ "$ENABLE_GAMING_PACKAGES" == "true" ]]; then
         log_step "Installing optional gaming packages"
         local gaming_script
-        # FIX: Use a single-quoted heredoc to prevent host shell expansion.
-        # Variables are passed explicitly as arguments for clarity and safety.
         read -r -d '' gaming_script << 'EOF' || true
 set -euo pipefail
 # The first argument ($1) is the ENABLE_MULTILIB flag from the host script.
@@ -733,15 +733,16 @@ for package in "${gaming_packages[@]}"; do
     fi
 done
 
+# FIX: Signal failure if any packages failed to install.
 if [[ ${#failed_packages[@]} -gt 0 ]]; then
-    echo "Warning: Failed to install one or more packages: ${failed_packages[*]}"
-else
-    echo "All selected gaming packages installed successfully."
+    echo "Error: The following packages failed to install: ${failed_packages[*]}" >&2
+    exit 1
 fi
+
+echo "All selected gaming packages installed successfully."
 EOF
-        # FIX: Pass the ENABLE_MULTILIB variable as an argument to the container script.
         if ! echo "$gaming_script" | run_command distrobox enter "$CONTAINER_NAME" -- bash -s "$ENABLE_MULTILIB"; then
-            log_warn "Some gaming packages may have failed to install. Check log for details."
+            log_warn "One or more gaming packages failed to install. Check the log for details."
         fi
     fi
 }
@@ -755,8 +756,8 @@ export_pamac_to_host() {
     if run_command sh -c "$export_cmd"; then
         log_success "Pamac exported successfully to the application menu."
     else
-        log_warn "'distrobox-export' failed. Creating a manual launcher as a fallback."
-        log_warn "The error from 'distrobox-export' has been logged. Some Pamac versions may require additional flags like '--enable-features=NetworkService'. You may need to export manually if the fallback fails."
+        # FIX: Simplified warning message.
+        log_warn "'distrobox-export' failed. The error has been logged. Creating a manual launcher as a fallback."
 
         local desktop_dir="$HOME/.local/share/applications"
         mkdir -p "$desktop_dir"
@@ -837,9 +838,8 @@ run_pre_flight_checks() {
 main() {
     setup_colors
     
-    # FIX: Add a check to ensure the script is not run as root.
     if [[ "$EUID" -eq 0 ]]; then
-        # Logging isn't initialized yet, so use direct echo.
+        # Logging isn't initialized yet, so use direct echo with color codes.
         echo -e "\e[91m❌ This script should not be run as root. Please run as the 'deck' user.\e[0m" >&2
         exit 1
     fi

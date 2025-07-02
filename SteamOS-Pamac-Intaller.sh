@@ -22,12 +22,10 @@ ENABLE_MULTILIB="${ENABLE_MULTILIB:-true}"
 ENABLE_BUILD_CACHE="${ENABLE_BUILD_CACHE:-true}"
 ENABLE_GAMING_PACKAGES="${ENABLE_GAMING_PACKAGES:-false}"
 FORCE_REBUILD="${FORCE_REBUILD:-false}"
-# FIX: Added mirror optimization flag, enabled by default.
 OPTIMIZE_MIRRORS="${OPTIMIZE_MIRRORS:-true}"
 
 # Operation mode flags
 DRY_RUN="${DRY_RUN:-false}"
-# FIX: Added check mode flag.
 CHECK_ONLY="${CHECK_ONLY:-false}"
 LOG_LEVEL="${LOG_LEVEL:-normal}"
 
@@ -50,7 +48,6 @@ initialize_logging() {
     local steamos_version
     steamos_version=$(grep VERSION_ID /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo 'Unknown')
 
-    # FIX: Label log file as DRY RUN if applicable.
     local dry_run_header=""
     if [[ "$DRY_RUN" == "true" ]]; then
         dry_run_header=" (DRY RUN MODE)"
@@ -102,8 +99,10 @@ run_command() {
     # NOTE: Piping stderr/stdout can capture progress bar escape codes.
     # We use --noprogressbar flags where possible to minimize this.
     if [[ "$LOG_LEVEL" == "verbose" ]]; then
-        # The trailing '|| true' prevents the script from exiting if the pipe fails (e.g., on tee error)
-        # while still capturing the correct exit code with PIPESTATUS.
+        # FIX: Clarified comment. With 'set -o pipefail', the exit status of a pipeline
+        # is the status of the last command to fail. Using '|| true' ensures this
+        # line itself doesn't trigger 'set -e', while PIPESTATUS[0] captures the
+        # real exit code of the executed command.
         "$@" 2>&1 | tee -a "$LOG_FILE" || true
         return "${PIPESTATUS[0]}"
     else
@@ -249,7 +248,6 @@ parse_arguments() {
                 ENABLE_BUILD_CACHE="false"
                 shift
                 ;;
-            # FIX: Add mirror optimization flags.
             --optimize-mirrors)
                 OPTIMIZE_MIRRORS="true"
                 shift
@@ -262,7 +260,6 @@ parse_arguments() {
                 DRY_RUN="true"
                 shift
                 ;;
-            # FIX: Add check flag.
             --check)
                 CHECK_ONLY="true"
                 shift
@@ -309,7 +306,6 @@ update_script() {
         return
     fi
 
-    # FIX: This check for write permissions was already present and is good.
     if [[ ! -w "$0" ]]; then
         log_error "Cannot update: The script location '$0' is not writable."
         log_info "Please download the script to a writable location and run it from there."
@@ -436,7 +432,6 @@ create_container() {
 configure_container_base() {
     log_step "Configuring container base environment (sudo, keyring)"
 
-    # FIX: Use rngd to boost entropy for pacman-key, preventing hangs.
     local setup_script
     read -r -d '' setup_script << 'EOF' || true
 set -euo pipefail
@@ -497,7 +492,6 @@ EOF
     fi
 }
 
-# FIX: New function to optimize Pacman mirrors using reflector.
 optimize_pacman_mirrors() {
     if [[ "$OPTIMIZE_MIRRORS" == "false" ]]; then
         log_info "Skipping Pacman mirror optimization as requested."
@@ -528,7 +522,6 @@ else
 fi
 EOF
 
-    # FIX: This is a "best effort" feature, so log a warning on failure.
     if ! echo "$mirror_script" | run_command distrobox enter --root "$CONTAINER_NAME" -- bash; then
         log_warn "Failed to optimize mirrors. The script will continue with default mirrors."
     fi
@@ -550,7 +543,6 @@ fi
 echo "Updating package database..."
 pacman -Sy --noconfirm
 EOF
-        # FIX: This is a "best effort" feature, so log a warning on failure.
         if ! echo "$multilib_script" | run_command distrobox enter --root "$CONTAINER_NAME" -- bash; then
             log_warn "Failed to enable multilib support. Installation of 32-bit packages will likely fail."
         fi
@@ -560,7 +552,6 @@ EOF
 install_aur_helper() {
     log_step "Installing AUR helper (yay)"
 
-    # FIX: Add idempotency check for yay.
     if distrobox enter "$CONTAINER_NAME" -- command -v yay >/dev/null 2>&1; then
         log_info "AUR helper 'yay' is already installed. Skipping."
         return 0
@@ -572,7 +563,7 @@ set -euo pipefail
 echo "Updating system and installing build tools..."
 sudo pacman -Syu --noconfirm --needed git base-devel
 
-# FIX: Switched from yay-bin to the upstream yay source.
+# Switched from yay-bin to the upstream yay source.
 # This requires a compile step but is the more standard approach.
 echo "Cloning and building 'yay' AUR helper from source..."
 cd /tmp
@@ -587,7 +578,6 @@ echo "'yay' installation completed."
 yay --version
 EOF
 
-    # FIX: More specific error message
     if ! run_command distrobox enter "$CONTAINER_NAME" -- bash -c "$yay_script"; then
         log_error "Failed to install AUR helper (yay). Pamac installation will be skipped."
         return 1
@@ -597,7 +587,6 @@ EOF
 install_pamac() {
     log_step "Installing Pamac package manager"
     
-    # FIX: Add idempotency check for pamac-manager.
     if distrobox enter "$CONTAINER_NAME" -- command -v pamac-manager >/dev/null 2>&1; then
         log_info "Pamac is already installed. Skipping."
         return 0
@@ -608,7 +597,6 @@ install_pamac() {
 set -euo pipefail
 
 echo "Installing 'pamac-aur' using yay..."
-# FIX: Add --noprogressbar to keep logs clean.
 yay -S --noconfirm --needed --answeredit n --noprogressbar pamac-aur
 
 # Configure Pamac to enable AUR support by default
@@ -649,7 +637,6 @@ setup_cleanup_hooks() {
 set -euo pipefail
 # This hook attempts to clean up exported .desktop files when a package is removed via pacman.
 # NOTE: This is a best-effort approach.
-# FIX: Added comments to explain potential limitations.
 # - It only works for .desktop files that pacman knows about.
 # - It relies on the user's home directory path not changing after setup, as the
 #   path is hardcoded into the hook configuration.
@@ -704,13 +691,13 @@ Target = *
 [Action]
 Description = Cleaning up exported desktop entries...
 When = PostTransaction
-Exec = /usr/local/bin/cleanup-exported-desktop-entries.sh ${CONTAINER_NAME} ${HOME}
+# FIX: Use an explicit home path for robustness instead of relying on the host's $HOME variable.
+Exec = /usr/local/bin/cleanup-exported-desktop-entries.sh ${CONTAINER_NAME} /home/${CURRENT_USER}
 NeedsTargets
 HOOK_CONFIG
 echo "Cleanup hooks configured."
 EOF
 
-    # FIX: This is a "best effort" feature, so log a warning on failure.
     if ! echo "$hook_script" | run_command distrobox enter --root "$CONTAINER_NAME" -- bash; then
         log_warn "Failed to set up cleanup hooks. Uninstalled packages may leave behind menu entries."
     fi
@@ -720,32 +707,40 @@ install_gaming_packages() {
     if [[ "$ENABLE_GAMING_PACKAGES" == "true" ]]; then
         log_step "Installing optional gaming packages"
         local gaming_script
-        read -r -d '' gaming_script << EOF || true
+        # FIX: Use a single-quoted heredoc to prevent host shell expansion.
+        # Variables are passed explicitly as arguments for clarity and safety.
+        read -r -d '' gaming_script << 'EOF' || true
 set -euo pipefail
+# The first argument ($1) is the ENABLE_MULTILIB flag from the host script.
+readonly IS_MULTILIB_ENABLED="$1"
+
 echo "Installing gaming-related packages..."
+# Define packages to install.
 gaming_packages=( "steam" "lutris" "wine-staging" "winetricks" "gamemode" "mangohud" )
-if [[ "${ENABLE_MULTILIB}" == "true" ]]; then
+
+# Add 32-bit packages if multilib is enabled.
+if [[ "$IS_MULTILIB_ENABLED" == "true" ]]; then
     echo "Multilib is enabled, adding 32-bit gaming libraries..."
     gaming_packages+=( "lib32-gamemode" "lib32-mangohud" )
 fi
 
 failed_packages=()
-for package in "\${gaming_packages[@]}"; do
-    echo "Installing \$package..."
-    # FIX: Add --noprogressbar
-    if ! yay -S --noconfirm --needed --answeredit n --noprogressbar "\$package"; then
-        echo "Warning: Failed to install \$package"
-        failed_packages+=("\$package")
+for package in "${gaming_packages[@]}"; do
+    echo "Installing ${package}..."
+    if ! yay -S --noconfirm --needed --answeredit n --noprogressbar "${package}"; then
+        echo "Warning: Failed to install ${package}"
+        failed_packages+=("${package}")
     fi
 done
 
-if [[ \${#failed_packages[@]} -gt 0 ]]; then
-    echo "Warning: Failed to install one or more packages: \${failed_packages[*]}"
+if [[ ${#failed_packages[@]} -gt 0 ]]; then
+    echo "Warning: Failed to install one or more packages: ${failed_packages[*]}"
 else
     echo "All selected gaming packages installed successfully."
 fi
 EOF
-        if ! run_command distrobox enter "$CONTAINER_NAME" -- bash -c "$gaming_script"; then
+        # FIX: Pass the ENABLE_MULTILIB variable as an argument to the container script.
+        if ! echo "$gaming_script" | run_command distrobox enter "$CONTAINER_NAME" -- bash -s "$ENABLE_MULTILIB"; then
             log_warn "Some gaming packages may have failed to install. Check log for details."
         fi
     fi
@@ -757,7 +752,6 @@ export_pamac_to_host() {
     log_info "Attempting to export using 'distrobox-export'..."
     local export_cmd="distrobox enter $CONTAINER_NAME -- distrobox-export --app pamac-manager --extra-flags '--no-sandbox'"
     
-    # FIX: Improved error handling for distrobox-export.
     if run_command sh -c "$export_cmd"; then
         log_success "Pamac exported successfully to the application menu."
     else
@@ -773,7 +767,6 @@ export_pamac_to_host() {
 Name=Pamac Manager (${CONTAINER_NAME})
 Comment=Add/Remove Software from the Arch container
 Exec=distrobox enter ${CONTAINER_NAME} -- /usr/bin/pamac-manager --no-sandbox
-# FIX: Use a more specific icon name.
 Icon=pamac-manager
 Terminal=false
 Type=Application
@@ -830,7 +823,6 @@ show_completion_message() {
     echo
 }
 
-# FIX: New function for --check mode.
 run_pre_flight_checks() {
     log_step "Performing pre-flight system checks..."
     if check_system_requirements; then
@@ -844,12 +836,19 @@ run_pre_flight_checks() {
 # --- Main Function ---
 main() {
     setup_colors
+    
+    # FIX: Add a check to ensure the script is not run as root.
+    if [[ "$EUID" -eq 0 ]]; then
+        # Logging isn't initialized yet, so use direct echo.
+        echo -e "\e[91m❌ This script should not be run as root. Please run as the 'deck' user.\e[0m" >&2
+        exit 1
+    fi
+    
     parse_arguments "$@"
 
     # Must initialize after parsing to respect --quiet etc.
     initialize_logging
 
-    # FIX: Handle --check mode
     if [[ "$CHECK_ONLY" == "true" ]]; then
         run_pre_flight_checks
         exit 0
@@ -877,7 +876,7 @@ main() {
     fi
 
     configure_container_base || exit 1
-    optimize_pacman_mirrors # New step
+    optimize_pacman_mirrors
     configure_multilib
 
     install_aur_helper || exit 1

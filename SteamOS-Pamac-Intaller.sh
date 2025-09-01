@@ -624,7 +624,7 @@ install_gaming_packages() {
 set -euo pipefail
 
 readonly IS_MULTILIB_ENABLED="$1"
-gaming_packages=( "steam" "lutris" "wine-staging" "winetricks" "gamemode" "mangohud" )
+gaming_packages=( "lutris" "wine-staging" "winetricks" "gamemode" "mangohud" )
 
 if [[ "$IS_MULTILIB_ENABLED" == "true" ]]; then
     echo "Adding 32-bit gaming libraries..."

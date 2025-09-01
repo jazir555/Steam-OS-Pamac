@@ -324,7 +324,7 @@ uninstall_setup() {
     # Stop and remove the container
     if distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
         log_info "Stopping and removing container: $CONTAINER_NAME"
-        run_command distrobox stop "$CONTAINER_NAME" --yes || true
+        run_command distrobox stop "$CONTAINER_NAME" || true
         run_command distrobox rm "$CONTAINER_NAME" --force || true
     else
         log_info "Container '$CONTAINER_NAME' not found, skipping removal."

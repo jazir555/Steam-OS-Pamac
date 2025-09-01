@@ -15,7 +15,12 @@ readonly LOG_FILE="$HOME/distrobox-pamac-setup.log"
 
 # User-configurable variables
 CONTAINER_NAME="${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}"
-CURRENT_USER=$(whoami)
+# Derive the real calling user, even when run with sudo -E
+if [[ -n "${SUDO_USER:-}" ]]; then
+    CURRENT_USER="$SUDO_USER"
+else
+    CURRENT_USER=$(whoami)
+fi
 
 # Feature flags with improved defaults
 ENABLE_MULTILIB="${ENABLE_MULTILIB:-true}"
@@ -655,7 +660,7 @@ export_pamac_to_host() {
 
     # Try using distrobox-export first
     log_info "Attempting to export Pamac using distrobox-export..."
-    if run_command distrobox-export --app pamac-manager --extra-flags '--no-sandbox' --container "$CONTAINER_NAME"; then
+    if run_command distrobox-export --app pamac-manager --extra-flags --no-sandbox --container "$CONTAINER_NAME"; then
         log_success "Pamac exported successfully using distrobox-export."
     else
         log_warn "distrobox-export failed. Creating manual desktop entry..."

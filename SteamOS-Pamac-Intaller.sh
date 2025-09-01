@@ -1,15 +1,15 @@
 #!/bin/bash
 
-# Steam Deck Pamac Setup Script - Improved Version
+# Steam Deck Pamac Setup Script - Fixed Version
 # This script sets up a persistent, GUI-based package management system
 # using Distrobox containers on SteamOS without Developer Mode
 
-set -euo pipefail  # Stricter error handling
+set -euo pipefail
 
 # --- Configuration Variables ---
-readonly SCRIPT_VERSION="4.3.1" # Version incremented
-readonly SCRIPT_URL="https://raw.githubusercontent.com/user/repo/main/setup-pamac.sh" # Assumed URL
-readonly REQUIRED_TOOLS=("distrobox" "podman")
+readonly SCRIPT_VERSION="4.3.3"
+readonly SCRIPT_URL="https://raw.githubusercontent.com/user/repo/main/setup-pamac.sh"
+readonly REQUIRED_TOOLS=("distrobox")
 readonly DEFAULT_CONTAINER_NAME="arch-pamac"
 readonly LOG_FILE="$HOME/distrobox-pamac-setup.log"
 
@@ -88,9 +88,7 @@ log_warn() { _log "WARN" "$YELLOW" "⚠️  $1"; }
 log_error() { _log "ERROR" "$RED" "❌ $1"; }
 log_debug() { _log "DEBUG" "" "$1"; }
 
-# FIX: The original run_command function did not correctly handle exit codes in
-# non-verbose mode when 'set -e' was active. This version reliably captures
-# the exit code of the executed command in all modes.
+# Improved command execution with better error handling
 run_command() {
     log_debug "Executing: $*"
 
@@ -101,17 +99,16 @@ run_command() {
 
     local status=0
     if [[ "$LOG_LEVEL" == "verbose" ]]; then
-        # When 'set -e' is active, a failing command in a pipeline would exit the script.
-        # The '|| true' prevents this line from triggering an exit. We then capture the
-        # true exit code from the executed command (the first in the pipeline) using PIPESTATUS.
         "$@" 2>&1 | tee -a "$LOG_FILE" || true
         status="${PIPESTATUS[0]}"
     else
-        # In non-verbose mode, we also need to prevent 'set -e' from exiting on failure
-        # so that the calling function can handle the error. The '|| status=$?' idiom
-        # captures the exit code without terminating the script.
         "$@" >> "$LOG_FILE" 2>&1 || status=$?
     fi
+    
+    if [[ $status -ne 0 ]]; then
+        log_debug "Command failed with exit code: $status"
+    fi
+    
     return "$status"
 }
 
@@ -120,12 +117,12 @@ validate_container_name() {
     if [[ ! "$CONTAINER_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
         log_error "Invalid container name: $CONTAINER_NAME"
         log_info "Container names must start with an alphanumeric character and contain only letters, numbers, hyphens, and underscores."
-        exit 1
+        return 1
     fi
 
     if [[ ${#CONTAINER_NAME} -gt 63 ]]; then
         log_error "Container name too long (max 63 characters): $CONTAINER_NAME"
-        exit 1
+        return 1
     fi
 }
 
@@ -134,7 +131,7 @@ check_system_requirements() {
     local missing_tools=()
     local all_ok=true
 
-    # Check for required tools
+    # Check distrobox
     for tool in "${REQUIRED_TOOLS[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing_tools+=("$tool")
@@ -142,22 +139,42 @@ check_system_requirements() {
         fi
     done
 
+    # Check for a supported runtime: podman OR docker
+    local have_runtime=false
+    if command -v podman >/dev/null 2>&1; then
+        have_runtime=true
+        log_debug "Found container runtime: podman"
+    elif command -v docker >/dev/null 2>&1; then
+        have_runtime=true
+        log_debug "Found container runtime: docker"
+    fi
+    
+    if [[ "$have_runtime" == "false" ]]; then
+        missing_tools+=("podman or docker")
+        all_ok=false
+    fi
+
     if [[ ${#missing_tools[@]} -gt 0 ]]; then
         log_error "Missing required tools: ${missing_tools[*]}"
         log_info "On SteamOS, install distrobox with:"
         log_info "  curl -s https://raw.githubusercontent.com/89luca89/distrobox/main/install | sh -s -- --prefix ~/.local"
+        log_info "Then restart your terminal or run: source ~/.bashrc"
     else
-        log_success "All required tools are present: ${REQUIRED_TOOLS[*]}"
+        log_success "All required tools are present."
     fi
 
     # Check disk space (need at least 2GB)
     local available_space
-    available_space=$(df --output=avail -k "$HOME" | awk 'NR==2')
-    if [[ $available_space -lt 2097152 ]]; then  # 2GB in KB
-        log_warn "Low disk space detected. At least 2GB is recommended."
-        all_ok=false
+    if available_space=$(df --output=avail -k "$HOME" 2>/dev/null | tail -n1); then
+        if [[ $available_space -lt 2097152 ]]; then  # 2GB in KB
+            log_warn "Low disk space detected. At least 2GB is recommended."
+            log_info "Available space: $(( available_space / 1024 ))MB"
+            all_ok=false
+        else
+            log_success "Sufficient disk space available: $(( available_space / 1024 / 1024 ))GB"
+        fi
     else
-        log_success "Sufficient disk space available."
+        log_warn "Could not check disk space."
     fi
 
     # Verify SteamOS compatibility
@@ -167,9 +184,7 @@ check_system_requirements() {
         log_success "SteamOS detected."
     fi
 
-    if [[ "$all_ok" == "false" ]]; then
-        return 1
-    fi
+    return $([[ "$all_ok" == "true" ]] && echo 0 || echo 1)
 }
 
 # --- Argument Parsing ---
@@ -191,8 +206,7 @@ OPTIONS:
     --disable-build-cache    Disable persistent build cache for yay
     --optimize-mirrors       Select fastest Pacman mirrors (default)
     --no-optimize-mirrors    Do not change default Pacman mirrors
-    --update                 Update this script to the latest version.
-                             (Requires write access to the script file)
+    --update                 Update this script to the latest version
     --uninstall              Remove container and all related files
     --check                  Perform system checks and exit without installing
     --dry-run                Show what would be done without making changes
@@ -225,79 +239,24 @@ parse_arguments() {
                 CONTAINER_NAME="$2"
                 shift 2
                 ;;
-            --force-rebuild)
-                FORCE_REBUILD="true"
-                shift
-                ;;
-            --enable-multilib)
-                ENABLE_MULTILIB="true"
-                shift
-                ;;
-            --disable-multilib)
-                ENABLE_MULTILIB="false"
-                shift
-                ;;
-            --enable-gaming)
-                ENABLE_GAMING_PACKAGES="true"
-                shift
-                ;;
-            --disable-gaming)
-                ENABLE_GAMING_PACKAGES="false"
-                shift
-                ;;
-            --enable-build-cache)
-                ENABLE_BUILD_CACHE="true"
-                shift
-                ;;
-            --disable-build-cache)
-                ENABLE_BUILD_CACHE="false"
-                shift
-                ;;
-            --optimize-mirrors)
-                OPTIMIZE_MIRRORS="true"
-                shift
-                ;;
-            --no-optimize-mirrors)
-                OPTIMIZE_MIRRORS="false"
-                shift
-                ;;
-            --dry-run)
-                DRY_RUN="true"
-                shift
-                ;;
-            --check)
-                CHECK_ONLY="true"
-                shift
-                ;;
-            --verbose)
-                LOG_LEVEL="verbose"
-                shift
-                ;;
-            --quiet)
-                LOG_LEVEL="quiet"
-                shift
-                ;;
-            --update)
-                update_script
-                exit 0
-                ;;
-            --uninstall)
-                uninstall_setup
-                exit 0
-                ;;
-            --version)
-                echo "Steam Deck Pamac Setup v${SCRIPT_VERSION}"
-                exit 0
-                ;;
-            -h|--help)
-                show_usage
-                exit 0
-                ;;
-            *)
-                log_error "Unknown option: $1"
-                show_usage
-                exit 1
-                ;;
+            --force-rebuild)        FORCE_REBUILD="true"; shift ;;
+            --enable-multilib)      ENABLE_MULTILIB="true"; shift ;;
+            --disable-multilib)     ENABLE_MULTILIB="false"; shift ;;
+            --enable-gaming)        ENABLE_GAMING_PACKAGES="true"; shift ;;
+            --disable-gaming)       ENABLE_GAMING_PACKAGES="false"; shift ;;
+            --enable-build-cache)   ENABLE_BUILD_CACHE="true"; shift ;;
+            --disable-build-cache)  ENABLE_BUILD_CACHE="false"; shift ;;
+            --optimize-mirrors)     OPTIMIZE_MIRRORS="true"; shift ;;
+            --no-optimize-mirrors)  OPTIMIZE_MIRRORS="false"; shift ;;
+            --dry-run)              DRY_RUN="true"; shift ;;
+            --check)                CHECK_ONLY="true"; shift ;;
+            --verbose)              LOG_LEVEL="verbose"; shift ;;
+            --quiet)                LOG_LEVEL="quiet"; shift ;;
+            --update)               update_script; exit 0 ;;
+            --uninstall)            uninstall_setup; exit 0 ;;
+            --version)              echo "Steam Deck Pamac Setup v${SCRIPT_VERSION}"; exit 0 ;;
+            -h|--help)              show_usage; exit 0 ;;
+            *)                      log_error "Unknown option: $1"; show_usage; exit 1 ;;
         esac
     done
 }
@@ -314,12 +273,12 @@ update_script() {
     if [[ ! -w "$0" ]]; then
         log_error "Cannot update: The script location '$0' is not writable."
         log_info "Please download the script to a writable location and run it from there."
-        exit 1
+        return 1
     fi
 
     local temp_file
-    temp_file=$(mktemp) || { log_error "Could not create temporary file."; exit 1; }
-    trap 'rm -f "$temp_file"' EXIT
+    temp_file=$(mktemp) || { log_error "Could not create temporary file."; return 1; }
+    trap 'rm -f "$temp_file"' RETURN
 
     local download_cmd
     if command -v curl >/dev/null 2>&1; then
@@ -328,26 +287,25 @@ update_script() {
         download_cmd="wget -qO-"
     else
         log_error "Neither curl nor wget is available for updating."
-        exit 1
+        return 1
     fi
 
     if $download_cmd "$SCRIPT_URL" > "$temp_file"; then
         if [[ -s "$temp_file" ]] && head -1 "$temp_file" | grep -q "^#!/bin/bash"; then
             chmod +x "$temp_file"
-            if mv -f "$temp_file" "$0"; then
-                trap - EXIT # Success, so disable the cleanup trap.
+            if cp "$temp_file" "$0"; then
                 log_success "Script updated successfully. Please run the new version again."
             else
                 log_error "Failed to replace the script file at '$0'. Update aborted."
-                exit 1
+                return 1
             fi
         else
             log_error "Downloaded file appears to be invalid or empty."
-            exit 1
+            return 1
         fi
     else
         log_error "Failed to download update from the server."
-        exit 1
+        return 1
     fi
 }
 
@@ -364,32 +322,34 @@ uninstall_setup() {
         run_command distrobox stop "$CONTAINER_NAME" --yes || true
         run_command distrobox rm "$CONTAINER_NAME" --force || true
     else
-        log_info "Container '$CONTAINER_NAME' not found, skipping."
+        log_info "Container '$CONTAINER_NAME' not found, skipping removal."
     fi
 
     # Clean up exported applications
     local app_dir="$HOME/.local/share/applications"
     if [[ -d "$app_dir" ]]; then
-        log_info "Cleaning up exported application launchers (.desktop files)"
+        log_info "Cleaning up exported application launchers"
         if [[ "$DRY_RUN" != "true" ]]; then
-            # Reliably find files created by `distrobox-export` or our manual fallback
+            # Remove files created by distrobox-export
             find "$app_dir" -type f -name "*-${CONTAINER_NAME}.desktop" -delete 2>/dev/null || true
-            # Safety net using a robust find/grep/xargs pipeline instead of a fragile glob
-            find "$app_dir" -maxdepth 1 -type f -name "*.desktop" -exec grep -lq "distrobox enter ${CONTAINER_NAME}" {} + | xargs -r rm -f 2>/dev/null || true
+            # Remove manual desktop files that reference our container
+            find "$app_dir" -maxdepth 1 -type f -name "*.desktop" -exec grep -l "distrobox enter ${CONTAINER_NAME}" {} \; 2>/dev/null | xargs -r rm -f 2>/dev/null || true
             if command -v update-desktop-database >/dev/null 2>&1; then
                 update-desktop-database "$app_dir" 2>/dev/null || true
             fi
         else
-             log_warn "[DRY RUN] Would search for and delete .desktop files in $app_dir"
+            log_warn "[DRY RUN] Would search for and delete .desktop files in $app_dir"
         fi
     fi
 
+    # Clean up build cache
     local cache_dir="$HOME/.cache/yay-${CONTAINER_NAME}"
     if [[ -d "$cache_dir" ]]; then
         log_info "Removing build cache at $cache_dir"
         [[ "$DRY_RUN" != "true" ]] && rm -rf "$cache_dir"
     fi
 
+    # Clean up CLI wrapper
     local bin_file="$HOME/.local/bin/pamac-${CONTAINER_NAME}"
     if [[ -f "$bin_file" ]]; then
         log_info "Removing CLI wrapper at $bin_file"
@@ -403,10 +363,11 @@ wait_for_container() {
     local max_attempts=60
     local attempt=0
     log_info "Waiting for container '$CONTAINER_NAME' to become ready..."
+    
     while ! distrobox enter "$CONTAINER_NAME" -- true >/dev/null 2>&1; do
         if [[ $((++attempt)) -gt $max_attempts ]]; then
             log_error "Container failed to become ready after $((max_attempts * 2)) seconds."
-            log_info "Check container logs with: podman logs $CONTAINER_NAME"
+            log_info "Try checking container status with: distrobox list"
             return 1
         fi
         sleep 2
@@ -420,22 +381,30 @@ wait_for_container() {
 # --- Core Setup Functions ---
 create_container() {
     log_step "Creating Arch Linux container: $CONTAINER_NAME"
-    local create_args=( --name "$CONTAINER_NAME" --image "archlinux:latest" --yes )
+    
+    local create_args=( 
+        --name "$CONTAINER_NAME" 
+        --image "archlinux:latest" 
+        --yes 
+    )
+    
     if [[ "$ENABLE_BUILD_CACHE" == "true" ]]; then
         local cache_dir="$HOME/.cache/yay-${CONTAINER_NAME}"
         mkdir -p "$cache_dir"
         create_args+=(--volume "$cache_dir:/home/$CURRENT_USER/.cache/yay:rw")
         log_info "Enabled persistent build cache: $cache_dir"
     fi
+    
     if ! run_command distrobox create "${create_args[@]}"; then
         log_error "Failed to create Distrobox container."
         return 1
     fi
+    
     wait_for_container || return 1
 }
 
 configure_container_base() {
-    log_step "Configuring container base environment (sudo, keyring)"
+    log_step "Configuring container base environment"
 
     local setup_script
     read -r -d '' setup_script << 'EOF' || true
@@ -443,15 +412,19 @@ set -euo pipefail
 
 echo "Setting up base environment inside container..."
 readonly current_user="$1"
+
 if [[ -z "$current_user" ]]; then
     echo "Error: Host username was not provided to the setup script." >&2
     exit 1
 fi
 
+# Create wheel group if it doesn't exist
 if ! getent group wheel >/dev/null 2>&1; then
     groupadd wheel
     echo "Created 'wheel' group."
 fi
+
+# Add user to wheel group
 if id "$current_user" >/dev/null 2>&1; then
     usermod -aG wheel "$current_user"
     echo "Added user '$current_user' to 'wheel' group."
@@ -459,34 +432,28 @@ else
     echo "Error: User '$current_user' not found inside the container." >&2
     exit 1
 fi
+
+# Configure passwordless sudo
 echo '%wheel ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/99-wheel-nopasswd
 chmod 0440 /etc/sudoers.d/99-wheel-nopasswd
 echo "Configured passwordless sudo for 'wheel' group."
 
-# Boost entropy for keyring generation
-echo "Installing rng-tools to speed up keyring generation..."
-pacman -S --noconfirm --needed rng-tools
-echo "Running rngd to gather entropy..."
-# Fork rngd to the background
-rngd -r /dev/urandom &
-RNGD_PID=$!
-# Give it a moment to start feeding entropy
-sleep 2
-
-# Initialize pacman keyring with timeout protection
+# Initialize pacman keyring with better error handling
 echo "Initializing pacman keyring..."
-if ! timeout 300 pacman-key --init; then
-    echo "Warning: 'pacman-key --init' timed out or failed. This can happen on low-entropy systems."
-fi
+pacman-key --init || {
+    echo "Warning: pacman-key --init failed. Trying to continue anyway."
+}
 
 echo "Populating archlinux keyring..."
-if ! timeout 300 pacman-key --populate archlinux; then
-    echo "Warning: 'pacman-key --populate' timed out or failed. Package signature checks might fail."
-fi
+pacman-key --populate archlinux || {
+    echo "Warning: pacman-key --populate failed. Package signature verification may fail."
+}
 
-# Clean up the rngd process
-echo "Stopping rngd..."
-kill "$RNGD_PID" 2>/dev/null || echo "rngd process not found, may have already exited."
+# Update system packages
+echo "Updating system packages..."
+pacman -Syu --noconfirm || {
+    echo "Warning: System update failed. Continuing with setup."
+}
 
 echo "Base environment setup complete."
 EOF
@@ -503,53 +470,58 @@ optimize_pacman_mirrors() {
         return
     fi
 
-    log_step "Optimizing Pacman mirrors with reflector"
+    log_step "Optimizing Pacman mirrors"
 
     local mirror_script
     read -r -d '' mirror_script << 'EOF'
 set -euo pipefail
+
 echo "Installing reflector..."
-pacman -S --noconfirm --needed reflector
+if ! pacman -S --noconfirm --needed reflector; then
+    echo "Failed to install reflector. Skipping mirror optimization."
+    exit 0
+fi
 
 echo "Backing up current mirrorlist..."
-cp /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.backup
+[[ -f /etc/pacman.d/mirrorlist ]] && cp /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.backup
 
-echo "Generating new mirrorlist (this may take a minute)..."
-# Select the 20 most recently synchronized HTTPS mirrors and sort them by download speed.
-# Using a timeout to prevent indefinite hangs.
-if timeout 300 reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist; then
+echo "Generating optimized mirrorlist..."
+if reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist; then
     echo "Successfully updated mirrorlist."
 else
-    echo "Warning: Reflector failed or timed out. Restoring original mirrorlist."
-    cp /etc/pacman.d/mirrorlist.backup /etc/pacman.d/mirrorlist
-    # This is a non-fatal warning.
+    echo "Reflector failed. Restoring backup if available."
+    [[ -f /etc/pacman.d/mirrorlist.backup ]] && cp /etc/pacman.d/mirrorlist.backup /etc/pacman.d/mirrorlist
     exit 0
 fi
 EOF
 
     if ! echo "$mirror_script" | run_command distrobox enter --root "$CONTAINER_NAME" -- bash; then
-        log_warn "Failed to optimize mirrors. The script will continue with default mirrors."
+        log_warn "Failed to optimize mirrors. Continuing with default mirrors."
     fi
 }
 
 configure_multilib() {
     if [[ "$ENABLE_MULTILIB" == "true" ]]; then
         log_step "Enabling multilib (32-bit) support"
+        
         local multilib_script
-        read -r -d '' multilib_script << 'EOF' || true
+        read -r -d '' multilib_script << 'EOF'
 set -euo pipefail
+
 if ! grep -q "^\s*\[multilib\]" /etc/pacman.conf; then
-    echo "Enabling multilib repository in /etc/pacman.conf..."
-    echo -e "\n[multilib]\nInclude = /etc/pacman.d/mirrorlist" | tee -a /etc/pacman.conf > /dev/null
+    echo "Enabling multilib repository..."
+    echo -e "\n[multilib]\nInclude = /etc/pacman.d/mirrorlist" >> /etc/pacman.conf
     echo "Multilib repository enabled."
 else
     echo "Multilib repository is already enabled."
 fi
+
 echo "Updating package database..."
 pacman -Sy --noconfirm
 EOF
+        
         if ! echo "$multilib_script" | run_command distrobox enter --root "$CONTAINER_NAME" -- bash; then
-            log_warn "Failed to enable multilib support. Installation of 32-bit packages will likely fail."
+            log_warn "Failed to enable multilib support. 32-bit packages may not be available."
         fi
     fi
 }
@@ -557,34 +529,35 @@ EOF
 install_aur_helper() {
     log_step "Installing AUR helper (yay)"
 
+    # Check if yay is already installed
     if distrobox enter "$CONTAINER_NAME" -- command -v yay >/dev/null 2>&1; then
-        log_info "AUR helper 'yay' is already installed. Skipping."
+        log_info "AUR helper 'yay' is already installed."
         return 0
     fi
 
     local yay_script
-    read -r -d '' yay_script << 'EOF' || true
+    read -r -d '' yay_script << 'EOF'
 set -euo pipefail
-echo "Updating system and installing build tools..."
-sudo pacman -Syu --noconfirm --needed git base-devel
 
-# Switched from yay-bin to the upstream yay source.
-# This requires a compile step but is the more standard approach.
-echo "Cloning and building 'yay' AUR helper from source..."
+echo "Installing build dependencies..."
+sudo pacman -S --noconfirm --needed git base-devel
+
+echo "Cloning yay from AUR..."
 cd /tmp
-if [[ -d yay ]]; then rm -rf yay; fi
+[[ -d yay ]] && rm -rf yay
 git clone https://aur.archlinux.org/yay.git
 cd yay
 
-# Build and install as a regular user.
-# makepkg will use sudo internally to install the final package.
+echo "Building and installing yay..."
 makepkg -si --noconfirm --clean
-echo "'yay' installation completed."
+
+echo "Verifying yay installation..."
 yay --version
+echo "yay installation completed successfully."
 EOF
 
     if ! run_command distrobox enter "$CONTAINER_NAME" -- bash -c "$yay_script"; then
-        log_error "Failed to install AUR helper (yay). Pamac installation will be skipped."
+        log_error "Failed to install AUR helper (yay)."
         return 1
     fi
 }
@@ -592,38 +565,38 @@ EOF
 install_pamac() {
     log_step "Installing Pamac package manager"
     
+    # Check if pamac is already installed
     if distrobox enter "$CONTAINER_NAME" -- command -v pamac-manager >/dev/null 2>&1; then
-        log_info "Pamac is already installed. Skipping."
+        log_info "Pamac is already installed."
         return 0
     fi
 
     local pamac_script
-    read -r -d '' pamac_script << 'EOF' || true
+    read -r -d '' pamac_script << 'EOF'
 set -euo pipefail
 
-echo "Installing 'pamac-aur' using yay..."
+echo "Installing pamac-aur from AUR..."
 yay -S --noconfirm --needed --answeredit n --noprogressbar pamac-aur
 
-# Configure Pamac to enable AUR support by default
+# Configure Pamac for AUR support
 if [[ -f /etc/pamac.conf ]]; then
-    echo "Enabling AUR support in Pamac config..."
+    echo "Configuring Pamac for AUR support..."
     sudo sed -i 's/^#EnableAUR/EnableAUR/' /etc/pamac.conf
     sudo sed -i 's/^#CheckAURUpdates/CheckAURUpdates/' /etc/pamac.conf
-    # This option may not exist in all versions, so we check for it.
     if grep -q "#CheckAURVCSUpdates" /etc/pamac.conf; then
         sudo sed -i 's/^#CheckAURVCSUpdates/CheckAURVCSUpdates/' /etc/pamac.conf
     fi
-    echo "Pamac configuration updated."
+    echo "Pamac configuration updated for AUR support."
 else
-    echo "Warning: /etc/pamac.conf not found. Cannot auto-enable AUR."
+    echo "Warning: /etc/pamac.conf not found. Cannot enable AUR support automatically."
 fi
 
 # Verify installation
 if command -v pamac-manager >/dev/null 2>&1; then
     echo "Pamac installed successfully."
-    pamac --version || true
+    pamac --version 2>/dev/null || echo "Pamac version info not available"
 else
-    echo "Error: Pamac installation could not be verified."
+    echo "Error: Pamac installation verification failed."
     exit 1
 fi
 EOF
@@ -634,102 +607,28 @@ EOF
     fi
 }
 
-setup_cleanup_hooks() {
-    log_step "Setting up cleanup hooks (experimental)"
-
-    local hook_script
-    read -r -d '' hook_script << EOF || true
-set -euo pipefail
-# This hook attempts to clean up exported .desktop files when a package is removed via pacman.
-# NOTE: This is a best-effort approach. It relies on the host user's home directory
-# being mounted at the same path inside the container (standard distrobox behavior).
-
-echo "Setting up pacman hooks for desktop entry cleanup..."
-mkdir -p /etc/pacman.d/hooks
-
-# Create the script that the hook will call
-cat > /usr/local/bin/cleanup-exported-desktop-entries.sh << 'CLEANUP_SCRIPT'
-#!/bin/bash
-set -euo pipefail
-
-# This script is run by pacman inside the container.
-# $1: The name of the container (e.g., 'arch-pamac')
-# $2: The path to the host user's home directory AS MOUNTED inside the container (e.g., '/home/deck')
-if [[ -z "\${1:-}" || -z "\${2:-}" ]]; then exit 0; fi
-
-readonly CONTAINER_NAME="\$1"
-readonly HOST_HOME_IN_CONTAINER="\$2"
-readonly HOST_APP_DIR="\$HOST_HOME_IN_CONTAINER/.local/share/applications"
-
-if [[ ! -d "\$HOST_APP_DIR" ]]; then exit 0; fi
-
-# Read removed package names from stdin
-while IFS= read -r pkg_name; do
-    if [[ -z "\$pkg_name" ]]; then continue; fi
-    # Find .desktop files installed by this package.
-    pkg_desktop_files=\$(pacman -Ql "\$pkg_name" | awk '/\\/usr\\/share\\/applications\\/.*\\.desktop\$/ {print \$2}' || true)
-    for desktop_file in \$pkg_desktop_files; do
-        app_name=\$(basename "\$desktop_file" .desktop)
-        exported_file="\${HOST_APP_DIR}/\${app_name}-\${CONTAINER_NAME}.desktop"
-        if [[ -f "\$exported_file" ]]; then
-            echo "Hook: Removing exported launcher: \$exported_file"
-            rm -f "\$exported_file"
-        fi
-    done
-done
-
-# This path is inside the container, but points to the host's directory structure.
-if command -v update-desktop-database >/dev/null 2>&1; then
-    update-desktop-database "\$HOST_APP_DIR" 2>/dev/null || true
-fi
-CLEANUP_SCRIPT
-chmod +x /usr/local/bin/cleanup-exported-desktop-entries.sh
-
-# Create pacman hook to trigger the script.
-# We expand variables from the host script to bake in the container name and host home path.
-cat > /etc/pacman.d/hooks/99-distrobox-cleanup.hook << HOOK_CONFIG
-[Trigger]
-Operation = Remove
-Type = Package
-Target = *
-
-[Action]
-Description = Cleaning up exported desktop entries...
-When = PostTransaction
-# The hook runs inside the container, so we must provide paths that are valid
-# inside it. Distrobox mounts the host's home directory (e.g., /home/deck) at
-# the same path inside the container. We bake this path into the hook for robustness.
-Exec = /usr/local/bin/cleanup-exported-desktop-entries.sh "${CONTAINER_NAME}" "/home/${CURRENT_USER}"
-NeedsTargets
-HOOK_CONFIG
-echo "Cleanup hooks configured."
-EOF
-
-    if ! echo "$hook_script" | run_command distrobox enter --root "$CONTAINER_NAME" -- bash; then
-        log_warn "Failed to set up cleanup hooks. Uninstalled packages may leave behind menu entries."
-    fi
-}
-
 install_gaming_packages() {
-    if [[ "$ENABLE_GAMING_PACKAGES" == "true" ]]; then
-        log_step "Installing optional gaming packages"
-        local gaming_script
-        read -r -d '' gaming_script << 'EOF' || true
-set -euo pipefail
-# The first argument ($1) is the ENABLE_MULTILIB flag from the host script.
-readonly IS_MULTILIB_ENABLED="$1"
+    if [[ "$ENABLE_GAMING_PACKAGES" != "true" ]]; then
+        return
+    fi
 
-echo "Installing gaming-related packages..."
-# Define packages to install.
+    log_step "Installing gaming packages"
+    
+    local gaming_script
+    read -r -d '' gaming_script << 'EOF'
+set -euo pipefail
+
+readonly IS_MULTILIB_ENABLED="$1"
 gaming_packages=( "steam" "lutris" "wine-staging" "winetricks" "gamemode" "mangohud" )
 
-# Add 32-bit packages if multilib is enabled.
 if [[ "$IS_MULTILIB_ENABLED" == "true" ]]; then
-    echo "Multilib is enabled, adding 32-bit gaming libraries..."
+    echo "Adding 32-bit gaming libraries..."
     gaming_packages+=( "lib32-gamemode" "lib32-mangohud" )
 fi
 
+echo "Installing gaming packages: ${gaming_packages[*]}"
 failed_packages=()
+
 for package in "${gaming_packages[@]}"; do
     echo "Installing ${package}..."
     if ! yay -S --noconfirm --needed --answeredit n --noprogressbar "${package}"; then
@@ -738,31 +637,30 @@ for package in "${gaming_packages[@]}"; do
     fi
 done
 
-# Signal failure if any packages failed to install.
 if [[ ${#failed_packages[@]} -gt 0 ]]; then
-    echo "Error: The following packages failed to install: ${failed_packages[*]}" >&2
-    exit 1
+    echo "Warning: Some packages failed to install: ${failed_packages[*]}"
+    echo "Gaming setup partially completed."
+else
+    echo "All gaming packages installed successfully."
 fi
-
-echo "All selected gaming packages installed successfully."
 EOF
-        if ! echo "$gaming_script" | run_command distrobox enter "$CONTAINER_NAME" -- bash -s "$ENABLE_MULTILIB"; then
-            log_warn "One or more gaming packages failed to install. Check the log for details."
-        fi
+
+    if ! echo "$gaming_script" | run_command distrobox enter "$CONTAINER_NAME" -- bash -s "$ENABLE_MULTILIB"; then
+        log_warn "Gaming package installation encountered errors. Check the log for details."
     fi
 }
 
 export_pamac_to_host() {
-    log_step "Exporting Pamac to the host application menu"
+    log_step "Exporting Pamac to host system"
 
-    log_info "Attempting to export using 'distrobox-export'..."
-    local export_cmd="distrobox enter $CONTAINER_NAME -- distrobox-export --app pamac-manager --extra-flags '--no-sandbox'"
-    
-    if run_command sh -c "$export_cmd"; then
-        log_success "Pamac exported successfully to the application menu."
+    # Try using distrobox-export first
+    log_info "Attempting to export Pamac using distrobox-export..."
+    if run_command distrobox-export --app pamac-manager --extra-flags '--no-sandbox' --container "$CONTAINER_NAME"; then
+        log_success "Pamac exported successfully using distrobox-export."
     else
-        log_warn "'distrobox-export' failed. The error has been logged. Creating a manual launcher as a fallback."
+        log_warn "distrobox-export failed. Creating manual desktop entry..."
 
+        # Create manual desktop entry
         local desktop_dir="$HOME/.local/share/applications"
         mkdir -p "$desktop_dir"
 
@@ -770,71 +668,77 @@ export_pamac_to_host() {
         cat > "$desktop_file" << EOF
 [Desktop Entry]
 Name=Pamac Manager (${CONTAINER_NAME})
-Comment=Add/Remove Software from the Arch container
-Exec=distrobox enter ${CONTAINER_NAME} -- /usr/bin/pamac-manager --no-sandbox
+Comment=Package Manager for Arch Linux Container
+Exec=distrobox enter ${CONTAINER_NAME} -- pamac-manager --no-sandbox
 Icon=pamac-manager
 Terminal=false
 Type=Application
 Categories=System;Settings;PackageManager;
-Keywords=package;manager;install;remove;update;software;arch;
+Keywords=package;manager;software;arch;aur;
 StartupNotify=true
 X-Distrobox-App=pamac-manager
 X-Distrobox-Container=${CONTAINER_NAME}
 EOF
         chmod +x "$desktop_file"
-        log_success "Created manual desktop launcher: $desktop_file"
+        log_success "Created manual desktop entry: $desktop_file"
     fi
 
+    # Update desktop database
     if command -v update-desktop-database >/dev/null 2>&1; then
-        run_command update-desktop-database "$HOME/.local/share/applications"
+        run_command update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
     fi
 
+    # Create CLI wrapper
     local bin_dir="$HOME/.local/bin"
     mkdir -p "$bin_dir"
     local cli_wrapper="$bin_dir/pamac-${CONTAINER_NAME}"
 
     cat > "$cli_wrapper" << EOF
 #!/bin/bash
-# Pamac CLI wrapper for the '${CONTAINER_NAME}' container
+# Pamac CLI wrapper for container: ${CONTAINER_NAME}
 exec distrobox enter "${CONTAINER_NAME}" -- pamac "\$@"
 EOF
     chmod +x "$cli_wrapper"
-    log_info "Created a command-line wrapper: $cli_wrapper"
-    log_info "Ensure '$bin_dir' is in your PATH to use it directly."
+    log_info "Created CLI wrapper: $cli_wrapper"
+    
+    if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
+        log_info "Add '$bin_dir' to your PATH to use the CLI wrapper directly."
+    fi
 }
 
 show_completion_message() {
     echo
-    log_success "Steam Deck Pamac Setup completed!"
+    log_success "Steam Deck Pamac Setup completed successfully!"
     echo
-    echo -e "${BOLD}${BLUE}--- Summary ---${NC}"
-    echo "  • Arch Linux container created: ${BOLD}$CONTAINER_NAME${NC}"
-    echo "  • Pamac GUI package manager installed and configured."
-    echo "  • 'yay' command-line AUR helper is available inside the container."
-    [[ "$OPTIMIZE_MIRRORS" == "true" ]] && echo "  • Pacman mirrors have been ${BOLD}optimized for speed${NC}."
-    [[ "$ENABLE_MULTILIB" == "true" ]] && echo "  • 32-bit (multilib) support is ${BOLD}enabled${NC}."
-    [[ "$ENABLE_GAMING_PACKAGES" == "true" ]] && echo "  • Gaming packages (Steam, Lutris, etc.) are ${BOLD}installed${NC}."
-    [[ "$ENABLE_BUILD_CACHE" == "true" ]] && echo "  • Persistent build cache is ${BOLD}enabled${NC} at ~/.cache/yay-${CONTAINER_NAME}"
+    echo -e "${BOLD}${BLUE}--- Installation Summary ---${NC}"
+    echo "  • Container: ${BOLD}$CONTAINER_NAME${NC}"
+    echo "  • Pamac GUI package manager installed and configured"
+    echo "  • AUR helper 'yay' available for command-line package management"
+    [[ "$OPTIMIZE_MIRRORS" == "true" ]] && echo "  • Pacman mirrors optimized for performance"
+    [[ "$ENABLE_MULTILIB" == "true" ]] && echo "  • 32-bit package support enabled"
+    [[ "$ENABLE_GAMING_PACKAGES" == "true" ]] && echo "  • Gaming packages installed (Steam, Lutris, etc.)"
+    [[ "$ENABLE_BUILD_CACHE" == "true" ]] && echo "  • Persistent build cache enabled"
     echo
     echo -e "${BOLD}${GREEN}--- How to Use ---${NC}"
-    echo "  • Find '${BOLD}Pamac Manager (${CONTAINER_NAME})${NC}' in your SteamOS application menu (under 'All Apps')."
-    echo "  • To use the command line, run: ${BOLD}distrobox enter $CONTAINER_NAME${NC}"
-    echo "  • A CLI shortcut is also available: ${BOLD}pamac-${CONTAINER_NAME} <command>${NC} (e.g., 'pamac-${CONTAINER_NAME} search firefox')"
+    echo "  • Find 'Pamac Manager ($CONTAINER_NAME)' in your application menu"
+    echo "  • Command line access: ${BOLD}distrobox enter $CONTAINER_NAME${NC}"
+    echo "  • CLI shortcut: ${BOLD}pamac-${CONTAINER_NAME} <command>${NC}"
     echo
     echo -e "${BOLD}${YELLOW}--- Important Notes ---${NC}"
-    echo "  • Your container and installed applications will persist across reboots."
-    echo "  • To uninstall everything, run this script with the ${BOLD}--uninstall${NC} flag."
-    echo "  • A detailed log of this installation is saved at: ${BOLD}$LOG_FILE${NC}"
+    echo "  • Container persists across reboots"
+    echo "  • To uninstall: run this script with ${BOLD}--uninstall${NC}"
+    echo "  • Installation log saved to: ${BOLD}$LOG_FILE${NC}"
     echo
 }
 
 run_pre_flight_checks() {
-    log_step "Performing pre-flight system checks..."
+    log_step "Running pre-flight system checks..."
     if check_system_requirements; then
-        log_success "All system checks passed. The system is ready for installation."
+        log_success "All system checks passed."
+        return 0
     else
-        log_error "One or more system checks failed. Please review the errors above."
-        exit 1
+        log_error "System requirements not met. Please address the issues above."
+        return 1
     fi
 }
 
@@ -842,36 +746,45 @@ run_pre_flight_checks() {
 main() {
     setup_colors
     
+    # Security check: don't run as root
     if [[ "$EUID" -eq 0 ]]; then
-        # Logging isn't initialized yet, so use direct echo with color codes.
-        echo -e "\e[91m❌ This script should not be run as root. Please run as the 'deck' user.\e[0m" >&2
+        echo -e "\e[91m❌ This script should not be run as root.\e[0m" >&2
+        echo -e "\e[91mPlease run as the regular user (e.g., 'deck' on Steam Deck).\e[0m" >&2
         exit 1
     fi
     
+    # Parse command line arguments
     parse_arguments "$@"
 
-    # Must initialize after parsing to respect --quiet etc.
+    # Initialize logging (must be after argument parsing to respect --quiet etc.)
     initialize_logging
 
+    # Handle check-only mode
     if [[ "$CHECK_ONLY" == "true" ]]; then
         run_pre_flight_checks
-        exit 0
+        exit $?
     fi
 
+    # Validate configuration
     validate_container_name || exit 1
-    run_pre_flight_checks # Also run checks before a full install
+    
+    # Run system checks
+    run_pre_flight_checks || exit 1
 
-    echo -e "${BOLD}${BLUE}Starting Steam Deck Pamac Setup v${SCRIPT_VERSION}${NC}"
+    # Show startup banner
+    echo -e "${BOLD}${BLUE}Steam Deck Pamac Setup v${SCRIPT_VERSION}${NC}"
     if [[ "$DRY_RUN" == "true" ]]; then
-        echo -e "${BOLD}${YELLOW}DRY RUN MODE: No changes will be made.${NC}"
+        echo -e "${BOLD}${YELLOW}DRY RUN MODE - No actual changes will be made${NC}"
     fi
     echo
 
+    # Handle force rebuild
     if [[ "$FORCE_REBUILD" == "true" ]] && distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
-        log_step "Force-rebuild is enabled. Removing existing container first."
+        log_step "Force rebuild requested - removing existing container"
         uninstall_setup
     fi
 
+    # Create or verify container exists
     if ! distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
         create_container || exit 1
     else
@@ -879,21 +792,26 @@ main() {
         wait_for_container || exit 1
     fi
 
+    # Configure the container
     configure_container_base || exit 1
     optimize_pacman_mirrors
     configure_multilib
 
+    # Install package management tools
     install_aur_helper || exit 1
     install_pamac || exit 1
 
+    # Install optional packages
     install_gaming_packages
-    setup_cleanup_hooks
 
+    # Export to host system
     export_pamac_to_host
 
+    # Show completion summary
     show_completion_message
 }
 
+# Only run main if script is executed directly (not sourced)
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     main "$@"
 fi

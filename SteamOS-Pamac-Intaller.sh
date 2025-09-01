@@ -76,9 +76,13 @@ _log() {
     local level="$1" color="$2" message="$3"
     local timestamp
     timestamp=$(date +'%Y-%m-%d %H:%M:%S')
-
-    echo "[$timestamp] $level: $message" >> "$LOG_FILE"
-
+    
+    # Strip ANSI escape codes for the log file
+    local plain_message
+    plain_message=$(echo "$message" | sed 's/\x1B\[[0-9;]*[A-Za-z]//g')
+    
+    echo "[$timestamp] $level: $plain_message" >> "$LOG_FILE"
+    
     case "$LOG_LEVEL" in
         "quiet") [[ "$level" == "ERROR" ]] && echo -e "${color}${message}${NC}" ;;
         "normal") [[ "$level" != "DEBUG" ]] && echo -e "${color}${message}${NC}" ;;

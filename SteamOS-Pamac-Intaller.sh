@@ -213,28 +213,37 @@ ensure_podman() {
 
   log_step "No container runtime found – installing podman locally (SteamOS)"
 
-  # 2. Pick a private prefix that is already in $HOME
   local prefix="$HOME/.local"
   mkdir -p "$prefix/bin"
 
-  # 3. Download and run the official distrobox helper (no sudo)
+  # 2. Download and install podman (user-local, no sudo)
   local url="https://raw.githubusercontent.com/89luca89/distrobox/main/extras/install-podman"
   if ! curl -fsSL "$url" | bash -s -- --prefix "$prefix"; then
     log_error "Podman installer failed – cannot continue"
     exit 1
   fi
 
-  # 4. Make sure our new binary is reachable in *this* shell
+  # 3. Ensure podman binary is in PATH for this shell
   export PATH="$prefix/bin:$PATH"
   export DISTROBOX_CONTAINER_MANAGER=podman
 
-  # 5. Quick smoke-test
-  if ! podman system info >/dev/null 2>&1; then
-    log_error "Podman installed but not functional – check logs"
-    exit 1
-  fi
+  # 4. Start podman user socket (SteamOS often lacks a running user bus)
+  log_info "Starting podman user socket..."
+  systemctl --user daemon-reload 2>/dev/null || true
+  systemctl --user start podman.socket 2>/dev/null || true
 
-  log_success "Podman installed and working"
+  # 5. Wait until podman answers (max 15 s)
+  local tries=0
+  until podman system info >/dev/null 2>&1; do
+    ((tries++))
+    if [[ $tries -gt 15 ]]; then
+      log_error "Podman socket did not come up – open a terminal once, then re-run."
+      exit 1
+    fi
+    sleep 1
+  done
+
+  log_success "Podman installed and socket ready"
 }
 
 # --- Argument Parsing ---

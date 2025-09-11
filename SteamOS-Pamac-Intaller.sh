@@ -196,6 +196,47 @@ check_system_requirements() {
     return $([[ "$all_ok" == "true" ]] && echo 0 || echo 1)
 }
 
+# ----------  SteamOS podman-on-demand installer  ----------
+ensure_podman() {
+  # 1. Fast exit if we already have a working runtime
+  if command -v podman >/dev/null 2>&1 && \
+     podman system info >/dev/null 2>&1; then
+    log_debug "Podman already usable – nothing to install"
+    export DISTROBOX_CONTAINER_MANAGER=podman
+    return 0
+  fi
+  if command -v docker >/dev/null 2>&1; then
+    log_debug "Docker found – using it"
+    export DISTROBOX_CONTAINER_MANAGER=docker
+    return 0
+  fi
+
+  log_step "No container runtime found – installing podman locally (SteamOS)"
+
+  # 2. Pick a private prefix that is already in $HOME
+  local prefix="$HOME/.local"
+  mkdir -p "$prefix/bin"
+
+  # 3. Download and run the official distrobox helper (no sudo)
+  local url="https://raw.githubusercontent.com/89luca89/distrobox/main/extras/install-podman"
+  if ! curl -fsSL "$url" | bash -s -- --prefix "$prefix"; then
+    log_error "Podman installer failed – cannot continue"
+    exit 1
+  fi
+
+  # 4. Make sure our new binary is reachable in *this* shell
+  export PATH="$prefix/bin:$PATH"
+  export DISTROBOX_CONTAINER_MANAGER=podman
+
+  # 5. Quick smoke-test
+  if ! podman system info >/dev/null 2>&1; then
+    log_error "Podman installed but not functional – check logs"
+    exit 1
+  fi
+
+  log_success "Podman installed and working"
+}
+
 # --- Argument Parsing ---
 show_usage() {
     cat << EOF
@@ -799,9 +840,11 @@ main() {
 
     # Initialize logging (must be after argument parsing to respect --quiet etc.)
     initialize_logging
+    
 
     # Handle check-only mode
     if [[ "$CHECK_ONLY" == "true" ]]; then
+        ensure_podman
         run_pre_flight_checks
         exit $?
     fi

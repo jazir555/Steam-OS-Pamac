@@ -98,26 +98,25 @@ log_error() { _log "ERROR" "$RED" "❌ $1"; }
 log_debug() { _log "DEBUG" "" "$1"; }
 
 # Improved command execution with better error handling
+# --- 3. run_command (pipefail + correct status capture) ---
 run_command() {
     log_debug "Executing: $*"
-
     if [[ "$DRY_RUN" == "true" ]]; then
         log_warn "[DRY RUN] Would execute: $*"
         return 0
     fi
 
     local status=0
+    # turn off -e while we run the pipeline so we can capture the real exit code
+    set +e
     if [[ "$LOG_LEVEL" == "verbose" ]]; then
-        "$@" 2>&1 | tee -a "$LOG_FILE" || true
-        status="${PIPESTATUS[0]}"
+        "$@" 2>&1 | tee -a "$LOG_FILE"; status=${PIPESTATUS[0]}
     else
-        "$@" >> "$LOG_FILE" 2>&1 || status=$?
+        "$@" >> "$LOG_FILE" 2>&1; status=$?
     fi
-    
-    if [[ $status -ne 0 ]]; then
-        log_debug "Command failed with exit code: $status"
-    fi
-    
+    set -e
+
+    [[ $status -ne 0 ]] && log_debug "Command failed with exit code: $status"
     return "$status"
 }
 
@@ -352,6 +351,7 @@ update_script() {
     fi
 }
 
+# --- 4. uninstall_setup (remove only the container, not the runtime) ---
 uninstall_setup() {
     log_step "Uninstalling Pamac setup for container: $CONTAINER_NAME"
 
@@ -359,11 +359,11 @@ uninstall_setup() {
         log_warn "[DRY RUN] Uninstall simulation started."
     fi
 
-    # Stop and remove the container
+    # Stop & remove the distrobox container (and nothing else)
     if distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
         log_info "Stopping and removing container: $CONTAINER_NAME"
-        run_command distrobox stop "$CONTAINER_NAME" || true
-        run_command distrobox rm "$CONTAINER_NAME" --force || true
+        run_command distrobox stop   "$CONTAINER_NAME" || true
+        run_command distrobox rm -f  "$CONTAINER_NAME" || true
     else
         log_info "Container '$CONTAINER_NAME' not found, skipping removal."
     fi
@@ -373,31 +373,23 @@ uninstall_setup() {
     if [[ -d "$app_dir" ]]; then
         log_info "Cleaning up exported application launchers"
         if [[ "$DRY_RUN" != "true" ]]; then
-            # Remove files created by distrobox-export
             find "$app_dir" -type f -name "*-${CONTAINER_NAME}.desktop" -delete 2>/dev/null || true
-            # Remove manual desktop files that reference our container
-            find "$app_dir" -maxdepth 1 -type f -name "*.desktop" -exec grep -l "distrobox enter ${CONTAINER_NAME}" {} \; 2>/dev/null | xargs -r rm -f 2>/dev/null || true
-            if command -v update-desktop-database >/dev/null 2>&1; then
+            find "$app_dir" -maxdepth 1 -type f -name "*.desktop" -exec \
+                grep -l "distrobox enter ${CONTAINER_NAME}" {} \; 2>/dev/null | xargs -r rm -f 2>/dev/null || true
+            command -v update-desktop-database >/dev/null 2>&1 && \
                 update-desktop-database "$app_dir" 2>/dev/null || true
-            fi
         else
             log_warn "[DRY RUN] Would search for and delete .desktop files in $app_dir"
         fi
     fi
 
-    # Clean up build cache
+    # Clean build cache
     local cache_dir="$HOME/.cache/yay-${CONTAINER_NAME}"
-    if [[ -d "$cache_dir" ]]; then
-        log_info "Removing build cache at $cache_dir"
-        [[ "$DRY_RUN" != "true" ]] && rm -rf "$cache_dir"
-    fi
+    [[ -d "$cache_dir" ]] && { log_info "Removing build cache at $cache_dir"; [[ "$DRY_RUN" != "true" ]] && rm -rf "$cache_dir"; }
 
-    # Clean up CLI wrapper
+    # Clean CLI wrapper
     local bin_file="$HOME/.local/bin/pamac-${CONTAINER_NAME}"
-    if [[ -f "$bin_file" ]]; then
-        log_info "Removing CLI wrapper at $bin_file"
-        [[ "$DRY_RUN" != "true" ]] && rm -f "$bin_file"
-    fi
+    [[ -f "$bin_file" ]] && { log_info "Removing CLI wrapper at $bin_file"; [[ "$DRY_RUN" != "true" ]] && rm -f "$bin_file"; }
 
     log_success "Uninstallation completed."
 }
@@ -838,7 +830,6 @@ main() {
     # Validate configuration
     validate_container_name || exit 1
     export PODMAN_ASSUME_YES=1            # ← silence podman pull prompts
-    export DISTROBOX_ENTER_FLAGS="--yes"  # ← silence any future enter prompts
     
     # Run system checks
     run_pre_flight_checks || exit 1

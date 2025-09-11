@@ -197,6 +197,7 @@ check_system_requirements() {
 }
 
 # ----------  SteamOS podman-on-demand installer  ----------
+# ----------  SteamOS podman-on-demand installer  ----------
 ensure_podman() {
   # 1. Fast exit if we already have a working runtime
   if command -v podman >/dev/null 2>&1 && \
@@ -211,39 +212,22 @@ ensure_podman() {
     return 0
   fi
 
-  log_step "No container runtime found – installing podman locally (SteamOS)"
+  log_step "No container runtime found – attempting to let Distrobox handle setup (SteamOS)"
 
-  local prefix="$HOME/.local"
-  mkdir -p "$prefix/bin"
-
-  # 2. Download and install podman (user-local, no sudo)
-  local url="https://raw.githubusercontent.com/89luca89/distrobox/main/extras/install-podman"
-  if ! curl -fsSL "$url" | bash -s -- --prefix "$prefix"; then
-    log_error "Podman installer failed – cannot continue"
-    exit 1
-  fi
-
-  # 3. Ensure podman binary is in PATH for this shell
-  export PATH="$prefix/bin:$PATH"
+  # Instead of trying to install podman manually, we set the environment variable
+  # and let Distrobox's 'create' command handle the podman setup automatically.
+  # Modern Distrobox versions can install podman-static automatically on SteamOS.
   export DISTROBOX_CONTAINER_MANAGER=podman
 
-  # 4. Start podman user socket (SteamOS often lacks a running user bus)
-  log_info "Starting podman user socket..."
-  systemctl --user daemon-reload 2>/dev/null || true
-  systemctl --user start podman.socket 2>/dev/null || true
+  # Inform the user that Distrobox will handle the installation
+  log_info "Distrobox will automatically install podman when creating the container."
+  log_info "This may take a few minutes on first run."
 
-  # 5. Wait until podman answers (max 15 s)
-  local tries=0
-  until podman system info >/dev/null 2>&1; do
-    ((tries++))
-    if [[ $tries -gt 15 ]]; then
-      log_error "Podman socket did not come up – open a terminal once, then re-run."
-      exit 1
-    fi
-    sleep 1
-  done
+  # No need to manually install or start podman.
+  # The 'distrobox create' command will trigger the automatic setup.
+  # We'll verify it works after container creation in the main flow.
 
-  log_success "Podman installed and socket ready"
+  log_success "Podman setup will be handled automatically by Distrobox."
 }
 
 # --- Argument Parsing ---

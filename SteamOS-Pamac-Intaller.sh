@@ -430,27 +430,28 @@ wait_for_container() {
 
 # --- Core Setup Functions ---
 create_container() {
-    log_step "Creating Arch Linux container: $CONTAINER_NAME"
-    
-    local create_args=( 
-        --name "$CONTAINER_NAME" 
-        --image "archlinux:latest" 
-        --yes 
-    )
-    
-    if [[ "$ENABLE_BUILD_CACHE" == "true" ]]; then
-        local cache_dir="$HOME/.cache/yay-${CONTAINER_NAME}"
-        mkdir -p "$cache_dir"
-        create_args+=(--volume "$cache_dir:/home/$CURRENT_USER/.cache/yay:rw")
-        log_info "Enabled persistent build cache: $cache_dir"
-    fi
-    
-    if ! run_command distrobox create "${create_args[@]}"; then
-        log_error "Failed to create Distrobox container."
-        return 1
-    fi
-    
-    wait_for_container || return 1
+  log_step "Creating Arch Linux container: $CONTAINER_NAME"
+
+  local -a create_args=(
+    --name "$CONTAINER_NAME"
+    --image "archlinux:latest"
+    --yes                 # <-- non-interactive
+  )
+
+  [[ "$ENABLE_BUILD_CACHE" == "true" ]] && {
+    local cache_dir="$HOME/.cache/yay-${CONTAINER_NAME}"
+    mkdir -p "$cache_dir"
+    create_args+=(--volume "${cache_dir}:/home/${CURRENT_USER}/.cache/yay:rw")
+    log_info "Enabled persistent build cache: $cache_dir"
+  }
+
+  # quote the array properly
+  if ! run_command distrobox create "${create_args[@]}"; then
+    log_error "Failed to create Distrobox container."
+    return 1
+  fi
+
+  wait_for_container || return 1
 }
 
 configure_container_base() {

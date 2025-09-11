@@ -8,7 +8,6 @@ set -euo pipefail
 
 # --- Configuration Variables ---
 readonly SCRIPT_VERSION="4.3.3"
-# --- 1. Configuration Variables (line 13) ---
 readonly SCRIPT_URL="https://raw.githubusercontent.com/user/repo/main/setup-pamac.sh"
 readonly REQUIRED_TOOLS=("distrobox")
 readonly DEFAULT_CONTAINER_NAME="arch-pamac"

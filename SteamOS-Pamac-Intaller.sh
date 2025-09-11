@@ -413,62 +413,94 @@ create_container() {
 }
 
 configure_container_base() {
-    log_step "Configuring container base environment"
+    log_step "Configuring container base environment (more robust)"
 
     local setup_script
-    read -r -d '' setup_script << 'EOF' || true
+    read -r -d '' setup_script <<'EOF' || true
 set -euo pipefail
 
-echo "Setting up base environment inside container..."
-readonly current_user="$1"
-
+# This script runs inside the container as root.
+current_user="$1"
 if [[ -z "$current_user" ]]; then
-    echo "Error: Host username was not provided to the setup script." >&2
+    echo "ERROR: Host username not supplied to container setup." >&2
     exit 1
 fi
 
-# Create wheel group if it doesn't exist
-if ! getent group wheel >/dev/null 2>&1; then
-    groupadd wheel
-    echo "Created 'wheel' group."
+echo "Container: configuring base environment for user='$current_user'"
+
+# Basic network check
+if ! ping -c1 8.8.8.8 >/dev/null 2>&1; then
+    echo "WARNING: No network (ping to 8.8.8.8 failed). Pacman operations may fail." >&2
 fi
 
-# Add user to wheel group
+# Ensure pacman DB exists and mirrors are reachable before heavy ops
+if ! pacman -Sy --noconfirm >/dev/null 2>&1; then
+    echo "WARNING: 'pacman -Sy' failed. Will continue but package installs may fail." >&2
+fi
+
+# Install minimal tooling if missing (sudo, shadow for usermod/groupadd, gnupg for pacman-key)
+need_pkgs=()
+for pkg in sudo shadow gpg pacman-key; do
+    if ! command -v "$pkg" >/dev/null 2>&1 && ! pacman -Qi "$pkg" >/dev/null 2>&1; then
+        need_pkgs+=("$pkg")
+    fi
+done
+if [[ ${#need_pkgs[@]} -gt 0 ]]; then
+    echo "Installing helper packages: ${need_pkgs[*]}"
+    pacman -S --noconfirm --needed "${need_pkgs[@]}" || echo "Warning: could not install helper packages: ${need_pkgs[*]}"
+fi
+
+# Ensure user exists; if not, create a matching user (no password) with home dir
 if id "$current_user" >/dev/null 2>&1; then
-    usermod -aG wheel "$current_user"
-    echo "Added user '$current_user' to 'wheel' group."
+    echo "User '$current_user' exists inside container."
 else
-    echo "Error: User '$current_user' not found inside the container." >&2
-    exit 1
+    echo "User '$current_user' not found. Creating user with same name."
+    # Pick a high UID that avoids collision if necessary; prefer to mirror host UID if provided via env
+    useradd -m -G wheel -s /bin/bash "$current_user" || { echo "Error: failed to create user '$current_user'"; exit 1; }
+    echo "Created user '$current_user' and added to wheel group."
 fi
 
-# Configure passwordless sudo
-echo '%wheel ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/99-wheel-nopasswd
-chmod 0440 /etc/sudoers.d/99-wheel-nopasswd
-echo "Configured passwordless sudo for 'wheel' group."
+# Ensure wheel group exists
+if ! getent group wheel >/dev/null 2>&1; then
+    echo "Creating wheel group..."
+    groupadd wheel || echo "Warning: groupadd wheel failed (may already exist)"
+fi
 
-# Initialize pacman keyring with better error handling
+# Configure passwordless sudo for wheel
+if [[ ! -f /etc/sudoers.d/99-wheel-nopasswd ]]; then
+    echo '%wheel ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/99-wheel-nopasswd
+    chmod 0440 /etc/sudoers.d/99-wheel-nopasswd || echo "Warning: chmod on sudoers file failed"
+    echo "Configured passwordless sudo for wheel."
+else
+    echo "Passwordless sudo for wheel already configured."
+fi
+
+# Try to initialize pacman keyring; tolerate failure but report it
 echo "Initializing pacman keyring..."
-pacman-key --init || {
-    echo "Warning: pacman-key --init failed. Trying to continue anyway."
-}
+if pacman-key --init >/dev/null 2>&1; then
+    echo "pacman-key --init OK"
+else
+    echo "Warning: pacman-key --init failed; continuing (signing may fail)."
+fi
 
-echo "Populating archlinux keyring..."
-pacman-key --populate archlinux || {
-    echo "Warning: pacman-key --populate failed. Package signature verification may fail."
-}
+if pacman-key --populate archlinux >/dev/null 2>&1; then
+    echo "pacman-key --populate OK"
+else
+    echo "Warning: pacman-key --populate failed."
+fi
 
-# Update system packages
-echo "Updating system packages..."
-pacman -Syu --noconfirm || {
-    echo "Warning: System update failed. Continuing with setup."
-}
+# Update system packages (best-effort)
+echo "Updating system packages (best-effort)..."
+if ! pacman -Syu --noconfirm; then
+    echo "Warning: pacman -Syu failed. You may need to run this manually inside the container."
+fi
 
-echo "Base environment setup complete."
+echo "Container base setup finished."
 EOF
 
+    # Execute inside the container as root and make sure we capture stdout/stderr in the log
     if ! echo "$setup_script" | run_command distrobox enter --root "$CONTAINER_NAME" -- bash -s "$CURRENT_USER"; then
-        log_error "Failed to configure container base environment."
+        log_error "Failed to configure container base environment (see container output in log)."
         return 1
     fi
 }

@@ -852,6 +852,8 @@ main() {
 
     # Validate configuration
     validate_container_name || exit 1
+    export PODMAN_ASSUME_YES=1            # ← silence podman pull prompts
+    export DISTROBOX_ENTER_FLAGS="--yes"  # ← silence any future enter prompts
     
     # Run system checks
     run_pre_flight_checks || exit 1

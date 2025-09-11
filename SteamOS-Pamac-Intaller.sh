@@ -621,7 +621,6 @@ EOF
 install_aur_helper() {
     log_step "Installing AUR helper (yay)"
 
-    # Check if yay is already installed
     if distrobox enter "$CONTAINER_NAME" -- command -v yay >/dev/null 2>&1; then
         log_info "AUR helper 'yay' is already installed."
         return 0
@@ -630,22 +629,15 @@ install_aur_helper() {
     local yay_script
     read -r -d '' yay_script << 'EOF'
 set -euo pipefail
-
 echo "Installing build dependencies..."
 sudo pacman -S --noconfirm --needed git base-devel
-
-echo "Cloning yay from AUR..."
+echo "Cloning and building yay from AUR..."
 cd /tmp
-[[ -d yay ]] && rm -rf yay
+# FIX: Ensure git clone is called correctly and directory is clean
+rm -rf yay
 git clone https://aur.archlinux.org/yay.git
 cd yay
-
-echo "Building and installing yay..."
 makepkg -si --noconfirm --clean
-
-echo "Verifying yay installation..."
-yay --version
-echo "yay installation completed successfully."
 EOF
 
     if ! run_command distrobox enter "$CONTAINER_NAME" -- bash -c "$yay_script"; then

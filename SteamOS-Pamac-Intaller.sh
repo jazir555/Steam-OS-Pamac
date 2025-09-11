@@ -619,7 +619,7 @@ echo "Cloning and building yay from AUR..."
 cd /tmp
 # FIX: Ensure git clone is called correctly and directory is clean
 rm -rf yay
-git clone https://aur.archlinux.org/yay.git yay
+git clone "https://aur.archlinux.org/yay.git" yay
 cd yay
 makepkg -si --noconfirm --clean
 EOF

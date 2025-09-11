@@ -854,6 +854,7 @@ main() {
     
     # Run system checks
     run_pre_flight_checks || exit 1
+    ensure_podman
 
     # Show startup banner
     echo -e "${BOLD}${BLUE}Steam Deck Pamac Setup v${SCRIPT_VERSION}${NC}"

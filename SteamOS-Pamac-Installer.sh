@@ -613,14 +613,22 @@ read -r -d '' setup_script <<'SETUP_EOF' || true
   rm -f /var/lib/pacman/db.lck
 
   echo "Installing essential packages..."
-pacman -S --noconfirm --needed sudo shadow gnupg archlinux-keyring base-devel git go
+pacman -S --noconfirm --needed --overwrite '*' sudo shadow gnupg archlinux-keyring base-devel git go
 
 echo "Initializing pacman keyring..."
 pacman-key --init || echo "Warning: pacman-key --init failed"
 pacman-key --populate archlinux || echo "Warning: pacman-key --populate failed"
 
 echo "Updating system packages (best-effort)..."
-pacman -Syu --noconfirm --overwrite '*' || echo "Warning: pacman -Syu partially failed"
+if pacman -Syu --noconfirm --overwrite '*' 2>/dev/null; then
+    echo "System packages updated."
+else
+    echo "Note: --overwrite upgrade had issues, trying alternative approaches..."
+    # Sync DB first, then try upgrade
+    pacman -Sy --noconfirm || true
+    # Explicitly remove conflicting files if DB is now consistent
+    pacman -Su --noconfirm --overwrite '*' 2>/dev/null || echo "Warning: partial upgrade may have issues"
+fi
 
 if ! id "$current_user" >/dev/null 2>&1; then
     echo "User '$current_user' not found. Creating user with same name."
@@ -640,7 +648,7 @@ chmod 0440 /etc/sudoers.d/99-wheel-nopasswd
 echo "Configured passwordless sudo for wheel."
 
 echo "Installing polkit..."
-if pacman -S --noconfirm --needed polkit; then
+if pacman -S --noconfirm --needed --overwrite '*' polkit; then
     polkit_dir="/etc/polkit-1/rules.d"
     mkdir -p "$polkit_dir"
     cat > "$polkit_dir/10-pamac-nopasswd.rules" << 'POLKIT_EOF'
@@ -695,7 +703,10 @@ echo "Container base setup finished."
 SETUP_EOF
 
     local _base_rc=0
-    echo "$setup_script" | container_root_exec bash -s "$CURRENT_USER" 2>&1 | tee -a "$LOG_FILE" || _base_rc=$?
+    set +e
+    echo "$setup_script" | container_root_exec bash -s "$CURRENT_USER" 2>&1 | tee -a "$LOG_FILE"
+    _base_rc=${PIPESTATUS[0]}
+    set -e
     if [[ $_base_rc -ne 0 ]]; then
         log_error "Failed to configure container base environment (exit=$_base_rc)."
         return 1
@@ -717,7 +728,7 @@ optimize_pacman_mirrors() {
   rm -f /var/lib/pacman/db.lck
 
   echo "Installing reflector..."
-if ! pacman -S --noconfirm --needed reflector; then
+if ! pacman -S --noconfirm --needed --overwrite '*' reflector; then
     echo "Failed to install reflector. Skipping mirror optimization."
     exit 0
 fi
@@ -785,7 +796,7 @@ install_aur_helper() {
   rm -f /var/lib/pacman/db.lck
 
   echo "Installing build dependencies..."
-pacman -S --noconfirm --needed git base-devel go
+pacman -S --noconfirm --needed --overwrite '*' git base-devel go
 
 echo "Cloning and building yay from AUR..."
 rm -rf /tmp/yay

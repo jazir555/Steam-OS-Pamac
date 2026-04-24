@@ -31,27 +31,40 @@ remove_container() {
     log_info "\n${BOLD}Removing container '$CONTAINER_NAME'...${NC}"
 
     if distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
-        export_list=$(distrobox-export --list 2>/dev/null | grep "$CONTAINER_NAME" || true)
-        if [[ -n "$export_list" ]]; then
-            log_info "Removing exported applications..."
-            while IFS= read -r line; do
-                app_name=$(echo "$line" | awk '{print $2}' | tr -d '\n')
-                if [[ -n "$app_name" ]]; then
+        log_info "Checking for exported applications..."
+
+        local container_accessible=false
+        if distrobox-enter "$CONTAINER_NAME" -- bash -c "echo accessible" 2>/dev/null | grep -q "accessible"; then
+            container_accessible=true
+        fi
+
+        if [[ "$container_accessible" == "true" ]]; then
+            local export_list
+            export_list=$(distrobox-enter "$CONTAINER_NAME" -- distrobox-export --list 2>/dev/null || true)
+            local parsed_apps
+            parsed_apps=$(echo "$export_list" | grep -E "^- (App|app|Application):" | sed 's/^- [A-Za-z]*: *//' || true)
+            if [[ -n "$parsed_apps" ]]; then
+                log_info "Removing exported applications..."
+                while IFS= read -r app_name; do
+                    [[ -z "$app_name" ]] && continue
                     log_info "Un-exporting: $app_name"
-                    distrobox-export --app "$app_name" --delete --container "$CONTAINER_NAME" 2>/dev/null || true
-                fi
-            done <<< "$export_list"
+                    distrobox-enter "$CONTAINER_NAME" -- distrobox-export --app "$app_name" --delete 2>/dev/null || true
+                done <<< "$parsed_apps"
+            fi
+        else
+            log_warn "Container not accessible - will clean desktop files directly."
         fi
 
         distrobox stop "$CONTAINER_NAME" &>> "$LOG_FILE" || true
         if distrobox rm -f "$CONTAINER_NAME" &>> "$LOG_FILE"; then
             log_success "Container removed"
         else
-            log_error "Failed to remove container"
-            return 1
+            log_warn "distrobox rm failed, trying podman rm directly..."
+            podman rm -f "$CONTAINER_NAME" &>> "$LOG_FILE" 2>/dev/null || true
         fi
     else
-        log_warn "Container not found - skipping removal"
+        log_warn "Container not found in distrobox list - checking podman directly..."
+        podman rm -f "$CONTAINER_NAME" &>> "$LOG_FILE" 2>/dev/null || true
     fi
 }
 
@@ -61,21 +74,28 @@ remove_exported_apps() {
     local count=0
 
     if [[ -d "$app_dir" ]]; then
-        find "$app_dir" -maxdepth 1 -type f -name "*.desktop" -exec \
-            grep -l "distrobox enter ${CONTAINER_NAME}" {} \; 2>/dev/null | while read -r f; do
-            rm -f "$f" 2>/dev/null
-            count=$((count + 1))
-        done
+        while IFS= read -r -d '' df; do
+            if grep -l "distrobox enter ${CONTAINER_NAME}" "$df" >/dev/null 2>&1; then
+                rm -f "$df" 2>/dev/null || true
+                count=$((count + 1))
+            fi
+        done < <(find "$app_dir" -maxdepth 1 -type f -name "*.desktop" -print0 2>/dev/null)
+
         find "$app_dir" -maxdepth 1 -type f -name "*-${CONTAINER_NAME}.desktop" -delete 2>/dev/null || true
-        find "$app_dir" -maxdepth 1 -type f -name "*pamac*.desktop" -exec \
-            grep -l "X-Distrobox-Container=${CONTAINER_NAME}" {} \; 2>/dev/null | xargs -r rm -f 2>/dev/null || true
+
+        while IFS= read -r -d '' df; do
+            if grep -l "X-Distrobox-Container=${CONTAINER_NAME}" "$df" >/dev/null 2>&1; then
+                rm -f "$df" 2>/dev/null || true
+                count=$((count + 1))
+            fi
+        done < <(find "$app_dir" -maxdepth 1 -type f -name "*pamac*.desktop" -print0 2>/dev/null)
 
         if command -v update-desktop-database &>/dev/null; then
             update-desktop-database "$app_dir" &>> "$LOG_FILE" || true
         fi
     fi
 
-    log_success "Application shortcuts removed"
+    log_success "Application shortcuts cleaned ($count removed)"
 }
 
 clean_wrappers_and_icons() {
@@ -97,13 +117,13 @@ clean_caches() {
 }
 
 show_header() {
-    clear
+    clear 2>/dev/null || true
     echo -e "${BOLD}Steam Deck Pamac Uninstaller${NC}"
     echo -e "This will remove:"
     echo -e "  ${BOLD}Pamac package manager${NC} container ($CONTAINER_NAME)"
     echo -e "  All ${BOLD}exported application shortcuts${NC}"
     echo -e "  Build caches and temporary files"
-    echo -e "\n${YELLOW}Note: Installed packages INSIDE the container will be deleted.${YELLOW}"
+    echo -e "\n${YELLOW}Note: Installed packages INSIDE the container will be deleted.${NC}"
     echo -e "\nLog file: ${BOLD}$LOG_FILE${NC}"
     echo -e "\n----------------------------------------------"
 }

@@ -24,6 +24,7 @@ OPTIMIZE_MIRRORS="${OPTIMIZE_MIRRORS:-true}"
 
 DRY_RUN="${DRY_RUN:-false}"
 CHECK_ONLY="${CHECK_ONLY:-false}"
+UNINSTALL="${UNINSTALL:-false}"
 LOG_LEVEL="${LOG_LEVEL:-normal}"
 
 setup_colors() {
@@ -117,6 +118,15 @@ container_user_exec() {
     docker exec -i -u "$CURRENT_USER" -e HOME="/home/${CURRENT_USER}" "$CONTAINER_NAME" "$@"
   else
     podman exec -i -u "$CURRENT_USER" -e HOME="/home/${CURRENT_USER}" "$CONTAINER_NAME" "$@"
+  fi
+}
+
+container_start() {
+  local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
+  if [[ "$mgr" == "docker" ]]; then
+    docker start "$CONTAINER_NAME" >>"$LOG_FILE" 2>&1 || true
+  else
+    podman start "$CONTAINER_NAME" >>"$LOG_FILE" 2>&1 || true
   fi
 }
 
@@ -325,6 +335,7 @@ parse_arguments() {
             --disable-build-cache) ENABLE_BUILD_CACHE="false"; shift ;;
             --optimize-mirrors) OPTIMIZE_MIRRORS="true"; shift ;;
             --no-optimize-mirrors) OPTIMIZE_MIRRORS="false"; shift ;;
+            --uninstall) UNINSTALL="true"; shift ;;
             --dry-run) DRY_RUN="true"; shift ;;
             --check) CHECK_ONLY="true"; shift ;;
             --verbose) LOG_LEVEL="verbose"; shift ;;
@@ -337,43 +348,66 @@ parse_arguments() {
 }
 
 uninstall_setup() {
-    initialize_logging
     log_step "Uninstalling Pamac setup for container: $CONTAINER_NAME"
 
     if [[ "$DRY_RUN" == "true" ]]; then
         log_warn "[DRY RUN] Uninstall simulation started."
     fi
 
+    local container_found=false
     if distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
-        log_info "Stopping and removing container: $CONTAINER_NAME"
+        container_found=true
+        log_info "Container '$CONTAINER_NAME' found. Cleaning exported apps and removing container..."
 
-    local export_list
-    export_list=$(distrobox-enter "$CONTAINER_NAME" -- distrobox-export --list-apps 2>/dev/null || true)
-    if [[ -n "$export_list" ]]; then
-      log_info "Removing exported applications..."
-      while IFS= read -r app_name; do
-        [[ -z "$app_name" ]] && continue
-        log_info "Un-exporting app: $app_name"
-        distrobox-enter "$CONTAINER_NAME" -- distrobox-export --app "$app_name" --delete 2>/dev/null || true
-      done <<< "$export_list"
-    fi
+        local container_accessible=false
+        if distrobox-enter "$CONTAINER_NAME" -- bash -c "echo accessible" 2>/dev/null | grep -q "accessible"; then
+            container_accessible=true
+        fi
+
+        if [[ "$container_accessible" == "true" ]]; then
+            local export_list
+            export_list=$(distrobox-enter "$CONTAINER_NAME" -- distrobox-export --list 2>/dev/null || true)
+            local parsed_apps
+            parsed_apps=$(echo "$export_list" | grep -E "^- (App|app|Application):" | sed 's/^- [A-Za-z]*: *//' || true)
+            if [[ -n "$parsed_apps" ]]; then
+                log_info "Removing exported applications..."
+                while IFS= read -r app_name; do
+                    [[ -z "$app_name" ]] && continue
+                    log_info "Un-exporting app: $app_name"
+                    distrobox-enter "$CONTAINER_NAME" -- distrobox-export --app "$app_name" --delete 2>/dev/null || true
+                done <<< "$parsed_apps"
+            fi
+        else
+            log_warn "Container not accessible for export unlisting. Will clean desktop files directly."
+        fi
 
         run_command distrobox stop "$CONTAINER_NAME" || true
         run_command distrobox rm -f "$CONTAINER_NAME" || true
         force_remove_container "$CONTAINER_NAME"
     else
-        log_info "Container '$CONTAINER_NAME' not found, skipping removal."
+        log_info "Container '$CONTAINER_NAME' not found, skipping container removal."
     fi
 
     local app_dir="$HOME/.local/share/applications"
     if [[ -d "$app_dir" ]]; then
         log_info "Cleaning up exported application launchers"
         if [[ "$DRY_RUN" != "true" ]]; then
-            find "$app_dir" -maxdepth 1 -type f -name "*.desktop" -exec \
-                grep -l "distrobox enter ${CONTAINER_NAME}" {} \; 2>/dev/null | xargs -r rm -f 2>/dev/null || true
+            local cleaned=0
+            while IFS= read -r -d '' df; do
+                if grep -l "distrobox enter ${CONTAINER_NAME}" "$df" >/dev/null 2>&1; then
+                    rm -f "$df" 2>/dev/null || true
+                    cleaned=$((cleaned + 1))
+                fi
+            done < <(find "$app_dir" -maxdepth 1 -type f -name "*.desktop" -print0 2>/dev/null)
             find "$app_dir" -maxdepth 1 -type f -name "*-${CONTAINER_NAME}.desktop" -delete 2>/dev/null || true
-            find "$app_dir" -maxdepth 1 -type f -name "*pamac*.desktop" -exec \
-                grep -l "X-Distrobox-Container=${CONTAINER_NAME}" {} \; 2>/dev/null | xargs -r rm -f 2>/dev/null || true
+            if [[ "$container_found" == "true" ]]; then
+                while IFS= read -r -d '' df; do
+                    if grep -l "X-Distrobox-Container=${CONTAINER_NAME}" "$df" >/dev/null 2>&1; then
+                        rm -f "$df" 2>/dev/null || true
+                        cleaned=$((cleaned + 1))
+                    fi
+                done < <(find "$app_dir" -maxdepth 1 -type f -name "*pamac*.desktop" -print0 2>/dev/null)
+            fi
             command -v update-desktop-database >/dev/null 2>&1 && \
                 update-desktop-database "$app_dir" 2>/dev/null || true
         else
@@ -436,7 +470,7 @@ wait_for_container() {
         ;;
       "created")
         log_debug "Container in 'created' state, attempting start..."
-        podman start "$CONTAINER_NAME" >>"$LOG_FILE" 2>&1 || true
+        container_start
         ;;
     esac
 
@@ -479,25 +513,22 @@ detect_init_support() {
         return
     fi
 
-    local test_name="${CONTAINER_NAME}-init-test"
-    force_remove_container "$test_name"
-
-    if distrobox create --name "$test_name" --image archlinux:latest --init --yes 2>>"$LOG_FILE"; then
-        local test_output
-        test_output=$(distrobox enter "$test_name" -- bash -c "echo init_ok" 2>&1)
-        if echo "$test_output" | grep -q "init_ok"; then
+    local init_binary=""
+    init_binary=$(podman info --format '{{.Host.InitPath}}' 2>/dev/null || echo "")
+    if [[ -n "$init_binary" ]]; then
+        local resolved
+        resolved=$(command -v "$init_binary" 2>/dev/null || echo "")
+        if [[ -n "$resolved" ]] || [[ -f "$init_binary" ]]; then
             CONTAINER_HAS_INIT="true"
-            log_info "Init system (systemd) supported in containers."
+            log_info "Init system supported (podman init binary: $init_binary)."
         else
             CONTAINER_HAS_INIT="false"
-            log_info "Init system not available - will use non-init container."
+            log_info "Init binary '$init_binary' not found - using non-init container."
         fi
     else
         CONTAINER_HAS_INIT="false"
-        log_info "Init system not available - will use non-init container."
+        log_info "No podman init support detected - using non-init container."
     fi
-
-    force_remove_container "$test_name"
 }
 
 create_container() {
@@ -537,7 +568,7 @@ create_container() {
 
   log_info "Starting container..."
   set +e
-  podman start "$CONTAINER_NAME" >>"$LOG_FILE" 2>&1
+  container_start
   set -e
 
   local wait_result=0
@@ -546,7 +577,7 @@ create_container() {
   if [[ "$wait_result" -eq 2 ]]; then
     log_info "Container was stuck, recreating..."
     if run_command distrobox create "${create_args[@]}"; then
-      podman start "$CONTAINER_NAME" >>"$LOG_FILE" 2>&1 || true
+      container_start
       wait_for_container || return 1
     else
       log_error "Failed to recreate container after removal."
@@ -567,8 +598,8 @@ create_container() {
 configure_container_base() {
     log_step "Configuring container base environment"
 
-    local setup_script
-  read -r -d '' setup_script <<'SETUP_EOF' || true
+local setup_script=""
+read -r -d '' setup_script <<'SETUP_EOF' || true
   set -euo pipefail
 
   current_user="$1"
@@ -585,11 +616,11 @@ configure_container_base() {
 pacman -S --noconfirm --needed sudo shadow gnupg archlinux-keyring base-devel git go
 
 echo "Initializing pacman keyring..."
-pacman-key --init 2>/dev/null || echo "Warning: pacman-key --init failed"
-pacman-key --populate archlinux 2>/dev/null || echo "Warning: pacman-key --populate failed"
+pacman-key --init || echo "Warning: pacman-key --init failed"
+pacman-key --populate archlinux || echo "Warning: pacman-key --populate failed"
 
 echo "Updating system packages (best-effort)..."
-pacman -Syu --noconfirm || echo "Warning: pacman -Syu partially failed"
+pacman -Syu --noconfirm --overwrite '*' || echo "Warning: pacman -Syu partially failed"
 
 if ! id "$current_user" >/dev/null 2>&1; then
     echo "User '$current_user' not found. Creating user with same name."
@@ -663,8 +694,10 @@ fi
 echo "Container base setup finished."
 SETUP_EOF
 
-    if ! echo "$setup_script" | container_root_exec bash -s "$CURRENT_USER"; then
-        log_error "Failed to configure container base environment."
+    local _base_rc=0
+    echo "$setup_script" | container_root_exec bash -s "$CURRENT_USER" 2>&1 | tee -a "$LOG_FILE" || _base_rc=$?
+    if [[ $_base_rc -ne 0 ]]; then
+        log_error "Failed to configure container base environment (exit=$_base_rc)."
         return 1
     fi
 }
@@ -703,7 +736,7 @@ fi
 EOF
 
     if ! echo "$mirror_script" | container_root_exec bash; then
-        log_warn "Failed to optimize mirrors. Continuing with default mirrors."
+        log_warn "Mirror optimization had issues. Continuing with default mirrors."
     fi
 }
 
@@ -808,11 +841,11 @@ echo "Syncing package database..."
 init_proc=$(cat /proc/1/comm 2>/dev/null || echo unknown)
 if [[ "$init_proc" == "systemd" ]]; then
     systemctl enable --now pamac-daemon 2>/dev/null || echo "Note: pamac-daemon service could not be enabled"
-    pamac update --no-confirm 2>/dev/null || pamac refresh 2>/dev/null || echo "Note: pamac DB sync failed"
+    pamac refresh --no-confirm 2>/dev/null || pamac refresh --force 2>/dev/null || echo "Note: pamac DB sync failed"
 else
     /usr/local/bin/pamac-daemon-launch.sh 2>/dev/null || true
     sleep 1
-    pamac update --no-confirm 2>/dev/null || pamac refresh 2>/dev/null || echo "Note: pamac DB sync failed (daemon may not be running)"
+    pamac refresh --no-confirm 2>/dev/null || pamac refresh --force 2>/dev/null || echo "Note: pamac DB sync failed (daemon may not be running)"
 fi
 
 if command -v pamac-manager >/dev/null 2>&1; then
@@ -822,6 +855,27 @@ else
     echo "Error: Pamac installation verification failed."
     exit 1
 fi
+
+echo "Creating pamac-manager launch wrapper..."
+cat > /usr/local/bin/pamac-manager-wrapper << 'WRAPPER'
+#!/bin/bash
+init_proc=$(cat /proc/1/comm 2>/dev/null || echo unknown)
+if [[ "$init_proc" != "systemd" ]]; then
+    if [[ ! -S /run/dbus/system_bus_socket ]]; then
+        mkdir -p /run/dbus 2>/dev/null || true
+        dbus-daemon --system --fork 2>/dev/null || true
+    fi
+    if command -v pamac-daemon >/dev/null 2>&1; then
+        if ! pidof pamac-daemon >/dev/null 2>&1; then
+            pamac-daemon 2>/dev/null &
+            sleep 1
+        fi
+    fi
+fi
+exec pamac-manager "$@"
+WRAPPER
+chmod +x /usr/local/bin/pamac-manager-wrapper
+echo "pamac-manager-wrapper created."
 PAMAC_EOF
 
     if ! echo "$pamac_script" | container_root_exec bash -s "$CURRENT_USER"; then
@@ -886,11 +940,21 @@ export_pamac_to_host() {
     set +e
     if container_root_exec test -f /usr/share/icons/hicolor/scalable/apps/pamac-manager.svg 2>/dev/null; then
         container_root_exec cat /usr/share/icons/hicolor/scalable/apps/pamac-manager.svg > "$icon_svg_dir/pamac-manager.svg" 2>/dev/null
-        log_info "Copied SVG icon"
+        if [[ -s "$icon_svg_dir/pamac-manager.svg" ]]; then
+            log_info "Copied SVG icon"
+        else
+            rm -f "$icon_svg_dir/pamac-manager.svg"
+            log_warn "SVG icon copy produced empty file, removed"
+        fi
     fi
     if container_root_exec test -f /usr/share/icons/hicolor/48x48/apps/pamac-manager.png 2>/dev/null; then
         container_root_exec cat /usr/share/icons/hicolor/48x48/apps/pamac-manager.png > "$icon_png48_dir/pamac-manager.png" 2>/dev/null
-        log_info "Copied PNG icon"
+        if [[ -s "$icon_png48_dir/pamac-manager.png" ]]; then
+            log_info "Copied PNG icon"
+        else
+            rm -f "$icon_png48_dir/pamac-manager.png"
+            log_warn "PNG icon copy produced empty file, removed"
+        fi
     fi
     set -e
 
@@ -900,6 +964,14 @@ export_pamac_to_host() {
   log_info "Exporting Pamac application using distrobox-export..."
   if run_command distrobox-enter "$CONTAINER_NAME" -- distrobox-export --app pamac-manager; then
     log_success "Pamac exported successfully using distrobox-export."
+    local exported_desktop
+    exported_desktop=$(find "$HOME/.local/share/applications" -maxdepth 1 -name "pamac-manager*.desktop" -print -quit 2>/dev/null)
+    if [[ -n "$exported_desktop" ]]; then
+        if grep -q '^Exec=.*pamac-manager$' "$exported_desktop" 2>/dev/null; then
+            sed -i 's/^Exec=.*pamac-manager$/Exec=distrobox enter '${CONTAINER_NAME}' -- pamac-manager-wrapper/' "$exported_desktop"
+            log_info "Patched desktop entry to use wrapper: $exported_desktop"
+        fi
+    fi
   else
     log_warn "distrobox-export failed. Creating manual desktop entry..."
 
@@ -911,7 +983,7 @@ export_pamac_to_host() {
 [Desktop Entry]
 Name=Pamac Manager
 Comment=Package Manager for Arch Linux Container
-Exec=distrobox enter ${CONTAINER_NAME} -- pamac-manager
+Exec=distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper
 Icon=pamac-manager
 Terminal=false
 Type=Application
@@ -976,14 +1048,33 @@ HOOKDEF
 set +e
 
 APP_DIR="/home/${current_user}/.local/share/applications"
+EXPORT_LOG="/tmp/distrobox-export-hook.log"
+echo "\$(date): Hook triggered" > "\$EXPORT_LOG"
+
+# Remove stale exports for apps no longer installed in container
+if [[ -d "\$APP_DIR" ]]; then
+    for df in "\$APP_DIR"/*.desktop; do
+        [[ -f "\$df" ]] || continue
+        local_app=\$(grep '^X-Distrobox-App=' "\$df" 2>/dev/null | cut -d= -f2)
+        [[ -z "\$local_app" ]] && continue
+        if [[ ! -f "/usr/share/applications/\${local_app}.desktop" ]]; then
+            echo "Removing stale export: \$df" >> "\$EXPORT_LOG"
+            rm -f "\$df"
+        fi
+    done
+fi
 
 if command -v distrobox-export >/dev/null 2>&1; then
-for desktop in /usr/share/applications/*.desktop; do
-[[ -f "\$desktop" ]] || continue
-app_name=\$(basename "\$desktop" .desktop)
-grep -qi 'NoDisplay=true' "\$desktop" && continue
-distrobox-export --app "\$app_name" 2>/dev/null || true
-done
+    exported=0
+    for desktop in /usr/share/applications/*.desktop; do
+        [[ -f "\$desktop" ]] || continue
+        grep -qi 'NoDisplay=true' "\$desktop" && continue
+        app_name=\$(basename "\$desktop" .desktop)
+        if distrobox-export --app "\$app_name" 2>/dev/null; then
+            exported=\$((exported + 1))
+        fi
+    done
+    echo "\$(date): Exported \$exported apps" >> "\$EXPORT_LOG"
 fi
 
 if command -v update-desktop-database >/dev/null 2>&1 && [[ -d "\$APP_DIR" ]]; then
@@ -1084,6 +1175,11 @@ main() {
     parse_arguments "$@"
     initialize_logging
 
+    if [[ "$UNINSTALL" == "true" ]]; then
+        uninstall_setup
+        exit 0
+    fi
+
     if [[ "$CHECK_ONLY" == "true" ]]; then
         ensure_podman
         run_pre_flight_checks
@@ -1138,7 +1234,7 @@ main() {
         ;;
       "created")
         log_info "Container in 'created' state, starting..."
-        podman start "$CONTAINER_NAME" >>"$LOG_FILE" 2>&1 || {
+        container_start || {
           log_warn "Failed to start, recreating..."
           force_remove_container "$CONTAINER_NAME"
           sleep 2

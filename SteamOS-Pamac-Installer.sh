@@ -150,6 +150,60 @@ container_is_usable() {
   container_root_exec bash -c "echo ok" 2>/dev/null | grep -q "ok"
 }
 
+container_get_status_safe() {
+  container_get_status 2>/dev/null || echo "unknown"
+}
+
+ensure_container_healthy() {
+    local desc="${1:-container operation}"
+    local max_attempts=3
+    local attempt=1
+
+    while [[ $attempt -le $max_attempts ]]; do
+        if container_is_usable; then
+            return 0
+        fi
+
+        local status
+        status=$(container_get_status_safe)
+        log_warn "Container status: '$status' (attempt $attempt/$max_attempts for: $desc)"
+
+        case "$status" in
+            "running")
+                log_info "Container running but not responding. Attempting exec retry..."
+                sleep 2
+                ;;
+            "stopped"|"exited")
+                log_info "Container stopped. Starting..."
+                container_start 2>/dev/null || true
+                wait_for_container || {
+                    log_error "Failed to start container."
+                    return 1
+                }
+                ;;
+            "improper")
+                log_warn "Container in improper state. Attempting forced recovery..."
+                force_remove_container "$CONTAINER_NAME"
+                log_error "Container had to be removed. Please re-run the script."
+                return 1
+                ;;
+            "not_found")
+                log_error "Container '$CONTAINER_NAME' not found."
+                return 1
+                ;;
+            *)
+                log_debug "Container in state '$status', waiting..."
+                sleep 3
+                ;;
+        esac
+
+        attempt=$((attempt + 1))
+    done
+
+    log_error "Container health check failed after $max_attempts attempts for: $desc"
+    return 1
+}
+
 force_remove_container() {
   local name="$1"
   local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
@@ -453,7 +507,7 @@ wait_for_container() {
           return 0
         fi
         ;;
-      "stopping"|"paused"|"stopped")
+      "stopping"|"paused"|"stopped"|"improper")
         if [[ $attempt -le 5 ]]; then
           log_debug "Container in '$status' state, waiting..."
         else
@@ -595,43 +649,171 @@ create_container() {
   fi
 }
 
+exec_container_raw() {
+    local _rc=0
+    set +e
+    "$@" 2>&1 | tee -a "$LOG_FILE"
+    _rc=${PIPESTATUS[0]}
+    set -e
+    return $_rc
+}
+
+exec_container_script() {
+    local _script="$1"
+    local _desc="$2"
+    shift 2
+    local _rc=0
+
+    set +e
+    echo "$_script" | container_root_exec bash -s "$@" 2>&1 | tee -a "$LOG_FILE"
+    _rc=${PIPESTATUS[1]}
+    set -e
+
+    if [[ $_rc -ne 0 ]]; then
+        log_warn "Script '$_desc' failed (exit=$_rc)."
+        ensure_container_healthy "$_desc" || return 1
+        return $_rc
+    fi
+    return 0
+}
+
 configure_container_base() {
     log_step "Configuring container base environment"
 
-local setup_script=""
-read -r -d '' setup_script <<'SETUP_EOF' || true
-  set -euo pipefail
+    local _ok=true
 
-  current_user="$1"
-  if [[ -z "$current_user" ]]; then
-    echo "ERROR: Host username not supplied to container setup." >&2
-    exit 1
-  fi
+    log_info "Stage 1/5: Syncing pacman database and upgrading system..."
+    local upgrade_script
+    read -r -d '' upgrade_script <<'UPG_EOF' || true
+set -euo pipefail
 
-  echo "Container: configuring base environment for user='$current_user'"
+rm -f /var/lib/pacman/db.lck
 
-  rm -f /var/lib/pacman/db.lck
+echo "Syncing package database (keeping local DB intact)..."
+pacman -Syy --noconfirm
 
-  echo "Installing essential packages..."
-pacman -S --noconfirm --needed --overwrite '*' sudo shadow gnupg archlinux-keyring base-devel git go
-
-echo "Initializing pacman keyring..."
-pacman-key --init || echo "Warning: pacman-key --init failed"
-pacman-key --populate archlinux || echo "Warning: pacman-key --populate failed"
-
-echo "Updating system packages (best-effort)..."
-if pacman -Syu --noconfirm --overwrite '*' 2>/dev/null; then
-    echo "System packages updated."
+echo "Upgrading system packages with conflict handling..."
+if pacman -Su --noconfirm --overwrite '*' 2>/dev/null; then
+    echo "System upgrade successful."
 else
-    echo "Note: --overwrite upgrade had issues, trying alternative approaches..."
-    # Sync DB first, then try upgrade
-    pacman -Sy --noconfirm || true
-    # Explicitly remove conflicting files if DB is now consistent
-    pacman -Su --noconfirm --overwrite '*' 2>/dev/null || echo "Warning: partial upgrade may have issues"
+    echo "Handling filesystem conflicts..."
+    upgrade_out=$(pacman -Su --noconfirm --overwrite '*' 2>&1) && rc=0 || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        echo "$upgrade_out"
+        conflicting=$(echo "$upgrade_out" | grep "exists in filesystem" | sed 's/.*: *//' || true)
+        if [[ -n "$conflicting" ]]; then
+            echo "Removing conflicting files..."
+            while IFS= read -r f; do
+                [[ -z "$f" ]] && continue
+                rm -f "$f" 2>/dev/null || true
+            done <<< "$conflicting"
+        fi
+        if pacman -Su --noconfirm --overwrite '*' 2>/dev/null; then
+            echo "System upgrade successful after resolving conflicts."
+        else
+            echo "Warning: upgrade still had issues. Trying nuclear option..."
+            rm -rf /var/lib/pacman/local/*
+            pacman -Syy --noconfirm
+            pacman -Su --noconfirm --overwrite '*' 2>/dev/null || echo "Warning: upgrade partially failed"
+        fi
+    fi
+fi
+UPG_EOF
+
+    if ! exec_container_script "$upgrade_script" "pacman-upgrade"; then
+        log_warn "System upgrade had issues, continuing anyway..."
+        if ! container_is_usable; then
+            log_warn "Container not usable, attempting restart..."
+            container_start 2>/dev/null || true
+            wait_for_container || {
+                log_error "Container unrecoverable after upgrade attempt."
+                return 1
+            }
+        fi
+    fi
+
+    log_info "Stage 2/5: Installing core system packages..."
+    local core_script
+    read -r -d '' core_script <<'CORE_EOF' || true
+set -euo pipefail
+
+rm -f /var/lib/pacman/db.lck
+
+echo "Installing core packages (sudo, shadow, gnupg)..."
+if pacman -S --noconfirm --needed --overwrite '*' sudo shadow gnupg; then
+    echo "Core packages installed."
+else
+    echo "Core package install failed. Trying DB recovery..."
+    rm -rf /var/lib/pacman/local/*
+    pacman -Syy --noconfirm
+    pacman -S --noconfirm --needed --overwrite '*' sudo shadow gnupg || exit 1
 fi
 
+echo "Installing archlinux-keyring..."
+pacman -S --noconfirm --needed --overwrite '*' archlinux-keyring || echo "Warning: archlinux-keyring install failed"
+
+echo "Initializing pacman keyring..."
+pacman-key --init 2>/dev/null || echo "Warning: pacman-key --init failed"
+pacman-key --populate archlinux 2>/dev/null || echo "Warning: pacman-key --populate failed"
+CORE_EOF
+
+    if ! exec_container_script "$core_script" "core-packages"; then
+        log_warn "Failed to install core packages. Continuing to ensure later stages run..."
+        _ok=false
+        if ! container_is_usable; then
+            log_warn "Container not usable, attempting restart..."
+            container_start 2>/dev/null || true
+            wait_for_container || {
+                log_error "Container unrecoverable after core package failure."
+                return 1
+            }
+        fi
+    fi
+
+    log_info "Stage 3/5: Installing development packages..."
+    local dev_script
+    read -r -d '' dev_script <<'DEV_EOF' || true
+set -euo pipefail
+
+rm -f /var/lib/pacman/db.lck
+
+echo "Installing development packages (base-devel, git, go)..."
+if pacman -S --noconfirm --needed --overwrite '*' base-devel git go; then
+    echo "Development packages installed."
+else
+    echo "Dev package install failed. Checking container..."
+    exit 1
+fi
+DEV_EOF
+
+    if ! exec_container_script "$dev_script" "dev-packages"; then
+        log_warn "Development package install failed. Continuing..."
+
+        if ! container_is_usable; then
+            log_warn "Container not usable, attempting restart..."
+            container_start 2>/dev/null || true
+            wait_for_container || {
+                log_error "Container unrecoverable."
+                return 1
+            }
+        fi
+    fi
+
+    log_info "Stage 4/5: Creating user and configuring sudo..."
+    local user_script
+    read -r -d '' user_script <<'USER_EOF' || true
+set -euo pipefail
+
+current_user="$1"
+if [[ -z "$current_user" ]]; then
+    echo "ERROR: Host username not supplied." >&2
+    exit 1
+fi
+
+echo "Container: configuring user '${current_user}'"
+
 if ! id "$current_user" >/dev/null 2>&1; then
-    echo "User '$current_user' not found. Creating user with same name."
+    echo "User '$current_user' not found. Creating user."
     useradd -m -G wheel -s /bin/bash "$current_user" || { echo "Error: failed to create user"; exit 1; }
     echo "Created user '$current_user' and added to wheel group."
 else
@@ -646,19 +828,25 @@ fi
 echo '%wheel ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/99-wheel-nopasswd
 chmod 0440 /etc/sudoers.d/99-wheel-nopasswd
 echo "Configured passwordless sudo for wheel."
+USER_EOF
+
+    exec_container_script "$user_script" "user-setup" "$CURRENT_USER" || return 1
+
+    log_info "Stage 5/5: Installing polkit, dbus, and pamac-daemon helper..."
+    local misc_script
+    read -r -d '' misc_script <<'MISC_EOF' || true
+set -euo pipefail
 
 echo "Installing polkit..."
 if pacman -S --noconfirm --needed --overwrite '*' polkit; then
     polkit_dir="/etc/polkit-1/rules.d"
     mkdir -p "$polkit_dir"
-    cat > "$polkit_dir/10-pamac-nopasswd.rules" << 'POLKIT_EOF'
-polkit.addRule(function(action, subject) {
-    if (action.id.indexOf("org.manjaro.pamac.") == 0 &&
-        subject.isInGroup("wheel")) {
-        return polkit.Result.YES;
-    }
-});
-POLKIT_EOF
+    printf '%s\n' 'polkit.addRule(function(action, subject) {' \
+        '    if (action.id.indexOf("org.manjaro.pamac.") == 0 &&' \
+        '        subject.isInGroup("wheel")) {' \
+        '        return polkit.Result.YES;' \
+        '    }' \
+        '});' > "$polkit_dir/10-pamac-nopasswd.rules"
     echo "polkit passwordless rule created for pamac operations."
 else
     echo "Warning: could not install polkit. pamac GUI may prompt for password."
@@ -676,23 +864,19 @@ echo "Setting up pamac-daemon autostart for non-systemd environments..."
 init_proc=$(cat /proc/1/comm 2>/dev/null || echo unknown)
 if [[ "$init_proc" != "systemd" ]]; then
     echo "Non-systemd container detected. Setting up pamac-daemon launch helper."
-    cat > /usr/local/bin/pamac-daemon-launch.sh << 'LAUNCHER_EOF'
-#!/bin/bash
-set +e
-if [[ ! -S /run/dbus/system_bus_socket ]]; then
-    mkdir -p /run/dbus
-    dbus-daemon --system --fork 2>/dev/null
-fi
-if command -v pamac-daemon >/dev/null 2>&1; then
-    pamac-daemon 2>/dev/null &
-fi
-LAUNCHER_EOF
+    printf '%s\n' '#!/bin/bash' \
+        'set +e' \
+        'if [[ ! -S /run/dbus/system_bus_socket ]]; then' \
+        '    mkdir -p /run/dbus' \
+        '    dbus-daemon --system --fork 2>/dev/null' \
+        'fi' \
+        'if command -v pamac-daemon >/dev/null 2>&1; then' \
+        '    pamac-daemon 2>/dev/null &' \
+        'fi' > /usr/local/bin/pamac-daemon-launch.sh
     chmod +x /usr/local/bin/pamac-daemon-launch.sh
 
-    cat > /etc/profile.d/pamac-daemon.sh << 'PROFILE_EOF'
-#!/bin/bash
-/usr/local/bin/pamac-daemon-launch.sh 2>/dev/null &
-PROFILE_EOF
+    printf '%s\n' '#!/bin/bash' \
+        '/usr/local/bin/pamac-daemon-launch.sh 2>/dev/null &' > /etc/profile.d/pamac-daemon.sh
     chmod +x /etc/profile.d/pamac-daemon.sh
     echo "pamac-daemon launch helper installed."
 else
@@ -700,16 +884,17 @@ else
 fi
 
 echo "Container base setup finished."
-SETUP_EOF
+MISC_EOF
 
-    local _base_rc=0
-    set +e
-    echo "$setup_script" | container_root_exec bash -s "$CURRENT_USER" 2>&1 | tee -a "$LOG_FILE"
-    _base_rc=${PIPESTATUS[0]}
-    set -e
-    if [[ $_base_rc -ne 0 ]]; then
-        log_error "Failed to configure container base environment (exit=$_base_rc)."
-        return 1
+    if ! exec_container_script "$misc_script" "polkit-dbus-setup"; then
+        log_warn "Polkit/dbus setup had issues."
+        _ok=false
+    fi
+
+    if [[ "$_ok" == "true" ]]; then
+        log_success "Container base environment configured."
+    else
+        log_warn "Container base setup completed with some errors."
     fi
 }
 
@@ -782,53 +967,120 @@ EOF
 install_aur_helper() {
     log_step "Installing AUR helper (yay)"
 
-    if container_user_exec bash -c "command -v yay >/dev/null 2>&1"; then
+    if container_user_exec bash -c "command -v yay >/dev/null 2>&1" 2>/dev/null; then
         log_info "AUR helper 'yay' is already installed."
         return 0
     fi
 
-    local yay_script
-  read -r -d '' yay_script <<'YAY_EOF' || true
-  set -euo pipefail
+    log_info "Stage 1/2: Installing build dependencies..."
+    local deps_script
+    read -r -d '' deps_script <<'DEPS_EOF' || true
+set -euo pipefail
 
-  current_user="$1"
+rm -f /var/lib/pacman/db.lck
 
-  rm -f /var/lib/pacman/db.lck
+echo "Installing build dependencies..."
+if pacman -S --noconfirm --needed --overwrite '*' git base-devel go; then
+    echo "Build dependencies installed."
+else
+    echo "Build dependency install failed."
+    exit 1
+fi
+DEPS_EOF
 
-  echo "Installing build dependencies..."
-pacman -S --noconfirm --needed --overwrite '*' git base-devel go
+    if ! exec_container_script "$deps_script" "yay-deps"; then
+        if ! container_is_usable; then
+            log_warn "Container not usable. Restarting..."
+            container_start 2>/dev/null || true
+            wait_for_container || {
+                log_error "Container unrecoverable."
+                return 1
+            }
+            log_info "Retrying build dependencies..."
+            if ! exec_container_script "$deps_script" "yay-deps-retry"; then
+                log_error "Failed to install build dependencies."
+                return 1
+            fi
+        else
+            log_error "Failed to install build dependencies."
+            return 1
+        fi
+    fi
+
+    log_info "Stage 2/2: Building yay from AUR..."
+    local build_script
+    read -r -d '' build_script <<'BUILD_EOF' || true
+set -euo pipefail
+
+current_user="$1"
+
+rm -f /var/lib/pacman/db.lck
 
 echo "Cloning and building yay from AUR..."
 rm -rf /tmp/yay
 sudo -Hu "$current_user" git clone "https://aur.archlinux.org/yay.git" /tmp/yay
 chown -R "$current_user:$current_user" /tmp/yay
 sudo -Hu "$current_user" bash -lc "cd /tmp/yay && makepkg -si --noconfirm --clean"
-YAY_EOF
+BUILD_EOF
 
-    if ! echo "$yay_script" | container_root_exec bash -s "$CURRENT_USER"; then
-        log_error "Failed to install AUR helper (yay)."
+    if ! exec_container_script "$build_script" "yay-build" "$CURRENT_USER"; then
+        log_error "Failed to build yay from AUR."
         return 1
     fi
+
+    log_success "AUR helper yay installed."
 }
 
 install_pamac() {
     log_step "Installing Pamac package manager"
 
-    if container_user_exec bash -c "command -v pamac-manager >/dev/null 2>&1"; then
+    if container_user_exec bash -c "command -v pamac-manager >/dev/null 2>&1" 2>/dev/null; then
         log_info "Pamac is already installed."
         return 0
     fi
 
-    local pamac_script
-  read -r -d '' pamac_script <<'PAMAC_EOF' || true
-  set -euo pipefail
+    log_info "Stage 1/2: Installing pamac-aur from AUR..."
+    local pamac_install
+    read -r -d '' pamac_install <<'PAMAC_INSTALL_EOF' || true
+set -euo pipefail
 
-  current_user="$1"
+current_user="$1"
 
-  rm -f /var/lib/pacman/db.lck
+rm -f /var/lib/pacman/db.lck
 
-  echo "Installing pamac-aur from AUR..."
+echo "Installing pamac-aur from AUR..."
 sudo -Hu "$current_user" bash -lc "yay -S --noconfirm --needed --noprogressbar pamac-aur"
+
+if ! command -v pamac-manager >/dev/null 2>&1; then
+    echo "Error: pamac-manager not found after install."
+    exit 1
+fi
+echo "pamac-manager installed successfully."
+PAMAC_INSTALL_EOF
+
+    if ! exec_container_script "$pamac_install" "pamac-install" "$CURRENT_USER"; then
+        if ! container_is_usable; then
+            log_warn "Container not usable after pamac install. Restarting..."
+            container_start 2>/dev/null || true
+            wait_for_container || {
+                log_error "Container unrecoverable."
+                return 1
+            }
+            log_info "Retrying pamac install..."
+            if ! exec_container_script "$pamac_install" "pamac-install-retry" "$CURRENT_USER"; then
+                log_error "Failed to install Pamac after retry."
+                return 1
+            fi
+        else
+            log_error "Failed to install Pamac."
+            return 1
+        fi
+    fi
+
+    log_info "Stage 2/2: Configuring Pamac..."
+    local pamac_cfg
+    read -r -d '' pamac_cfg <<'PAMAC_CFG_EOF' || true
+set -euo pipefail
 
 echo "Configuring Pamac for AUR support..."
 if [[ -f /etc/pamac.conf ]]; then
@@ -866,33 +1118,9 @@ else
     echo "Error: Pamac installation verification failed."
     exit 1
 fi
+PAMAC_CFG_EOF
 
-echo "Creating pamac-manager launch wrapper..."
-cat > /usr/local/bin/pamac-manager-wrapper << 'WRAPPER'
-#!/bin/bash
-init_proc=$(cat /proc/1/comm 2>/dev/null || echo unknown)
-if [[ "$init_proc" != "systemd" ]]; then
-    if [[ ! -S /run/dbus/system_bus_socket ]]; then
-        mkdir -p /run/dbus 2>/dev/null || true
-        dbus-daemon --system --fork 2>/dev/null || true
-    fi
-    if command -v pamac-daemon >/dev/null 2>&1; then
-        if ! pidof pamac-daemon >/dev/null 2>&1; then
-            pamac-daemon 2>/dev/null &
-            sleep 1
-        fi
-    fi
-fi
-exec pamac-manager "$@"
-WRAPPER
-chmod +x /usr/local/bin/pamac-manager-wrapper
-echo "pamac-manager-wrapper created."
-PAMAC_EOF
-
-    if ! echo "$pamac_script" | container_root_exec bash -s "$CURRENT_USER"; then
-        log_error "Failed to install Pamac."
-        return 1
-    fi
+    exec_container_script "$pamac_cfg" "pamac-config" || log_warn "Pamac configuration had minor issues."
 }
 
 install_gaming_packages() {
@@ -1011,6 +1239,26 @@ DESKTOP_EOF
     if command -v update-desktop-database >/dev/null 2>&1; then
         run_command update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
     fi
+
+    log_info "Creating pamac-manager launch wrapper inside container..."
+    printf '%s\n' '#!/bin/bash' \
+        'init_proc=$(cat /proc/1/comm 2>/dev/null || echo unknown)' \
+        'if [[ "$init_proc" != "systemd" ]]; then' \
+        '  if [[ ! -S /run/dbus/system_bus_socket ]]; then' \
+        '    mkdir -p /run/dbus 2>/dev/null || true' \
+        '    dbus-daemon --system --fork 2>/dev/null || true' \
+        '  fi' \
+        '  if command -v pamac-daemon >/dev/null 2>&1; then' \
+        '    if ! pidof pamac-daemon >/dev/null 2>&1; then' \
+        '      pamac-daemon 2>/dev/null &' \
+        '      sleep 1' \
+        '    fi' \
+        '  fi' \
+        'fi' \
+        'exec pamac-manager "$@"' \
+        | container_root_exec tee /usr/local/bin/pamac-manager-wrapper > /dev/null
+    container_root_exec chmod +x /usr/local/bin/pamac-manager-wrapper
+    log_info "pamac-manager-wrapper created inside container."
 
     local bin_dir="$HOME/.local/bin"
     mkdir -p "$bin_dir"
@@ -1237,7 +1485,7 @@ main() {
           create_container || exit 1
         fi
         ;;
-      "stopping"|"paused"|"dead"|"exited"|"stopped")
+      "stopping"|"paused"|"dead"|"exited"|"stopped"|"improper")
         log_warn "Container in '$existing_status' state - removing and recreating"
         force_remove_container "$CONTAINER_NAME"
         sleep 2
@@ -1262,12 +1510,39 @@ main() {
     esac
   fi
 
-    configure_container_base || exit 1
+    if ! configure_container_base; then
+        log_warn "Container base setup had errors. Checking container health..."
+        if ! ensure_container_healthy "base setup recovery"; then
+            exit 1
+        fi
+    fi
+
     optimize_pacman_mirrors
     configure_multilib
 
-    install_aur_helper || exit 1
-    install_pamac || exit 1
+    ensure_container_healthy "after base setup" || exit 1
+
+    if ! install_aur_helper; then
+        if ensure_container_healthy "aur helper recovery"; then
+            log_info "Retrying AUR helper install..."
+            install_aur_helper || exit 1
+        else
+            exit 1
+        fi
+    fi
+
+    ensure_container_healthy "after aur helper" || exit 1
+
+    if ! install_pamac; then
+        if ensure_container_healthy "pamac install recovery"; then
+            log_info "Retrying Pamac install..."
+            install_pamac || exit 1
+        else
+            exit 1
+        fi
+    fi
+
+    ensure_container_healthy "after pamac install" || exit 1
 
     install_gaming_packages
 

@@ -107,7 +107,7 @@ run_command() {
 
 container_root_exec() {
   if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
-    docker exec -i -u 0 "$CONTAINER_NAME" "$@"
+    docker exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" "$@"
   else
     podman exec -i -u 0 -e HOME="/home/${CURRENT_USER}" "$CONTAINER_NAME" "$@"
   fi
@@ -119,6 +119,15 @@ container_user_exec() {
   else
     podman exec -i -u "$CURRENT_USER" -e HOME="/home/${CURRENT_USER}" "$CONTAINER_NAME" "$@"
   fi
+}
+
+container_cp_from() {
+    local src="$1" dst="$2"
+    if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
+        docker cp "$CONTAINER_NAME:$src" "$dst" 2>/dev/null
+    else
+        podman cp "$CONTAINER_NAME:$src" "$dst" 2>/dev/null
+    fi
 }
 
 container_start() {
@@ -855,33 +864,59 @@ if command -v dbus-daemon >/dev/null 2>&1; then
 fi
 
 echo "Installing Pamac bootstrap helper..."
-printf '%s\n' '#!/bin/bash' \
-    'set +e' \
-    'run_root() {' \
-    '    if [[ "$(id -u)" -eq 0 ]]; then' \
-    '        "$@"' \
-    '    else' \
-    '        sudo "$@"' \
-    '    fi' \
-    '}' \
-    'if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then' \
-    '    systemctl start pamac-daemon >/dev/null 2>&1 || true' \
-    'else' \
-    '    if [[ ! -S /run/dbus/system_bus_socket ]]; then' \
-    '        mkdir -p /run/dbus >/dev/null 2>&1 || true' \
-    '        run_root dbus-daemon --system --fork >/dev/null 2>&1 || true' \
-    '    fi' \
-    '    if command -v pgrep >/dev/null 2>&1 && ! pgrep -x polkitd >/dev/null 2>&1; then' \
-    '        if [[ -x /usr/lib/polkit-1/polkitd ]]; then' \
-    '            run_root /usr/lib/polkit-1/polkitd --no-debug >/dev/null 2>&1 &' \
-    '            sleep 2' \
-    '        fi' \
-    '    fi' \
-    '    if command -v pamac-daemon >/dev/null 2>&1 && ! pgrep -x pamac-daemon >/dev/null 2>&1; then' \
-    '        run_root pamac-daemon >/dev/null 2>&1 &' \
-    '        sleep 2' \
-    '    fi' \
-    'fi' > /usr/local/bin/pamac-session-bootstrap.sh
+cat > /usr/local/bin/pamac-session-bootstrap.sh << 'BOOTSTRAP'
+#!/bin/bash
+set +e
+BOOTSTRAP_LOG="/tmp/pamac-bootstrap.log"
+
+log_bootstrap() {
+    echo "[$(date '+%H:%M:%S')] $*" >> "$BOOTSTRAP_LOG"
+}
+
+run_root() {
+    if [[ "$(id -u)" -eq 0 ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+ensure_service() {
+    local name="$1"
+    local pid_ok="$2"
+    local start_cmd="$3"
+    local retries=5
+    local count=0
+
+    if command -v pgrep >/dev/null 2>&1 && pgrep -x "$pid_ok" >/dev/null 2>&1; then
+        log_bootstrap "$name already running (pid $(pgrep -x "$pid_ok" 2>/dev/null | head -1))"
+        return 0
+    fi
+
+    log_bootstrap "Starting $name..."
+    while [[ $count -lt $retries ]]; do
+        eval "$start_cmd" >> "$BOOTSTRAP_LOG" 2>&1
+        sleep 1
+        if command -v pgrep >/dev/null 2>&1 && pgrep -x "$pid_ok" >/dev/null 2>&1; then
+            log_bootstrap "$name started successfully"
+            return 0
+        fi
+        count=$((count + 1))
+    done
+    log_bootstrap "WARNING: $name may not have started after $retries attempts"
+    return 1
+}
+
+if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
+    log_bootstrap "systemd detected, starting pamac-daemon via systemctl"
+    systemctl start pamac-daemon >/dev/null 2>&1 || true
+else
+    log_bootstrap "Non-systemd environment, starting services manually"
+    ensure_service "dbus-daemon" "dbus-daemon" 'mkdir -p /run/dbus; dbus-daemon --system --fork 2>/dev/null'
+    ensure_service "polkitd" "polkitd" 'if [[ -x /usr/lib/polkit-1/polkitd ]]; then run_root /usr/lib/polkit-1/polkitd --no-debug; fi'
+    ensure_service "pamac-daemon" "pamac-daemon" 'run_root pamac-daemon'
+fi
+BOOTSTRAP
 chmod +x /usr/local/bin/pamac-session-bootstrap.sh
 
 echo "Adjusting Pamac D-Bus activation for environments without a functional systemd..."
@@ -1186,26 +1221,26 @@ export_pamac_to_host() {
 
     log_info "Copying pamac icons from container to host..."
 
-    set +e
-    if container_root_exec test -f /usr/share/icons/hicolor/scalable/apps/pamac-manager.svg 2>/dev/null; then
-        container_root_exec cat /usr/share/icons/hicolor/scalable/apps/pamac-manager.svg > "$icon_svg_dir/pamac-manager.svg" 2>/dev/null
+    if container_cp_from /usr/share/icons/hicolor/scalable/apps/pamac-manager.svg "$icon_svg_dir/pamac-manager.svg"; then
         if [[ -s "$icon_svg_dir/pamac-manager.svg" ]]; then
             log_info "Copied SVG icon"
         else
             rm -f "$icon_svg_dir/pamac-manager.svg"
             log_warn "SVG icon copy produced empty file, removed"
         fi
+    else
+        log_debug "SVG icon not found in container, skipping"
     fi
-    if container_root_exec test -f /usr/share/icons/hicolor/48x48/apps/pamac-manager.png 2>/dev/null; then
-        container_root_exec cat /usr/share/icons/hicolor/48x48/apps/pamac-manager.png > "$icon_png48_dir/pamac-manager.png" 2>/dev/null
+    if container_cp_from /usr/share/icons/hicolor/48x48/apps/pamac-manager.png "$icon_png48_dir/pamac-manager.png"; then
         if [[ -s "$icon_png48_dir/pamac-manager.png" ]]; then
             log_info "Copied PNG icon"
         else
             rm -f "$icon_png48_dir/pamac-manager.png"
             log_warn "PNG icon copy produced empty file, removed"
         fi
+    else
+        log_debug "PNG icon not found in container, skipping"
     fi
-    set -e
 
     command -v gtk-update-icon-cache >/dev/null 2>&1 && \
         gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" -f 2>/dev/null || true
@@ -1227,16 +1262,35 @@ export_pamac_to_host() {
     container_root_exec chmod +x /usr/local/bin/pamac-cli-wrapper
 
     log_info "Exporting Pamac application using distrobox-export..."
+    local distrobox_export_ok=false
     if run_command distrobox-enter "$CONTAINER_NAME" -- distrobox-export --app pamac-manager; then
-        log_success "Pamac exported successfully using distrobox-export."
-    else
-        log_warn "distrobox-export failed for Pamac. Creating manual desktop entry..."
+        log_success "Pamac exported via distrobox-export."
+        distrobox_export_ok=true
+    fi
 
-        local desktop_dir="$HOME/.local/share/applications"
-        mkdir -p "$desktop_dir"
+    local desktop_dir="$HOME/.local/share/applications"
+    mkdir -p "$desktop_dir"
+    local exported_desktop=""
 
-        local desktop_file="$desktop_dir/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
-        cat > "$desktop_file" << DESKTOP_EOF
+    local possible_files=(
+        "$desktop_dir/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
+        "$desktop_dir/${CONTAINER_NAME}-pamac-manager.desktop"
+    )
+    for f in "${possible_files[@]}"; do
+        if [[ -f "$f" ]]; then
+            exported_desktop="$f"
+            break
+        fi
+    done
+
+    if [[ -z "$exported_desktop" ]] && [[ "$distrobox_export_ok" == "true" ]]; then
+        exported_desktop=$(find "$desktop_dir" -maxdepth 1 -type f -name "${CONTAINER_NAME}-*.desktop" 2>/dev/null | head -1)
+    fi
+
+    if [[ -z "$exported_desktop" ]]; then
+        log_warn "distrobox-export did not produce a desktop file. Creating manually..."
+        exported_desktop="$desktop_dir/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
+        cat > "$exported_desktop" << DESKTOP_EOF
 [Desktop Entry]
 Name=Add/Remove Software (on ${CONTAINER_NAME})
 Comment=Manage packages inside the ${CONTAINER_NAME} distrobox
@@ -1254,26 +1308,23 @@ X-SteamOS-Pamac-SourceApp=pamac-manager
 X-SteamOS-Pamac-SourceDesktop=org.manjaro.pamac.manager.desktop
 X-SteamOS-Pamac-SourcePackage=pamac-aur
 DESKTOP_EOF
-        chmod +x "$desktop_file"
-        log_success "Created manual desktop entry: $desktop_file"
+        chmod +x "$exported_desktop"
+        log_success "Created manual desktop entry: $exported_desktop"
     fi
 
-    local exported_desktop="$HOME/.local/share/applications/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
-    if [[ -f "$exported_desktop" ]]; then
-        sed -i -E \
-            -e '/^DBusActivatable=/d' \
-            -e "s|^Exec=.*pamac-manager(.*)$|Exec=distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper\\1|" \
-            "$exported_desktop"
-        sed -i \
-            -e '/^X-SteamOS-Pamac-Managed=/d' \
-            -e '/^X-SteamOS-Pamac-Container=/d' \
-            -e '/^X-SteamOS-Pamac-SourceApp=/d' \
-            -e '/^X-SteamOS-Pamac-SourceDesktop=/d' \
-            -e '/^X-SteamOS-Pamac-SourcePackage=/d' \
-            "$exported_desktop"
-        printf '\nX-SteamOS-Pamac-Managed=true\nX-SteamOS-Pamac-Container=%s\nX-SteamOS-Pamac-SourceApp=pamac-manager\nX-SteamOS-Pamac-SourceDesktop=org.manjaro.pamac.manager.desktop\nX-SteamOS-Pamac-SourcePackage=pamac-aur\n' "$CONTAINER_NAME" >> "$exported_desktop"
-        log_info "Patched exported Pamac desktop entry: $exported_desktop"
-    fi
+    sed -i '/^DBusActivatable=/d' "$exported_desktop"
+    sed -i "s|^Exec=.*$|Exec=distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper %U|" "$exported_desktop"
+    for key in X-SteamOS-Pamac-Managed X-SteamOS-Pamac-Container X-SteamOS-Pamac-SourceApp X-SteamOS-Pamac-SourceDesktop X-SteamOS-Pamac-SourcePackage; do
+        sed -i "/^${key}=/d" "$exported_desktop"
+    done
+    {
+        printf '\nX-SteamOS-Pamac-Managed=true'
+        printf '\nX-SteamOS-Pamac-Container=%s' "$CONTAINER_NAME"
+        printf '\nX-SteamOS-Pamac-SourceApp=pamac-manager'
+        printf '\nX-SteamOS-Pamac-SourceDesktop=org.manjaro.pamac.manager.desktop'
+        printf '\nX-SteamOS-Pamac-SourcePackage=pamac-aur'
+    } >> "$exported_desktop"
+    log_info "Patched Pamac desktop entry: $exported_desktop"
 
     mkdir -p "$HOME/.local/share/steamos-pamac/$CONTAINER_NAME"
     printf '%s\n' "$exported_desktop" > "$HOME/.local/share/steamos-pamac/$CONTAINER_NAME/exported-apps.list"
@@ -1414,7 +1465,7 @@ if command -v distrobox-export >/dev/null 2>&1; then
         should_export_desktop "\$desktop" "\$app_name" "\$owner_pkg" || continue
 
         if run_distrobox_export "\$export_name" >/dev/null 2>&1; then
-            host_desktop="\$APP_DIR/${container_name}-\${app_name}.desktop"
+            host_desktop="\$APP_DIR/${container_name}-\${export_name}.desktop"
             annotate_desktop "\$host_desktop" "\$app_name" "\$export_name" "\$owner_pkg" || true
             [[ -f "\$host_desktop" ]] && printf '%s\n' "\$host_desktop" >> "\$NEW_STATE_FILE"
             exported=\$((exported + 1))

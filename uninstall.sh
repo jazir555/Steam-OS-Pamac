@@ -5,7 +5,7 @@
 # Preserves installed packages in container if you want to keep using it
 
 # --- Configuration ---
-CONTAINER_NAME="${CONTAINER_NAME:-arch-box}"  # Must match install script's container name
+CONTAINER_NAME="${CONTAINER_NAME:-arch-pamac}"  # Must match install script's container name
 USER_HOME="$HOME"
 LOG_FILE="$USER_HOME/pamac-uninstall.log"
 
@@ -90,11 +90,21 @@ clean_caches() {
   log_info "\n${BOLD}Cleaning leftover files...${NC}"
   # Remove build caches
   rm -rf "$USER_HOME/.cache/yay" "$USER_HOME/.cache/pacman/pkg" &>> "$LOG_FILE"
-  
+
   # Remove container config
   rm -rf "$USER_HOME/.local/share/distrobox/containers/$CONTAINER_NAME" &>> "$LOG_FILE"
-  
+
   log_success "Cache files removed"
+}
+
+clean_wrappers_and_icons() {
+  log_info "\n${BOLD}Cleaning CLI wrappers and icons...${NC}"
+  # Remove CLI wrapper
+  rm -f "$USER_HOME/.local/bin/pamac-$CONTAINER_NAME" &>> "$LOG_FILE"
+  # Remove icons that were copied from the container
+  rm -f "$USER_HOME/.local/share/icons/hicolor/scalable/apps/pamac-manager.svg" &>> "$LOG_FILE"
+  rm -f "$USER_HOME/.local/share/icons/hicolor/48x48/apps/pamac-manager.png" &>> "$LOG_FILE"
+  log_success "CLI wrappers and icons removed"
 }
 
 # --- Uninstallation Flow ---
@@ -129,6 +139,7 @@ confirm_uninstall
   remove_container
   remove_exported_apps
   remove_boxbuddy
+  clean_wrappers_and_icons
   clean_caches
 )
 

@@ -192,7 +192,7 @@ check_system_requirements() {
         log_success "SteamOS detected."
     fi
 
-    return $([[ "$all_ok" == "true" ]] && echo 0 || echo 1)
+    [[ "$all_ok" == "true" ]]
 }
 
 # ----------  SteamOS podman-on-demand installer  ----------
@@ -353,6 +353,7 @@ update_script() {
 
 # --- 4. uninstall_setup (remove only the container, not the runtime) ---
 uninstall_setup() {
+    initialize_logging
     log_step "Uninstalling Pamac setup for container: $CONTAINER_NAME"
 
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -390,6 +391,12 @@ uninstall_setup() {
     # Clean CLI wrapper
     local bin_file="$HOME/.local/bin/pamac-${CONTAINER_NAME}"
     [[ -f "$bin_file" ]] && { log_info "Removing CLI wrapper at $bin_file"; [[ "$DRY_RUN" != "true" ]] && rm -f "$bin_file"; }
+
+    # Clean icon files copied from container
+    local icon_svg="$HOME/.local/share/icons/hicolor/scalable/apps/pamac-manager.svg"
+    local icon_png="$HOME/.local/share/icons/hicolor/48x48/apps/pamac-manager.png"
+    [[ -f "$icon_svg" ]] && { log_info "Removing icon: $icon_svg"; [[ "$DRY_RUN" != "true" ]] && rm -f "$icon_svg"; }
+    [[ -f "$icon_png" ]] && { log_info "Removing icon: $icon_png"; [[ "$DRY_RUN" != "true" ]] && rm -f "$icon_png"; }
 
     log_success "Uninstallation completed."
 }
@@ -465,9 +472,10 @@ if ! pacman -Sy --noconfirm >/dev/null 2>&1; then
     echo "WARNING: 'pacman -Sy' failed. Will continue but package installs may fail." >&2
 fi
 
-# Install minimal tooling if missing (sudo, shadow for usermod/groupadd, gnupg for pacman-key)
+# Install minimal tooling if missing
 need_pkgs=()
-for pkg in sudo shadow gpg pacman-key; do
+# shadow provides useradd/usermod/groupadd; gnupg provides gpg for pacman-key
+for pkg in sudo shadow gnupg; do
     if ! command -v "$pkg" >/dev/null 2>&1 && ! pacman -Qi "$pkg" >/dev/null 2>&1; then
         need_pkgs+=("$pkg")
     fi
@@ -480,9 +488,9 @@ fi
 # Ensure user exists; if not, create a matching user (no password) with home dir
 if id "$current_user" >/dev/null 2>&1; then
     echo "User '$current_user' exists inside container."
+    usermod -aG wheel "$current_user" || echo "Warning: could not add user to wheel group"
 else
     echo "User '$current_user' not found. Creating user with same name."
-    # Pick a high UID that avoids collision if necessary; prefer to mirror host UID if provided via env
     useradd -m -G wheel -s /bin/bash "$current_user" || { echo "Error: failed to create user '$current_user'"; exit 1; }
     echo "Created user '$current_user' and added to wheel group."
 fi
@@ -500,6 +508,38 @@ if [[ ! -f /etc/sudoers.d/99-wheel-nopasswd ]]; then
     echo "Configured passwordless sudo for wheel."
 else
     echo "Passwordless sudo for wheel already configured."
+fi
+
+# Install polkit for pamac privilege escalation
+echo "Installing polkit..."
+if pacman -S --noconfirm --needed polkit; then
+    echo "polkit installed."
+    # Create polkit rule allowing pamac operations without password for wheel users
+    local polkit_dir="/etc/polkit-1/rules.d"
+    mkdir -p "$polkit_dir"
+    cat > "$polkit_dir/10-pamac-nopasswd.rules" << 'POLKIT_EOF'
+polkit.addRule(function(action, subject) {
+    if (action.id.indexOf("org.manjaro.pamac.") == 0 &&
+        subject.isInGroup("wheel")) {
+        return polkit.Result.YES;
+    }
+});
+POLKIT_EOF
+    echo "polkit passwordless rule created for pamac operations."
+else
+    echo "Warning: could not install polkit. pamac GUI may prompt for password."
+fi
+
+# Ensure D-Bus session socket from host is accessible
+# Distrobox mounts the host's X11 and Wayland sockets automatically,
+# but we also need the D-Bus session bus for pamac-daemon communication.
+if [[ -d /run/user ]]; then
+    local dbus_dir
+    dbus_dir=$(find /run/user -maxdepth 1 -type d -name "$(id -u "$current_user" 2>/dev/null)" 2>/dev/null | head -1)
+    if [[ -n "$dbus_dir" ]] && [[ ! -e "$dbus_dir/bus" ]]; then
+        echo "Warning: D-Bus session socket not found at $dbus_dir/bus."
+        echo "pamac-daemon may fall back to alternative transport."
+    fi
 fi
 
 # Try to initialize pacman keyring; tolerate failure but report it
@@ -553,11 +593,12 @@ fi
 echo "Backing up current mirrorlist..."
 [[ -f /etc/pacman.d/mirrorlist ]] && cp /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.backup
 
-echo "Generating optimized mirrorlist..."
-if reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist; then
+echo "Generating optimized mirrorlist (this may take a minute)..."
+# Use timeout to prevent reflector from hanging on slow networks
+if timeout 120 reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist; then
     echo "Successfully updated mirrorlist."
 else
-    echo "Reflector failed. Restoring backup if available."
+    echo "Reflector failed or timed out. Restoring backup if available."
     [[ -f /etc/pacman.d/mirrorlist.backup ]] && cp /etc/pacman.d/mirrorlist.backup /etc/pacman.d/mirrorlist
     exit 0
 fi
@@ -636,19 +677,30 @@ install_pamac() {
 set -euo pipefail
 
 echo "Installing pamac-aur from AUR..."
-yay -S --noconfirm --needed --answeredit n --noprogressbar pamac-aur
+yay -S --noconfirm --needed --noprogressbar pamac-aur
 
 # Configure Pamac for AUR support
 if [[ -f /etc/pamac.conf ]]; then
     echo "Configuring Pamac for AUR support..."
     sudo sed -i 's/^#EnableAUR/EnableAUR/' /etc/pamac.conf
     sudo sed -i 's/^#CheckAURUpdates/CheckAURUpdates/' /etc/pamac.conf
-    if grep -q "#CheckAURVCSUpdates" /etc/pamac.conf; then
-        sudo sed -i 's/^#CheckAURVCSUpdates/CheckAURVCSUpdates/' /etc/pamac.conf
-    fi
+    sudo sed -i 's/^#CheckAURVCSUpdates/CheckAURVCSUpdates/' /etc/pamac.conf
     echo "Pamac configuration updated for AUR support."
 else
     echo "Warning: /etc/pamac.conf not found. Cannot enable AUR support automatically."
+fi
+
+# Ensure pamac-daemon can communicate via D-Bus
+# Start pamac-daemon as a user service so the GUI can perform package operations
+if command -v pamac-daemon >/dev/null 2>&1; then
+    if systemctl --user daemon-reload 2>/dev/null; then
+        systemctl --user enable --now pamac-daemon 2>/dev/null || \
+            echo "Note: pamac-daemon user service could not be enabled (will start on demand)."
+    else
+        echo "Note: systemd user bus not available; pamac-daemon will be started on demand by pamac-manager."
+    fi
+else
+    echo "Note: pamac-daemon not found; pamac-manager will use direct backend."
 fi
 
 # Verify installation
@@ -669,6 +721,7 @@ EOF
 
 install_gaming_packages() {
     if [[ "$ENABLE_GAMING_PACKAGES" != "true" ]]; then
+        log_info "Skipping gaming packages (use --enable-gaming to include them)."
         return
     fi
 
@@ -691,7 +744,7 @@ failed_packages=()
 
 for package in "${gaming_packages[@]}"; do
     echo "Installing ${package}..."
-    if ! yay -S --noconfirm --needed --answeredit n --noprogressbar "${package}"; then
+    if ! yay -S --noconfirm --needed --noprogressbar "${package}"; then
         echo "Warning: Failed to install ${package}"
         failed_packages+=("${package}")
     fi
@@ -713,14 +766,30 @@ EOF
 export_pamac_to_host() {
     log_step "Exporting Pamac to host system"
 
-    # Try using distrobox-export first
+    # Copy pamac icon from container to host for proper desktop integration
+    local icon_svg_dir="$HOME/.local/share/icons/hicolor/scalable/apps"
+    local icon_png48_dir="$HOME/.local/share/icons/hicolor/48x48/apps"
+    local icon_svg_file="$icon_svg_dir/pamac-manager.svg"
+    if [[ ! -f "$icon_svg_file" ]]; then
+        mkdir -p "$icon_svg_dir" "$icon_png48_dir"
+        if distrobox enter "$CONTAINER_NAME" -- bash -c "test -f /usr/share/icons/hicolor/scalable/apps/pamac-manager.svg" 2>/dev/null; then
+            distrobox enter "$CONTAINER_NAME" -- cat /usr/share/icons/hicolor/scalable/apps/pamac-manager.svg > "$icon_svg_file" 2>/dev/null
+        fi
+        if distrobox enter "$CONTAINER_NAME" -- bash -c "test -f /usr/share/icons/hicolor/48x48/apps/pamac-manager.png" 2>/dev/null; then
+            distrobox enter "$CONTAINER_NAME" -- cat /usr/share/icons/hicolor/48x48/apps/pamac-manager.png > "$icon_png48_dir/pamac-manager.png" 2>/dev/null
+        fi
+        if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+            gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" -f 2>/dev/null || true
+        fi
+    fi
+
+    # Try using distrobox-export first (fixed quoting for --extra-flags)
     log_info "Attempting to export Pamac using distrobox-export..."
-    if run_command distrobox-export --app pamac-manager --extra-flags --no-sandbox --container "$CONTAINER_NAME"; then
+    if run_command distrobox-export --app pamac-manager --extra-flags "--no-sandbox" --container "$CONTAINER_NAME"; then
         log_success "Pamac exported successfully using distrobox-export."
     else
         log_warn "distrobox-export failed. Creating manual desktop entry..."
 
-        # Create manual desktop entry
         local desktop_dir="$HOME/.local/share/applications"
         mkdir -p "$desktop_dir"
 
@@ -729,11 +798,11 @@ export_pamac_to_host() {
 [Desktop Entry]
 Name=Pamac Manager (${CONTAINER_NAME})
 Comment=Package Manager for Arch Linux Container
-Exec=distrobox enter ${CONTAINER_NAME} -- pamac-manager --no-sandbox
+Exec=distrobox enter ${CONTAINER_NAME} -- pamac-manager
 Icon=pamac-manager
 Terminal=false
 Type=Application
-Categories=System;Settings;PackageManager;
+Categories=System;PackageManager;Settings;
 Keywords=package;manager;software;arch;aur;
 StartupNotify=true
 X-Distrobox-App=pamac-manager

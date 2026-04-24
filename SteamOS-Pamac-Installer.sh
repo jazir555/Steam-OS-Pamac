@@ -105,37 +105,84 @@ run_command() {
 }
 
 container_root_exec() {
-    if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
-        docker exec -u 0 "$CONTAINER_NAME" "$@"
-    else
-        podman exec -u 0 -e HOME="/home/${CURRENT_USER}" "$CONTAINER_NAME" "$@"
-    fi
+  if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
+    docker exec -i -u 0 "$CONTAINER_NAME" "$@"
+  else
+    podman exec -i -u 0 -e HOME="/home/${CURRENT_USER}" "$CONTAINER_NAME" "$@"
+  fi
 }
 
 container_user_exec() {
-    if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
-        docker exec -u "$CURRENT_USER" -e HOME="/home/${CURRENT_USER}" "$CONTAINER_NAME" "$@"
-    else
-        podman exec -u "$CURRENT_USER" -e HOME="/home/${CURRENT_USER}" "$CONTAINER_NAME" "$@"
-    fi
+  if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
+    docker exec -i -u "$CURRENT_USER" -e HOME="/home/${CURRENT_USER}" "$CONTAINER_NAME" "$@"
+  else
+    podman exec -i -u "$CURRENT_USER" -e HOME="/home/${CURRENT_USER}" "$CONTAINER_NAME" "$@"
+  fi
 }
 
 container_is_running() {
-    if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
-        docker inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q "true"
-    else
-        podman inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q "true"
-    fi
+  if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
+    docker inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q "true"
+  else
+    podman inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q "true"
+  fi
+}
+
+container_get_status() {
+  if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
+    docker inspect "$CONTAINER_NAME" --format '{{.State.Status}}' 2>/dev/null || echo "not_found"
+  else
+    podman inspect "$CONTAINER_NAME" --format '{{.State.Status}}' 2>/dev/null || echo "not_found"
+  fi
+}
+
+container_is_usable() {
+  container_root_exec bash -c "echo ok" 2>/dev/null | grep -q "ok"
 }
 
 force_remove_container() {
-    local name="$1"
-    if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
-        docker rm -f "$name" 2>/dev/null || true
-    else
-        podman rm -f "$name" 2>/dev/null || true
-        sudo podman rm -f "$name" 2>/dev/null || true
+  local name="$1"
+  local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
+
+  if [[ "$mgr" == "docker" ]]; then
+    docker rm -f "$name" 2>/dev/null || true
+    return
+  fi
+
+  if ! podman inspect "$name" >/dev/null 2>&1; then
+    return
+  fi
+
+  local status
+  status=$(podman inspect "$name" --format '{{.State.Status}}' 2>/dev/null || echo "not_found")
+  if [[ "$status" == "not_found" ]]; then
+    return
+  fi
+
+  if [[ "$status" == "stopping" || "$status" == "stopped" ]]; then
+    log_debug "Container '$name' in '$status' state - killing container processes"
+    local pid
+    pid=$(podman inspect "$name" --format '{{.State.Pid}}' 2>/dev/null || echo "0")
+    if [[ "$pid" -gt 0 ]]; then
+      kill -9 "$pid" 2>/dev/null || true
     fi
+    local conmon_pid
+    conmon_pid=$(podman inspect "$name" --format '{{.ConmonPidFile}}' 2>/dev/null || true)
+    if [[ -n "$conmon_pid" && -f "$conmon_pid" ]]; then
+      local cpid
+      cpid=$(cat "$conmon_pid" 2>/dev/null || echo "0")
+      if [[ "$cpid" -gt 0 ]]; then
+        kill -9 "$cpid" 2>/dev/null || true
+      fi
+    fi
+    sleep 1
+  fi
+
+  podman rm -f "$name" 2>/dev/null || true
+  if podman inspect "$name" >/dev/null 2>&1; then
+    log_debug "User podman rm failed, trying sudo..."
+    sudo podman rm -f "$name" 2>/dev/null || true
+  fi
 }
 
 validate_container_name() {
@@ -300,19 +347,16 @@ uninstall_setup() {
     if distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
         log_info "Stopping and removing container: $CONTAINER_NAME"
 
-        local export_list
-        export_list=$(distrobox-export --list 2>/dev/null | grep "$CONTAINER_NAME" || true)
-        if [[ -n "$export_list" ]]; then
-            log_info "Removing exported applications..."
-            while IFS= read -r line; do
-                local app_name
-                app_name=$(echo "$line" | awk '{print $2}' | tr -d '\n')
-                if [[ -n "$app_name" ]]; then
-                    log_info "Un-exporting app: $app_name"
-                    distrobox-export --app "$app_name" --delete --container "$CONTAINER_NAME" 2>/dev/null || true
-                fi
-            done <<< "$export_list"
-        fi
+    local export_list
+    export_list=$(distrobox-enter "$CONTAINER_NAME" -- distrobox-export --list-apps 2>/dev/null || true)
+    if [[ -n "$export_list" ]]; then
+      log_info "Removing exported applications..."
+      while IFS= read -r app_name; do
+        [[ -z "$app_name" ]] && continue
+        log_info "Un-exporting app: $app_name"
+        distrobox-enter "$CONTAINER_NAME" -- distrobox-export --app "$app_name" --delete 2>/dev/null || true
+      done <<< "$export_list"
+    fi
 
         run_command distrobox stop "$CONTAINER_NAME" || true
         run_command distrobox rm -f "$CONTAINER_NAME" || true
@@ -355,40 +399,59 @@ uninstall_setup() {
 }
 
 wait_for_container() {
-    local max_attempts=60
-    local attempt=0
-    log_info "Waiting for container '$CONTAINER_NAME' to become ready..."
+  local max_attempts=30
+  local attempt=0
+  log_info "Waiting for container '$CONTAINER_NAME' to become ready..."
 
-    set +e
-    while true; do
-        attempt=$((attempt + 1))
+  set +e
+  while true; do
+    attempt=$((attempt + 1))
 
-        if container_is_running; then
-            if container_root_exec bash -c "echo ready" 2>/dev/null | grep -q "ready"; then
-                set -e
-                log_success "Container is ready."
-                return 0
-            fi
+    local status
+    status=$(container_get_status)
+    log_debug "Container status: $status (attempt $attempt/$max_attempts)"
+
+    case "$status" in
+      "running")
+        if container_root_exec bash -c "echo ready" 2>/dev/null | grep -q "ready"; then
+          set -e
+          log_success "Container is ready."
+          return 0
         fi
-
-        if distrobox enter "$CONTAINER_NAME" -- bash -c "echo ready" 2>/dev/null | grep -q "ready"; then
-            set -e
-            log_success "Container is ready (via distrobox enter)."
-            return 0
+        ;;
+      "stopping"|"paused"|"stopped")
+        if [[ $attempt -le 5 ]]; then
+          log_debug "Container in '$status' state, waiting..."
+        else
+          log_warn "Container stuck in '$status' state - removing and recreating"
+          set -e
+          force_remove_container "$CONTAINER_NAME"
+          return 2
         fi
+        ;;
+      "not_found")
+        set -e
+        log_error "Container '$CONTAINER_NAME' not found."
+        return 1
+        ;;
+      "created")
+        log_debug "Container in 'created' state, attempting start..."
+        podman start "$CONTAINER_NAME" >>"$LOG_FILE" 2>&1 || true
+        ;;
+    esac
 
-        if [[ $attempt -gt $max_attempts ]]; then
-            set -e
-            log_error "Container failed to become ready after $((max_attempts * 2)) seconds."
-            log_info "Try checking container status with: distrobox list"
-            return 1
-        fi
+    if [[ $attempt -gt $max_attempts ]]; then
+      set -e
+      log_error "Container failed to become ready after $((max_attempts * 2)) seconds."
+      log_info "Try removing with: podman rm -f $CONTAINER_NAME"
+      return 1
+    fi
 
-        sleep 2
-        if [[ $((attempt % 10)) -eq 0 ]]; then
-            log_info "Still waiting... (${attempt}/${max_attempts})"
-        fi
-    done
+    sleep 2
+    if [[ $((attempt % 5)) -eq 0 ]]; then
+      log_info "Still waiting... (${attempt}/${max_attempts})"
+    fi
+  done
 }
 
 detect_init_support() {
@@ -462,61 +525,63 @@ create_container() {
         log_info "Enabled persistent build cache: $cache_dir"
     fi
 
+  if ! run_command distrobox create "${create_args[@]}"; then
+    log_warn "Container create failed - attempting cleanup and retry..."
+    force_remove_container "$CONTAINER_NAME"
+    sleep 2
     if ! run_command distrobox create "${create_args[@]}"; then
-        log_warn "Container create failed - attempting cleanup and retry..."
-        force_remove_container "$CONTAINER_NAME"
-        if ! run_command distrobox create "${create_args[@]}"; then
-            log_error "Failed to create Distrobox container after retry."
-            return 1
-        fi
+      log_error "Failed to create Distrobox container after retry."
+      return 1
     fi
+  fi
 
-    log_info "Waiting for container to initialize..."
-    set +e
-    local init_output
-    init_output=$(distrobox enter "$CONTAINER_NAME" -- bash -c "echo init_ok" 2>&1)
-    local init_status=$?
-    set -e
+  log_info "Starting container..."
+  set +e
+  podman start "$CONTAINER_NAME" >>"$LOG_FILE" 2>&1
+  set -e
 
-    if echo "$init_output" | grep -q "init_ok"; then
-        log_success "Container initialized successfully."
+  local wait_result=0
+  wait_for_container || wait_result=$?
+
+  if [[ "$wait_result" -eq 2 ]]; then
+    log_info "Container was stuck, recreating..."
+    if run_command distrobox create "${create_args[@]}"; then
+      podman start "$CONTAINER_NAME" >>"$LOG_FILE" 2>&1 || true
+      wait_for_container || return 1
     else
-        log_warn "Container init check produced warnings, trying direct exec..."
-        log_debug "Init output: $init_output"
-
-        set +e
-        local retry_output
-        retry_output=$(container_root_exec bash -c "whoami" 2>&1)
-        set -e
-
-        if echo "$retry_output" | grep -q "root"; then
-            log_success "Container is functional (direct exec works)."
-        else
-            log_error "Container is not functional. Check podman/distrobox setup."
-            log_debug "Direct exec output: $retry_output"
-            return 1
-        fi
+      log_error "Failed to recreate container after removal."
+      return 1
     fi
+  elif [[ "$wait_result" -ne 0 ]]; then
+    return 1
+  fi
 
-    wait_for_container || return 1
+  if container_root_exec bash -c "echo ready" 2>/dev/null | grep -q "ready"; then
+    log_success "Container is functional and ready."
+  else
+    log_error "Container created but is not functional."
+    return 1
+  fi
 }
 
 configure_container_base() {
     log_step "Configuring container base environment"
 
     local setup_script
-    read -r -d '' setup_script <<'SETUP_EOF' || true
-set -euo pipefail
+  read -r -d '' setup_script <<'SETUP_EOF' || true
+  set -euo pipefail
 
-current_user="$1"
-if [[ -z "$current_user" ]]; then
+  current_user="$1"
+  if [[ -z "$current_user" ]]; then
     echo "ERROR: Host username not supplied to container setup." >&2
     exit 1
-fi
+  fi
 
-echo "Container: configuring base environment for user='$current_user'"
+  echo "Container: configuring base environment for user='$current_user'"
 
-echo "Installing essential packages..."
+  rm -f /var/lib/pacman/db.lck
+
+  echo "Installing essential packages..."
 pacman -S --noconfirm --needed sudo shadow gnupg archlinux-keyring base-devel git go
 
 echo "Initializing pacman keyring..."
@@ -613,10 +678,12 @@ optimize_pacman_mirrors() {
     log_step "Optimizing Pacman mirrors"
 
     local mirror_script
-    read -r -d '' mirror_script << 'EOF' || true
-set -euo pipefail
+  read -r -d '' mirror_script << 'EOF' || true
+  set -euo pipefail
 
-echo "Installing reflector..."
+  rm -f /var/lib/pacman/db.lck
+
+  echo "Installing reflector..."
 if ! pacman -S --noconfirm --needed reflector; then
     echo "Failed to install reflector. Skipping mirror optimization."
     exit 0
@@ -645,10 +712,12 @@ configure_multilib() {
         log_step "Enabling multilib (32-bit) support"
 
         local multilib_script
-        read -r -d '' multilib_script << 'EOF' || true
-set -euo pipefail
+  read -r -d '' multilib_script << 'EOF' || true
+  set -euo pipefail
 
-if ! grep -q '^\[multilib\]' /etc/pacman.conf; then
+  rm -f /var/lib/pacman/db.lck
+
+  if ! grep -q '^\[multilib\]' /etc/pacman.conf; then
     echo "Enabling multilib repository..."
     printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' >> /etc/pacman.conf
     echo "Multilib repository enabled."
@@ -675,12 +744,14 @@ install_aur_helper() {
     fi
 
     local yay_script
-    read -r -d '' yay_script <<'YAY_EOF' || true
-set -euo pipefail
+  read -r -d '' yay_script <<'YAY_EOF' || true
+  set -euo pipefail
 
-current_user="$1"
+  current_user="$1"
 
-echo "Installing build dependencies..."
+  rm -f /var/lib/pacman/db.lck
+
+  echo "Installing build dependencies..."
 pacman -S --noconfirm --needed git base-devel go
 
 echo "Cloning and building yay from AUR..."
@@ -705,12 +776,14 @@ install_pamac() {
     fi
 
     local pamac_script
-    read -r -d '' pamac_script <<'PAMAC_EOF' || true
-set -euo pipefail
+  read -r -d '' pamac_script <<'PAMAC_EOF' || true
+  set -euo pipefail
 
-current_user="$1"
+  current_user="$1"
 
-echo "Installing pamac-aur from AUR..."
+  rm -f /var/lib/pacman/db.lck
+
+  echo "Installing pamac-aur from AUR..."
 sudo -Hu "$current_user" bash -lc "yay -S --noconfirm --needed --noprogressbar pamac-aur"
 
 echo "Configuring Pamac for AUR support..."
@@ -824,11 +897,11 @@ export_pamac_to_host() {
     command -v gtk-update-icon-cache >/dev/null 2>&1 && \
         gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" -f 2>/dev/null || true
 
-    log_info "Exporting Pamac application using distrobox-export..."
-    if run_command distrobox-export --app pamac-manager --container "$CONTAINER_NAME"; then
-        log_success "Pamac exported successfully using distrobox-export."
-    else
-        log_warn "distrobox-export failed. Creating manual desktop entry..."
+  log_info "Exporting Pamac application using distrobox-export..."
+  if run_command distrobox-enter "$CONTAINER_NAME" -- distrobox-export --app pamac-manager; then
+    log_success "Pamac exported successfully using distrobox-export."
+  else
+    log_warn "distrobox-export failed. Creating manual desktop entry..."
 
         local desktop_dir="$HOME/.local/share/applications"
         mkdir -p "$desktop_dir"
@@ -898,20 +971,19 @@ When = PostTransaction
 Exec = /usr/local/bin/distrobox-export-hook.sh
 HOOKDEF
 
-cat > "/usr/local/bin/distrobox-export-hook.sh" << HOOKSCRIPT
+  cat > "/usr/local/bin/distrobox-export-hook.sh" << HOOKSCRIPT
 #!/bin/bash
 set +e
 
-CONTAINER_NAME="${container_name}"
 APP_DIR="/home/${current_user}/.local/share/applications"
 
 if command -v distrobox-export >/dev/null 2>&1; then
-    for desktop in /usr/share/applications/*.desktop; do
-        [[ -f "\$desktop" ]] || continue
-        app_name=\$(basename "\$desktop" .desktop)
-        grep -qi 'NoDisplay=true' "\$desktop" && continue
-        distrobox-export --app "\$app_name" --container "\$CONTAINER_NAME" 2>/dev/null || true
-    done
+for desktop in /usr/share/applications/*.desktop; do
+[[ -f "\$desktop" ]] || continue
+app_name=\$(basename "\$desktop" .desktop)
+grep -qi 'NoDisplay=true' "\$desktop" && continue
+distrobox-export --app "\$app_name" 2>/dev/null || true
+done
 fi
 
 if command -v update-desktop-database >/dev/null 2>&1 && [[ -d "\$APP_DIR" ]]; then
@@ -929,39 +1001,39 @@ HOOK_EOF
 }
 
 export_existing_apps() {
-    log_step "Exporting existing desktop applications from container"
+  log_step "Exporting existing desktop applications from container"
 
-    local export_script
-    read -r -d '' export_script <<'EXPORT_EOF' || true
-set +e
+  local export_script
+  read -r -d '' export_script <<'EXPORT_EOF' || true
+  set +e
 
-current_user="$1"
-container_name="$2"
-exported=0
-failed=0
+  current_user="$1"
+  container_name="$2"
+  exported=0
+  failed=0
 
-for desktop in /usr/share/applications/*.desktop; do
+  for desktop in /usr/share/applications/*.desktop; do
     [[ -f "$desktop" ]] || continue
     app_name=$(basename "$desktop" .desktop)
 
     grep -qi 'NoDisplay=true' "$desktop" && continue
     grep -qi 'TerminalOnly=true' "$desktop" && continue
 
-    if distrobox-export --app "$app_name" --container "$container_name" 2>/dev/null; then
-        exported=$((exported + 1))
+    if distrobox-export --app "$app_name" 2>/dev/null; then
+      exported=$((exported + 1))
     else
-        failed=$((failed + 1))
+      failed=$((failed + 1))
     fi
-done
+  done
 
-echo "Exported $exported applications ($failed failed)"
+  echo "Exported $exported applications ($failed failed)"
 EXPORT_EOF
 
-    if ! echo "$export_script" | container_user_exec bash -s "$CURRENT_USER" "$CONTAINER_NAME"; then
-        log_warn "Some applications could not be exported to host."
-    else
-        log_success "Existing applications exported to host menu."
-    fi
+  if ! echo "$export_script" | distrobox-enter "$CONTAINER_NAME" -- bash -s "$CURRENT_USER" "$CONTAINER_NAME"; then
+    log_warn "Some applications could not be exported to host."
+  else
+    log_success "Existing applications exported to host menu."
+  fi
 }
 
 show_completion_message() {
@@ -1030,27 +1102,58 @@ main() {
     fi
     echo
 
-    if [[ "$FORCE_REBUILD" == "true" ]] && distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
-        log_step "Force rebuild requested - removing existing container"
-        uninstall_setup
-        force_remove_container "$CONTAINER_NAME"
-    fi
+  if [[ "$FORCE_REBUILD" == "true" ]] && distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
+    log_step "Force rebuild requested - removing existing container"
+    uninstall_setup
+    force_remove_container "$CONTAINER_NAME"
+    sleep 2
+  fi
 
-    if ! distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
-        force_remove_container "$CONTAINER_NAME"
-        create_container || exit 1
-    else
-        log_success "Using existing container: $CONTAINER_NAME"
-        if ! container_is_running; then
-            log_info "Container is not running, starting it..."
-            distrobox enter "$CONTAINER_NAME" -- true 2>/dev/null || {
-                log_warn "Container start failed, rebuilding..."
-                force_remove_container "$CONTAINER_NAME"
-                create_container || exit 1
-            }
+  if ! distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
+    force_remove_container "$CONTAINER_NAME"
+    create_container || exit 1
+  else
+    log_info "Container '$CONTAINER_NAME' exists, checking usability..."
+
+    local existing_status
+    existing_status=$(container_get_status)
+    log_debug "Existing container status: $existing_status"
+
+    case "$existing_status" in
+      "running")
+        if container_is_usable; then
+          log_success "Using existing running container: $CONTAINER_NAME"
+        else
+          log_warn "Container is running but not usable, rebuilding..."
+          force_remove_container "$CONTAINER_NAME"
+          sleep 2
+          create_container || exit 1
         fi
+        ;;
+      "stopping"|"paused"|"dead"|"exited"|"stopped")
+        log_warn "Container in '$existing_status' state - removing and recreating"
+        force_remove_container "$CONTAINER_NAME"
+        sleep 2
+        create_container || exit 1
+        ;;
+      "created")
+        log_info "Container in 'created' state, starting..."
+        podman start "$CONTAINER_NAME" >>"$LOG_FILE" 2>&1 || {
+          log_warn "Failed to start, recreating..."
+          force_remove_container "$CONTAINER_NAME"
+          sleep 2
+          create_container || exit 1
+        }
         wait_for_container || exit 1
-    fi
+        ;;
+      *)
+        log_warn "Container in unknown state '$existing_status' - removing and recreating"
+        force_remove_container "$CONTAINER_NAME"
+        sleep 2
+        create_container || exit 1
+        ;;
+    esac
+  fi
 
     configure_container_base || exit 1
     optimize_pacman_mirrors

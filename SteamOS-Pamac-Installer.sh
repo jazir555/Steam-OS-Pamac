@@ -419,18 +419,16 @@ uninstall_setup() {
         fi
 
         if [[ "$container_accessible" == "true" ]]; then
-            local export_list
-            export_list=$(distrobox-enter "$CONTAINER_NAME" -- distrobox-export --list 2>/dev/null || true)
-            local parsed_apps
-            parsed_apps=$(echo "$export_list" | grep -E "^- (App|app|Application):" | sed 's/^- [A-Za-z]*: *//' || true)
-            if [[ -n "$parsed_apps" ]]; then
-                log_info "Removing exported applications..."
-                while IFS= read -r app_name; do
-                    [[ -z "$app_name" ]] && continue
+            log_info "Removing exported applications..."
+            while IFS= read -r app_file; do
+                [[ -z "$app_file" || ! -f "$app_file" ]] && continue
+                local app_name
+                app_name=$(grep '^X-SteamOS-Pamac-SourceApp=' "$app_file" 2>/dev/null | cut -d= -f2- || true)
+                if [[ -n "$app_name" ]]; then
                     log_info "Un-exporting app: $app_name"
                     distrobox-enter "$CONTAINER_NAME" -- distrobox-export --app "$app_name" --delete 2>/dev/null || true
-                done <<< "$parsed_apps"
-            fi
+                fi
+            done < <(find "$HOME/.local/share/applications" -maxdepth 1 -type f -name "*.desktop" -exec grep -l "^X-SteamOS-Pamac-Container=${CONTAINER_NAME}$" {} + 2>/dev/null || true)
         else
             log_warn "Container not accessible for export unlisting. Will clean desktop files directly."
         fi
@@ -448,26 +446,22 @@ uninstall_setup() {
         if [[ "$DRY_RUN" != "true" ]]; then
             local cleaned=0
             while IFS= read -r -d '' df; do
-                if grep -l "distrobox enter ${CONTAINER_NAME}" "$df" >/dev/null 2>&1; then
+                if grep -Eq "X-SteamOS-Pamac-Container=${CONTAINER_NAME}|distrobox( enter|[-]enter).*(^| )${CONTAINER_NAME}( |$)" "$df" >/dev/null 2>&1; then
                     rm -f "$df" 2>/dev/null || true
                     cleaned=$((cleaned + 1))
                 fi
             done < <(find "$app_dir" -maxdepth 1 -type f -name "*.desktop" -print0 2>/dev/null)
-            find "$app_dir" -maxdepth 1 -type f -name "*-${CONTAINER_NAME}.desktop" -delete 2>/dev/null || true
-            if [[ "$container_found" == "true" ]]; then
-                while IFS= read -r -d '' df; do
-                    if grep -l "X-Distrobox-Container=${CONTAINER_NAME}" "$df" >/dev/null 2>&1; then
-                        rm -f "$df" 2>/dev/null || true
-                        cleaned=$((cleaned + 1))
-                    fi
-                done < <(find "$app_dir" -maxdepth 1 -type f -name "*pamac*.desktop" -print0 2>/dev/null)
-            fi
+            find "$app_dir" -maxdepth 1 -type f \( -name "${CONTAINER_NAME}-*.desktop" -o -name "*-${CONTAINER_NAME}.desktop" \) -delete 2>/dev/null || true
+            rm -f "$app_dir/${CONTAINER_NAME}.desktop" 2>/dev/null || true
             command -v update-desktop-database >/dev/null 2>&1 && \
                 update-desktop-database "$app_dir" 2>/dev/null || true
         else
             log_warn "[DRY RUN] Would search for and delete .desktop files in $app_dir"
         fi
     fi
+
+    local state_dir="$HOME/.local/share/steamos-pamac/$CONTAINER_NAME"
+    [[ -d "$state_dir" ]] && { log_info "Removing export state at $state_dir"; [[ "$DRY_RUN" != "true" ]] && rm -rf "$state_dir"; }
 
     local cache_dir="$HOME/.cache/yay-${CONTAINER_NAME}"
     [[ -d "$cache_dir" ]] && { log_info "Removing build cache at $cache_dir"; [[ "$DRY_RUN" != "true" ]] && rm -rf "$cache_dir"; }
@@ -860,27 +854,46 @@ if command -v dbus-daemon >/dev/null 2>&1; then
     fi
 fi
 
-echo "Setting up pamac-daemon autostart for non-systemd environments..."
-init_proc=$(cat /proc/1/comm 2>/dev/null || echo unknown)
-if [[ "$init_proc" != "systemd" ]]; then
-    echo "Non-systemd container detected. Setting up pamac-daemon launch helper."
-    printf '%s\n' '#!/bin/bash' \
-        'set +e' \
-        'if [[ ! -S /run/dbus/system_bus_socket ]]; then' \
-        '    mkdir -p /run/dbus' \
-        '    dbus-daemon --system --fork 2>/dev/null' \
-        'fi' \
-        'if command -v pamac-daemon >/dev/null 2>&1; then' \
-        '    pamac-daemon 2>/dev/null &' \
-        'fi' > /usr/local/bin/pamac-daemon-launch.sh
-    chmod +x /usr/local/bin/pamac-daemon-launch.sh
+echo "Installing Pamac bootstrap helper..."
+printf '%s\n' '#!/bin/bash' \
+    'set +e' \
+    'run_root() {' \
+    '    if [[ "$(id -u)" -eq 0 ]]; then' \
+    '        "$@"' \
+    '    else' \
+    '        sudo "$@"' \
+    '    fi' \
+    '}' \
+    'if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then' \
+    '    systemctl start pamac-daemon >/dev/null 2>&1 || true' \
+    'else' \
+    '    if [[ ! -S /run/dbus/system_bus_socket ]]; then' \
+    '        mkdir -p /run/dbus >/dev/null 2>&1 || true' \
+    '        run_root dbus-daemon --system --fork >/dev/null 2>&1 || true' \
+    '    fi' \
+    '    if command -v pgrep >/dev/null 2>&1 && ! pgrep -x polkitd >/dev/null 2>&1; then' \
+    '        if [[ -x /usr/lib/polkit-1/polkitd ]]; then' \
+    '            run_root /usr/lib/polkit-1/polkitd --no-debug >/dev/null 2>&1 &' \
+    '            sleep 2' \
+    '        fi' \
+    '    fi' \
+    '    if command -v pamac-daemon >/dev/null 2>&1 && ! pgrep -x pamac-daemon >/dev/null 2>&1; then' \
+    '        run_root pamac-daemon >/dev/null 2>&1 &' \
+    '        sleep 2' \
+    '    fi' \
+    'fi' > /usr/local/bin/pamac-session-bootstrap.sh
+chmod +x /usr/local/bin/pamac-session-bootstrap.sh
 
+echo "Adjusting Pamac D-Bus activation for environments without a functional systemd..."
+if ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/dev/null 2>&1; then
+    sed -i '/^SystemdService=/d' /usr/share/dbus-1/system-services/org.manjaro.pamac.daemon.service 2>/dev/null || true
+    sed -i '/^SystemdService=/d' /usr/share/dbus-1/system-services/org.freedesktop.PolicyKit1.service 2>/dev/null || true
     printf '%s\n' '#!/bin/bash' \
-        '/usr/local/bin/pamac-daemon-launch.sh 2>/dev/null &' > /etc/profile.d/pamac-daemon.sh
+        '/usr/local/bin/pamac-session-bootstrap.sh 2>/dev/null &' > /etc/profile.d/pamac-daemon.sh
     chmod +x /etc/profile.d/pamac-daemon.sh
-    echo "pamac-daemon launch helper installed."
+    echo "Non-systemd bootstrap path installed."
 else
-    echo "Systemd container detected. pamac-daemon will be managed by systemd."
+    echo "Functional systemd detected. Pamac daemon can be started with systemctl."
 fi
 
 echo "Container base setup finished."
@@ -1101,15 +1114,12 @@ else
 fi
 
 echo "Syncing package database..."
-init_proc=$(cat /proc/1/comm 2>/dev/null || echo unknown)
-if [[ "$init_proc" == "systemd" ]]; then
+if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
     systemctl enable --now pamac-daemon 2>/dev/null || echo "Note: pamac-daemon service could not be enabled"
-    pamac refresh --no-confirm 2>/dev/null || pamac refresh --force 2>/dev/null || echo "Note: pamac DB sync failed"
 else
-    /usr/local/bin/pamac-daemon-launch.sh 2>/dev/null || true
-    sleep 1
-    pamac refresh --no-confirm 2>/dev/null || pamac refresh --force 2>/dev/null || echo "Note: pamac DB sync failed (daemon may not be running)"
+    /usr/local/bin/pamac-session-bootstrap.sh 2>/dev/null || true
 fi
+pacman -Sy --noconfirm >/dev/null 2>&1 || echo "Note: package database sync failed"
 
 if command -v pamac-manager >/dev/null 2>&1; then
     echo "Pamac installed successfully."
@@ -1200,65 +1210,78 @@ export_pamac_to_host() {
     command -v gtk-update-icon-cache >/dev/null 2>&1 && \
         gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" -f 2>/dev/null || true
 
-  log_info "Exporting Pamac application using distrobox-export..."
-  if run_command distrobox-enter "$CONTAINER_NAME" -- distrobox-export --app pamac-manager; then
-    log_success "Pamac exported successfully using distrobox-export."
-    local exported_desktop
-    exported_desktop=$(find "$HOME/.local/share/applications" -maxdepth 1 -name "pamac-manager*.desktop" -print -quit 2>/dev/null)
-    if [[ -n "$exported_desktop" ]]; then
-        if grep -q '^Exec=.*pamac-manager$' "$exported_desktop" 2>/dev/null; then
-            sed -i 's/^Exec=.*pamac-manager$/Exec=distrobox enter '${CONTAINER_NAME}' -- pamac-manager-wrapper/' "$exported_desktop"
-            log_info "Patched desktop entry to use wrapper: $exported_desktop"
-        fi
-    fi
-  else
-    log_warn "distrobox-export failed. Creating manual desktop entry..."
+    log_info "Creating pamac-manager launch wrapper inside container..."
+    printf '%s\n' '#!/bin/bash' \
+        'set +e' \
+        '/usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true' \
+        'exec pamac-manager "$@"' \
+        | container_root_exec tee /usr/local/bin/pamac-manager-wrapper > /dev/null
+    container_root_exec chmod +x /usr/local/bin/pamac-manager-wrapper
+    log_info "pamac-manager-wrapper created inside container."
+
+    printf '%s\n' '#!/bin/bash' \
+        'set +e' \
+        '/usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true' \
+        'exec pamac "$@"' \
+        | container_root_exec tee /usr/local/bin/pamac-cli-wrapper > /dev/null
+    container_root_exec chmod +x /usr/local/bin/pamac-cli-wrapper
+
+    log_info "Exporting Pamac application using distrobox-export..."
+    if run_command distrobox-enter "$CONTAINER_NAME" -- distrobox-export --app pamac-manager; then
+        log_success "Pamac exported successfully using distrobox-export."
+    else
+        log_warn "distrobox-export failed for Pamac. Creating manual desktop entry..."
 
         local desktop_dir="$HOME/.local/share/applications"
         mkdir -p "$desktop_dir"
 
-        local desktop_file="$desktop_dir/pamac-manager-${CONTAINER_NAME}.desktop"
+        local desktop_file="$desktop_dir/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
         cat > "$desktop_file" << DESKTOP_EOF
 [Desktop Entry]
-Name=Pamac Manager
-Comment=Package Manager for Arch Linux Container
-Exec=distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper
-Icon=pamac-manager
+Name=Add/Remove Software (on ${CONTAINER_NAME})
+Comment=Manage packages inside the ${CONTAINER_NAME} distrobox
+Exec=distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper %U
+Icon=system-software-install
 Terminal=false
 Type=Application
 Categories=System;PackageManager;Settings;
 Keywords=package;manager;software;arch;aur;
 StartupNotify=true
-X-Distrobox-App=pamac-manager
-X-Distrobox-Container=${CONTAINER_NAME}
+StartupWMClass=pamac-manager
+X-SteamOS-Pamac-Managed=true
+X-SteamOS-Pamac-Container=${CONTAINER_NAME}
+X-SteamOS-Pamac-SourceApp=pamac-manager
+X-SteamOS-Pamac-SourceDesktop=org.manjaro.pamac.manager.desktop
+X-SteamOS-Pamac-SourcePackage=pamac-aur
 DESKTOP_EOF
         chmod +x "$desktop_file"
         log_success "Created manual desktop entry: $desktop_file"
     fi
 
+    local exported_desktop="$HOME/.local/share/applications/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
+    if [[ -f "$exported_desktop" ]]; then
+        sed -i -E \
+            -e '/^DBusActivatable=/d' \
+            -e "s|^Exec=.*pamac-manager(.*)$|Exec=distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper\\1|" \
+            "$exported_desktop"
+        sed -i \
+            -e '/^X-SteamOS-Pamac-Managed=/d' \
+            -e '/^X-SteamOS-Pamac-Container=/d' \
+            -e '/^X-SteamOS-Pamac-SourceApp=/d' \
+            -e '/^X-SteamOS-Pamac-SourceDesktop=/d' \
+            -e '/^X-SteamOS-Pamac-SourcePackage=/d' \
+            "$exported_desktop"
+        printf '\nX-SteamOS-Pamac-Managed=true\nX-SteamOS-Pamac-Container=%s\nX-SteamOS-Pamac-SourceApp=pamac-manager\nX-SteamOS-Pamac-SourceDesktop=org.manjaro.pamac.manager.desktop\nX-SteamOS-Pamac-SourcePackage=pamac-aur\n' "$CONTAINER_NAME" >> "$exported_desktop"
+        log_info "Patched exported Pamac desktop entry: $exported_desktop"
+    fi
+
+    mkdir -p "$HOME/.local/share/steamos-pamac/$CONTAINER_NAME"
+    printf '%s\n' "$exported_desktop" > "$HOME/.local/share/steamos-pamac/$CONTAINER_NAME/exported-apps.list"
+    rm -f "$HOME/.local/share/applications/${CONTAINER_NAME}.desktop" 2>/dev/null || true
+
     if command -v update-desktop-database >/dev/null 2>&1; then
         run_command update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
     fi
-
-    log_info "Creating pamac-manager launch wrapper inside container..."
-    printf '%s\n' '#!/bin/bash' \
-        'init_proc=$(cat /proc/1/comm 2>/dev/null || echo unknown)' \
-        'if [[ "$init_proc" != "systemd" ]]; then' \
-        '  if [[ ! -S /run/dbus/system_bus_socket ]]; then' \
-        '    mkdir -p /run/dbus 2>/dev/null || true' \
-        '    dbus-daemon --system --fork 2>/dev/null || true' \
-        '  fi' \
-        '  if command -v pamac-daemon >/dev/null 2>&1; then' \
-        '    if ! pidof pamac-daemon >/dev/null 2>&1; then' \
-        '      pamac-daemon 2>/dev/null &' \
-        '      sleep 1' \
-        '    fi' \
-        '  fi' \
-        'fi' \
-        'exec pamac-manager "$@"' \
-        | container_root_exec tee /usr/local/bin/pamac-manager-wrapper > /dev/null
-    container_root_exec chmod +x /usr/local/bin/pamac-manager-wrapper
-    log_info "pamac-manager-wrapper created inside container."
 
     local bin_dir="$HOME/.local/bin"
     mkdir -p "$bin_dir"
@@ -1266,7 +1289,7 @@ DESKTOP_EOF
 
     cat > "$cli_wrapper" << WRAPPER_EOF
 #!/bin/bash
-exec distrobox enter "${CONTAINER_NAME}" -- pamac "\$@"
+exec distrobox enter "${CONTAINER_NAME}" -- pamac-cli-wrapper "\$@"
 WRAPPER_EOF
     chmod +x "$cli_wrapper"
     log_info "Created CLI wrapper: $cli_wrapper"
@@ -1307,34 +1330,120 @@ HOOKDEF
 set +e
 
 APP_DIR="/home/${current_user}/.local/share/applications"
-EXPORT_LOG="/tmp/distrobox-export-hook.log"
+STATE_DIR="/home/${current_user}/.local/share/steamos-pamac/${container_name}"
+STATE_FILE="\$STATE_DIR/exported-apps.list"
+EXPORT_LOG="\$STATE_DIR/export-hook.log"
+EXPLICIT_FILE="\$(mktemp)"
+NEW_STATE_FILE="\$(mktemp)"
 echo "\$(date): Hook triggered" > "\$EXPORT_LOG"
+mkdir -p "\$APP_DIR" "\$STATE_DIR"
+trap 'rm -f "\$EXPLICIT_FILE" "\$NEW_STATE_FILE"' EXIT
 
-# Remove stale exports for apps no longer installed in container
-if [[ -d "\$APP_DIR" ]]; then
-    for df in "\$APP_DIR"/*.desktop; do
-        [[ -f "\$df" ]] || continue
-        local_app=\$(grep '^X-Distrobox-App=' "\$df" 2>/dev/null | cut -d= -f2)
-        [[ -z "\$local_app" ]] && continue
-        if [[ ! -f "/usr/share/applications/\${local_app}.desktop" ]]; then
-            echo "Removing stale export: \$df" >> "\$EXPORT_LOG"
-            rm -f "\$df"
-        fi
-    done
-fi
+pacman -Qeq > "\$EXPLICIT_FILE" 2>/dev/null || true
+
+should_export_desktop() {
+    local desktop_file="\$1"
+    local app_name="\$2"
+    local owner_pkg="\$3"
+
+    [[ -f "\$desktop_file" ]] || return 1
+    grep -qi '^NoDisplay=true' "\$desktop_file" && return 1
+    grep -qi '^Hidden=true' "\$desktop_file" && return 1
+    grep -qi '^TerminalOnly=true' "\$desktop_file" && return 1
+    if grep -qi '^Type=' "\$desktop_file" && ! grep -qi '^Type=Application$' "\$desktop_file"; then
+        return 1
+    fi
+
+    case "\$app_name" in
+        "${container_name}"|distrobox*)
+            return 1
+            ;;
+        pamac-installer|pamac-tray)
+            return 1
+            ;;
+    esac
+
+    [[ -n "\$owner_pkg" ]] || return 1
+    grep -Fxq "\$owner_pkg" "\$EXPLICIT_FILE"
+}
+
+annotate_desktop() {
+    local desktop_file="\$1"
+    local app_name="\$2"
+    local export_name="\$3"
+    local owner_pkg="\$4"
+
+    [[ -f "\$desktop_file" ]] || return 1
+
+    if [[ "\$app_name" == "org.manjaro.pamac.manager" ]]; then
+        sed -i -E \
+            -e '/^DBusActivatable=/d' \
+            -e "s|^Exec=.*pamac-manager(.*)$|Exec=distrobox enter ${container_name} -- pamac-manager-wrapper\\1|" \
+            "\$desktop_file"
+    fi
+
+    sed -i \
+        -e '/^X-SteamOS-Pamac-Managed=/d' \
+        -e '/^X-SteamOS-Pamac-Container=/d' \
+        -e '/^X-SteamOS-Pamac-SourceApp=/d' \
+        -e '/^X-SteamOS-Pamac-SourceDesktop=/d' \
+        -e '/^X-SteamOS-Pamac-SourcePackage=/d' \
+        "\$desktop_file"
+    printf '\nX-SteamOS-Pamac-Managed=true\nX-SteamOS-Pamac-Container=%s\nX-SteamOS-Pamac-SourceApp=%s\nX-SteamOS-Pamac-SourceDesktop=%s.desktop\nX-SteamOS-Pamac-SourcePackage=%s\n' \
+        "${container_name}" "\$export_name" "\$app_name" "\$owner_pkg" >> "\$desktop_file"
+}
+
+run_distrobox_export() {
+    local app_name="\$1"
+
+    if [[ "\$(id -u)" -eq 0 ]]; then
+        sudo -Hu "${current_user}" env HOME="/home/${current_user}" distrobox-export --app "\$app_name"
+    else
+        HOME="/home/${current_user}" distrobox-export --app "\$app_name"
+    fi
+}
 
 if command -v distrobox-export >/dev/null 2>&1; then
     exported=0
     for desktop in /usr/share/applications/*.desktop; do
         [[ -f "\$desktop" ]] || continue
-        grep -qi 'NoDisplay=true' "\$desktop" && continue
-        app_name=\$(basename "\$desktop" .desktop)
-        if distrobox-export --app "\$app_name" 2>/dev/null; then
+        app_name="\$(basename "\$desktop" .desktop)"
+        export_name="\$app_name"
+        [[ "\$app_name" == "org.manjaro.pamac.manager" ]] && export_name="pamac-manager"
+        owner_pkg="\$(pacman -Qoq "\$desktop" 2>/dev/null || true)"
+        should_export_desktop "\$desktop" "\$app_name" "\$owner_pkg" || continue
+
+        if run_distrobox_export "\$export_name" >/dev/null 2>&1; then
+            host_desktop="\$APP_DIR/${container_name}-\${app_name}.desktop"
+            annotate_desktop "\$host_desktop" "\$app_name" "\$export_name" "\$owner_pkg" || true
+            [[ -f "\$host_desktop" ]] && printf '%s\n' "\$host_desktop" >> "\$NEW_STATE_FILE"
             exported=\$((exported + 1))
         fi
     done
     echo "\$(date): Exported \$exported apps" >> "\$EXPORT_LOG"
 fi
+
+rm -f "\$APP_DIR/${container_name}.desktop" 2>/dev/null || true
+
+while IFS= read -r existing_export; do
+    [[ -n "\$existing_export" ]] || continue
+    if ! grep -Fxq "\$existing_export" "\$NEW_STATE_FILE" 2>/dev/null; then
+        echo "Removing stale container export: \$existing_export" >> "\$EXPORT_LOG"
+        rm -f "\$existing_export"
+    fi
+done < <(find "\$APP_DIR" -maxdepth 1 -type f -name "${container_name}-*.desktop" ! -name "${container_name}.desktop" 2>/dev/null | sort)
+
+if [[ -f "\$STATE_FILE" ]]; then
+    while IFS= read -r old_export; do
+        [[ -n "\$old_export" ]] || continue
+        if ! grep -Fxq "\$old_export" "\$NEW_STATE_FILE" 2>/dev/null; then
+            echo "Removing stale export: \$old_export" >> "\$EXPORT_LOG"
+            rm -f "\$old_export"
+        fi
+    done < "\$STATE_FILE"
+fi
+
+sort -u "\$NEW_STATE_FILE" > "\$STATE_FILE"
 
 if command -v update-desktop-database >/dev/null 2>&1 && [[ -d "\$APP_DIR" ]]; then
     update-desktop-database "\$APP_DIR" 2>/dev/null || true
@@ -1353,36 +1462,10 @@ HOOK_EOF
 export_existing_apps() {
   log_step "Exporting existing desktop applications from container"
 
-  local export_script
-  read -r -d '' export_script <<'EXPORT_EOF' || true
-  set +e
-
-  current_user="$1"
-  container_name="$2"
-  exported=0
-  failed=0
-
-  for desktop in /usr/share/applications/*.desktop; do
-    [[ -f "$desktop" ]] || continue
-    app_name=$(basename "$desktop" .desktop)
-
-    grep -qi 'NoDisplay=true' "$desktop" && continue
-    grep -qi 'TerminalOnly=true' "$desktop" && continue
-
-    if distrobox-export --app "$app_name" 2>/dev/null; then
-      exported=$((exported + 1))
-    else
-      failed=$((failed + 1))
-    fi
-  done
-
-  echo "Exported $exported applications ($failed failed)"
-EXPORT_EOF
-
-  if ! echo "$export_script" | distrobox-enter "$CONTAINER_NAME" -- bash -s "$CURRENT_USER" "$CONTAINER_NAME"; then
-    log_warn "Some applications could not be exported to host."
+  if distrobox-enter "$CONTAINER_NAME" -- /usr/local/bin/distrobox-export-hook.sh >> "$LOG_FILE" 2>&1; then
+    log_success "Existing explicit desktop applications exported to host menu."
   else
-    log_success "Existing applications exported to host menu."
+    log_warn "Some applications could not be exported to host."
   fi
 }
 

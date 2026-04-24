@@ -39,18 +39,16 @@ remove_container() {
         fi
 
         if [[ "$container_accessible" == "true" ]]; then
-            local export_list
-            export_list=$(distrobox-enter "$CONTAINER_NAME" -- distrobox-export --list 2>/dev/null || true)
-            local parsed_apps
-            parsed_apps=$(echo "$export_list" | grep -E "^- (App|app|Application):" | sed 's/^- [A-Za-z]*: *//' || true)
-            if [[ -n "$parsed_apps" ]]; then
-                log_info "Removing exported applications..."
-                while IFS= read -r app_name; do
-                    [[ -z "$app_name" ]] && continue
+            log_info "Removing exported applications..."
+            while IFS= read -r app_file; do
+                [[ -z "$app_file" || ! -f "$app_file" ]] && continue
+                local app_name
+                app_name=$(grep '^X-SteamOS-Pamac-SourceApp=' "$app_file" 2>/dev/null | cut -d= -f2- || true)
+                if [[ -n "$app_name" ]]; then
                     log_info "Un-exporting: $app_name"
                     distrobox-enter "$CONTAINER_NAME" -- distrobox-export --app "$app_name" --delete 2>/dev/null || true
-                done <<< "$parsed_apps"
-            fi
+                fi
+            done < <(find "$HOME/.local/share/applications" -maxdepth 1 -type f -name "*.desktop" -exec grep -l "^X-SteamOS-Pamac-Container=${CONTAINER_NAME}$" {} + 2>/dev/null || true)
         else
             log_warn "Container not accessible - will clean desktop files directly."
         fi
@@ -75,20 +73,14 @@ remove_exported_apps() {
 
     if [[ -d "$app_dir" ]]; then
         while IFS= read -r -d '' df; do
-            if grep -l "distrobox enter ${CONTAINER_NAME}" "$df" >/dev/null 2>&1; then
+            if grep -Eq "X-SteamOS-Pamac-Container=${CONTAINER_NAME}|distrobox( enter|[-]enter).*(^| )${CONTAINER_NAME}( |$)" "$df" >/dev/null 2>&1; then
                 rm -f "$df" 2>/dev/null || true
                 count=$((count + 1))
             fi
         done < <(find "$app_dir" -maxdepth 1 -type f -name "*.desktop" -print0 2>/dev/null)
 
-        find "$app_dir" -maxdepth 1 -type f -name "*-${CONTAINER_NAME}.desktop" -delete 2>/dev/null || true
-
-        while IFS= read -r -d '' df; do
-            if grep -l "X-Distrobox-Container=${CONTAINER_NAME}" "$df" >/dev/null 2>&1; then
-                rm -f "$df" 2>/dev/null || true
-                count=$((count + 1))
-            fi
-        done < <(find "$app_dir" -maxdepth 1 -type f -name "*pamac*.desktop" -print0 2>/dev/null)
+        find "$app_dir" -maxdepth 1 -type f \( -name "${CONTAINER_NAME}-*.desktop" -o -name "*-${CONTAINER_NAME}.desktop" \) -delete 2>/dev/null || true
+        rm -f "$app_dir/${CONTAINER_NAME}.desktop" 2>/dev/null || true
 
         if command -v update-desktop-database &>/dev/null; then
             update-desktop-database "$app_dir" &>> "$LOG_FILE" || true
@@ -113,6 +105,7 @@ clean_wrappers_and_icons() {
 clean_caches() {
     log_info "\n${BOLD}Cleaning leftover files...${NC}"
     rm -rf "$HOME/.cache/yay-${CONTAINER_NAME}" &>> "$LOG_FILE" || true
+    rm -rf "$HOME/.local/share/steamos-pamac/${CONTAINER_NAME}" &>> "$LOG_FILE" || true
     log_success "Cache files removed"
 }
 

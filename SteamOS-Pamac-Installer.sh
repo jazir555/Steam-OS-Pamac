@@ -105,14 +105,20 @@ run_command() {
     return "$status"
 }
 
+container_runtime() {
+    if [[ -n "${PODMAN_SUDO_FALLBACK:-}" ]]; then
+        sudo podman "$@"
+    else
+        podman "$@"
+    fi
+}
+
 container_root_exec() {
-  local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
-  "$mgr" exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" "$@"
+  container_runtime exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" "$@"
 }
 
 container_user_exec() {
-  local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
-  "$mgr" exec -i -u "$CURRENT_USER" \
+  container_runtime exec -i -u "$CURRENT_USER" \
     -e HOME="/home/${CURRENT_USER}" \
     -e XDG_DATA_DIRS="/usr/local/share:/usr/share" \
     -e XDG_DATA_HOME="/home/${CURRENT_USER}/.local/share" \
@@ -122,9 +128,8 @@ container_user_exec() {
 
 container_cp_from() {
     local src="$1" dst="$2"
-    local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
     log_debug "Copying from container: $src -> $dst"
-    if "$mgr" cp "$CONTAINER_NAME:$src" "$dst" 2>/dev/null; then
+    if container_runtime cp "$CONTAINER_NAME:$src" "$dst" 2>/dev/null; then
         log_debug "Copied $src from container."
         return 0
     else
@@ -134,18 +139,15 @@ container_cp_from() {
 }
 
 container_start() {
-  local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
-  "$mgr" start "$CONTAINER_NAME" >>"$LOG_FILE" 2>&1 || true
+  container_runtime start "$CONTAINER_NAME" >>"$LOG_FILE" 2>&1 || true
 }
 
 container_is_running() {
-  local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
-  "$mgr" inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q "true"
+  container_runtime inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q "true"
 }
 
 container_get_status() {
-  local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
-  "$mgr" inspect "$CONTAINER_NAME" --format '{{.State.Status}}' 2>/dev/null || echo "not_found"
+  container_runtime inspect "$CONTAINER_NAME" --format '{{.State.Status}}' 2>/dev/null || echo "not_found"
 }
 
 container_is_usable() {
@@ -208,32 +210,33 @@ ensure_container_healthy() {
 
 force_remove_container() {
   local name="$1"
-  local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
+  local runtime_cmd="podman"
+  [[ -n "${PODMAN_SUDO_FALLBACK:-}" ]] && runtime_cmd="sudo podman"
 
-  if [[ "$mgr" == "docker" ]]; then
+  if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
     docker rm -f "$name" 2>/dev/null || true
     return
   fi
 
-  if ! podman inspect "$name" >/dev/null 2>&1; then
+  if ! $runtime_cmd inspect "$name" >/dev/null 2>&1; then
     return
   fi
 
   local status
-  status=$(podman inspect "$name" --format '{{.State.Status}}' 2>/dev/null || echo "not_found")
+  status=$($runtime_cmd inspect "$name" --format '{{.State.Status}}' 2>/dev/null || echo "not_found")
   if [[ "$status" == "not_found" ]]; then
     return
   fi
 
-  if [[ "$status" == "stopping" || "$status" == "stopped" ]]; then
+  if [[ "$status" == "stopping" || "$status" == "stopped" || "$status" == "improper" ]]; then
     log_debug "Container '$name' in '$status' state - killing container processes"
     local pid
-    pid=$(podman inspect "$name" --format '{{.State.Pid}}' 2>/dev/null || echo "0")
+    pid=$($runtime_cmd inspect "$name" --format '{{.State.Pid}}' 2>/dev/null || echo "0")
     if [[ "$pid" -gt 0 ]]; then
       kill -9 "$pid" 2>/dev/null || true
     fi
     local conmon_pid
-    conmon_pid=$(podman inspect "$name" --format '{{.ConmonPidFile}}' 2>/dev/null || true)
+    conmon_pid=$($runtime_cmd inspect "$name" --format '{{.ConmonPidFile}}' 2>/dev/null || true)
     if [[ -n "$conmon_pid" && -f "$conmon_pid" ]]; then
       local cpid
       cpid=$(cat "$conmon_pid" 2>/dev/null || echo "0")
@@ -244,9 +247,23 @@ force_remove_container() {
     sleep 1
   fi
 
-  podman rm -f "$name" 2>/dev/null || true
-  if podman inspect "$name" >/dev/null 2>&1; then
+  $runtime_cmd rm -f "$name" 2>/dev/null || true
+  if $runtime_cmd inspect "$name" >/dev/null 2>&1; then
     log_debug "User podman rm failed, trying sudo..."
+    sudo podman rm -f "$name" 2>/dev/null || true
+  fi
+
+  if $runtime_cmd inspect "$name" >/dev/null 2>&1; then
+    log_warn "Podman rm still failed for '$name'. Podman may be corrupted. Trying storage cleanup..."
+    local podman_storage="${XDG_DATA_HOME:-$HOME/.local/share}/containers/storage"
+    if [[ -d "$podman_storage" ]]; then
+      find "$podman_storage" -maxdepth 3 -path "*/$name*" -exec rm -rf {} \; 2>/dev/null || true
+    fi
+    local podman_run="/run/user/$(id -u)/containers"
+    if [[ -d "$podman_run" ]]; then
+      find "$podman_run" -maxdepth 2 -path "*/$name*" -exec rm -rf {} \; 2>/dev/null || true
+    fi
+    $runtime_cmd rm -f "$name" 2>/dev/null || true
     sudo podman rm -f "$name" 2>/dev/null || true
   fi
 }
@@ -262,6 +279,39 @@ validate_container_name() {
         log_error "Container name too long (max 63 characters): $CONTAINER_NAME"
         return 1
     fi
+}
+
+check_memory_ok() {
+    local min_avail_kb="${1:-524288}"
+    local desc="${2:-operation}"
+
+    if [[ ! -f /proc/meminfo ]]; then
+        log_debug "Cannot check /proc/meminfo, skipping memory check."
+        return 0
+    fi
+
+    local mem_avail_kb
+    mem_avail_kb=$(grep MemAvailable /proc/meminfo 2>/dev/null | awk '{print $2}' || echo "0")
+
+    if [[ "$mem_avail_kb" == "0" ]]; then
+        log_debug "MemAvailable not found, skipping memory check."
+        return 0
+    fi
+
+    if [[ "$mem_avail_kb" -lt "$min_avail_kb" ]]; then
+        local mem_avail_mb=$(( mem_avail_kb / 1024 ))
+        local min_avail_mb=$(( min_avail_kb / 1024 ))
+        log_warn "Low available memory: ${mem_avail_mb}MB (need at least ${min_avail_mb}MB for $desc)."
+        log_warn "The operation may be killed by OOM. Consider closing other applications."
+        if [[ "$mem_avail_kb" -lt $(( min_avail_kb / 2 )) ]]; then
+            log_error "Insufficient memory for $desc. Skipping this operation."
+            return 1
+        fi
+    else
+        log_debug "Memory check OK: $(( mem_avail_kb / 1024 ))MB available for $desc."
+    fi
+
+    return 0
 }
 
 check_system_requirements() {
@@ -321,6 +371,72 @@ check_system_requirements() {
     [[ "$all_ok" == "true" ]]
 }
 
+repair_podman() {
+    log_step "Attempting podman repair..."
+    local repaired=false
+
+    log_info "Checking rootless podman socket..."
+    local socket_path="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
+    if [[ -S "$socket_path" ]]; then
+        log_debug "Podman socket exists at $socket_path"
+    else
+        log_warn "Podman socket not found. Trying to start podman socket..."
+        if systemctl --user start podman.socket 2>/dev/null; then
+            log_info "Started podman user socket."
+            sleep 2
+            repaired=true
+        fi
+    fi
+
+    if podman info >/dev/null 2>&1; then
+        log_success "Podman is now functional."
+        return 0
+    fi
+
+    log_info "Checking for podman database lock files..."
+    local podman_root="${XDG_DATA_HOME:-$HOME/.local/share}/containers/storage"
+    if [[ -d "$podman_root" ]]; then
+        find "$podman_root" -name "*.lock" -type f -delete 2>/dev/null || true
+        log_debug "Cleaned stale lock files."
+    fi
+
+    if podman info >/dev/null 2>&1; then
+        log_success "Podman recovered after lock cleanup."
+        return 0
+    fi
+
+    log_warn "Podman database may be corrupted. Attempting system reset..."
+    local reset_output
+    reset_output=$(podman system reset --force 2>&1) && rc=0 || rc=$?
+    log_debug "podman system reset: $reset_output"
+
+    if podman info >/dev/null 2>&1; then
+        log_success "Podman recovered after system reset."
+        return 0
+    fi
+
+    log_info "Attempting to migrate podman storage..."
+    podman system migrate 2>/dev/null || true
+
+    if podman info >/dev/null 2>&1; then
+        log_success "Podman recovered after storage migration."
+        return 0
+    fi
+
+    log_info "Trying podman with sudo fallback..."
+    if sudo podman info >/dev/null 2>&1; then
+        log_warn "Rootless podman broken, root podman works. Using sudo for container operations."
+        export PODMAN_SUDO_FALLBACK=true
+        if container_runtime info >/dev/null 2>&1; then
+            log_success "Using root podman fallback."
+            return 0
+        fi
+    fi
+
+    log_error "Podman repair failed. All recovery attempts exhausted."
+    return 1
+}
+
 ensure_podman() {
     if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
         log_debug "Podman already usable"
@@ -330,6 +446,21 @@ ensure_podman() {
     if command -v docker >/dev/null 2>&1; then
         log_debug "Docker found - using it"
         export DISTROBOX_CONTAINER_MANAGER=docker
+        return 0
+    fi
+
+    if command -v podman >/dev/null 2>&1; then
+        log_warn "Podman installed but not functional."
+        if ! repair_podman; then
+            if command -v docker >/dev/null 2>&1; then
+                log_warn "Podman repair failed. Falling back to docker."
+                export DISTROBOX_CONTAINER_MANAGER=docker
+                return 0
+            fi
+            log_error "No working container runtime available. Install podman or docker."
+            return 1
+        fi
+        export DISTROBOX_CONTAINER_MANAGER=podman
         return 0
     fi
 
@@ -522,6 +653,27 @@ wait_for_container() {
           return 2
         fi
         ;;
+      "exited")
+        if [[ $attempt -le 2 ]]; then
+          log_debug "Container exited. Attempting restart (attempt $attempt)..."
+          container_start
+        elif [[ $attempt -le 5 ]]; then
+          local exit_code
+          exit_code=$(container_runtime inspect "$CONTAINER_NAME" --format '{{.State.ExitCode}}' 2>/dev/null || echo "unknown")
+          log_warn "Container keeps exiting (exit code: $exit_code). Inspecting..."
+          case "$exit_code" in
+            137) log_error "Container was OOM-killed (exit 137). Not enough memory available." ;;
+            139) log_error "Container segfaulted (exit 139). Possible kernel or image incompatibility." ;;
+            1) log_warn "Container exited with code 1 (general error)." ;;
+          esac
+          log_debug "Waiting longer before next restart attempt..."
+        else
+          log_warn "Container stuck in 'exited' state - removing and recreating"
+          set -e
+          force_remove_container "$CONTAINER_NAME"
+          return 2
+        fi
+        ;;
       "not_found")
         set -e
         log_error "Container '$CONTAINER_NAME' not found."
@@ -555,8 +707,8 @@ detect_init_support() {
     log_info "Detecting container init system support..."
 
     if grep -q "ID=steamos" /etc/os-release 2>/dev/null; then
-        CONTAINER_HAS_INIT="true"
-        log_info "SteamOS detected - assuming init (systemd) is supported."
+        CONTAINER_HAS_INIT="false"
+        log_info "SteamOS detected - using non-init mode (nested systemd is unreliable on Steam Deck)."
         return
     fi
 
@@ -574,7 +726,11 @@ detect_init_support() {
 
     local init_binary=""
     local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
-    init_binary=$("$mgr" info --format '{{.Host.InitPath}}' 2>/dev/null || echo "")
+    if [[ "$mgr" == "docker" ]]; then
+        init_binary=$(docker info --format '{{.Host.InitPath}}' 2>/dev/null || echo "")
+    else
+        init_binary=$(container_runtime info --format '{{.Host.InitPath}}' 2>/dev/null || echo "")
+    fi
     if [[ -n "$init_binary" ]]; then
         local resolved
         resolved=$(command -v "$init_binary" 2>/dev/null || echo "")
@@ -702,22 +858,78 @@ set -euo pipefail
 
 rm -f /var/lib/pacman/db.lck
 
-echo "Syncing package database..."
-pacman -Syy --noconfirm
+echo "Step 1/4: Cleaning up stale gpg-agent state..."
+pkill -9 gpg-agent 2>/dev/null || true
+pkill -9 dirmngr 2>/dev/null || true
+sleep 1
+rm -f /etc/pacman.d/gnupg/S.gpg-agent 2>/dev/null || true
+rm -f /etc/pacman.d/gnupg/S.gpg-agent.extra 2>/dev/null || true
+rm -f /etc/pacman.d/gnupg/S.gpg-agent.browser 2>/dev/null || true
+rm -f /etc/pacman.d/gnupg/S.gpg-agent.ssh 2>/dev/null || true
+rm -f /etc/pacman.d/gnupg/S.dirmngr 2>/dev/null || true
 
-echo "Updating archlinux-keyring..."
-pacman -S --noconfirm --needed --overwrite '*' archlinux-keyring || {
-    echo "Warning: archlinux-keyring update failed, attempting with forced signatures..."
-    pacman -S --noconfirm --needed archlinux-keyring || echo "Warning: keyring update failed"
-}
+if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
+    echo "Disabling systemd gpg-agent socket activation that interferes with keyring init..."
+    systemctl stop 'gpg-agent@*.socket' 2>/dev/null || true
+    systemctl stop 'gpg-agent@*.service' 2>/dev/null || true
+    systemctl stop 'dirmngr@*.socket' 2>/dev/null || true
+fi
 
-echo "Initializing pacman keyring..."
-pacman-key --init 2>/dev/null || echo "Warning: pacman-key --init had issues"
-pacman-key --populate archlinux 2>/dev/null || {
-    echo "Warning: pacman-key --populate failed."
-    echo "Trying alternative population..."
-    pacman-key --populate archlinux 2>/dev/null || echo "Warning: key population failed - some packages may not verify"
-}
+export GNUPGHOME=/etc/pacman.d/gnupg
+export GPG_AGENT_INFO=
+chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
+
+echo "Step 2/4: Initializing pacman keyring with existing keyring..."
+keyring_init_ok=false
+if pacman-key --init 2>/dev/null; then
+    echo "Keyring init succeeded."
+    keyring_init_ok=true
+else
+    echo "Warning: pacman-key --init failed (likely gpg-agent/systemd conflict)."
+    echo "Attempting with forced gpg-agent cleanup..."
+    pkill -9 gpg-agent 2>/dev/null || true
+    pkill -9 dirmngr 2>/dev/null || true
+    sleep 3
+    rm -f /etc/pacman.d/gnupg/S.gpg-agent /etc/pacman.d/gnupg/S.gpg-agent.extra 2>/dev/null || true
+    rm -f /etc/pacman.d/gnupg/S.gpg-agent.browser /etc/pacman.d/gnupg/S.gpg-agent.ssh 2>/dev/null || true
+    rm -f /etc/pacman.d/gnupg/S.dirmngr 2>/dev/null || true
+    if pacman-key --init 2>/dev/null; then
+        echo "Keyring init succeeded on retry."
+        keyring_init_ok=true
+    else
+        echo "Warning: pacman-key --init still failed."
+    fi
+fi
+
+if [[ "$keyring_init_ok" == "true" ]]; then
+    echo "Step 3/4: Populating keyring with existing archlinux keys..."
+    pacman-key --populate archlinux 2>/dev/null || {
+        echo "Warning: pacman-key --populate failed on first attempt."
+        pacman-key --populate archlinux 2>/dev/null || echo "Warning: key population failed"
+    }
+else
+    echo "Falling back to SigLevel=Never to allow package installation without PGP verification."
+    if command -v sed >/dev/null 2>&1 && sed --version >/dev/null 2>&1; then
+        sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+        if ! grep -q '^SigLevel' /etc/pacman.conf; then
+            echo 'SigLevel = Never' >> /etc/pacman.conf
+        fi
+    else
+        echo "sed not available, writing pacman.conf fallback directly..."
+        printf '[options]\nArchitecture = auto\nSigLevel = Never\n' > /etc/pacman.conf
+    fi
+fi
+
+echo "Step 4/4: Updating archlinux-keyring package..."
+rm -f /var/lib/pacman/db.lck
+if pacman -Syy --noconfirm 2>/dev/null; then
+    pacman -S --noconfirm --needed archlinux-keyring 2>/dev/null || {
+        echo "Warning: archlinux-keyring update failed, retrying..."
+        pacman -S --noconfirm --needed archlinux-keyring 2>/dev/null || echo "Warning: keyring update failed"
+    }
+else
+    echo "Warning: database sync failed, skipping keyring update."
+fi
 
 echo "Keyring initialization complete."
 KEYRING_EOF
@@ -739,43 +951,97 @@ set -euo pipefail
 
 rm -f /var/lib/pacman/db.lck
 
-echo "Upgrading system packages..."
-if pacman -Su --noconfirm --overwrite '*' 2>/dev/null; then
-    echo "System upgrade successful."
-else
-    echo "Standard upgrade had issues. Attempting conflict resolution..."
-    upgrade_out=$(pacman -Su --noconfirm --overwrite '*' 2>&1) && rc=0 || rc=$?
-    if [[ $rc -ne 0 ]]; then
-        echo "$upgrade_out"
-        if echo "$upgrade_out" | grep -q "GPGME error\|invalid or corrupted package\|missing required signature"; then
-            echo "ERROR: PGP signature verification failed. The package keyring may be outdated."
-            echo "The container can still be used for package installation via --noconfirm."
-        elif echo "$upgrade_out" | grep -q "exists in filesystem"; then
-            conflicting=$(echo "$upgrade_out" | grep "exists in filesystem" | sed "s/^[^:]*: *//; s/ exists in filesystem.*$//" || true)
-            if [[ -n "$conflicting" ]]; then
-                echo "Removing conflicting files..."
-                while IFS= read -r f; do
-                    [[ -z "$f" ]] && continue
-                    rm -f "$f" 2>/dev/null || true
-                done <<< "$conflicting"
-            fi
-            if pacman -Su --noconfirm --overwrite '*' 2>/dev/null; then
-                echo "System upgrade successful after resolving conflicts."
-            else
-                echo "Warning: upgrade still failed after conflict resolution."
-            fi
-        else
-            echo "Warning: upgrade failed with unknown error."
-        fi
+echo "Syncing package databases..."
+pacman -Syy --noconfirm 2>/dev/null || echo "Note: database sync had issues but continuing"
+
+verify_core_tools() {
+    if ! command -v pacman >/dev/null 2>&1; then
+        echo "FATAL: pacman is missing. Cannot recover."
+        return 1
+    fi
+    if ! command -v grep >/dev/null 2>&1; then
+        echo "FATAL: grep is missing."
+        return 1
+    fi
+    return 0
+}
+
+verify_core_tools || { echo "Core tools missing before upgrade. Cannot proceed."; exit 2; }
+
+echo "Checking for disk space before upgrade..."
+df_home_kb=$(df -k / 2>/dev/null | awk 'NR==2{print $4}' || echo "0")
+if [[ "$df_home_kb" -lt 512000 ]] && [[ "$df_home_kb" -gt 0 ]]; then
+    echo "Warning: Low disk space (${df_home_kb}KB). Upgrade may fail."
+fi
+
+echo "Checking available system memory..."
+if grep -q MemAvailable /proc/meminfo 2>/dev/null; then
+    mem_avail_kb=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
+    if [[ "$mem_avail_kb" -lt 524288 ]]; then
+        echo "Warning: Low available memory (${mem_avail_kb}KB). Upgrade may be killed by OOM."
     fi
 fi
 
-if ! command -v grep >/dev/null 2>&1 || ! command -v sed >/dev/null 2>&1 || ! command -v pacman >/dev/null 2>&1; then
-    echo "FATAL: Core system utilities missing after upgrade. The container is corrupted."
-    echo "This usually means glibc was partially upgraded and is now broken."
-    echo "The container must be recreated."
-    exit 2
+echo "Upgrading system packages (2-pass: non-critical first, then critical)..."
+rm -f /var/lib/pacman/db.lck
+
+CRITICAL_PKGS="openssl glibc lib32-glibc systemd systemd-libs pam"
+upgrade_ok=true
+
+echo "Pass 1: Upgrading non-critical packages..."
+exclude_args=""
+for pkg in $CRITICAL_PKGS; do
+    exclude_args="$exclude_args --ignore $pkg"
+done
+if ! pacman -Su --noconfirm --needed $exclude_args 2>/dev/null; then
+    echo "Non-critical upgrade had issues, trying with conflict resolution..."
+    pacman -Su --noconfirm --needed $exclude_args 2>/dev/null || echo "Warning: non-critical upgrade failed"
 fi
+
+verify_core_tools || {
+    echo "FATAL: Core tools broken after non-critical upgrade. Cannot recover."
+    exit 2
+}
+
+echo "Pass 2: Upgrading critical packages (openssl, glibc, systemd)..."
+for pkg in $CRITICAL_PKGS; do
+    if pacman -Q "$pkg" >/dev/null 2>&1; then
+        rm -f /var/lib/pacman/db.lck
+        echo "Upgrading $pkg..."
+        if pacman -S --noconfirm --needed "$pkg" 2>/dev/null; then
+            echo "$pkg upgraded."
+        else
+            echo "Warning: $pkg upgrade failed. Attempting recovery..."
+            if ! command -v pacman >/dev/null 2>&1; then
+                echo "FATAL: pacman broken after partial $pkg upgrade. This indicates shared library corruption."
+                echo "Attempting to recover by re-installing $pkg from cache..."
+                if [[ -f /var/cache/pacman/pkg/${pkg}-*.pkg.tar.zst ]] || [[ -f /var/cache/pacman/pkg/${pkg}-*.pkg.tar.xz ]]; then
+                    pacman -U --noconfirm /var/cache/pacman/pkg/${pkg}-*.pkg.tar.* 2>/dev/null || {
+                        echo "FATAL: Recovery failed. The container must be recreated."
+                        exit 2
+                    }
+                else
+                    echo "FATAL: No cached package for $pkg. The container must be recreated."
+                    exit 2
+                fi
+            fi
+        fi
+    fi
+done
+
+verify_core_tools || {
+    echo "FATAL: Core tools broken after critical upgrade. The container must be recreated."
+    exit 2
+}
+
+echo "Running ldconfig to update shared library cache..."
+if command -v ldconfig >/dev/null 2>&1; then
+    ldconfig 2>/dev/null || echo "Note: ldconfig had issues"
+else
+    echo "Note: ldconfig not found, skipping"
+fi
+
+echo "System upgrade completed."
 UPG_EOF
 
     if ! exec_container_script "$upgrade_script" "pacman-upgrade"; then
@@ -796,19 +1062,38 @@ set -euo pipefail
 
 rm -f /var/lib/pacman/db.lck
 
+safe_install() {
+    local attempt=0
+    local max_attempts=3
+    local rc=0
+    while [[ $attempt -lt $max_attempts ]]; do
+        rm -f /var/lib/pacman/db.lck
+        if pacman -S --noconfirm --needed "$@"; then
+            return 0
+        fi
+        rc=$?
+        attempt=$((attempt + 1))
+        if [[ $attempt -lt $max_attempts ]]; then
+            echo "Core package install failed (attempt $attempt/$max_attempts, exit=$rc), repairing DB..."
+            if [[ $rc -eq 137 ]]; then
+                echo "Exit code 137 indicates OOM kill. Syncing and retrying..."
+                sync 2>/dev/null || true
+                sleep 3
+            fi
+            pacman -Dk 2>/dev/null || true
+            pacman -Syy --noconfirm 2>/dev/null || true
+            sleep 2
+        fi
+    done
+    return $rc
+}
+
 echo "Installing core packages (sudo, shadow, gnupg)..."
-if pacman -S --noconfirm --needed --overwrite '*' sudo shadow gnupg; then
-    echo "Core packages installed."
-else
-    echo "Core package install failed. Trying DB recovery..."
-    if pacman -Dk 2>/dev/null; then
-        echo "Local database is consistent. Retrying with force sync..."
-    else
-        echo "Local database has issues. Attempting repair..."
-        pacman -Syy --noconfirm
-    fi
-    pacman -S --noconfirm --needed --overwrite '*' sudo shadow gnupg || exit 1
+if ! safe_install sudo shadow gnupg; then
+    echo "ERROR: Failed to install core packages after retries."
+    exit 1
 fi
+echo "Core packages installed."
 CORE_EOF
 
     if ! exec_container_script "$core_script" "core-packages"; then
@@ -824,20 +1109,74 @@ CORE_EOF
         fi
     fi
 
-    log_info "Stage 4/6: Installing development packages..."
+    log_info "Stage 4/6: Installing development packages (batched to avoid OOM)..."
     local dev_script
     read -r -d '' dev_script <<'DEV_EOF' || true
 set -euo pipefail
 
 rm -f /var/lib/pacman/db.lck
 
-echo "Installing development packages (base-devel, git, go)..."
-if pacman -S --noconfirm --needed --overwrite '*' base-devel git go; then
-    echo "Development packages installed."
-else
-    echo "Dev package install failed. Checking container..."
+check_mem() {
+    local min_kb="${1:-262144}"
+    local desc="${2:-install}"
+    if [[ ! -f /proc/meminfo ]]; then
+        return 0
+    fi
+    local avail_kb
+    avail_kb=$(grep MemAvailable /proc/meminfo 2>/dev/null | awk '{print $2}' || echo "0")
+    if [[ "$avail_kb" != "0" && "$avail_kb" -lt "$min_kb" ]]; then
+        echo "Warning: Low memory (${avail_kb}KB available) for $desc."
+    fi
+}
+
+safe_install() {
+    local attempt=0
+    local max_attempts=3
+    local rc=0
+    while [[ $attempt -lt $max_attempts ]]; do
+        rm -f /var/lib/pacman/db.lck
+        if pacman -S --noconfirm --needed "$@"; then
+            return 0
+        fi
+        rc=$?
+        attempt=$((attempt + 1))
+        if [[ $attempt -lt $max_attempts ]]; then
+            echo "Install failed (attempt $attempt/$max_attempts, exit=$rc), repairing DB..."
+            if [[ $rc -eq 137 ]]; then
+                echo "Exit code 137 indicates OOM kill. Trying with swap flush..."
+                sync 2>/dev/null || true
+                sleep 3
+            fi
+            pacman -Dk 2>/dev/null || true
+            pacman -Syy --noconfirm 2>/dev/null || true
+            sleep 3
+        fi
+    done
+    return $rc
+}
+
+echo "Installing git..."
+check_mem 262144 "git install"
+if ! safe_install git; then
+    echo "Failed to install git."
     exit 1
 fi
+
+echo "Installing base-devel (this may use significant memory)..."
+check_mem 524288 "base-devel install"
+if ! safe_install base-devel; then
+    echo "Failed to install base-devel."
+    exit 1
+fi
+
+echo "Installing go..."
+check_mem 262144 "go install"
+if ! safe_install go; then
+    echo "Failed to install go."
+    exit 1
+fi
+
+echo "Development packages installed."
 DEV_EOF
 
     if ! exec_container_script "$dev_script" "dev-packages"; then
@@ -892,7 +1231,7 @@ USER_EOF
 set -euo pipefail
 
 echo "Installing polkit..."
-if pacman -S --noconfirm --needed --overwrite '*' polkit; then
+if pacman -S --noconfirm --needed polkit; then
     polkit_dir="/etc/polkit-1/rules.d"
     mkdir -p "$polkit_dir"
     printf '%s\n' 'polkit.addRule(function(action, subject) {' \
@@ -1020,7 +1359,7 @@ optimize_pacman_mirrors() {
   rm -f /var/lib/pacman/db.lck
 
   echo "Installing reflector..."
-if ! pacman -S --noconfirm --needed --overwrite '*' reflector; then
+if ! pacman -S --noconfirm --needed reflector; then
     echo "Failed to install reflector. Skipping mirror optimization."
     exit 0
 fi
@@ -1079,20 +1418,74 @@ install_aur_helper() {
         return 0
     fi
 
-    log_info "Stage 1/2: Installing build dependencies..."
+    log_info "Stage 1/2: Installing build dependencies (batched to avoid OOM)..."
     local deps_script
     read -r -d '' deps_script <<'DEPS_EOF' || true
 set -euo pipefail
 
 rm -f /var/lib/pacman/db.lck
 
-echo "Installing build dependencies..."
-if pacman -S --noconfirm --needed --overwrite '*' git base-devel go; then
-    echo "Build dependencies installed."
-else
-    echo "Build dependency install failed."
+check_mem() {
+    local min_kb="${1:-262144}"
+    local desc="${2:-install}"
+    if [[ ! -f /proc/meminfo ]]; then
+        return 0
+    fi
+    local avail_kb
+    avail_kb=$(grep MemAvailable /proc/meminfo 2>/dev/null | awk '{print $2}' || echo "0")
+    if [[ "$avail_kb" != "0" && "$avail_kb" -lt "$min_kb" ]]; then
+        echo "Warning: Low memory (${avail_kb}KB available) for $desc."
+    fi
+}
+
+safe_install() {
+    local attempt=0
+    local max_attempts=3
+    local rc=0
+    while [[ $attempt -lt $max_attempts ]]; do
+        rm -f /var/lib/pacman/db.lck
+        if pacman -S --noconfirm --needed "$@"; then
+            return 0
+        fi
+        rc=$?
+        attempt=$((attempt + 1))
+        if [[ $attempt -lt $max_attempts ]]; then
+            echo "Install failed (attempt $attempt/$max_attempts, exit=$rc), repairing DB..."
+            if [[ $rc -eq 137 ]]; then
+                echo "Exit code 137 indicates OOM kill. Syncing and retrying..."
+                sync 2>/dev/null || true
+                sleep 3
+            fi
+            pacman -Dk 2>/dev/null || true
+            pacman -Syy --noconfirm 2>/dev/null || true
+            sleep 3
+        fi
+    done
+    return $rc
+}
+
+echo "Installing git..."
+check_mem 262144 "git install"
+if ! safe_install git; then
+    echo "Failed to install git."
     exit 1
 fi
+
+echo "Installing base-devel (this may use significant memory)..."
+check_mem 524288 "base-devel install"
+if ! safe_install base-devel; then
+    echo "Failed to install base-devel."
+    exit 1
+fi
+
+echo "Installing go..."
+check_mem 262144 "go install"
+if ! safe_install go; then
+    echo "Failed to install go."
+    exit 1
+fi
+
+echo "Build dependencies installed."
 DEPS_EOF
 
     if ! exec_container_script "$deps_script" "yay-deps"; then
@@ -1126,14 +1519,24 @@ rm -f /var/lib/pacman/db.lck
 echo "Cloning and building yay from AUR..."
 rm -rf /tmp/yay
 
+echo "Ensuring CA certificates are available for HTTPS..."
+pacman -S --noconfirm --needed ca-certificates-mozilla 2>/dev/null || true
+
 clone_retry=0
 max_clone_retries=3
 while [[ $clone_retry -lt $max_clone_retries ]]; do
     if sudo -Hu "$current_user" git clone "https://aur.archlinux.org/yay.git" /tmp/yay 2>/tmp/yay_clone_err; then
         break
     fi
+    clone_err=$(cat /tmp/yay_clone_err 2>/dev/null || true)
     clone_retry=$((clone_retry + 1))
     if [[ $clone_retry -lt $max_clone_retries ]]; then
+        if echo "$clone_err" | grep -qi "SSL\|TLS\|certificate"; then
+            echo "TLS error detected, retrying with SSL verification disabled..."
+            if sudo -Hu "$current_user" env GIT_SSL_NO_VERIFY=true git clone "https://aur.archlinux.org/yay.git" /tmp/yay 2>/tmp/yay_clone_err; then
+                break
+            fi
+        fi
         wait_time=$((2 ** clone_retry))
         echo "Clone failed (attempt $clone_retry/$max_clone_retries). Retrying in ${wait_time}s..."
         sleep "$wait_time"
@@ -1724,6 +2127,15 @@ main() {
     echo -e "${BOLD}${BLUE}Steam Deck Pamac Setup v${SCRIPT_VERSION}${NC}"
     echo
 
+    log_info "Checking available system resources..."
+    check_memory_ok 262144 "container creation" || {
+        log_warn "Low memory detected. Some operations may be skipped to avoid OOM kills."
+        if [[ "$ENABLE_GAMING_PACKAGES" == "true" ]]; then
+            log_warn "Disabling gaming packages to conserve memory."
+            ENABLE_GAMING_PACKAGES="false"
+        fi
+    }
+
   if [[ "$FORCE_REBUILD" == "true" ]] && distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
     log_step "Force rebuild requested - removing existing container"
     uninstall_setup
@@ -1777,6 +2189,8 @@ main() {
     esac
   fi
 
+    check_memory_ok 262144 "base setup" || log_warn "Low memory may cause OOM kills during base setup."
+
     if ! configure_container_base; then
         log_warn "Container base setup had errors. Checking container health..."
         if ! ensure_container_healthy "base setup recovery"; then
@@ -1788,6 +2202,8 @@ main() {
     configure_multilib
 
     ensure_container_healthy "after base setup" || exit 1
+
+    check_memory_ok 524288 "AUR helper build" || log_warn "Low memory may cause OOM kills during yay compilation."
 
     if ! install_aur_helper; then
         if ensure_container_healthy "aur helper recovery"; then

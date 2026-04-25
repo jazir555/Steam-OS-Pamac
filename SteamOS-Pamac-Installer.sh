@@ -72,8 +72,8 @@ _log() {
     echo "[$timestamp] $level: $plain_message" >> "$LOG_FILE"
 
     case "$LOG_LEVEL" in
-        "quiet") [[ "$level" == "ERROR" ]] && echo -e "${color}${message}${NC}" ;;
-        "normal") [[ "$level" != "DEBUG" ]] && echo -e "${color}${message}${NC}" ;;
+        "quiet") if [[ "$level" == "ERROR" ]]; then echo -e "${color}${message}${NC}"; fi ;;
+        "normal") if [[ "$level" != "DEBUG" ]]; then echo -e "${color}${message}${NC}"; fi ;;
         "verbose") echo -e "${color}${message}${NC}" ;;
     esac
 }
@@ -1946,6 +1946,9 @@ export_pamac_to_host() {
         /usr/share/icons/hicolor/scalable/apps/pamac-manager.svg
         /usr/share/icons/hicolor/scalable/apps/org.manjaro.pamac.manager.svg
         /usr/share/icons/hicolor/scalable/apps/system-software-install.svg
+        /usr/share/icons/hicolor/48x48/apps/system-software-install.svg
+        /usr/share/icons/hicolor/32x32/apps/system-software-install.svg
+        /usr/share/icons/hicolor/16x16/apps/system-software-install.svg
         /usr/share/pixmaps/pamac-manager.svg
     )
     for src_icon in "${svg_sources[@]}"; do
@@ -1966,6 +1969,8 @@ export_pamac_to_host() {
         /usr/share/icons/hicolor/48x48/apps/system-software-install.png
         /usr/share/icons/hicolor/64x64/apps/pamac-manager.png
         /usr/share/icons/hicolor/64x64/apps/system-software-install.png
+        /usr/share/icons/AdwaitaLegacy/48x48/legacy/system-software-install.png
+        /usr/share/icons/AdwaitaLegacy/32x32/legacy/system-software-install.png
         /usr/share/pixmaps/pamac-manager.png
     )
     for src_icon in "${png_sources[@]}"; do
@@ -2055,21 +2060,36 @@ DESKTOP_EOF
     fi
 
     if [[ -n "$exported_desktop" && -f "$exported_desktop" ]]; then
-        sed -i '/^DBusActivatable=/d' "$exported_desktop"
-        sed -i "s|^Exec=.*$|Exec=distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper %U|" "$exported_desktop"
-        for key in X-SteamOS-Pamac-Managed X-SteamOS-Pamac-Container X-SteamOS-Pamac-SourceApp X-SteamOS-Pamac-SourceDesktop X-SteamOS-Pamac-SourcePackage; do
-            sed -i "/^${key}=/d" "$exported_desktop"
-        done
-        {
-            printf '\nX-SteamOS-Pamac-Managed=true'
-            printf '\nX-SteamOS-Pamac-Container=%s' "$CONTAINER_NAME"
-            printf '\nX-SteamOS-Pamac-SourceApp=pamac-manager'
-            printf '\nX-SteamOS-Pamac-SourceDesktop=org.manjaro.pamac.manager.desktop'
-            printf '\nX-SteamOS-Pamac-SourcePackage=pamac-aur'
-        } >> "$exported_desktop"
-        log_info "Patched Pamac desktop entry: $exported_desktop"
-    else
-        log_warn "No desktop entry found to patch."
+        rm -f "$exported_desktop"
+    fi
+
+    log_info "Writing clean pamac-manager desktop entry with proper integration markers..."
+    exported_desktop="$desktop_dir/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
+    cat > "$exported_desktop" << DESKTOP_EOF
+[Desktop Entry]
+Type=Application
+Name=Add/Remove Software (on ${CONTAINER_NAME})
+Comment=Manage packages inside the ${CONTAINER_NAME} distrobox
+Exec=distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper %U
+Icon=system-software-install
+Terminal=false
+Categories=System;PackageManager;Settings;
+Keywords=package;manager;software;arch;aur;
+StartupNotify=true
+StartupWMClass=pamac-manager
+NoDisplay=false
+DBusActivatable=false
+X-SteamOS-Pamac-Managed=true
+X-SteamOS-Pamac-Container=${CONTAINER_NAME}
+X-SteamOS-Pamac-SourceApp=pamac-manager
+X-SteamOS-Pamac-SourceDesktop=org.manjaro.pamac.manager.desktop
+X-SteamOS-Pamac-SourcePackage=pamac-aur
+DESKTOP_EOF
+    chmod +x "$exported_desktop"
+    log_success "Pamac desktop entry written: $exported_desktop"
+
+    if [[ ! -f "$exported_desktop" ]]; then
+        log_error "Failed to create desktop entry."
         return 1
     fi
 

@@ -114,10 +114,12 @@ container_runtime() {
 }
 
 container_root_exec() {
+  container_start 2>/dev/null || true
   container_runtime exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" "$@"
 }
 
 container_user_exec() {
+  container_start 2>/dev/null || true
   container_runtime exec -i -u "$CURRENT_USER" \
     -e HOME="/home/${CURRENT_USER}" \
     -e XDG_DATA_DIRS="/usr/local/share:/usr/share" \
@@ -653,27 +655,42 @@ wait_for_container() {
           return 2
         fi
         ;;
-      "exited")
-        if [[ $attempt -le 2 ]]; then
-          log_debug "Container exited. Attempting restart (attempt $attempt)..."
-          container_start
-        elif [[ $attempt -le 5 ]]; then
-          local exit_code
-          exit_code=$(container_runtime inspect "$CONTAINER_NAME" --format '{{.State.ExitCode}}' 2>/dev/null || echo "unknown")
-          log_warn "Container keeps exiting (exit code: $exit_code). Inspecting..."
-          case "$exit_code" in
-            137) log_error "Container was OOM-killed (exit 137). Not enough memory available." ;;
-            139) log_error "Container segfaulted (exit 139). Possible kernel or image incompatibility." ;;
-            1) log_warn "Container exited with code 1 (general error)." ;;
-          esac
-          log_debug "Waiting longer before next restart attempt..."
-        else
-          log_warn "Container stuck in 'exited' state - removing and recreating"
-          set -e
-          force_remove_container "$CONTAINER_NAME"
-          return 2
-        fi
-        ;;
+  "exited")
+    if [[ "$CONTAINER_HAS_INIT" == "false" ]]; then
+      log_debug "Container exited (normal in non-init mode). Restarting..."
+      container_start
+      sleep 3
+      if container_is_usable; then
+        set -e
+        log_success "Container restarted and ready (non-init mode)."
+        return 0
+      fi
+      if [[ $attempt -gt 5 ]]; then
+        log_warn "Non-init container not responding after restart. Removing and recreating."
+        set -e
+        force_remove_container "$CONTAINER_NAME"
+        return 2
+      fi
+    elif [[ $attempt -le 2 ]]; then
+      log_debug "Container exited. Attempting restart (attempt $attempt)..."
+      container_start
+    elif [[ $attempt -le 5 ]]; then
+      local exit_code
+      exit_code=$(container_runtime inspect "$CONTAINER_NAME" --format '{{.State.ExitCode}}' 2>/dev/null || echo "unknown")
+      log_warn "Container keeps exiting (exit code: $exit_code). Inspecting..."
+      case "$exit_code" in
+        137) log_error "Container was OOM-killed (exit 137). Not enough memory available." ;;
+        139) log_error "Container segfaulted (exit 139). Possible kernel or image incompatibility." ;;
+        1) log_warn "Container exited with code 1 (general error)." ;;
+      esac
+      log_debug "Waiting longer before next restart attempt..."
+    else
+      log_warn "Container stuck in 'exited' state - removing and recreating"
+      set -e
+      force_remove_container "$CONTAINER_NAME"
+      return 2
+    fi
+    ;;
       "not_found")
         set -e
         log_error "Container '$CONTAINER_NAME' not found."
@@ -817,33 +834,48 @@ create_container() {
 }
 
 exec_container_script() {
-    local _script="$1"
-    local _desc="$2"
-    shift 2
-    local _rc=0
-    local _script_file
+  local _script="$1"
+  local _desc="$2"
+  shift 2
+  local _rc=0
+  local _script_file
 
-    _script_file=$(mktemp /tmp/pamac-script-XXXXXXXX)
-    printf '%s\n' "$_script" > "$_script_file"
+  _script_file=$(mktemp /tmp/pamac-script-XXXXXXXX)
+  printf '%s\n' "$_script" > "$_script_file"
 
-    set +e
-    if [[ "$LOG_LEVEL" == "verbose" ]]; then
-        container_root_exec bash -s "$@" < "$_script_file" 2>&1 | tee -a "$LOG_FILE"
-        _rc=${PIPESTATUS[0]}
-    else
-        container_root_exec bash -s "$@" < "$_script_file" >> "$LOG_FILE" 2>&1
-        _rc=$?
+  local _marker="PAMAC_SCRIPT_OK_$$_$(date +%s)"
+  printf '\necho "%s"\n' "$_marker" >> "$_script_file"
+
+  set +e
+  local _output=""
+  if [[ "$LOG_LEVEL" == "verbose" ]]; then
+    _output=$(container_root_exec bash -s "$@" < "$_script_file" 2>&1 | tee -a "$LOG_FILE")
+    _rc=${PIPESTATUS[0]}
+  else
+    _output=$(container_root_exec bash -s "$@" < "$_script_file" 2>&1)
+    _rc=$?
+    echo "$_output" >> "$LOG_FILE"
+  fi
+  set -e
+
+  rm -f "$_script_file"
+
+  if [[ "$CONTAINER_HAS_INIT" == "false" ]] && [[ $_rc -eq 137 ]]; then
+    if echo "$_output" | grep -q "$_marker"; then
+      log_debug "Script '$_desc' completed successfully (exit 137 is expected in non-init container - podman kills entry process after completion)."
+      container_start 2>/dev/null || true
+      return 0
     fi
-    set -e
+    log_warn "Script '$_desc' got exit 137 without completion marker. May be OOM or signal kill."
+  fi
 
-    rm -f "$_script_file"
-
-    if [[ $_rc -ne 0 ]]; then
-        log_warn "Script '$_desc' failed (exit=$_rc)."
-        ensure_container_healthy "$_desc" || return 1
-        return $_rc
-    fi
-    return 0
+  if [[ $_rc -ne 0 ]]; then
+    log_warn "Script '$_desc' failed (exit=$_rc)."
+    container_root_exec bash -c "rm -f /var/lib/pacman/db.lck; pkill -9 gpg-agent 2>/dev/null || true" 2>/dev/null || true
+    ensure_container_healthy "$_desc" || return 1
+    return $_rc
+  fi
+  return 0
 }
 
 configure_container_base() {
@@ -1102,6 +1134,7 @@ safe_install() {
     while [[ $attempt -lt $max_attempts ]]; do
         rm -f /var/lib/pacman/db.lck
         if pacman -S --noconfirm --needed "$@"; then
+            ldconfig 2>/dev/null || true
             return 0
         fi
         rc=$?
@@ -1169,6 +1202,7 @@ safe_install() {
     while [[ $attempt -lt $max_attempts ]]; do
         rm -f /var/lib/pacman/db.lck
         if pacman -S --noconfirm --needed "$@"; then
+            ldconfig 2>/dev/null || true
             return 0
         fi
         rc=$?
@@ -1195,20 +1229,33 @@ if ! safe_install git; then
     exit 1
 fi
 
-echo "Installing base-devel (this may use significant memory)..."
+echo "Installing base-devel in smaller batches to avoid OOM..."
 check_mem 524288 "base-devel install"
 sync 2>/dev/null || true
-echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
 sleep 1
-if ! safe_install base-devel; then
-    echo "Failed to install base-devel."
-    exit 1
+BASE_DEVEL_BATCHES=(
+    "m4 autoconf automake binutils"
+    "bison debugedit diffutils fakeroot"
+    "flex gcc gettext groff"
+    "gzip libtool make patch"
+    "pkgconf sed texinfo which"
+)
+for batch in "${BASE_DEVEL_BATCHES[@]}"; do
+    echo "Installing batch: $batch"
+    check_mem 262144 "base-devel batch"
+    sync 2>/dev/null || true
+    sleep 1
+    if ! safe_install $batch; then
+        echo "Warning: batch install failed for: $batch"
+    fi
+done
+if ! pacman -Q base-devel >/dev/null 2>&1 && ! safe_install base-devel; then
+    echo "Warning: base-devel group meta-package could not be installed."
 fi
 
 echo "Installing go..."
 check_mem 262144 "go install"
 sync 2>/dev/null || true
-echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
 sleep 1
 if ! safe_install go; then
     echo "Failed to install go."
@@ -1484,6 +1531,7 @@ safe_install() {
     while [[ $attempt -lt $max_attempts ]]; do
         rm -f /var/lib/pacman/db.lck
         if pacman -S --noconfirm --needed "$@"; then
+            ldconfig 2>/dev/null || true
             return 0
         fi
         rc=$?
@@ -1510,20 +1558,33 @@ if ! safe_install git; then
     exit 1
 fi
 
-echo "Installing base-devel (this may use significant memory)..."
+echo "Installing base-devel in smaller batches to avoid OOM..."
 check_mem 524288 "base-devel install"
 sync 2>/dev/null || true
-echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
 sleep 1
-if ! safe_install base-devel; then
-    echo "Failed to install base-devel."
-    exit 1
+BASE_DEVEL_BATCHES=(
+    "m4 autoconf automake binutils"
+    "bison debugedit diffutils fakeroot"
+    "flex gcc gettext groff"
+    "gzip libtool make patch"
+    "pkgconf sed texinfo which"
+)
+for batch in "${BASE_DEVEL_BATCHES[@]}"; do
+    echo "Installing batch: $batch"
+    check_mem 262144 "base-devel batch"
+    sync 2>/dev/null || true
+    sleep 1
+    if ! safe_install $batch; then
+        echo "Warning: batch install failed for: $batch"
+    fi
+done
+if ! pacman -Q base-devel >/dev/null 2>&1 && ! safe_install base-devel; then
+    echo "Warning: base-devel group meta-package could not be installed."
 fi
 
 echo "Installing go..."
 check_mem 262144 "go install"
 sync 2>/dev/null || true
-echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
 sleep 1
 if ! safe_install go; then
     echo "Failed to install go."
@@ -1588,7 +1649,15 @@ while [[ $clone_retry -lt $max_clone_retries ]]; do
     else
         echo "Clone failed after $max_clone_retries attempts."
         cat /tmp/yay_clone_err 2>/dev/null || true
-        exit 1
+        echo "AUR clone failed. Trying to download yay from GitHub..."
+        rm -rf /tmp/yay
+        if sudo -Hu "$current_user" git clone --depth=1 "https://github.com/Jguer/yay.git" /tmp/yay 2>/tmp/yay_gh_err; then
+            echo "Successfully cloned yay from GitHub."
+        else
+            echo "GitHub clone also failed."
+            cat /tmp/yay_gh_err 2>/dev/null || true
+            exit 1
+        fi
     fi
 done
 
@@ -2243,7 +2312,10 @@ main() {
         fi
     fi
 
+    ensure_container_healthy "before mirror optimization" || exit 1
     optimize_pacman_mirrors
+
+    ensure_container_healthy "before multilib setup" || exit 1
     configure_multilib
 
     ensure_container_healthy "after base setup" || exit 1

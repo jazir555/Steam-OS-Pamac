@@ -1497,18 +1497,29 @@ chmod +x /usr/local/bin/pamac-session-bootstrap.sh
 
 echo "Adjusting Pamac D-Bus activation for environments without a functional systemd..."
 if ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/dev/null 2>&1; then
-    for svc_file in /usr/share/dbus-1/system-services/org.manjaro.pamac.daemon.service \
-                    /usr/share/dbus-1/system-services/org.freedesktop.PolicyKit1.service; do
-        if [[ -f "$svc_file" ]]; then
-            mv "$svc_file" "${svc_file}.disabled-by-steamos-pamac" 2>/dev/null || true
-        fi
-    done
-    printf '%s\n' '#!/bin/bash' \
-        '/usr/local/bin/pamac-session-bootstrap.sh 2>/dev/null &' > /etc/profile.d/pamac-daemon.sh
-    chmod +x /etc/profile.d/pamac-daemon.sh
-    echo "Non-systemd bootstrap path installed (dbus activation disabled for managed services)."
+for svc_file in /usr/share/dbus-1/system-services/org.manjaro.pamac.daemon.service \
+/usr/share/dbus-1/system-services/org.freedesktop.PolicyKit1.service; do
+if [[ -f "$svc_file" ]]; then
+mv "$svc_file" "${svc_file}.disabled-by-steamos-pamac" 2>/dev/null || true
+fi
+done
+printf '%s\n' '#!/bin/bash' \
+'/usr/local/bin/pamac-session-bootstrap.sh 2>/dev/null &' > /etc/profile.d/pamac-daemon.sh
+chmod +x /etc/profile.d/pamac-daemon.sh
+echo "Non-systemd bootstrap path installed (dbus activation disabled for managed services)."
+
+echo "Patching polkit policy for non-interactive authorization..."
+pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
+if [[ -f "$pamac_policy" ]]; then
+sed -i 's|<allow_any>auth_admin_keep</allow_any>|<allow_any>yes</allow_any>|' "$pamac_policy"
+sed -i 's|<allow_inactive>auth_admin_keep</allow_inactive>|<allow_inactive>yes</allow_inactive>|' "$pamac_policy"
+sed -i 's|<allow_active>auth_admin_keep</allow_active>|<allow_active>yes</allow_active>|' "$pamac_policy"
+echo "Polkit policy patched: allow_any=yes, allow_inactive=yes, allow_active=yes"
 else
-    echo "Functional systemd detected. Pamac daemon can be started with systemctl."
+echo "Warning: pamac polkit policy file not found at $pamac_policy"
+fi
+else
+echo "Functional systemd detected. Pamac daemon can be started with systemctl."
 fi
 
 echo "Container base setup finished."

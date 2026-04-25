@@ -2196,29 +2196,47 @@ should_export_desktop() {
 }
 
 annotate_desktop() {
-    local desktop_file="\$1"
-    local app_name="\$2"
-    local export_name="\$3"
-    local owner_pkg="\$4"
+local desktop_file="\$1"
+local app_name="\$2"
+local export_name="\$3"
+local owner_pkg="\$4"
 
-    [[ -f "\$desktop_file" ]] || return 1
+[[ -f "\$desktop_file" ]] || return 1
 
-    if [[ "\$app_name" == "org.manjaro.pamac.manager" ]]; then
-        sed -i -E \
-            -e '/^DBusActivatable=/d' \
-            -e "s|^Exec=.*pamac-manager(.*)$|Exec=distrobox enter ${container_name} -- pamac-manager-wrapper\\1|" \
-            "\$desktop_file"
-    fi
+if [[ "\$app_name" == "org.manjaro.pamac.manager" ]]; then
+cat > "\$desktop_file" << PAMAC_DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Add/Remove Software (on ${container_name})
+Comment=Manage packages inside the ${container_name} distrobox
+Exec=distrobox enter ${container_name} -- pamac-manager-wrapper %U
+Icon=system-software-install
+Terminal=false
+Categories=System;PackageManager;Settings;
+Keywords=package;manager;software;arch;aur;
+StartupNotify=true
+StartupWMClass=pamac-manager
+NoDisplay=false
+DBusActivatable=false
+X-SteamOS-Pamac-Managed=true
+X-SteamOS-Pamac-Container=${container_name}
+X-SteamOS-Pamac-SourceApp=pamac-manager
+X-SteamOS-Pamac-SourceDesktop=org.manjaro.pamac.manager.desktop
+X-SteamOS-Pamac-SourcePackage=pamac-aur
+PAMAC_DESKTOP
+chmod +x "\$desktop_file"
+return 0
+fi
 
-    sed -i \
-        -e '/^X-SteamOS-Pamac-Managed=/d' \
-        -e '/^X-SteamOS-Pamac-Container=/d' \
-        -e '/^X-SteamOS-Pamac-SourceApp=/d' \
-        -e '/^X-SteamOS-Pamac-SourceDesktop=/d' \
-        -e '/^X-SteamOS-Pamac-SourcePackage=/d' \
-        "\$desktop_file"
-    printf '\nX-SteamOS-Pamac-Managed=true\nX-SteamOS-Pamac-Container=%s\nX-SteamOS-Pamac-SourceApp=%s\nX-SteamOS-Pamac-SourceDesktop=%s.desktop\nX-SteamOS-Pamac-SourcePackage=%s\n' \
-        "${container_name}" "\$export_name" "\$app_name" "\$owner_pkg" >> "\$desktop_file"
+sed -i \
+-e '/^X-SteamOS-Pamac-Managed=/d' \
+-e '/^X-SteamOS-Pamac-Container=/d' \
+-e '/^X-SteamOS-Pamac-SourceApp=/d' \
+-e '/^X-SteamOS-Pamac-SourceDesktop=/d' \
+-e '/^X-SteamOS-Pamac-SourcePackage=/d' \
+"\$desktop_file"
+printf '\nX-SteamOS-Pamac-Managed=true\nX-SteamOS-Pamac-Container=%s\nX-SteamOS-Pamac-SourceApp=%s\nX-SteamOS-Pamac-SourceDesktop=%s.desktop\nX-SteamOS-Pamac-SourcePackage=%s\n' \
+"${container_name}" "\$export_name" "\$app_name" "\$owner_pkg" >> "\$desktop_file"
 }
 
 run_distrobox_export() {
@@ -2253,12 +2271,23 @@ if command -v distrobox-export >/dev/null 2>&1; then
         owner_pkg="\$(pacman -Qoq "\$desktop" 2>/dev/null || true)"
         should_export_desktop "\$desktop" "\$app_name" "\$owner_pkg" || continue
 
-        if run_distrobox_export "\$export_name" >/dev/null 2>&1; then
-            host_desktop="\$APP_DIR/${container_name}-\${export_name}.desktop"
-            annotate_desktop "\$host_desktop" "\$app_name" "\$export_name" "\$owner_pkg" || true
-            [[ -f "\$host_desktop" ]] && printf '%s\n' "\$host_desktop" >> "\$NEW_STATE_FILE"
-            exported=\$((exported + 1))
-        fi
+if run_distrobox_export "\$export_name" >/dev/null 2>&1; then
+host_desktop=""
+for candidate in "\$APP_DIR/${container_name}-\${app_name}.desktop" "\$APP_DIR/${container_name}-\${export_name}.desktop"; do
+if [[ -f "\$candidate" ]]; then
+host_desktop="\$candidate"
+break
+fi
+done
+if [[ -z "\$host_desktop" ]]; then
+host_desktop="\$(find "\$APP_DIR" -maxdepth 1 -name "${container_name}-*.desktop" -newer "\$EXPLICIT_FILE" -print -quit 2>/dev/null)"
+fi
+if [[ -n "\$host_desktop" && -f "\$host_desktop" ]]; then
+annotate_desktop "\$host_desktop" "\$app_name" "\$export_name" "\$owner_pkg" || true
+printf '%s\n' "\$host_desktop" >> "\$NEW_STATE_FILE"
+fi
+exported=\$((exported + 1))
+fi
     done
     echo "\$(date): Exported \$exported apps" >> "\$EXPORT_LOG"
 fi

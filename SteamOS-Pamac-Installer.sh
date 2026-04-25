@@ -179,14 +179,25 @@ ensure_container_healthy() {
                 log_info "Container running but not responding. Attempting exec retry..."
                 sleep 2
                 ;;
-            "stopped"|"exited")
-                log_info "Container stopped. Starting..."
-                container_start 2>/dev/null || true
-                wait_for_container || {
-                    log_error "Failed to start container."
-                    return 1
-                }
-                ;;
+  "stopped"|"exited")
+    log_info "Container stopped. Starting..."
+    container_start 2>/dev/null || true
+    sleep 3
+    if [[ "$CONTAINER_HAS_INIT" == "false" ]]; then
+      if container_is_usable; then
+        return 0
+      fi
+      log_debug "Non-init container not yet usable after start, waiting..."
+      sleep 3
+      if container_is_usable; then
+        return 0
+      fi
+    fi
+    wait_for_container || {
+      log_error "Failed to start container."
+      return 1
+    }
+    ;;
             "improper")
                 log_warn "Container in improper state. Attempting forced recovery..."
                 force_remove_container "$CONTAINER_NAME"
@@ -878,6 +889,30 @@ exec_container_script() {
   return 0
 }
 
+exec_container_pipe() {
+  local _desc="$1"
+  local _rc=0
+  local _output=""
+
+  set +e
+  _output=$(container_runtime exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" bash 2>&1)
+  _rc=$?
+  echo "$_output" >> "$LOG_FILE"
+  set -e
+
+  if [[ "$CONTAINER_HAS_INIT" == "false" ]] && [[ $_rc -eq 137 ]]; then
+    log_debug "Piped script '$_desc' completed (exit 137 normal in non-init container)."
+    container_start 2>/dev/null || true
+    return 0
+  fi
+
+  if [[ $_rc -ne 0 ]]; then
+    log_warn "Piped script '$_desc' failed (exit=$_rc)."
+    return 1
+  fi
+  return 0
+}
+
 configure_container_base() {
     log_step "Configuring container base environment"
 
@@ -1463,7 +1498,7 @@ else
 fi
 EOF
 
-    if ! echo "$mirror_script" | container_root_exec bash; then
+    if ! echo "$mirror_script" | exec_container_pipe "mirror-optimization"; then
         log_warn "Mirror optimization had issues. Continuing with default mirrors."
     fi
 }
@@ -2225,10 +2260,11 @@ main() {
         exit $?
     fi
 
-    validate_container_name || exit 1
+  validate_container_name || exit 1
 
-    run_pre_flight_checks || exit 1
-    ensure_podman
+  run_pre_flight_checks || exit 1
+  ensure_podman
+  detect_init_support
 
     if [[ "$DRY_RUN" == "true" ]]; then
         echo -e "${BOLD}${BLUE}Steam Deck Pamac Setup v${SCRIPT_VERSION}${NC} ${BOLD}${YELLOW}(DRY RUN)${NC}"
@@ -2279,10 +2315,25 @@ main() {
         fi
         ;;
       "stopping"|"paused"|"dead"|"exited"|"stopped"|"improper")
-        log_warn "Container in '$existing_status' state - removing and recreating"
-        force_remove_container "$CONTAINER_NAME"
-        sleep 2
-        create_container || exit 1
+        if [[ "$CONTAINER_HAS_INIT" == "false" ]] && [[ "$existing_status" == "exited" || "$existing_status" == "stopped" ]]; then
+          log_info "Container in '$existing_status' state (normal for non-init). Starting..."
+          container_start 2>/dev/null || true
+          sleep 3
+          if container_is_usable; then
+            log_success "Using existing container (restarted): $CONTAINER_NAME"
+            continue_to_setup=true
+          else
+            log_warn "Container not usable after restart, recreating..."
+            force_remove_container "$CONTAINER_NAME"
+            sleep 2
+            create_container || exit 1
+          fi
+        else
+          log_warn "Container in '$existing_status' state - removing and recreating"
+          force_remove_container "$CONTAINER_NAME"
+          sleep 2
+          create_container || exit 1
+        fi
         ;;
       "created")
         log_info "Container in 'created' state, starting..."

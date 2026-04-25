@@ -53,7 +53,7 @@ remove_container() {
             log_warn "Container not accessible - will clean desktop files directly."
         fi
 
-        distrobox stop "$CONTAINER_NAME" &>> "$LOG_FILE" || true
+        distrobox stop --yes "$CONTAINER_NAME" &>> "$LOG_FILE" || true
         if distrobox rm -f "$CONTAINER_NAME" &>> "$LOG_FILE"; then
             log_success "Container removed"
         else

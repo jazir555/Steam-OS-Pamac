@@ -58,7 +58,7 @@ initialize_logging() {
         echo "=========================================="
     } > "$LOG_FILE"
 
-    trap 'echo "=== Run finished: $(date) - Exit: $? ===" >> "$LOG_FILE"' EXIT
+    trap 'exit_code=$?; echo "=== Run finished: $(date) - Exit: $exit_code ===" >> "$LOG_FILE"' EXIT
 }
 
 _log() {
@@ -106,53 +106,46 @@ run_command() {
 }
 
 container_root_exec() {
-  if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
-    docker exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" "$@"
-  else
-    podman exec -i -u 0 -e HOME="/home/${CURRENT_USER}" "$CONTAINER_NAME" "$@"
-  fi
+  local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
+  "$mgr" exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" "$@"
 }
 
 container_user_exec() {
-  if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
-    docker exec -i -u "$CURRENT_USER" -e HOME="/home/${CURRENT_USER}" "$CONTAINER_NAME" "$@"
-  else
-    podman exec -i -u "$CURRENT_USER" -e HOME="/home/${CURRENT_USER}" "$CONTAINER_NAME" "$@"
-  fi
+  local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
+  "$mgr" exec -i -u "$CURRENT_USER" \
+    -e HOME="/home/${CURRENT_USER}" \
+    -e XDG_DATA_DIRS="/usr/local/share:/usr/share" \
+    -e XDG_DATA_HOME="/home/${CURRENT_USER}/.local/share" \
+    -e PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    "$CONTAINER_NAME" "$@"
 }
 
 container_cp_from() {
     local src="$1" dst="$2"
-    if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
-        docker cp "$CONTAINER_NAME:$src" "$dst" 2>/dev/null
+    local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
+    log_debug "Copying from container: $src -> $dst"
+    if "$mgr" cp "$CONTAINER_NAME:$src" "$dst" 2>/dev/null; then
+        log_debug "Copied $src from container."
+        return 0
     else
-        podman cp "$CONTAINER_NAME:$src" "$dst" 2>/dev/null
+        log_debug "Failed to copy $src from container."
+        return 1
     fi
 }
 
 container_start() {
   local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
-  if [[ "$mgr" == "docker" ]]; then
-    docker start "$CONTAINER_NAME" >>"$LOG_FILE" 2>&1 || true
-  else
-    podman start "$CONTAINER_NAME" >>"$LOG_FILE" 2>&1 || true
-  fi
+  "$mgr" start "$CONTAINER_NAME" >>"$LOG_FILE" 2>&1 || true
 }
 
 container_is_running() {
-  if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
-    docker inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q "true"
-  else
-    podman inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q "true"
-  fi
+  local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
+  "$mgr" inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q "true"
 }
 
 container_get_status() {
-  if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
-    docker inspect "$CONTAINER_NAME" --format '{{.State.Status}}' 2>/dev/null || echo "not_found"
-  else
-    podman inspect "$CONTAINER_NAME" --format '{{.State.Status}}' 2>/dev/null || echo "not_found"
-  fi
+  local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
+  "$mgr" inspect "$CONTAINER_NAME" --format '{{.State.Status}}' 2>/dev/null || echo "not_found"
 }
 
 container_is_usable() {
@@ -425,6 +418,9 @@ uninstall_setup() {
         local container_accessible=false
         if distrobox-enter "$CONTAINER_NAME" -- bash -c "echo accessible" 2>/dev/null | grep -q "accessible"; then
             container_accessible=true
+        elif container_is_usable 2>/dev/null; then
+            container_accessible=true
+            log_debug "Container accessible via container exec fallback."
         fi
 
         if [[ "$container_accessible" == "true" ]]; then
@@ -435,14 +431,16 @@ uninstall_setup() {
                 app_name=$(grep '^X-SteamOS-Pamac-SourceApp=' "$app_file" 2>/dev/null | cut -d= -f2- || true)
                 if [[ -n "$app_name" ]]; then
                     log_info "Un-exporting app: $app_name"
-                    distrobox-enter "$CONTAINER_NAME" -- distrobox-export --app "$app_name" --delete 2>/dev/null || true
+                    if [[ "$DRY_RUN" != "true" ]]; then
+                        distrobox-enter "$CONTAINER_NAME" -- env XDG_DATA_DIRS="/usr/local/share:/usr/share" XDG_DATA_HOME="/home/${CURRENT_USER}/.local/share" distrobox-export --app "$app_name" --delete 2>/dev/null || true
+                    fi
                 fi
             done < <(find "$HOME/.local/share/applications" -maxdepth 1 -type f -name "*.desktop" -exec grep -l "^X-SteamOS-Pamac-Container=${CONTAINER_NAME}$" {} + 2>/dev/null || true)
         else
             log_warn "Container not accessible for export unlisting. Will clean desktop files directly."
         fi
 
-        run_command distrobox stop "$CONTAINER_NAME" || true
+        run_command distrobox stop --yes "$CONTAINER_NAME" || true
         run_command distrobox rm -f "$CONTAINER_NAME" || true
         force_remove_container "$CONTAINER_NAME"
     else
@@ -490,6 +488,10 @@ uninstall_setup() {
 }
 
 wait_for_container() {
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_warn "[DRY RUN] Would wait for container '$CONTAINER_NAME'"
+    return 0
+  fi
   local max_attempts=30
   local attempt=0
   log_info "Waiting for container '$CONTAINER_NAME' to become ready..."
@@ -571,25 +573,31 @@ detect_init_support() {
     fi
 
     local init_binary=""
-    init_binary=$(podman info --format '{{.Host.InitPath}}' 2>/dev/null || echo "")
+    local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
+    init_binary=$("$mgr" info --format '{{.Host.InitPath}}' 2>/dev/null || echo "")
     if [[ -n "$init_binary" ]]; then
         local resolved
         resolved=$(command -v "$init_binary" 2>/dev/null || echo "")
         if [[ -n "$resolved" ]] || [[ -f "$init_binary" ]]; then
             CONTAINER_HAS_INIT="true"
-            log_info "Init system supported (podman init binary: $init_binary)."
+            log_info "Init system supported ($mgr init binary: $init_binary)."
         else
             CONTAINER_HAS_INIT="false"
             log_info "Init binary '$init_binary' not found - using non-init container."
         fi
     else
         CONTAINER_HAS_INIT="false"
-        log_info "No podman init support detected - using non-init container."
+        log_info "No $mgr init support detected - using non-init container."
     fi
 }
 
 create_container() {
     log_step "Creating Arch Linux container: $CONTAINER_NAME"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_warn "[DRY RUN] Would create container '$CONTAINER_NAME'"
+        return 0
+    fi
 
     detect_init_support
 
@@ -652,25 +660,27 @@ create_container() {
   fi
 }
 
-exec_container_raw() {
-    local _rc=0
-    set +e
-    "$@" 2>&1 | tee -a "$LOG_FILE"
-    _rc=${PIPESTATUS[0]}
-    set -e
-    return $_rc
-}
-
 exec_container_script() {
     local _script="$1"
     local _desc="$2"
     shift 2
     local _rc=0
+    local _script_file
+
+    _script_file=$(mktemp /tmp/pamac-script-XXXXXXXX)
+    printf '%s\n' "$_script" > "$_script_file"
 
     set +e
-    echo "$_script" | container_root_exec bash -s "$@" 2>&1 | tee -a "$LOG_FILE"
-    _rc=${PIPESTATUS[1]}
+    if [[ "$LOG_LEVEL" == "verbose" ]]; then
+        container_root_exec bash -s "$@" < "$_script_file" 2>&1 | tee -a "$LOG_FILE"
+        _rc=${PIPESTATUS[0]}
+    else
+        container_root_exec bash -s "$@" < "$_script_file" >> "$LOG_FILE" 2>&1
+        _rc=$?
+    fi
     set -e
+
+    rm -f "$_script_file"
 
     if [[ $_rc -ne 0 ]]; then
         log_warn "Script '$_desc' failed (exit=$_rc)."
@@ -703,7 +713,7 @@ else
     upgrade_out=$(pacman -Su --noconfirm --overwrite '*' 2>&1) && rc=0 || rc=$?
     if [[ $rc -ne 0 ]]; then
         echo "$upgrade_out"
-        conflicting=$(echo "$upgrade_out" | grep "exists in filesystem" | sed 's/.*: *//' || true)
+        conflicting=$(echo "$upgrade_out" | grep "exists in filesystem" | sed 's/^[^:]*: *//; s/ exists in filesystem.*$//' || true)
         if [[ -n "$conflicting" ]]; then
             echo "Removing conflicting files..."
             while IFS= read -r f; do
@@ -714,10 +724,13 @@ else
         if pacman -Su --noconfirm --overwrite '*' 2>/dev/null; then
             echo "System upgrade successful after resolving conflicts."
         else
-            echo "Warning: upgrade still had issues. Trying nuclear option..."
-            rm -rf /var/lib/pacman/local/*
+            echo "Warning: upgrade still had issues after conflict resolution."
+            echo "Attempting recovery with force refresh and reinstall..."
             pacman -Syy --noconfirm
-            pacman -Su --noconfirm --overwrite '*' 2>/dev/null || echo "Warning: upgrade partially failed"
+            pacman -Su --noconfirm --overwrite '*' 2>/dev/null || {
+                echo "Warning: upgrade partially failed. Continuing with setup."
+                echo "Container may need manual intervention if package DB is corrupted."
+            }
         fi
     fi
 fi
@@ -747,8 +760,12 @@ if pacman -S --noconfirm --needed --overwrite '*' sudo shadow gnupg; then
     echo "Core packages installed."
 else
     echo "Core package install failed. Trying DB recovery..."
-    rm -rf /var/lib/pacman/local/*
-    pacman -Syy --noconfirm
+    if pacman -Dk 2>/dev/null; then
+        echo "Local database is consistent. Retrying with force sync..."
+    else
+        echo "Local database has issues. Attempting repair..."
+        pacman -Syy --noconfirm
+    fi
     pacman -S --noconfirm --needed --overwrite '*' sudo shadow gnupg || exit 1
 fi
 
@@ -851,6 +868,9 @@ if pacman -S --noconfirm --needed --overwrite '*' polkit; then
         '    }' \
         '});' > "$polkit_dir/10-pamac-nopasswd.rules"
     echo "polkit passwordless rule created for pamac operations."
+    if ! id polkitd >/dev/null 2>&1; then
+        useradd -r -d / -s /usr/bin/nologin polkitd 2>/dev/null || echo "Note: polkitd user creation failed"
+    fi
 else
     echo "Warning: could not install polkit. pamac GUI may prompt for password."
 fi
@@ -908,7 +928,8 @@ ensure_service() {
 }
 
 if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
-    log_bootstrap "systemd detected, starting pamac-daemon via systemctl"
+    log_bootstrap "systemd detected, starting services via systemctl"
+    systemctl start polkit 2>/dev/null || true
     systemctl start pamac-daemon >/dev/null 2>&1 || true
 else
     log_bootstrap "Non-systemd environment, starting services manually"
@@ -921,12 +942,16 @@ chmod +x /usr/local/bin/pamac-session-bootstrap.sh
 
 echo "Adjusting Pamac D-Bus activation for environments without a functional systemd..."
 if ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/dev/null 2>&1; then
-    sed -i '/^SystemdService=/d' /usr/share/dbus-1/system-services/org.manjaro.pamac.daemon.service 2>/dev/null || true
-    sed -i '/^SystemdService=/d' /usr/share/dbus-1/system-services/org.freedesktop.PolicyKit1.service 2>/dev/null || true
+    for svc_file in /usr/share/dbus-1/system-services/org.manjaro.pamac.daemon.service \
+                    /usr/share/dbus-1/system-services/org.freedesktop.PolicyKit1.service; do
+        if [[ -f "$svc_file" ]]; then
+            mv "$svc_file" "${svc_file}.disabled-by-steamos-pamac" 2>/dev/null || true
+        fi
+    done
     printf '%s\n' '#!/bin/bash' \
         '/usr/local/bin/pamac-session-bootstrap.sh 2>/dev/null &' > /etc/profile.d/pamac-daemon.sh
     chmod +x /etc/profile.d/pamac-daemon.sh
-    echo "Non-systemd bootstrap path installed."
+    echo "Non-systemd bootstrap path installed (dbus activation disabled for managed services)."
 else
     echo "Functional systemd detected. Pamac daemon can be started with systemctl."
 fi
@@ -1066,7 +1091,25 @@ rm -f /var/lib/pacman/db.lck
 
 echo "Cloning and building yay from AUR..."
 rm -rf /tmp/yay
-sudo -Hu "$current_user" git clone "https://aur.archlinux.org/yay.git" /tmp/yay
+
+clone_retry=0
+max_clone_retries=3
+while [[ $clone_retry -lt $max_clone_retries ]]; do
+    if sudo -Hu "$current_user" git clone "https://aur.archlinux.org/yay.git" /tmp/yay 2>/tmp/yay_clone_err; then
+        break
+    fi
+    clone_retry=$((clone_retry + 1))
+    if [[ $clone_retry -lt $max_clone_retries ]]; then
+        wait_time=$((2 ** clone_retry))
+        echo "Clone failed (attempt $clone_retry/$max_clone_retries). Retrying in ${wait_time}s..."
+        sleep "$wait_time"
+    else
+        echo "Clone failed after $max_clone_retries attempts."
+        cat /tmp/yay_clone_err 2>/dev/null || true
+        exit 1
+    fi
+done
+
 chown -R "$current_user:$current_user" /tmp/yay
 sudo -Hu "$current_user" bash -lc "cd /tmp/yay && makepkg -si --noconfirm --clean"
 BUILD_EOF
@@ -1150,8 +1193,15 @@ fi
 
 echo "Syncing package database..."
 if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
+    systemctl start polkit 2>/dev/null || true
     systemctl enable --now pamac-daemon 2>/dev/null || echo "Note: pamac-daemon service could not be enabled"
 else
+    for svc_file in /usr/share/dbus-1/system-services/org.manjaro.pamac.daemon.service \
+                    /usr/share/dbus-1/system-services/org.freedesktop.PolicyKit1.service; do
+        if [[ -f "$svc_file" ]] && [[ ! -f "${svc_file}.disabled-by-steamos-pamac" ]]; then
+            mv "$svc_file" "${svc_file}.disabled-by-steamos-pamac" 2>/dev/null || true
+        fi
+    done
     /usr/local/bin/pamac-session-bootstrap.sh 2>/dev/null || true
 fi
 pacman -Sy --noconfirm >/dev/null 2>&1 || echo "Note: package database sync failed"
@@ -1221,25 +1271,44 @@ export_pamac_to_host() {
 
     log_info "Copying pamac icons from container to host..."
 
-    if container_cp_from /usr/share/icons/hicolor/scalable/apps/pamac-manager.svg "$icon_svg_dir/pamac-manager.svg"; then
-        if [[ -s "$icon_svg_dir/pamac-manager.svg" ]]; then
-            log_info "Copied SVG icon"
-        else
-            rm -f "$icon_svg_dir/pamac-manager.svg"
-            log_warn "SVG icon copy produced empty file, removed"
+    local icon_copied=false
+    local svg_sources=(
+        /usr/share/icons/hicolor/scalable/apps/pamac-manager.svg
+        /usr/share/icons/hicolor/scalable/apps/org.manjaro.pamac.manager.svg
+        /usr/share/pixmaps/pamac-manager.svg
+    )
+    for src_icon in "${svg_sources[@]}"; do
+        if container_cp_from "$src_icon" "$icon_svg_dir/pamac-manager.svg"; then
+            if [[ -s "$icon_svg_dir/pamac-manager.svg" ]]; then
+                log_info "Copied SVG icon from $src_icon"
+                icon_copied=true
+                break
+            else
+                rm -f "$icon_svg_dir/pamac-manager.svg"
+            fi
         fi
-    else
-        log_debug "SVG icon not found in container, skipping"
-    fi
-    if container_cp_from /usr/share/icons/hicolor/48x48/apps/pamac-manager.png "$icon_png48_dir/pamac-manager.png"; then
-        if [[ -s "$icon_png48_dir/pamac-manager.png" ]]; then
-            log_info "Copied PNG icon"
-        else
-            rm -f "$icon_png48_dir/pamac-manager.png"
-            log_warn "PNG icon copy produced empty file, removed"
+    done
+
+    local png_sources=(
+        /usr/share/icons/hicolor/48x48/apps/pamac-manager.png
+        /usr/share/icons/hicolor/48x48/apps/org.manjaro.pamac.manager.png
+        /usr/share/icons/hicolor/64x64/apps/pamac-manager.png
+        /usr/share/pixmaps/pamac-manager.png
+    )
+    for src_icon in "${png_sources[@]}"; do
+        if container_cp_from "$src_icon" "$icon_png48_dir/pamac-manager.png"; then
+            if [[ -s "$icon_png48_dir/pamac-manager.png" ]]; then
+                log_info "Copied PNG icon from $src_icon"
+                icon_copied=true
+                break
+            else
+                rm -f "$icon_png48_dir/pamac-manager.png"
+            fi
         fi
-    else
-        log_debug "PNG icon not found in container, skipping"
+    done
+
+    if [[ "$icon_copied" == "false" ]]; then
+        log_info "Pamac icons not found in container. Using system default icon."
     fi
 
     command -v gtk-update-icon-cache >/dev/null 2>&1 && \
@@ -1263,7 +1332,7 @@ export_pamac_to_host() {
 
     log_info "Exporting Pamac application using distrobox-export..."
     local distrobox_export_ok=false
-    if run_command distrobox-enter "$CONTAINER_NAME" -- distrobox-export --app pamac-manager; then
+    if run_command distrobox-enter "$CONTAINER_NAME" -- env XDG_DATA_DIRS="/usr/local/share:/usr/share" XDG_DATA_HOME="/home/${CURRENT_USER}/.local/share" distrobox-export --app pamac-manager; then
         log_success "Pamac exported via distrobox-export."
         distrobox_export_ok=true
     fi
@@ -1312,19 +1381,24 @@ DESKTOP_EOF
         log_success "Created manual desktop entry: $exported_desktop"
     fi
 
-    sed -i '/^DBusActivatable=/d' "$exported_desktop"
-    sed -i "s|^Exec=.*$|Exec=distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper %U|" "$exported_desktop"
-    for key in X-SteamOS-Pamac-Managed X-SteamOS-Pamac-Container X-SteamOS-Pamac-SourceApp X-SteamOS-Pamac-SourceDesktop X-SteamOS-Pamac-SourcePackage; do
-        sed -i "/^${key}=/d" "$exported_desktop"
-    done
-    {
-        printf '\nX-SteamOS-Pamac-Managed=true'
-        printf '\nX-SteamOS-Pamac-Container=%s' "$CONTAINER_NAME"
-        printf '\nX-SteamOS-Pamac-SourceApp=pamac-manager'
-        printf '\nX-SteamOS-Pamac-SourceDesktop=org.manjaro.pamac.manager.desktop'
-        printf '\nX-SteamOS-Pamac-SourcePackage=pamac-aur'
-    } >> "$exported_desktop"
-    log_info "Patched Pamac desktop entry: $exported_desktop"
+    if [[ -n "$exported_desktop" && -f "$exported_desktop" ]]; then
+        sed -i '/^DBusActivatable=/d' "$exported_desktop"
+        sed -i "s|^Exec=.*$|Exec=distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper %U|" "$exported_desktop"
+        for key in X-SteamOS-Pamac-Managed X-SteamOS-Pamac-Container X-SteamOS-Pamac-SourceApp X-SteamOS-Pamac-SourceDesktop X-SteamOS-Pamac-SourcePackage; do
+            sed -i "/^${key}=/d" "$exported_desktop"
+        done
+        {
+            printf '\nX-SteamOS-Pamac-Managed=true'
+            printf '\nX-SteamOS-Pamac-Container=%s' "$CONTAINER_NAME"
+            printf '\nX-SteamOS-Pamac-SourceApp=pamac-manager'
+            printf '\nX-SteamOS-Pamac-SourceDesktop=org.manjaro.pamac.manager.desktop'
+            printf '\nX-SteamOS-Pamac-SourcePackage=pamac-aur'
+        } >> "$exported_desktop"
+        log_info "Patched Pamac desktop entry: $exported_desktop"
+    else
+        log_warn "No desktop entry found to patch."
+        return 1
+    fi
 
     mkdir -p "$HOME/.local/share/steamos-pamac/$CONTAINER_NAME"
     printf '%s\n' "$exported_desktop" > "$HOME/.local/share/steamos-pamac/$CONTAINER_NAME/exported-apps.list"
@@ -1447,10 +1521,22 @@ annotate_desktop() {
 run_distrobox_export() {
     local app_name="\$1"
 
+    local xdg_data_dirs="\${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    local xdg_data_home="\${XDG_DATA_HOME:-/home/${current_user}/.local/share}"
+    local user_path="\${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+
     if [[ "\$(id -u)" -eq 0 ]]; then
-        sudo -Hu "${current_user}" env HOME="/home/${current_user}" distrobox-export --app "\$app_name"
+        sudo -Hu "${current_user}" \
+            env HOME="/home/${current_user}" \
+            XDG_DATA_DIRS="\$xdg_data_dirs" \
+            XDG_DATA_HOME="\$xdg_data_home" \
+            PATH="\$user_path" \
+            distrobox-export --app "\$app_name"
     else
-        HOME="/home/${current_user}" distrobox-export --app "\$app_name"
+        export HOME="/home/${current_user}"
+        export XDG_DATA_DIRS="\$xdg_data_dirs"
+        export XDG_DATA_HOME="\$xdg_data_home"
+        distrobox-export --app "\$app_name"
     fi
 }
 
@@ -1476,23 +1562,27 @@ fi
 
 rm -f "\$APP_DIR/${container_name}.desktop" 2>/dev/null || true
 
+if [[ -f "\$STATE_FILE" ]]; then
+    while IFS= read -r old_export; do
+        [[ -n "\$old_export" ]] || continue
+        if [[ -f "\$old_export" ]]; then
+            printf '%s\n' "\$old_export" >> "\$NEW_STATE_FILE"
+        fi
+    done < "\$STATE_FILE"
+fi
+
 while IFS= read -r existing_export; do
     [[ -n "\$existing_export" ]] || continue
+    if grep -q '^X-SteamOS-Pamac-SourceApp=pamac-manager$' "\$existing_export" 2>/dev/null; then
+        echo "Preserving pamac-manager export: \$existing_export" >> "\$EXPORT_LOG"
+        printf '%s\n' "\$existing_export" >> "\$NEW_STATE_FILE"
+        continue
+    fi
     if ! grep -Fxq "\$existing_export" "\$NEW_STATE_FILE" 2>/dev/null; then
         echo "Removing stale container export: \$existing_export" >> "\$EXPORT_LOG"
         rm -f "\$existing_export"
     fi
 done < <(find "\$APP_DIR" -maxdepth 1 -type f -name "${container_name}-*.desktop" ! -name "${container_name}.desktop" 2>/dev/null | sort)
-
-if [[ -f "\$STATE_FILE" ]]; then
-    while IFS= read -r old_export; do
-        [[ -n "\$old_export" ]] || continue
-        if ! grep -Fxq "\$old_export" "\$NEW_STATE_FILE" 2>/dev/null; then
-            echo "Removing stale export: \$old_export" >> "\$EXPORT_LOG"
-            rm -f "\$old_export"
-        fi
-    done < "\$STATE_FILE"
-fi
 
 sort -u "\$NEW_STATE_FILE" > "\$STATE_FILE"
 
@@ -1513,7 +1603,7 @@ HOOK_EOF
 export_existing_apps() {
   log_step "Exporting existing desktop applications from container"
 
-  if distrobox-enter "$CONTAINER_NAME" -- /usr/local/bin/distrobox-export-hook.sh >> "$LOG_FILE" 2>&1; then
+  if distrobox-enter "$CONTAINER_NAME" -- env XDG_DATA_DIRS="/usr/local/share:/usr/share" XDG_DATA_HOME="/home/${CURRENT_USER}/.local/share" /usr/local/bin/distrobox-export-hook.sh >> "$LOG_FILE" 2>&1; then
     log_success "Existing explicit desktop applications exported to host menu."
   else
     log_warn "Some applications could not be exported to host."
@@ -1580,15 +1670,19 @@ main() {
     fi
 
     validate_container_name || exit 1
-    export PODMAN_ASSUME_YES=1
 
     run_pre_flight_checks || exit 1
     ensure_podman
 
-    echo -e "${BOLD}${BLUE}Steam Deck Pamac Setup v${SCRIPT_VERSION}${NC}"
     if [[ "$DRY_RUN" == "true" ]]; then
-        echo -e "${BOLD}${YELLOW}DRY RUN MODE - No actual changes will be made${NC}"
+        echo -e "${BOLD}${BLUE}Steam Deck Pamac Setup v${SCRIPT_VERSION}${NC} ${BOLD}${YELLOW}(DRY RUN)${NC}"
+        echo
+        log_success "Pre-flight checks passed. Dry run complete."
+        log_info "No actual changes were made."
+        exit 0
     fi
+
+    echo -e "${BOLD}${BLUE}Steam Deck Pamac Setup v${SCRIPT_VERSION}${NC}"
     echo
 
   if [[ "$FORCE_REBUILD" == "true" ]] && distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then

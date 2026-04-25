@@ -841,12 +841,40 @@ create_container() {
   else
     log_error "Container created but is not functional."
     return 1
-  fi
+    fi
+}
+
+repair_pacman_db() {
+    log_info "Checking and repairing pacman database (if needed)..."
+    container_root_exec bash -c '
+set +e
+rm -f /var/lib/pacman/db.lck
+
+if ! pacman -Dk 2>/dev/null; then
+    echo "Pacman DB inconsistencies detected. Attempting repair..."
+    for db_dir in /var/lib/pacman/local/*/; do
+        pkg_name=$(basename "$db_dir")
+        if [[ ! -f "$db_dir/desc" ]]; then
+            echo "Removing broken DB entry: $pkg_name (missing desc)"
+            rm -rf "$db_dir"
+        fi
+        if [[ ! -f "$db_dir/files" ]]; then
+            echo "Reinstalling package with missing files DB: $pkg_name"
+            pkg_base=$(grep -m1 "^%NAME%$" "$db_dir/desc" 2>/dev/null | tail -1)
+            [[ -z "$pkg_base" ]] && pkg_base=$(echo "$pkg_name" | sed "s/-[0-9].*//")
+            pacman -S --noconfirm --needed "$pkg_base" 2>/dev/null || true
+        fi
+    done
+    pacman -Dk 2>/dev/null || echo "Warning: pacman DB still has minor inconsistencies (non-fatal)."
+else
+    echo "Pacman DB is consistent."
+fi
+' 2>/dev/null || true
 }
 
 exec_container_script() {
-  local _script="$1"
-  local _desc="$2"
+    local _script="$1"
+    local _desc="$2"
   shift 2
   local _rc=0
   local _script_file
@@ -871,46 +899,73 @@ exec_container_script() {
 
   rm -f "$_script_file"
 
-  if [[ "$CONTAINER_HAS_INIT" == "false" ]] && [[ $_rc -eq 137 ]]; then
-    if echo "$_output" | grep -q "$_marker"; then
-      log_debug "Script '$_desc' completed successfully (exit 137 is expected in non-init container - podman kills entry process after completion)."
-      container_start 2>/dev/null || true
-      return 0
+    if [[ "$CONTAINER_HAS_INIT" == "false" ]] && [[ $_rc -eq 137 ]]; then
+        if echo "$_output" | grep -q "$_marker"; then
+            log_debug "Script '$_desc' completed successfully (exit 137 is expected in non-init container - podman kills entry process after completion)."
+            container_start 2>/dev/null || true
+            repair_pacman_db
+            return 0
+        fi
+        log_warn "Script '$_desc' got exit 137 without completion marker. May be OOM or signal kill. Attempting DB repair..."
+        container_start 2>/dev/null || true
+        repair_pacman_db
     fi
-    log_warn "Script '$_desc' got exit 137 without completion marker. May be OOM or signal kill."
-  fi
 
-  if [[ $_rc -ne 0 ]]; then
-    log_warn "Script '$_desc' failed (exit=$_rc)."
-    container_root_exec bash -c "rm -f /var/lib/pacman/db.lck; pkill -9 gpg-agent 2>/dev/null || true" 2>/dev/null || true
-    ensure_container_healthy "$_desc" || return 1
-    return $_rc
-  fi
-  return 0
+    if [[ $_rc -ne 0 ]]; then
+        log_warn "Script '$_desc' failed (exit=$_rc)."
+        container_root_exec bash -c "rm -f /var/lib/pacman/db.lck; pkill -9 gpg-agent 2>/dev/null || true" 2>/dev/null || true
+        ensure_container_healthy "$_desc" || return 1
+        repair_pacman_db
+        return $_rc
+    fi
+    return 0
 }
 
 exec_container_pipe() {
-  local _desc="$1"
-  local _rc=0
-  local _output=""
+    local _desc="$1"
+    shift
+    local _rc=0
+    local _script_file
+    local _marker="PAMAC_PIPE_OK_$$_$(date +%s)"
 
-  set +e
-  _output=$(container_runtime exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" bash 2>&1)
-  _rc=$?
-  echo "$_output" >> "$LOG_FILE"
-  set -e
+    _script_file=$(mktemp /tmp/pamac-pipe-XXXXXXXX)
+    cat > "$_script_file"
+    printf '\necho "%s"\n' "$_marker" >> "$_script_file"
 
-  if [[ "$CONTAINER_HAS_INIT" == "false" ]] && [[ $_rc -eq 137 ]]; then
-    log_debug "Piped script '$_desc' completed (exit 137 normal in non-init container)."
-    container_start 2>/dev/null || true
+    set +e
+    local _output=""
+    if [[ "$LOG_LEVEL" == "verbose" ]]; then
+        _output=$(container_root_exec bash -s "$@" < "$_script_file" 2>&1 | tee -a "$LOG_FILE")
+        _rc=${PIPESTATUS[0]}
+    else
+        _output=$(container_root_exec bash -s "$@" < "$_script_file" 2>&1)
+        _rc=$?
+        echo "$_output" >> "$LOG_FILE"
+    fi
+    set -e
+
+    rm -f "$_script_file"
+
+    if [[ "$CONTAINER_HAS_INIT" == "false" ]] && [[ $_rc -eq 137 ]]; then
+        if echo "$_output" | grep -q "$_marker"; then
+            log_debug "Piped script '$_desc' completed successfully (exit 137 is expected in non-init container - podman kills entry process after completion)."
+            container_start 2>/dev/null || true
+            repair_pacman_db
+            return 0
+        fi
+        log_warn "Piped script '$_desc' got exit 137 without completion marker. May be OOM or signal kill. Attempting DB repair..."
+        container_start 2>/dev/null || true
+        repair_pacman_db
+    fi
+
+    if [[ $_rc -ne 0 ]]; then
+        log_warn "Piped script '$_desc' failed (exit=$_rc)."
+        container_root_exec bash -c "rm -f /var/lib/pacman/db.lck; pkill -9 gpg-agent 2>/dev/null || true" 2>/dev/null || true
+        ensure_container_healthy "$_desc" || return 1
+        repair_pacman_db
+        return $_rc
+    fi
     return 0
-  fi
-
-  if [[ $_rc -ne 0 ]]; then
-    log_warn "Piped script '$_desc' failed (exit=$_rc)."
-    return 1
-  fi
-  return 0
 }
 
 configure_container_base() {
@@ -1525,7 +1580,7 @@ echo "Updating package database..."
 pacman -Sy --noconfirm
 EOF
 
-        if ! echo "$multilib_script" | container_root_exec bash; then
+        if ! echo "$multilib_script" | exec_container_pipe "multilib-setup"; then
             log_warn "Failed to enable multilib support. 32-bit packages may not be available."
         fi
     fi
@@ -1848,7 +1903,7 @@ else
 fi
 EOF
 
-    if ! echo "$gaming_script" | container_root_exec bash -s "$CURRENT_USER" "$ENABLE_MULTILIB"; then
+    if ! echo "$gaming_script" | exec_container_pipe "gaming-packages" "$CURRENT_USER" "$ENABLE_MULTILIB"; then
         log_warn "Gaming package installation encountered errors."
     fi
 }
@@ -2186,7 +2241,7 @@ chmod +x "/usr/local/bin/distrobox-export-hook.sh"
 echo "Post-install hook configured."
 HOOK_EOF
 
-    if ! echo "$hook_script" | container_root_exec bash -s "$CURRENT_USER" "$CONTAINER_NAME"; then
+    if ! echo "$hook_script" | exec_container_pipe "post-install-hooks" "$CURRENT_USER" "$CONTAINER_NAME"; then
         log_warn "Failed to set up post-install hooks. Newly installed apps may not auto-appear in menu."
     fi
 }

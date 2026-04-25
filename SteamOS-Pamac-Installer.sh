@@ -1489,7 +1489,7 @@ systemctl start pamac-daemon >/dev/null 2>&1 || true
 else
 log_bootstrap "Non-systemd environment, starting services manually"
 ensure_service "dbus-daemon" "dbus-daemon" 'mkdir -p /run/dbus; dbus-daemon --system --fork 2>/dev/null'
-ensure_service "polkitd" "polkitd" 'if [[ -x /usr/lib/polkit-1/polkitd ]]; then /usr/lib/polkit-1/polkitd --no-debug &; fi'
+ensure_service "polkitd" "polkitd" 'if [[ -x /usr/lib/polkit-1/polkitd ]]; then /usr/lib/polkit-1/polkitd --no-debug & fi'
 ensure_service "pamac-daemon" "pamac-daemon" '/usr/bin/pamac-daemon &'
 fi
 BOOTSTRAP

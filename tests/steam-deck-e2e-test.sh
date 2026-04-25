@@ -53,9 +53,9 @@ distrobox_exec() {
 }
 
 pamac_exec() {
-	local cmd="${1//\'/\\\'}"
-	local timeout_sec="${2:-30}"
-	distrobox_exec "pamac-daemon --no-daemon &>/dev/null & sleep 1; $cmd" "$timeout_sec"
+local cmd="${1//\'/\\\'}"
+local timeout_sec="${2:-30}"
+distrobox_exec "mkdir -p /run/dbus; dbus-daemon --system --fork 2>/dev/null; /usr/lib/polkit-1/polkitd --no-debug &>/dev/null & sleep 1; /usr/bin/pamac-daemon &>/dev/null & sleep 2; $cmd" "$timeout_sec"
 }
 
 cleanup_package() {

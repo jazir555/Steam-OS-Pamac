@@ -695,60 +695,101 @@ configure_container_base() {
 
     local _ok=true
 
-    log_info "Stage 1/5: Syncing pacman database and upgrading system..."
+    log_info "Stage 1/6: Initializing pacman keyring..."
+    local keyring_script
+    read -r -d '' keyring_script <<'KEYRING_EOF' || true
+set -euo pipefail
+
+rm -f /var/lib/pacman/db.lck
+
+echo "Syncing package database..."
+pacman -Syy --noconfirm
+
+echo "Updating archlinux-keyring..."
+pacman -S --noconfirm --needed --overwrite '*' archlinux-keyring || {
+    echo "Warning: archlinux-keyring update failed, attempting with forced signatures..."
+    pacman -S --noconfirm --needed archlinux-keyring || echo "Warning: keyring update failed"
+}
+
+echo "Initializing pacman keyring..."
+pacman-key --init 2>/dev/null || echo "Warning: pacman-key --init had issues"
+pacman-key --populate archlinux 2>/dev/null || {
+    echo "Warning: pacman-key --populate failed."
+    echo "Trying alternative population..."
+    pacman-key --populate archlinux 2>/dev/null || echo "Warning: key population failed - some packages may not verify"
+}
+
+echo "Keyring initialization complete."
+KEYRING_EOF
+
+    if ! exec_container_script "$keyring_script" "keyring-init"; then
+        log_warn "Keyring initialization had issues. Continuing..."
+        _ok=false
+    fi
+
+    if ! container_is_usable; then
+        log_error "Container not usable after keyring init."
+        return 1
+    fi
+
+    log_info "Stage 2/6: Performing system upgrade..."
     local upgrade_script
     read -r -d '' upgrade_script <<'UPG_EOF' || true
 set -euo pipefail
 
 rm -f /var/lib/pacman/db.lck
 
-echo "Syncing package database (keeping local DB intact)..."
-pacman -Syy --noconfirm
-
-echo "Upgrading system packages with conflict handling..."
+echo "Upgrading system packages..."
 if pacman -Su --noconfirm --overwrite '*' 2>/dev/null; then
     echo "System upgrade successful."
 else
-    echo "Handling filesystem conflicts..."
+    echo "Standard upgrade had issues. Attempting conflict resolution..."
     upgrade_out=$(pacman -Su --noconfirm --overwrite '*' 2>&1) && rc=0 || rc=$?
     if [[ $rc -ne 0 ]]; then
         echo "$upgrade_out"
-        conflicting=$(echo "$upgrade_out" | grep "exists in filesystem" | sed 's/^[^:]*: *//; s/ exists in filesystem.*$//' || true)
-        if [[ -n "$conflicting" ]]; then
-            echo "Removing conflicting files..."
-            while IFS= read -r f; do
-                [[ -z "$f" ]] && continue
-                rm -f "$f" 2>/dev/null || true
-            done <<< "$conflicting"
-        fi
-        if pacman -Su --noconfirm --overwrite '*' 2>/dev/null; then
-            echo "System upgrade successful after resolving conflicts."
+        if echo "$upgrade_out" | grep -q "GPGME error\|invalid or corrupted package\|missing required signature"; then
+            echo "ERROR: PGP signature verification failed. The package keyring may be outdated."
+            echo "The container can still be used for package installation via --noconfirm."
+        elif echo "$upgrade_out" | grep -q "exists in filesystem"; then
+            conflicting=$(echo "$upgrade_out" | grep "exists in filesystem" | sed "s/^[^:]*: *//; s/ exists in filesystem.*$//" || true)
+            if [[ -n "$conflicting" ]]; then
+                echo "Removing conflicting files..."
+                while IFS= read -r f; do
+                    [[ -z "$f" ]] && continue
+                    rm -f "$f" 2>/dev/null || true
+                done <<< "$conflicting"
+            fi
+            if pacman -Su --noconfirm --overwrite '*' 2>/dev/null; then
+                echo "System upgrade successful after resolving conflicts."
+            else
+                echo "Warning: upgrade still failed after conflict resolution."
+            fi
         else
-            echo "Warning: upgrade still had issues after conflict resolution."
-            echo "Attempting recovery with force refresh and reinstall..."
-            pacman -Syy --noconfirm
-            pacman -Su --noconfirm --overwrite '*' 2>/dev/null || {
-                echo "Warning: upgrade partially failed. Continuing with setup."
-                echo "Container may need manual intervention if package DB is corrupted."
-            }
+            echo "Warning: upgrade failed with unknown error."
         fi
     fi
+fi
+
+if ! command -v grep >/dev/null 2>&1 || ! command -v sed >/dev/null 2>&1 || ! command -v pacman >/dev/null 2>&1; then
+    echo "FATAL: Core system utilities missing after upgrade. The container is corrupted."
+    echo "This usually means glibc was partially upgraded and is now broken."
+    echo "The container must be recreated."
+    exit 2
 fi
 UPG_EOF
 
     if ! exec_container_script "$upgrade_script" "pacman-upgrade"; then
         log_warn "System upgrade had issues, continuing anyway..."
         if ! container_is_usable; then
-            log_warn "Container not usable, attempting restart..."
-            container_start 2>/dev/null || true
-            wait_for_container || {
-                log_error "Container unrecoverable after upgrade attempt."
-                return 1
-            }
+            log_error "Container is not usable after upgrade attempt."
+            log_error "This usually indicates a partial glibc upgrade corrupted the container."
+            log_error "Try running: podman rm -f $CONTAINER_NAME && distrobox rm -f $CONTAINER_NAME"
+            log_error "Then re-run this script with --force-rebuild"
+            return 1
         fi
     fi
 
-    log_info "Stage 2/5: Installing core system packages..."
+    log_info "Stage 3/6: Installing core system packages..."
     local core_script
     read -r -d '' core_script <<'CORE_EOF' || true
 set -euo pipefail
@@ -768,13 +809,6 @@ else
     fi
     pacman -S --noconfirm --needed --overwrite '*' sudo shadow gnupg || exit 1
 fi
-
-echo "Installing archlinux-keyring..."
-pacman -S --noconfirm --needed --overwrite '*' archlinux-keyring || echo "Warning: archlinux-keyring install failed"
-
-echo "Initializing pacman keyring..."
-pacman-key --init 2>/dev/null || echo "Warning: pacman-key --init failed"
-pacman-key --populate archlinux 2>/dev/null || echo "Warning: pacman-key --populate failed"
 CORE_EOF
 
     if ! exec_container_script "$core_script" "core-packages"; then
@@ -790,7 +824,7 @@ CORE_EOF
         fi
     fi
 
-    log_info "Stage 3/5: Installing development packages..."
+    log_info "Stage 4/6: Installing development packages..."
     local dev_script
     read -r -d '' dev_script <<'DEV_EOF' || true
 set -euo pipefail
@@ -819,7 +853,7 @@ DEV_EOF
         fi
     fi
 
-    log_info "Stage 4/5: Creating user and configuring sudo..."
+    log_info "Stage 5/6: Creating user and configuring sudo..."
     local user_script
     read -r -d '' user_script <<'USER_EOF' || true
 set -euo pipefail
@@ -852,7 +886,7 @@ USER_EOF
 
     exec_container_script "$user_script" "user-setup" "$CURRENT_USER" || return 1
 
-    log_info "Stage 5/5: Installing polkit, dbus, and pamac-daemon helper..."
+    log_info "Stage 6/6: Installing polkit, dbus, and pamac-daemon helper..."
     local misc_script
     read -r -d '' misc_script <<'MISC_EOF' || true
 set -euo pipefail

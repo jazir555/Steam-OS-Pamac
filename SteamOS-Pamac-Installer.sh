@@ -903,20 +903,33 @@ fi
 
 if [[ "$keyring_init_ok" == "true" ]]; then
     echo "Step 3/4: Populating keyring with existing archlinux keys..."
-    pacman-key --populate archlinux 2>/dev/null || {
-        echo "Warning: pacman-key --populate failed on first attempt."
-        pacman-key --populate archlinux 2>/dev/null || echo "Warning: key population failed"
-    }
+    echo "Ensuring correct permissions on GPG directory..."
+    chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
+    find /etc/pacman.d/gnupg -type f -exec chmod 600 {} \; 2>/dev/null || true
+    find /etc/pacman.d/gnupg -type d -exec chmod 700 {} \; 2>/dev/null || true
+    if pacman-key --populate archlinux 2>/dev/null; then
+        echo "Keyring populated successfully."
+    else
+        echo "Warning: pacman-key --populate failed."
+        echo "Falling back to SigLevel=Never."
+        if command -v sed >/dev/null 2>&1; then
+            sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+            if ! grep -q '^SigLevel' /etc/pacman.conf; then
+                echo 'SigLevel = Never' >> /etc/pacman.conf
+            fi
+        else
+            echo 'SigLevel = Never' >> /etc/pacman.conf
+        fi
+    fi
 else
     echo "Falling back to SigLevel=Never to allow package installation without PGP verification."
-    if command -v sed >/dev/null 2>&1 && sed --version >/dev/null 2>&1; then
+    if command -v sed >/dev/null 2>&1; then
         sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
         if ! grep -q '^SigLevel' /etc/pacman.conf; then
             echo 'SigLevel = Never' >> /etc/pacman.conf
         fi
     else
-        echo "sed not available, writing pacman.conf fallback directly..."
-        printf '[options]\nArchitecture = auto\nSigLevel = Never\n' > /etc/pacman.conf
+        echo 'SigLevel = Never' >> /etc/pacman.conf
     fi
 fi
 
@@ -929,6 +942,13 @@ if pacman -Syy --noconfirm 2>/dev/null; then
     }
 else
     echo "Warning: database sync failed, skipping keyring update."
+fi
+
+echo "Configuring pacman for low-memory environment..."
+if grep -q '^ParallelDownloads' /etc/pacman.conf 2>/dev/null; then
+    sed -i 's/^ParallelDownloads.*/ParallelDownloads = 1/' /etc/pacman.conf
+else
+    echo 'ParallelDownloads = 1' >> /etc/pacman.conf
 fi
 
 echo "Keyring initialization complete."
@@ -982,15 +1002,28 @@ if grep -q MemAvailable /proc/meminfo 2>/dev/null; then
     fi
 fi
 
-echo "Upgrading system packages (2-pass: non-critical first, then critical)..."
+echo "Upgrading system packages (3-pass: keyring+SSL first, then non-critical, then critical)..."
 rm -f /var/lib/pacman/db.lck
 
-CRITICAL_PKGS="openssl glibc lib32-glibc systemd systemd-libs pam"
+CRITICAL_PKGS="openssl glibc lib32-glibc systemd-libs pam"
 upgrade_ok=true
 
-echo "Pass 1: Upgrading non-critical packages..."
+echo "Pass 1: Upgrading keyring and certificate packages first..."
+sync 2>/dev/null || true
+sleep 1
+if ! pacman -S --noconfirm --needed archlinux-keyring ca-certificates-mozilla 2>/dev/null; then
+    echo "Note: keyring/cert upgrade had issues but continuing..."
+fi
+
+verify_core_tools || {
+    echo "FATAL: Core tools broken after keyring upgrade. Cannot recover."
+    exit 2
+}
+
+echo "Pass 2: Upgrading remaining non-critical packages..."
+SKIP_PKGS="systemd systemd-sysvcompat"
 exclude_args=""
-for pkg in $CRITICAL_PKGS; do
+for pkg in $CRITICAL_PKGS archlinux-keyring ca-certificates-mozilla $SKIP_PKGS; do
     exclude_args="$exclude_args --ignore $pkg"
 done
 if ! pacman -Su --noconfirm --needed $exclude_args 2>/dev/null; then
@@ -1003,7 +1036,7 @@ verify_core_tools || {
     exit 2
 }
 
-echo "Pass 2: Upgrading critical packages (openssl, glibc, systemd)..."
+echo "Pass 3: Upgrading critical packages (openssl, glibc, systemd)..."
 for pkg in $CRITICAL_PKGS; do
     if pacman -Q "$pkg" >/dev/null 2>&1; then
         rm -f /var/lib/pacman/db.lck
@@ -1015,7 +1048,7 @@ for pkg in $CRITICAL_PKGS; do
             if ! command -v pacman >/dev/null 2>&1; then
                 echo "FATAL: pacman broken after partial $pkg upgrade. This indicates shared library corruption."
                 echo "Attempting to recover by re-installing $pkg from cache..."
-                if [[ -f /var/cache/pacman/pkg/${pkg}-*.pkg.tar.zst ]] || [[ -f /var/cache/pacman/pkg/${pkg}-*.pkg.tar.xz ]]; then
+                if ls /var/cache/pacman/pkg/${pkg}-*.pkg.tar.* >/dev/null 2>&1; then
                     pacman -U --noconfirm /var/cache/pacman/pkg/${pkg}-*.pkg.tar.* 2>/dev/null || {
                         echo "FATAL: Recovery failed. The container must be recreated."
                         exit 2
@@ -1164,6 +1197,9 @@ fi
 
 echo "Installing base-devel (this may use significant memory)..."
 check_mem 524288 "base-devel install"
+sync 2>/dev/null || true
+echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+sleep 1
 if ! safe_install base-devel; then
     echo "Failed to install base-devel."
     exit 1
@@ -1171,6 +1207,9 @@ fi
 
 echo "Installing go..."
 check_mem 262144 "go install"
+sync 2>/dev/null || true
+echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+sleep 1
 if ! safe_install go; then
     echo "Failed to install go."
     exit 1
@@ -1473,6 +1512,9 @@ fi
 
 echo "Installing base-devel (this may use significant memory)..."
 check_mem 524288 "base-devel install"
+sync 2>/dev/null || true
+echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+sleep 1
 if ! safe_install base-devel; then
     echo "Failed to install base-devel."
     exit 1
@@ -1480,6 +1522,9 @@ fi
 
 echo "Installing go..."
 check_mem 262144 "go install"
+sync 2>/dev/null || true
+echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+sleep 1
 if ! safe_install go; then
     echo "Failed to install go."
     exit 1

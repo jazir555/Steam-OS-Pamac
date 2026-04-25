@@ -488,13 +488,13 @@ test_reinstall() {
 test_db_integrity() {
 	log_test "=== 11/12: Pacman DB Integrity ==="
 
-	local db_check
-	db_check=$(container_exec "pacman -Dk 2>&1" || true)
-	if echo "$db_check" | grep -qi "error\|inconsisten\|broken\|missing"; then
-		fail "Pacman DB has inconsistencies: $(echo "$db_check" | head -3)"
-	else
-		pass "Pacman DB is consistent"
-	fi
+local db_check
+db_check=$(container_exec "pacman -Dk 2>&1" || true)
+if echo "$db_check" | grep -qiE "^(error|inconsisten|broken|missing)"; then
+fail "Pacman DB has inconsistencies: $(echo "$db_check" | head -3)"
+else
+pass "Pacman DB is consistent"
+fi
 
 	local lock_check
 	lock_check=$(container_exec "test -f /var/lib/pacman/db.lck && echo locked || echo unlocked" || echo "unlocked")

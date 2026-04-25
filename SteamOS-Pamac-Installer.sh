@@ -1168,6 +1168,11 @@ PAMAC_INSTALL_EOF
         fi
     fi
 
+    if ! container_user_exec bash -c "command -v pamac-manager >/dev/null 2>&1" 2>/dev/null; then
+        log_error "pamac-manager not found after installation. Disk or network issue?"
+        return 1
+    fi
+
     log_info "Stage 2/2: Configuring Pamac..."
     local pamac_cfg
     read -r -d '' pamac_cfg <<'PAMAC_CFG_EOF' || true

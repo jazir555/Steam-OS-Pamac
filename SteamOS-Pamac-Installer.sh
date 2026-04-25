@@ -875,12 +875,14 @@ fi
 exec_container_script() {
     local _script="$1"
     local _desc="$2"
-  shift 2
-  local _rc=0
-  local _script_file
+    shift 2
+    local _rc=0
+    local _script_file
+    local _preamble='_safe_sleep() { if ! sleep "$1" 2>/dev/null; then read -t "$1" -r _ 2>/dev/null || true; fi; }
+'
 
-  _script_file=$(mktemp /tmp/pamac-script-XXXXXXXX)
-  printf '%s\n' "$_script" > "$_script_file"
+    _script_file=$(mktemp /tmp/pamac-script-XXXXXXXX)
+    printf '%s\n' "${_preamble}${_script}" > "$_script_file"
 
   local _marker="PAMAC_SCRIPT_OK_$$_$(date +%s)"
   printf '\necho "%s"\n' "$_marker" >> "$_script_file"
@@ -927,9 +929,12 @@ exec_container_pipe() {
     local _rc=0
     local _script_file
     local _marker="PAMAC_PIPE_OK_$$_$(date +%s)"
+    local _preamble='_safe_sleep() { if ! sleep "$1" 2>/dev/null; then read -t "$1" -r _ 2>/dev/null || true; fi; }
+'
 
     _script_file=$(mktemp /tmp/pamac-pipe-XXXXXXXX)
-    cat > "$_script_file"
+    printf '%s' "$_preamble" > "$_script_file"
+    cat >> "$_script_file"
     printf '\necho "%s"\n' "$_marker" >> "$_script_file"
 
     set +e
@@ -975,15 +980,15 @@ configure_container_base() {
 
     log_info "Stage 1/6: Initializing pacman keyring..."
     local keyring_script
-    read -r -d '' keyring_script <<'KEYRING_EOF' || true
-set -euo pipefail
+read -r -d '' keyring_script <<'KEYRING_EOF' || true
+set -uo pipefail
 
 rm -f /var/lib/pacman/db.lck
 
 echo "Step 1/4: Cleaning up stale gpg-agent state..."
 pkill -9 gpg-agent 2>/dev/null || true
 pkill -9 dirmngr 2>/dev/null || true
-sleep 1
+_safe_sleep 1
 rm -f /etc/pacman.d/gnupg/S.gpg-agent 2>/dev/null || true
 rm -f /etc/pacman.d/gnupg/S.gpg-agent.extra 2>/dev/null || true
 rm -f /etc/pacman.d/gnupg/S.gpg-agent.browser 2>/dev/null || true
@@ -991,10 +996,10 @@ rm -f /etc/pacman.d/gnupg/S.gpg-agent.ssh 2>/dev/null || true
 rm -f /etc/pacman.d/gnupg/S.dirmngr 2>/dev/null || true
 
 if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
-    echo "Disabling systemd gpg-agent socket activation that interferes with keyring init..."
-    systemctl stop 'gpg-agent@*.socket' 2>/dev/null || true
-    systemctl stop 'gpg-agent@*.service' 2>/dev/null || true
-    systemctl stop 'dirmngr@*.socket' 2>/dev/null || true
+echo "Disabling systemd gpg-agent socket activation that interferes with keyring init..."
+systemctl stop 'gpg-agent@*.socket' 2>/dev/null || true
+systemctl stop 'gpg-agent@*.service' 2>/dev/null || true
+systemctl stop 'dirmngr@*.socket' 2>/dev/null || true
 fi
 
 export GNUPGHOME=/etc/pacman.d/gnupg
@@ -1004,23 +1009,23 @@ chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
 echo "Step 2/4: Initializing pacman keyring with existing keyring..."
 keyring_init_ok=false
 if pacman-key --init 2>/dev/null; then
-    echo "Keyring init succeeded."
-    keyring_init_ok=true
+echo "Keyring init succeeded."
+keyring_init_ok=true
 else
-    echo "Warning: pacman-key --init failed (likely gpg-agent/systemd conflict)."
-    echo "Attempting with forced gpg-agent cleanup..."
-    pkill -9 gpg-agent 2>/dev/null || true
-    pkill -9 dirmngr 2>/dev/null || true
-    sleep 3
-    rm -f /etc/pacman.d/gnupg/S.gpg-agent /etc/pacman.d/gnupg/S.gpg-agent.extra 2>/dev/null || true
-    rm -f /etc/pacman.d/gnupg/S.gpg-agent.browser /etc/pacman.d/gnupg/S.gpg-agent.ssh 2>/dev/null || true
-    rm -f /etc/pacman.d/gnupg/S.dirmngr 2>/dev/null || true
-    if pacman-key --init 2>/dev/null; then
-        echo "Keyring init succeeded on retry."
-        keyring_init_ok=true
-    else
-        echo "Warning: pacman-key --init still failed."
-    fi
+echo "Warning: pacman-key --init failed (likely gpg-agent/systemd conflict)."
+echo "Attempting with forced gpg-agent cleanup..."
+pkill -9 gpg-agent 2>/dev/null || true
+pkill -9 dirmngr 2>/dev/null || true
+_safe_sleep 3
+rm -f /etc/pacman.d/gnupg/S.gpg-agent /etc/pacman.d/gnupg/S.gpg-agent.extra 2>/dev/null || true
+rm -f /etc/pacman.d/gnupg/S.gpg-agent.browser /etc/pacman.d/gnupg/S.gpg-agent.ssh 2>/dev/null || true
+rm -f /etc/pacman.d/gnupg/S.dirmngr 2>/dev/null || true
+if pacman-key --init 2>/dev/null; then
+echo "Keyring init succeeded on retry."
+keyring_init_ok=true
+else
+echo "Warning: pacman-key --init still failed."
+fi
 fi
 
 if [[ "$keyring_init_ok" == "true" ]]; then
@@ -1089,7 +1094,7 @@ KEYRING_EOF
     log_info "Stage 2/6: Performing system upgrade..."
     local upgrade_script
     read -r -d '' upgrade_script <<'UPG_EOF' || true
-set -euo pipefail
+set -uo pipefail
 
 rm -f /var/lib/pacman/db.lck
 
@@ -1132,7 +1137,7 @@ upgrade_ok=true
 
 echo "Pass 1: Upgrading keyring and certificate packages first..."
 sync 2>/dev/null || true
-sleep 1
+_safe_sleep 1
 if ! pacman -S --noconfirm --needed archlinux-keyring ca-certificates-mozilla 2>/dev/null; then
     echo "Note: keyring/cert upgrade had issues but continuing..."
 fi
@@ -1213,7 +1218,7 @@ UPG_EOF
     log_info "Stage 3/6: Installing core system packages..."
     local core_script
     read -r -d '' core_script <<'CORE_EOF' || true
-set -euo pipefail
+set -uo pipefail
 
 rm -f /var/lib/pacman/db.lck
 
@@ -1231,15 +1236,15 @@ safe_install() {
         attempt=$((attempt + 1))
         if [[ $attempt -lt $max_attempts ]]; then
             echo "Core package install failed (attempt $attempt/$max_attempts, exit=$rc), repairing DB..."
-            if [[ $rc -eq 137 ]]; then
-                echo "Exit code 137 indicates OOM kill. Syncing and retrying..."
-                sync 2>/dev/null || true
-                sleep 3
-            fi
-            pacman -Dk 2>/dev/null || true
-            pacman -Syy --noconfirm 2>/dev/null || true
-            sleep 2
-        fi
+if [[ $rc -eq 137 ]]; then
+echo "Exit code 137 indicates OOM kill. Syncing and retrying..."
+sync 2>/dev/null || true
+_safe_sleep 3
+fi
+pacman -Dk 2>/dev/null || true
+pacman -Syy --noconfirm 2>/dev/null || true
+_safe_sleep 2
+fi
     done
     return $rc
 }
@@ -1268,7 +1273,7 @@ CORE_EOF
     log_info "Stage 4/6: Installing development packages (batched to avoid OOM)..."
     local dev_script
     read -r -d '' dev_script <<'DEV_EOF' || true
-set -euo pipefail
+set -uo pipefail
 
 rm -f /var/lib/pacman/db.lck
 
@@ -1299,15 +1304,15 @@ safe_install() {
         attempt=$((attempt + 1))
         if [[ $attempt -lt $max_attempts ]]; then
             echo "Install failed (attempt $attempt/$max_attempts, exit=$rc), repairing DB..."
-            if [[ $rc -eq 137 ]]; then
-                echo "Exit code 137 indicates OOM kill. Trying with swap flush..."
-                sync 2>/dev/null || true
-                sleep 3
-            fi
-            pacman -Dk 2>/dev/null || true
-            pacman -Syy --noconfirm 2>/dev/null || true
-            sleep 3
-        fi
+if [[ $rc -eq 137 ]]; then
+echo "Exit code 137 indicates OOM kill. Trying with swap flush..."
+sync 2>/dev/null || true
+_safe_sleep 3
+fi
+pacman -Dk 2>/dev/null || true
+pacman -Syy --noconfirm 2>/dev/null || true
+_safe_sleep 3
+fi
     done
     return $rc
 }
@@ -1322,20 +1327,22 @@ fi
 echo "Installing base-devel in smaller batches to avoid OOM..."
 check_mem 524288 "base-devel install"
 sync 2>/dev/null || true
-sleep 1
+_safe_sleep 1
 BASE_DEVEL_BATCHES=(
     "m4 autoconf automake binutils"
     "bison debugedit diffutils fakeroot"
-    "flex gcc gettext groff"
+    "flex"
+    "gcc"
+    "gettext groff"
     "gzip libtool make patch"
     "pkgconf sed texinfo which"
 )
 for batch in "${BASE_DEVEL_BATCHES[@]}"; do
-    echo "Installing batch: $batch"
-    check_mem 262144 "base-devel batch"
-    sync 2>/dev/null || true
-    sleep 1
-    if ! safe_install $batch; then
+echo "Installing batch: $batch"
+check_mem 262144 "base-devel batch"
+sync 2>/dev/null || true
+_safe_sleep 1
+if ! safe_install $batch; then
         echo "Warning: batch install failed for: $batch"
     fi
 done
@@ -1346,7 +1353,7 @@ fi
 echo "Installing go..."
 check_mem 262144 "go install"
 sync 2>/dev/null || true
-sleep 1
+_safe_sleep 1
 if ! safe_install go; then
     echo "Failed to install go."
     exit 1
@@ -1371,7 +1378,7 @@ DEV_EOF
     log_info "Stage 5/6: Creating user and configuring sudo..."
     local user_script
     read -r -d '' user_script <<'USER_EOF' || true
-set -euo pipefail
+set -uo pipefail
 
 current_user="$1"
 if [[ -z "$current_user" ]]; then
@@ -1404,7 +1411,7 @@ USER_EOF
     log_info "Stage 6/6: Installing polkit, dbus, and pamac-daemon helper..."
     local misc_script
     read -r -d '' misc_script <<'MISC_EOF' || true
-set -euo pipefail
+set -uo pipefail
 
 echo "Installing polkit..."
 if pacman -S --noconfirm --needed polkit; then
@@ -1464,8 +1471,8 @@ ensure_service() {
 
     log_bootstrap "Starting $name..."
     while [[ $count -lt $retries ]]; do
-        eval "$start_cmd" >> "$BOOTSTRAP_LOG" 2>&1
-        sleep 1
+eval "$start_cmd" >> "$BOOTSTRAP_LOG" 2>&1
+_safe_sleep 1
         if command -v pgrep >/dev/null 2>&1 && pgrep -x "$pid_ok" >/dev/null 2>&1; then
             log_bootstrap "$name started successfully"
             return 0
@@ -1530,7 +1537,7 @@ optimize_pacman_mirrors() {
 
     local mirror_script
   read -r -d '' mirror_script << 'EOF' || true
-  set -euo pipefail
+  set -uo pipefail
 
   rm -f /var/lib/pacman/db.lck
 
@@ -1564,7 +1571,7 @@ configure_multilib() {
 
         local multilib_script
   read -r -d '' multilib_script << 'EOF' || true
-  set -euo pipefail
+  set -uo pipefail
 
   rm -f /var/lib/pacman/db.lck
 
@@ -1597,7 +1604,7 @@ install_aur_helper() {
     log_info "Stage 1/2: Installing build dependencies (batched to avoid OOM)..."
     local deps_script
     read -r -d '' deps_script <<'DEPS_EOF' || true
-set -euo pipefail
+set -uo pipefail
 
 rm -f /var/lib/pacman/db.lck
 
@@ -1628,15 +1635,15 @@ safe_install() {
         attempt=$((attempt + 1))
         if [[ $attempt -lt $max_attempts ]]; then
             echo "Install failed (attempt $attempt/$max_attempts, exit=$rc), repairing DB..."
-            if [[ $rc -eq 137 ]]; then
-                echo "Exit code 137 indicates OOM kill. Syncing and retrying..."
-                sync 2>/dev/null || true
-                sleep 3
-            fi
-            pacman -Dk 2>/dev/null || true
-            pacman -Syy --noconfirm 2>/dev/null || true
-            sleep 3
-        fi
+if [[ $rc -eq 137 ]]; then
+echo "Exit code 137 indicates OOM kill. Syncing and retrying..."
+sync 2>/dev/null || true
+_safe_sleep 3
+fi
+pacman -Dk 2>/dev/null || true
+pacman -Syy --noconfirm 2>/dev/null || true
+_safe_sleep 3
+fi
     done
     return $rc
 }
@@ -1651,20 +1658,22 @@ fi
 echo "Installing base-devel in smaller batches to avoid OOM..."
 check_mem 524288 "base-devel install"
 sync 2>/dev/null || true
-sleep 1
+_safe_sleep 1
 BASE_DEVEL_BATCHES=(
     "m4 autoconf automake binutils"
     "bison debugedit diffutils fakeroot"
-    "flex gcc gettext groff"
+    "flex"
+    "gcc"
+    "gettext groff"
     "gzip libtool make patch"
     "pkgconf sed texinfo which"
 )
 for batch in "${BASE_DEVEL_BATCHES[@]}"; do
-    echo "Installing batch: $batch"
-    check_mem 262144 "base-devel batch"
-    sync 2>/dev/null || true
-    sleep 1
-    if ! safe_install $batch; then
+echo "Installing batch: $batch"
+check_mem 262144 "base-devel batch"
+sync 2>/dev/null || true
+_safe_sleep 1
+if ! safe_install $batch; then
         echo "Warning: batch install failed for: $batch"
     fi
 done
@@ -1675,7 +1684,7 @@ fi
 echo "Installing go..."
 check_mem 262144 "go install"
 sync 2>/dev/null || true
-sleep 1
+_safe_sleep 1
 if ! safe_install go; then
     echo "Failed to install go."
     exit 1
@@ -1706,7 +1715,7 @@ DEPS_EOF
     log_info "Stage 2/2: Building yay from AUR..."
     local build_script
     read -r -d '' build_script <<'BUILD_EOF' || true
-set -euo pipefail
+set -uo pipefail
 
 current_user="$1"
 
@@ -1733,9 +1742,9 @@ while [[ $clone_retry -lt $max_clone_retries ]]; do
                 break
             fi
         fi
-        wait_time=$((2 ** clone_retry))
-        echo "Clone failed (attempt $clone_retry/$max_clone_retries). Retrying in ${wait_time}s..."
-        sleep "$wait_time"
+wait_time=$((2 ** clone_retry))
+echo "Clone failed (attempt $clone_retry/$max_clone_retries). Retrying in ${wait_time}s..."
+_safe_sleep "$wait_time"
     else
         echo "Clone failed after $max_clone_retries attempts."
         cat /tmp/yay_clone_err 2>/dev/null || true
@@ -1773,19 +1782,34 @@ install_pamac() {
 
     log_info "Stage 1/2: Installing pamac-aur from AUR..."
     local pamac_install
-    read -r -d '' pamac_install <<'PAMAC_INSTALL_EOF' || true
-set -euo pipefail
+read -r -d '' pamac_install <<'PAMAC_INSTALL_EOF' || true
+set -uo pipefail
 
 current_user="$1"
 
 rm -f /var/lib/pacman/db.lck
 
 echo "Installing pamac-aur from AUR..."
-sudo -Hu "$current_user" bash -lc "yay -S --noconfirm --needed --noprogressbar pamac-aur"
+pamac_installed=false
+for attempt in 1 2 3; do
+if sudo -Hu "$current_user" bash -lc "yay -S --noconfirm --needed --noprogressbar pamac-aur"; then
+pamac_installed=true
+break
+fi
+echo "yay install attempt $attempt failed. Retrying in 5 seconds..."
+_safe_sleep 5
+sudo -Hu "$current_user" bash -lc "yay -Y --gendb" 2>/dev/null || true
+rm -f /var/lib/pacman/db.lck
+done
+
+if [[ "$pamac_installed" != "true" ]]; then
+echo "Error: pamac-aur install failed after 3 attempts."
+exit 1
+fi
 
 if ! command -v pamac-manager >/dev/null 2>&1; then
-    echo "Error: pamac-manager not found after install."
-    exit 1
+echo "Error: pamac-manager not found after install."
+exit 1
 fi
 echo "pamac-manager installed successfully."
 PAMAC_INSTALL_EOF
@@ -1817,7 +1841,7 @@ PAMAC_INSTALL_EOF
     log_info "Stage 2/2: Configuring Pamac..."
     local pamac_cfg
     read -r -d '' pamac_cfg <<'PAMAC_CFG_EOF' || true
-set -euo pipefail
+set -uo pipefail
 
 echo "Configuring Pamac for AUR support..."
 if [[ -f /etc/pamac.conf ]]; then
@@ -1874,7 +1898,7 @@ install_gaming_packages() {
 
     local gaming_script
     read -r -d '' gaming_script << 'EOF' || true
-set -euo pipefail
+set -uo pipefail
 
 current_user="$1"
 is_multilib="$2"
@@ -1921,6 +1945,7 @@ export_pamac_to_host() {
     local svg_sources=(
         /usr/share/icons/hicolor/scalable/apps/pamac-manager.svg
         /usr/share/icons/hicolor/scalable/apps/org.manjaro.pamac.manager.svg
+        /usr/share/icons/hicolor/scalable/apps/system-software-install.svg
         /usr/share/pixmaps/pamac-manager.svg
     )
     for src_icon in "${svg_sources[@]}"; do
@@ -1938,7 +1963,9 @@ export_pamac_to_host() {
     local png_sources=(
         /usr/share/icons/hicolor/48x48/apps/pamac-manager.png
         /usr/share/icons/hicolor/48x48/apps/org.manjaro.pamac.manager.png
+        /usr/share/icons/hicolor/48x48/apps/system-software-install.png
         /usr/share/icons/hicolor/64x64/apps/pamac-manager.png
+        /usr/share/icons/hicolor/64x64/apps/system-software-install.png
         /usr/share/pixmaps/pamac-manager.png
     )
     for src_icon in "${png_sources[@]}"; do
@@ -2075,7 +2102,7 @@ setup_post_install_hooks() {
 
     local hook_script
     read -r -d '' hook_script <<'HOOK_EOF' || true
-set -euo pipefail
+set -uo pipefail
 
 current_user="$1"
 container_name="$2"

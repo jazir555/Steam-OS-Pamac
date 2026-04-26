@@ -891,9 +891,11 @@ main() {
 	echo "" | tee -a "$TEST_LOG"
 	test_uninstall_helper
 	echo "" | tee -a "$TEST_LOG"
-	test_desktop_action_uninstall
-	echo "" | tee -a "$TEST_LOG"
-	print_summary
+  test_desktop_action_uninstall
+  echo "" | tee -a "$TEST_LOG"
+  test_kde_uninstall_integration
+  echo "" | tee -a "$TEST_LOG"
+  print_summary
 
 	local final_fail=$FAIL
 	if [[ $FAIL -gt 0 ]]; then

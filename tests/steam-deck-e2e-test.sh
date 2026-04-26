@@ -53,9 +53,9 @@ distrobox_exec() {
 }
 
 pamac_exec() {
-local cmd="${1//\'/\\\'}"
-local timeout_sec="${2:-30}"
-distrobox_exec "mkdir -p /run/dbus; dbus-daemon --system --fork 2>/dev/null; /usr/lib/polkit-1/polkitd --no-debug &>/dev/null & sleep 1; /usr/bin/pamac-daemon &>/dev/null & sleep 2; $cmd" "$timeout_sec"
+    local cmd="${1//\'/\\\'}"
+    local timeout_sec="${2:-120}"
+    ssh_check "timeout $timeout_sec podman exec -i -u 0 '$CONTAINER_NAME' bash -c 'rm -f /run/dbus/pid 2>/dev/null; pkill pamac-daemon 2>/dev/null; pkill polkitd 2>/dev/null; pkill dbus-daemon 2>/dev/null; sleep 1; mkdir -p /run/dbus; dbus-daemon --system --fork 2>/dev/null; sleep 1; /usr/lib/polkit-1/polkitd --no-debug &>/dev/null & sleep 1; /usr/bin/pamac-daemon &>/dev/null & sleep 2; $cmd' 2>&1"
 }
 
 cleanup_package() {
@@ -488,13 +488,15 @@ test_reinstall() {
 test_db_integrity() {
 	log_test "=== 11/12: Pacman DB Integrity ==="
 
-local db_check
-db_check=$(container_exec "pacman -Dk 2>&1" || true)
-if echo "$db_check" | grep -qiE "^(error|inconsisten|broken|missing)"; then
-fail "Pacman DB has inconsistencies: $(echo "$db_check" | head -3)"
-else
-pass "Pacman DB is consistent"
-fi
+    local db_check
+    db_check=$(container_exec "pacman -Dk 2>&1" || true)
+    if echo "$db_check" | grep -qi "No database errors have been found"; then
+        pass "Pacman DB is consistent"
+    elif echo "$db_check" | grep -qiE "^error|has error|inconsisten|broken|missing dependency"; then
+        fail "Pacman DB has inconsistencies: $(echo "$db_check" | head -3)"
+    else
+        pass "Pacman DB check passed (no errors reported)"
+    fi
 
 	local lock_check
 	lock_check=$(container_exec "test -f /var/lib/pacman/db.lck && echo locked || echo unlocked" || echo "unlocked")

@@ -1495,18 +1495,64 @@ fi
 BOOTSTRAP
 chmod +x /usr/local/bin/pamac-session-bootstrap.sh
 
-echo "Adjusting Pamac D-Bus activation for environments without a functional systemd..."
+echo "Installing fake systemd-run wrapper for non-systemd AUR builds..."
 if ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/dev/null 2>&1; then
-for svc_file in /usr/share/dbus-1/system-services/org.manjaro.pamac.daemon.service \
-/usr/share/dbus-1/system-services/org.freedesktop.PolicyKit1.service; do
-if [[ -f "$svc_file" ]]; then
-mv "$svc_file" "${svc_file}.disabled-by-steamos-pamac" 2>/dev/null || true
+cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE'
+#!/bin/bash
+DYNAMIC_USER=false
+CACHE_DIR=""
+WORK_DIR=""
+SKIP_NEXT=false
+CMD_ARGS=()
+for arg in "$@"; do
+if $SKIP_NEXT; then
+SKIP_NEXT=false
+continue
 fi
+case "$arg" in
+--service-type=*) continue ;;
+--service-type) SKIP_NEXT=true; continue ;;
+--pipe|--wait|--pty|-q|--quiet|--no-block) continue ;;
+--property=DynamicUser=yes) DYNAMIC_USER=true; continue ;;
+--property=CacheDirectory=*) CACHE_DIR="${arg#--property=CacheDirectory=}"; continue ;;
+--property=WorkingDirectory=*) WORK_DIR="${arg#--property=WorkingDirectory=}"; continue ;;
+--property=*) continue ;;
+--property) SKIP_NEXT=true; continue ;;
+--user|--uid=*|--gid=*|--setenv=*) continue ;;
+--user|--setenv) SKIP_NEXT=true; continue ;;
+*) CMD_ARGS+=("$arg") ;;
+esac
 done
+if [[ ${#CMD_ARGS[@]} -eq 0 ]]; then exit 1; fi
+if [[ -n "$WORK_DIR" ]]; then
+mkdir -p "$WORK_DIR" 2>/dev/null || true
+if $DYNAMIC_USER; then chown deck:deck "$WORK_DIR" 2>/dev/null || true; fi
+fi
+if [[ -n "$CACHE_DIR" ]]; then
+CACHE_FULL="/var/cache/$CACHE_DIR"
+mkdir -p "$CACHE_FULL" 2>/dev/null || true
+if $DYNAMIC_USER; then chown -R deck:deck "$CACHE_FULL" 2>/dev/null || true; fi
+fi
+if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
+BUILD_USER="deck"
+if ! id "$BUILD_USER" >/dev/null 2>&1; then BUILD_USER="nobody"; fi
+if [[ -n "$WORK_DIR" ]]; then
+exec sudo -u "$BUILD_USER" -H -- bash -c "cd '$WORK_DIR' 2>/dev/null; exec ${CMD_ARGS[*]}"
+else
+exec sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
+fi
+else
+if [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR" ]]; then cd "$WORK_DIR" 2>/dev/null || true; fi
+exec "${CMD_ARGS[@]}"
+fi
+SYSTEMD_RUN_FAKE
+chmod +x /usr/local/sbin/systemd-run
+echo "Fake systemd-run installed at /usr/local/sbin/systemd-run (simulates DynamicUser for AUR builds)."
+
 printf '%s\n' '#!/bin/bash' \
 '/usr/local/bin/pamac-session-bootstrap.sh 2>/dev/null &' > /etc/profile.d/pamac-daemon.sh
 chmod +x /etc/profile.d/pamac-daemon.sh
-echo "Non-systemd bootstrap path installed (dbus activation disabled for managed services)."
+echo "Non-systemd bootstrap path installed (D-Bus services kept enabled for daemon registration)."
 
 echo "Patching polkit policy for non-interactive authorization..."
 pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
@@ -1871,18 +1917,12 @@ else
     printf 'EnableAUR\nCheckAURUpdates\nCheckAURVCSUpdates\n' > /etc/pamac.conf
 fi
 
-echo "Syncing package database..."
+    echo "Syncing package database..."
 if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
-    systemctl start polkit 2>/dev/null || true
-    systemctl enable --now pamac-daemon 2>/dev/null || echo "Note: pamac-daemon service could not be enabled"
+systemctl start polkit 2>/dev/null || true
+systemctl enable --now pamac-daemon 2>/dev/null || echo "Note: pamac-daemon service could not be enabled"
 else
-    for svc_file in /usr/share/dbus-1/system-services/org.manjaro.pamac.daemon.service \
-                    /usr/share/dbus-1/system-services/org.freedesktop.PolicyKit1.service; do
-        if [[ -f "$svc_file" ]] && [[ ! -f "${svc_file}.disabled-by-steamos-pamac" ]]; then
-            mv "$svc_file" "${svc_file}.disabled-by-steamos-pamac" 2>/dev/null || true
-        fi
-    done
-    /usr/local/bin/pamac-session-bootstrap.sh 2>/dev/null || true
+/usr/local/bin/pamac-session-bootstrap.sh 2>/dev/null || true
 fi
 pacman -Sy --noconfirm >/dev/null 2>&1 || echo "Note: package database sync failed"
 

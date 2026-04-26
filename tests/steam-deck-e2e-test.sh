@@ -117,7 +117,7 @@ check_desktop_file_format() {
 # 1. PREREQUISITES CHECK
 ###############################################################################
 test_prerequisites() {
-	log_test "=== 1/14: Prerequisites Check ==="
+  log_test "=== 1/15: Prerequisites Check ==="
 
 	if ssh_check "podman inspect '$CONTAINER_NAME' >/dev/null 2>&1"; then
 		pass "Container '$CONTAINER_NAME' exists"
@@ -197,7 +197,7 @@ fi
 # 2. PAMAC SEARCH (AUR + repos)
 ###############################################################################
 test_search() {
-	log_test "=== 2/14: Pamac Search ==="
+  log_test "=== 2/15: Pamac Search ==="
 
 	local search_out
 	search_out=$(pamac_exec "pamac search $TEST_PACKAGE_AUR 2>/dev/null" 30 || true)
@@ -228,7 +228,7 @@ test_search() {
 # 3. PAMAC INSTALL AUR PACKAGE
 ###############################################################################
 test_install() {
-	log_test "=== 3/14: Pamac Install AUR Package ==="
+  log_test "=== 3/15: Pamac Install AUR Package ==="
 	cleanup_package "$TEST_PACKAGE_AUR"
 
 	local install_out
@@ -264,7 +264,7 @@ test_install() {
 # 4. VERIFY POST-INSTALL EXPORT HOOK
 ###############################################################################
 test_export_hook() {
-	log_test "=== 4/14: Post-Install Export Hook ==="
+  log_test "=== 4/15: Post-Install Export Hook ==="
 
 	local hook_exists
 	hook_exists=$(container_exec "test -x /usr/local/bin/distrobox-export-hook.sh && echo true || echo false" || echo "false")
@@ -300,7 +300,7 @@ test_export_hook() {
 # 5. VERIFY DESKTOP FILE INTEGRITY
 ###############################################################################
 test_desktop_file() {
-	log_test "=== 5/14: Desktop File Integrity ==="
+  log_test "=== 5/15: Desktop File Integrity ==="
 
 	local desktop_files
 	desktop_files=$(ssh_check "find /home/deck/.local/share/applications -maxdepth 1 -type f -name '${CONTAINER_NAME}-*.desktop' 2>/dev/null" || true)
@@ -332,7 +332,7 @@ test_desktop_file() {
 # 6. VERIFY ICON EXPORT
 ###############################################################################
 test_icons() {
-	log_test "=== 6/14: Icon Export ==="
+  log_test "=== 6/15: Icon Export ==="
 
 	local icon_found=false
 	for icon_path in \
@@ -366,7 +366,7 @@ test_icons() {
 # 7. VERIFY PAMAC MANAGER WRAPPER
 ###############################################################################
 test_pamac_manager_wrapper() {
-	log_test "=== 7/14: Pamac Manager Wrapper ==="
+  log_test "=== 7/15: Pamac Manager Wrapper ==="
 
 	local wrapper_exists
 	wrapper_exists=$(container_exec "test -x /usr/local/bin/pamac-manager-wrapper && echo true || echo false" || echo "false")
@@ -414,7 +414,7 @@ test_pamac_manager_wrapper() {
 # 8. TEST CLI WRAPPER FROM HOST
 ###############################################################################
 test_host_cli_wrapper() {
-	log_test "=== 8/14: Host CLI Wrapper ==="
+  log_test "=== 8/15: Host CLI Wrapper ==="
 
 	local wrapper_path="/home/deck/.local/bin/pamac-${CONTAINER_NAME}"
 	local wrapper_exists
@@ -455,7 +455,7 @@ test_host_cli_wrapper() {
 # 9. TEST PAMAC UNINSTALL
 ###############################################################################
 test_uninstall() {
-	log_test "=== 9/14: Pamac Uninstall ==="
+  log_test "=== 9/15: Pamac Uninstall ==="
 
 	local pkg_installed
 	pkg_installed=$(container_exec "pacman -Q ${TEST_PACKAGE_AUR} 2>/dev/null && echo yes || echo no" || echo "no")
@@ -485,7 +485,7 @@ test_uninstall() {
 # 10. TEST REINSTALL AND PERSISTENCE
 ###############################################################################
 test_reinstall() {
-	log_test "=== 10/14: Reinstall After Uninstall ==="
+  log_test "=== 10/15: Reinstall After Uninstall ==="
 
 	cleanup_package "$TEST_PACKAGE_AUR"
 
@@ -510,7 +510,7 @@ test_reinstall() {
 # 11. TEST PACMAN DB INTEGRITY
 ###############################################################################
 test_db_integrity() {
-	log_test "=== 11/14: Pacman DB Integrity ==="
+  log_test "=== 11/15: Pacman DB Integrity ==="
 
     local db_check
     db_check=$(container_exec "pacman -Dk 2>&1" || true)
@@ -550,7 +550,7 @@ test_db_integrity() {
 # 12. TEST HOST INTEGRATION (desktop, state, uninstall path)
 ###############################################################################
 test_host_integration() {
-	log_test "=== 12/14: Host Integration ==="
+  log_test "=== 12/15: Host Integration ==="
 
 	local state_dir_exists
 	state_dir_exists=$(ssh_check "test -d /home/deck/.local/share/steamos-pamac/$CONTAINER_NAME && echo true || echo false" || echo "false")
@@ -601,7 +601,7 @@ test_host_integration() {
 # 13. TEST UNINSTALL HELPER (steamos-pamac-uninstall)
 ###############################################################################
 test_uninstall_helper() {
-	log_test "=== 13/14: Uninstall Helper ==="
+  log_test "=== 13/15: Uninstall Helper ==="
 
 	local helper_path="/home/deck/.local/bin/steamos-pamac-uninstall"
 	local helper_exists
@@ -659,7 +659,7 @@ test_uninstall_helper() {
 # 14. TEST DESKTOP ACTION UNINSTALL
 ###############################################################################
 test_desktop_action_uninstall() {
-	log_test "=== 14/14: Desktop Action Uninstall ==="
+  log_test "=== 14/15: Desktop Action Uninstall ==="
 
 	local pamac_desktop="/home/deck/.local/share/applications/arch-pamac-org.manjaro.pamac.manager.desktop"
 	local has_actions

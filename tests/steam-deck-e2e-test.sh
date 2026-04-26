@@ -92,12 +92,20 @@ check_desktop_file_format() {
 		failures=$((failures + 1))
 	fi
 
-	local has_container
-	has_container=$(ssh_check "grep -q 'X-SteamOS-Pamac-Container=${CONTAINER_NAME}' '$f' 2>/dev/null && echo true || echo false" || echo "false")
-	if [[ "$has_container" != "true" ]]; then
-		fail "$desc: Missing X-SteamOS-Pamac-Container marker"
-		failures=$((failures + 1))
-	fi
+    local has_container
+    has_container=$(ssh_check "grep -q 'X-SteamOS-Pamac-Container=${CONTAINER_NAME}' '$f' 2>/dev/null && echo true || echo false" || echo "false")
+    if [[ "$has_container" != "true" ]]; then
+        fail "$desc: Missing X-SteamOS-Pamac-Container marker"
+        failures=$((failures + 1))
+    fi
+
+    local has_uninstall_action
+    has_uninstall_action=$(ssh_check "grep -q '^\[Desktop Action uninstall\]' '$f' 2>/dev/null && echo true || echo false" || echo "false")
+    if [[ "$has_uninstall_action" == "true" ]]; then
+        pass "$desc: Uninstall desktop action present"
+    else
+        skip "$desc: No uninstall desktop action (may need export hook update)"
+    fi
 
 	if [[ $failures -eq 0 ]]; then
 		pass "$desc: desktop file format valid"

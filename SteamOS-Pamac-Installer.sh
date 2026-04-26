@@ -2099,11 +2099,17 @@ Categories=System;PackageManager;Settings;
 Keywords=package;manager;software;arch;aur;
 StartupNotify=true
 StartupWMClass=pamac-manager
+Actions=uninstall;
 X-SteamOS-Pamac-Managed=true
 X-SteamOS-Pamac-Container=${CONTAINER_NAME}
 X-SteamOS-Pamac-SourceApp=pamac-manager
 X-SteamOS-Pamac-SourceDesktop=org.manjaro.pamac.manager.desktop
 X-SteamOS-Pamac-SourcePackage=pamac-aur
+
+[Desktop Action uninstall]
+Name=Uninstall Packages
+Exec=${HOME}/.local/bin/steamos-pamac-uninstall --desktop-file ${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop
+Icon=edit-delete
 DESKTOP_EOF
         chmod +x "$exported_desktop"
         log_success "Created manual desktop entry: $exported_desktop"
@@ -2161,12 +2167,126 @@ DESKTOP_EOF
     mkdir -p "$bin_dir"
     local cli_wrapper="$bin_dir/pamac-${CONTAINER_NAME}"
 
-    cat > "$cli_wrapper" << WRAPPER_EOF
+cat > "$cli_wrapper" << WRAPPER_EOF
 #!/bin/bash
 exec distrobox enter "${CONTAINER_NAME}" -- pamac-cli-wrapper "\$@"
 WRAPPER_EOF
-    chmod +x "$cli_wrapper"
-    log_info "Created CLI wrapper: $cli_wrapper"
+chmod +x "$cli_wrapper"
+log_info "Created CLI wrapper: $cli_wrapper"
+
+local uninstall_helper="$bin_dir/steamos-pamac-uninstall"
+cat > "$uninstall_helper" << UNINSTALL_EOF
+#!/bin/bash
+set +e
+CONTAINER_NAME="${CONTAINER_NAME}"
+APP_DIR="\$HOME/.local/share/applications"
+STATE_DIR="\$HOME/.local/share/steamos-pamac/\$CONTAINER_NAME"
+
+show_help() {
+echo "Usage: steamos-pamac-uninstall [options]"
+echo "Options:"
+echo "  --desktop-file FILE   Uninstall the package associated with the given desktop file"
+echo "  --package PKG         Uninstall a package by name from the container"
+echo "  --list                List all pamac-managed applications"
+echo "  --help                Show this help"
+}
+
+uninstall_package() {
+local pkg="\$1"
+if [[ -z "\$pkg" ]]; then
+echo "Error: No package specified." >&2
+exit 1
+fi
+echo "Uninstalling \$pkg from \$CONTAINER_NAME..."
+podman exec -i -u 0 "\$CONTAINER_NAME" bash -c '
+rm -f /run/dbus/pid 2>/dev/null
+pkill pamac-daemon 2>/dev/null; pkill polkitd 2>/dev/null; pkill dbus-daemon 2>/dev/null
+sleep 1
+mkdir -p /run/dbus
+dbus-daemon --system --fork 2>/dev/null
+sleep 1
+/usr/lib/polkit-1/polkitd --no-debug &>/dev/null &
+sleep 1
+/usr/bin/pamac-daemon &>/dev/null &
+sleep 2
+pamac remove --no-confirm --no-save "'"\$pkg"'" 2>&1
+'
+local rc=\$?
+if [[ \$rc -eq 0 ]]; then
+echo "Successfully uninstalled \$pkg"
+/usr/local/bin/distrobox-export-hook.sh 2>/dev/null || true
+else
+echo "Failed to uninstall \$pkg (exit code: \$rc)" >&2
+exit \$rc
+fi
+}
+
+list_apps() {
+if [[ -f "\$STATE_DIR/exported-apps.list" ]]; then
+while IFS= read -r desktop_path; do
+[[ -f "\$desktop_path" ]] || continue
+local pkg
+pkg=\$(grep '^X-SteamOS-Pamac-SourcePackage=' "\$desktop_path" 2>/dev/null | cut -d= -f2)
+local name
+name=\$(grep '^Name=' "\$desktop_path" 2>/dev/null | head -1 | cut -d= -f2)
+if [[ -n "\$pkg" ]]; then
+echo "\$name  [\$pkg]"
+fi
+done < "\$STATE_DIR/exported-apps.list"
+else
+echo "No pamac-managed applications found."
+fi
+}
+
+if [[ \$# -eq 0 ]]; then
+show_help
+exit 0
+fi
+
+case "\$1" in
+--desktop-file)
+shift
+desktop_file="\$1"
+if [[ -z "\$desktop_file" ]]; then
+echo "Error: --desktop-file requires a file name argument" >&2
+exit 1
+fi
+full_path="\$APP_DIR/\$desktop_file"
+if [[ ! -f "\$full_path" ]]; then
+echo "Error: Desktop file not found: \$full_path" >&2
+exit 1
+fi
+pkg=\$(grep '^X-SteamOS-Pamac-SourcePackage=' "\$full_path" 2>/dev/null | cut -d= -f2)
+if [[ -z "\$pkg" ]]; then
+echo "Error: No X-SteamOS-Pamac-SourcePackage marker found in \$full_path" >&2
+exit 1
+fi
+uninstall_package "\$pkg"
+;;
+--package)
+shift
+pkg="\$1"
+if [[ -z "\$pkg" ]]; then
+echo "Error: --package requires a package name argument" >&2
+exit 1
+fi
+uninstall_package "\$pkg"
+;;
+--list)
+list_apps
+;;
+--help|-h)
+show_help
+;;
+*)
+echo "Error: Unknown option \$1" >&2
+show_help
+exit 1
+;;
+esac
+UNINSTALL_EOF
+chmod +x "$uninstall_helper"
+log_info "Created uninstall helper: $uninstall_helper"
 
     if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
         log_info "Add '$bin_dir' to your PATH to use the CLI wrapper directly."
@@ -2264,11 +2384,17 @@ StartupNotify=true
 StartupWMClass=pamac-manager
 NoDisplay=false
 DBusActivatable=false
+Actions=uninstall;
 X-SteamOS-Pamac-Managed=true
 X-SteamOS-Pamac-Container=${container_name}
 X-SteamOS-Pamac-SourceApp=pamac-manager
 X-SteamOS-Pamac-SourceDesktop=org.manjaro.pamac.manager.desktop
 X-SteamOS-Pamac-SourcePackage=pamac-aur
+
+[Desktop Action uninstall]
+Name=Uninstall Packages
+Exec=/home/${current_user}/.local/bin/steamos-pamac-uninstall --desktop-file ${container_name}-org.manjaro.pamac.manager.desktop
+Icon=edit-delete
 PAMAC_DESKTOP
 chmod +x "\$desktop_file"
 return 0
@@ -2280,9 +2406,12 @@ sed -i \
 -e '/^X-SteamOS-Pamac-SourceApp=/d' \
 -e '/^X-SteamOS-Pamac-SourceDesktop=/d' \
 -e '/^X-SteamOS-Pamac-SourcePackage=/d' \
+-e '/^Actions=/d' \
+-e '/^\[Desktop Action uninstall\]/,${ /^Name=Uninstall/d; /^Exec=.*steamos-pamac-uninstall/d; /^Icon=edit-delete/d; /^\[Desktop Action/d; }' \
 "\$desktop_file"
-printf '\nX-SteamOS-Pamac-Managed=true\nX-SteamOS-Pamac-Container=%s\nX-SteamOS-Pamac-SourceApp=%s\nX-SteamOS-Pamac-SourceDesktop=%s.desktop\nX-SteamOS-Pamac-SourcePackage=%s\n' \
-"${container_name}" "\$export_name" "\$app_name" "\$owner_pkg" >> "\$desktop_file"
+desktop_basename="\$(basename "\$desktop_file")"
+printf '\nActions=uninstall;\nX-SteamOS-Pamac-Managed=true\nX-SteamOS-Pamac-Container=%s\nX-SteamOS-Pamac-SourceApp=%s\nX-SteamOS-Pamac-SourceDesktop=%s.desktop\nX-SteamOS-Pamac-SourcePackage=%s\n\n[Desktop Action uninstall]\nName=Uninstall\nExec=/home/${current_user}/.local/bin/steamos-pamac-uninstall --desktop-file %s\nIcon=edit-delete\n' \
+"${container_name}" "\$export_name" "\$app_name" "\$owner_pkg" "\$desktop_basename" >> "\$desktop_file"
 }
 
 run_distrobox_export() {

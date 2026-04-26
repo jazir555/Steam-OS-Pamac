@@ -1408,36 +1408,70 @@ USER_EOF
 
     exec_container_script "$user_script" "user-setup" "$CURRENT_USER" || return 1
 
-    log_info "Stage 6/6: Installing polkit, dbus, and pamac-daemon helper..."
-    local misc_script
-    read -r -d '' misc_script <<'MISC_EOF' || true
+log_info "Stage 6a/7: Installing polkit and setting up D-Bus..."
+local polkit_dbus_script
+read -r -d '' polkit_dbus_script <<'POLKIT_DBUS_EOF' || true
 set -uo pipefail
 
 echo "Installing polkit..."
 if pacman -S --noconfirm --needed polkit; then
-    polkit_dir="/etc/polkit-1/rules.d"
-    mkdir -p "$polkit_dir"
-    printf '%s\n' 'polkit.addRule(function(action, subject) {' \
-        '    if (action.id.indexOf("org.manjaro.pamac.") == 0 &&' \
-        '        subject.isInGroup("wheel")) {' \
-        '        return polkit.Result.YES;' \
-        '    }' \
-        '});' > "$polkit_dir/10-pamac-nopasswd.rules"
-    echo "polkit passwordless rule created for pamac operations."
-    if ! id polkitd >/dev/null 2>&1; then
-        useradd -r -d / -s /usr/bin/nologin polkitd 2>/dev/null || echo "Note: polkitd user creation failed"
-    fi
+polkit_dir="/etc/polkit-1/rules.d"
+mkdir -p "$polkit_dir"
+printf '%s\n' 'polkit.addRule(function(action, subject) {' \
+' if (action.id.indexOf("org.manjaro.pamac.") == 0 &&' \
+' subject.isInGroup("wheel")) {' \
+' return polkit.Result.YES;' \
+' }' \
+'});' > "$polkit_dir/10-pamac-nopasswd.rules"
+echo "polkit passwordless rule created for pamac operations."
+if ! id polkitd >/dev/null 2>&1; then
+useradd -r -d / -s /usr/bin/nologin polkitd 2>/dev/null || echo "Note: polkitd user creation failed"
+fi
 else
-    echo "Warning: could not install polkit. pamac GUI may prompt for password."
+echo "Warning: could not install polkit. pamac GUI may prompt for password."
 fi
 
 echo "Setting up D-Bus..."
 if command -v dbus-daemon >/dev/null 2>&1; then
-    mkdir -p /run/dbus
-    if [[ ! -S /run/dbus/system_bus_socket ]]; then
-        dbus-daemon --system --fork 2>/dev/null || echo "Note: dbus-daemon start failed (may already be running via init)"
-    fi
+mkdir -p /run/dbus
+if [[ ! -S /run/dbus/system_bus_socket ]]; then
+dbus-daemon --system --fork 2>/dev/null || echo "Note: dbus-daemon start failed (may already be running via init)"
 fi
+fi
+
+echo "Patching polkit policy for non-interactive authorization..."
+pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
+if [[ -f "$pamac_policy" ]]; then
+sed -i 's|<allow_any>auth_admin_keep</allow_any>|<allow_any>yes</allow_any>|' "$pamac_policy"
+sed -i 's|<allow_inactive>auth_admin_keep</allow_inactive>|<allow_inactive>yes</allow_inactive>|' "$pamac_policy"
+sed -i 's|<allow_active>auth_admin_keep</allow_active>|<allow_active>yes</allow_active>|' "$pamac_policy"
+echo "Polkit policy patched: allow_any=yes, allow_inactive=yes, allow_active=yes"
+else
+echo "Note: pamac polkit policy not yet installed (will be patched after pamac-aur install)."
+fi
+
+echo "Polkit and D-Bus setup finished."
+POLKIT_DBUS_EOF
+
+if ! exec_container_script "$polkit_dbus_script" "polkit-dbus-setup"; then
+log_warn "Polkit/dbus setup had issues, retrying..."
+container_start 2>/dev/null || true
+sleep 3
+if container_is_usable; then
+if ! exec_container_script "$polkit_dbus_script" "polkit-dbus-setup-retry"; then
+log_warn "Polkit/dbus setup retry also failed. Will attempt repair later."
+_ok=false
+fi
+else
+log_warn "Container not usable for polkit/dbus retry. Will attempt repair later."
+_ok=false
+fi
+fi
+
+log_info "Stage 6b/7: Installing critical helpers (bootstrap, systemd-run, D-Bus config)..."
+local critical_script
+read -r -d '' critical_script <<'CRITICAL_EOF' || true
+set -uo pipefail
 
 echo "Installing Pamac bootstrap helper..."
 cat > /usr/local/bin/pamac-session-bootstrap.sh << 'BOOTSTRAP'
@@ -1494,6 +1528,7 @@ ensure_service "pamac-daemon" "pamac-daemon" '/usr/bin/pamac-daemon &'
 fi
 BOOTSTRAP
 chmod +x /usr/local/bin/pamac-session-bootstrap.sh
+echo "Bootstrap helper installed."
 
 echo "Installing fake systemd-run wrapper for non-systemd AUR builds..."
 if ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/dev/null 2>&1; then
@@ -1547,40 +1582,285 @@ exec "${CMD_ARGS[@]}"
 fi
 SYSTEMD_RUN_FAKE
 chmod +x /usr/local/sbin/systemd-run
-echo "Fake systemd-run installed at /usr/local/sbin/systemd-run (simulates DynamicUser for AUR builds)."
+echo "Fake systemd-run installed at /usr/local/sbin/systemd-run."
 
 printf '%s\n' '#!/bin/bash' \
 '/usr/local/bin/pamac-session-bootstrap.sh 2>/dev/null &' > /etc/profile.d/pamac-daemon.sh
 chmod +x /etc/profile.d/pamac-daemon.sh
-echo "Non-systemd bootstrap path installed (D-Bus services kept enabled for daemon registration)."
-
-echo "Patching polkit policy for non-interactive authorization..."
-pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
-if [[ -f "$pamac_policy" ]]; then
-sed -i 's|<allow_any>auth_admin_keep</allow_any>|<allow_any>yes</allow_any>|' "$pamac_policy"
-sed -i 's|<allow_inactive>auth_admin_keep</allow_inactive>|<allow_inactive>yes</allow_inactive>|' "$pamac_policy"
-sed -i 's|<allow_active>auth_admin_keep</allow_active>|<allow_active>yes</allow_active>|' "$pamac_policy"
-echo "Polkit policy patched: allow_any=yes, allow_inactive=yes, allow_active=yes"
-else
-echo "Note: pamac polkit policy not yet installed (will be patched after pamac-aur install)."
-fi
+echo "Non-systemd bootstrap profile hook installed."
 else
 echo "Functional systemd detected. Pamac daemon can be started with systemctl."
 fi
 
-echo "Container base setup finished."
-MISC_EOF
+echo "Creating D-Bus system policy for pamac-daemon..."
+mkdir -p /usr/share/dbus-1/system.d
+cat > /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf << 'DBUS_CONF'
+<!DOCTYPE busconfig PUBLIC
+"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
 
-    if ! exec_container_script "$misc_script" "polkit-dbus-setup"; then
-        log_warn "Polkit/dbus setup had issues."
-        _ok=false
-    fi
+<policy user="root">
+<allow own="org.manjaro.pamac.daemon"/>
+<allow send_destination="org.manjaro.pamac.daemon"/>
+</policy>
 
-    if [[ "$_ok" == "true" ]]; then
-        log_success "Container base environment configured."
-    else
-        log_warn "Container base setup completed with some errors."
-    fi
+<policy at_console="true">
+<allow send_destination="org.manjaro.pamac.daemon"/>
+</policy>
+
+<policy context="default">
+<allow send_destination="org.manjaro.pamac.daemon"/>
+</policy>
+
+</busconfig>
+DBUS_CONF
+echo "D-Bus system policy for pamac-daemon created."
+
+echo "Critical helpers setup finished."
+CRITICAL_EOF
+
+if ! exec_container_script "$critical_script" "critical-helpers"; then
+log_warn "Critical helpers setup had issues, retrying..."
+container_start 2>/dev/null || true
+sleep 3
+if container_is_usable; then
+if ! exec_container_script "$critical_script" "critical-helpers-retry"; then
+log_warn "Critical helpers retry also failed. Will verify and repair after base setup."
+_ok=false
+fi
+else
+log_warn "Container not usable for critical helpers retry. Will verify and repair later."
+_ok=false
+fi
+fi
+
+if [[ "$_ok" == "true" ]]; then
+log_success "Container base environment configured."
+else
+log_warn "Container base setup completed with some errors."
+fi
+}
+
+ensure_critical_helpers() {
+log_info "Verifying critical helper files in container..."
+
+local missing_items=()
+
+local systemd_run_check
+systemd_run_check=$(container_root_exec test -x /usr/local/sbin/systemd-run && echo "ok" || echo "missing" 2>/dev/null)
+if [[ "$systemd_run_check" != "ok" ]]; then
+log_warn "Fake systemd-run wrapper is MISSING from container."
+missing_items+=("systemd-run")
+fi
+
+local dbus_conf_check
+dbus_conf_check=$(container_root_exec test -f /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf && echo "ok" || echo "missing" 2>/dev/null)
+if [[ "$dbus_conf_check" != "ok" ]]; then
+log_warn "D-Bus daemon policy config is MISSING from container."
+missing_items+=("dbus-daemon-conf")
+fi
+
+local bootstrap_check
+bootstrap_check=$(container_root_exec test -x /usr/local/bin/pamac-session-bootstrap.sh && echo "ok" || echo "missing" 2>/dev/null)
+if [[ "$bootstrap_check" != "ok" ]]; then
+log_warn "Pamac bootstrap helper is MISSING from container."
+missing_items+=("bootstrap")
+fi
+
+if [[ ${#missing_items[@]} -eq 0 ]]; then
+log_success "All critical helpers verified present."
+return 0
+fi
+
+log_info "Repairing ${#missing_items[@]} missing critical item(s): ${missing_items[*]}"
+
+local repair_script
+read -r -d '' repair_script <<'REPAIR_EOF' || true
+set -uo pipefail
+
+repaired=0
+
+if [[ ! -x /usr/local/bin/pamac-session-bootstrap.sh ]]; then
+echo "Repairing: pamac-session-bootstrap.sh..."
+cat > /usr/local/bin/pamac-session-bootstrap.sh << 'BOOTSTRAP'
+#!/bin/bash
+set +e
+BOOTSTRAP_LOG="/tmp/pamac-bootstrap.log"
+touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 666 "$BOOTSTRAP_LOG" 2>/dev/null
+
+_safe_sleep() {
+if ! sleep "$1" 2>/dev/null; then
+read -t "$1" -r _ 2>/dev/null || true
+fi
+}
+
+log_bootstrap() {
+echo "[$(date '+%H:%M:%S')] $*" >> "$BOOTSTRAP_LOG" 2>/dev/null || true
+}
+
+ensure_service() {
+local name="$1"
+local pid_ok="$2"
+local start_cmd="$3"
+local retries=5
+local count=0
+
+if command -v pgrep >/dev/null 2>&1 && pgrep -x "$pid_ok" >/dev/null 2>&1; then
+log_bootstrap "$name already running (pid $(pgrep -x "$pid_ok" 2>/dev/null | head -1))"
+return 0
+fi
+
+log_bootstrap "Starting $name..."
+while [[ $count -lt $retries ]]; do
+eval "$start_cmd" >> "$BOOTSTRAP_LOG" 2>&1
+_safe_sleep 1
+if command -v pgrep >/dev/null 2>&1 && pgrep -x "$pid_ok" >/dev/null 2>&1; then
+log_bootstrap "$name started successfully"
+return 0
+fi
+count=$((count + 1))
+done
+log_bootstrap "WARNING: $name may not have started after $retries attempts"
+return 1
+}
+
+if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
+log_bootstrap "systemd detected, starting services via systemctl"
+systemctl start polkit 2>/dev/null || true
+systemctl start pamac-daemon >/dev/null 2>&1 || true
+else
+log_bootstrap "Non-systemd environment, starting services manually"
+ensure_service "dbus-daemon" "dbus-daemon" 'mkdir -p /run/dbus; dbus-daemon --system --fork 2>/dev/null'
+ensure_service "polkitd" "polkitd" 'if [[ -x /usr/lib/polkit-1/polkitd ]]; then /usr/lib/polkit-1/polkitd --no-debug & fi'
+ensure_service "pamac-daemon" "pamac-daemon" '/usr/bin/pamac-daemon &'
+fi
+BOOTSTRAP
+chmod +x /usr/local/bin/pamac-session-bootstrap.sh
+repaired=$((repaired + 1))
+echo "Bootstrap helper repaired."
+fi
+
+if [[ ! -x /usr/local/sbin/systemd-run ]]; then
+echo "Repairing: fake systemd-run wrapper..."
+if ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/dev/null 2>&1; then
+mkdir -p /usr/local/sbin
+cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE'
+#!/bin/bash
+DYNAMIC_USER=false
+CACHE_DIR=""
+WORK_DIR=""
+SKIP_NEXT=false
+CMD_ARGS=()
+for arg in "$@"; do
+if $SKIP_NEXT; then
+SKIP_NEXT=false
+continue
+fi
+case "$arg" in
+--service-type=*) continue ;;
+--service-type) SKIP_NEXT=true; continue ;;
+--pipe|--wait|--pty|-q|--quiet|--no-block) continue ;;
+--property=DynamicUser=yes) DYNAMIC_USER=true; continue ;;
+--property=CacheDirectory=*) CACHE_DIR="${arg#--property=CacheDirectory=}"; continue ;;
+--property=WorkingDirectory=*) WORK_DIR="${arg#--property=WorkingDirectory=}"; continue ;;
+--property=*) continue ;;
+--property) SKIP_NEXT=true; continue ;;
+--user|--uid=*|--gid=*|--setenv=*) continue ;;
+--user|--setenv) SKIP_NEXT=true; continue ;;
+*) CMD_ARGS+=("$arg") ;;
+esac
+done
+if [[ ${#CMD_ARGS[@]} -eq 0 ]]; then exit 1; fi
+if [[ -n "$WORK_DIR" ]]; then
+mkdir -p "$WORK_DIR" 2>/dev/null || true
+if $DYNAMIC_USER; then chown deck:deck "$WORK_DIR" 2>/dev/null || true; fi
+fi
+if [[ -n "$CACHE_DIR" ]]; then
+CACHE_FULL="/var/cache/$CACHE_DIR"
+mkdir -p "$CACHE_FULL" 2>/dev/null || true
+if $DYNAMIC_USER; then chown -R deck:deck "$CACHE_FULL" 2>/dev/null || true; fi
+fi
+if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
+BUILD_USER="deck"
+if ! id "$BUILD_USER" >/dev/null 2>&1; then BUILD_USER="nobody"; fi
+if [[ -n "$WORK_DIR" ]]; then
+exec sudo -u "$BUILD_USER" -H -- bash -c "cd '$WORK_DIR' 2>/dev/null; exec ${CMD_ARGS[*]}"
+else
+exec sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
+fi
+else
+if [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR" ]]; then cd "$WORK_DIR" 2>/dev/null || true; fi
+exec "${CMD_ARGS[@]}"
+fi
+SYSTEMD_RUN_FAKE
+chmod +x /usr/local/sbin/systemd-run
+repaired=$((repaired + 1))
+echo "Fake systemd-run repaired."
+
+if [[ ! -f /etc/profile.d/pamac-daemon.sh ]]; then
+printf '%s\n' '#!/bin/bash' \
+'/usr/local/bin/pamac-session-bootstrap.sh 2>/dev/null &' > /etc/profile.d/pamac-daemon.sh
+chmod +x /etc/profile.d/pamac-daemon.sh
+echo "Bootstrap profile hook repaired."
+fi
+else
+echo "Functional systemd detected, skipping fake systemd-run."
+fi
+fi
+
+if [[ ! -f /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf ]]; then
+echo "Repairing: D-Bus system policy for pamac-daemon..."
+mkdir -p /usr/share/dbus-1/system.d
+cat > /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf << 'DBUS_CONF'
+<!DOCTYPE busconfig PUBLIC
+"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+
+<policy user="root">
+<allow own="org.manjaro.pamac.daemon"/>
+<allow send_destination="org.manjaro.pamac.daemon"/>
+</policy>
+
+<policy at_console="true">
+<allow send_destination="org.manjaro.pamac.daemon"/>
+</policy>
+
+<policy context="default">
+<allow send_destination="org.manjaro.pamac.daemon"/>
+</policy>
+
+</busconfig>
+DBUS_CONF
+repaired=$((repaired + 1))
+echo "D-Bus daemon policy repaired."
+fi
+
+echo "Repaired $repaired critical item(s)."
+REPAIR_EOF
+
+local repair_ok=false
+for attempt in 1 2 3; do
+if exec_container_script "$repair_script" "critical-helpers-repair-attempt-$attempt"; then
+repair_ok=true
+break
+fi
+log_warn "Critical helpers repair attempt $attempt failed, restarting container..."
+container_start 2>/dev/null || true
+sleep 3
+if ! container_is_usable; then
+log_error "Container not usable for critical helpers repair."
+return 1
+fi
+done
+
+if [[ "$repair_ok" == "true" ]]; then
+log_success "Critical helpers repaired successfully."
+else
+log_error "Failed to repair critical helpers after 3 attempts."
+return 1
+fi
 }
 
 optimize_pacman_mirrors() {
@@ -2797,14 +3077,17 @@ main() {
 
     check_memory_ok 262144 "base setup" || log_warn "Low memory may cause OOM kills during base setup."
 
-    if ! configure_container_base; then
-        log_warn "Container base setup had errors. Checking container health..."
-        if ! ensure_container_healthy "base setup recovery"; then
-            exit 1
-        fi
-    fi
+if ! configure_container_base; then
+log_warn "Container base setup had errors. Checking container health..."
+if ! ensure_container_healthy "base setup recovery"; then
+exit 1
+fi
+fi
 
-    ensure_container_healthy "before mirror optimization" || exit 1
+ensure_container_healthy "before critical helpers check" || exit 1
+ensure_critical_helpers
+
+ensure_container_healthy "before mirror optimization" || exit 1
     optimize_pacman_mirrors
 
     ensure_container_healthy "before multilib setup" || exit 1
@@ -2834,9 +3117,10 @@ main() {
         fi
     fi
 
-    ensure_container_healthy "after pamac install" || exit 1
+ensure_container_healthy "after pamac install" || exit 1
+ensure_critical_helpers
 
-    install_gaming_packages
+install_gaming_packages
 
     export_pamac_to_host
 

@@ -3,6 +3,7 @@ echo "=== D-Bus ==="
 which dbus-daemon 2>/dev/null || echo "dbus-daemon NOT FOUND"
 ls /usr/share/dbus-1/system-services/org.manjaro.pamac* 2>/dev/null || echo "no pamac dbus services"
 ls /usr/share/dbus-1/system.d/org.manjaro.pamac* 2>/dev/null || echo "no pamac dbus config"
+test -f /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf && echo "daemon.conf EXISTS" || echo "daemon.conf MISSING"
 
 echo "=== Polkit ==="
 ls /usr/lib/polkit-1/polkitd 2>/dev/null || echo "polkitd NOT FOUND"

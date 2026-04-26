@@ -222,16 +222,15 @@ echo ""
 # 2. cli-text       - figlet (AUR, C program, no desktop)
 # 3. go-gui-tui     - lazygit (AUR, Go binary, has desktop in AUR PKGBUILD but not in package)
 # 4. rust-cli-bin   - ripgrep (extra repo, Rust binary, no desktop)
-# 5. rust-cli-bin - bat (extra repo, Rust binary, no desktop - CLI only, hard to search)
-# 5b. gui-gtk-aur - celluloid (AUR/extra, GTK frontend for mpv, has desktop)
+# 5. gui-gtk-aur - celluloid (AUR/extra, GTK frontend for mpv, has desktop)
 # 6. go-cli-bin - github-cli (extra repo, Go binary, no desktop - CLI only)
-# 7. font           - ttf-ms-fonts (AUR, font package, no desktop)
-# 8. gui-gtk        - mousepad (extra repo/AUR, GTK GUI, has desktop with org.xfce prefix)
-# 9. python-cli     - yt-dlp (AUR, Python script, no desktop)
-# 10. cpp-tui       - btop (AUR, C++ TUI, has desktop)
-# 11. gui-qt-bin    - librewolf-bin (AUR, Qt/GTK GUI binary, has desktop)
-# 12. gui-electron  - heroic-games-launcher-bin (AUR, Electron GUI, has desktop)
-# 13. rust-cli-bin  - fd (extra repo, Rust binary, no desktop)
+# 7. font - ttf-ms-fonts (AUR, font package, no desktop)
+# 8. gui-gtk - mousepad (extra repo/AUR, GTK GUI, has desktop with org.xfce prefix)
+# 9. python-cli - yt-dlp (AUR, Python script, no desktop)
+# 10. cpp-tui - btop (AUR, C++ TUI, has desktop)
+# 11. gui-qt-bin - librewolf-bin (AUR, Qt/GTK GUI binary, has desktop - 600s timeout for large download)
+# 12. gui-electron - heroic-games-launcher-bin (AUR, Electron GUI, has desktop - 600s timeout for large download)
+# 13. rust-cli-bin - fd (extra repo, Rust binary, no desktop)
 
 test_package "neofetch" "cli-info" "neofetch" "false" 120
 test_package "figlet" "cli-text" "figlet" "false" 120
@@ -243,8 +242,8 @@ test_package "ttf-ms-fonts" "font" "none" "false" 180
 test_package "mousepad" "gui-gtk" "mousepad" "true" 300
 test_package "yt-dlp" "python-cli" "yt-dlp" "false" 300
 test_package "btop" "cpp-tui" "btop" "true" 300
-test_package "librewolf-bin" "gui-qt-bin" "librewolf" "true" 300
-test_package "heroic-games-launcher-bin" "gui-electron-bin" "heroic" "true" 300
+test_package "librewolf-bin" "gui-qt-bin" "librewolf" "true" 600
+test_package "heroic-games-launcher-bin" "gui-electron-bin" "heroic" "true" 600
 test_package "fd" "rust-cli-bin" "fd" "false" 120
 
 echo "=== Final DB Integrity Check ==="

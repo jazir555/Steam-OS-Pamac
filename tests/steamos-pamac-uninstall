@@ -5,104 +5,171 @@ APP_DIR="$HOME/.local/share/applications"
 STATE_DIR="$HOME/.local/share/steamos-pamac/$CONTAINER_NAME"
 
 show_help() {
-echo "Usage: steamos-pamac-uninstall [options]"
-echo "Options:"
-echo "  --desktop-file FILE   Uninstall the package associated with the given desktop file"
-echo "  --package PKG         Uninstall a package by name from the container"
-echo "  --list                List all pamac-managed applications"
-echo "  --help                Show this help"
+    echo "Usage: steamos-pamac-uninstall [options]"
+    echo "Options:"
+    echo "  --desktop-file FILE   Uninstall the package associated with the given desktop file"
+    echo "  --package PKG         Uninstall a package by name from the container"
+    echo "  --appstream-id ID     Uninstall via AppStream component ID (maps to pamac package)"
+    echo "  --list                List all pamac-managed applications"
+    echo "  --help                Show this help"
 }
 
 uninstall_package() {
-local pkg="$1"
-if [[ -z "$pkg" ]]; then
-echo "Error: No package specified." >&2
-exit 1
-fi
-echo "Uninstalling $pkg from $CONTAINER_NAME..."
-podman exec -i -u 0 "$CONTAINER_NAME" bash -c '
-rm -f /run/dbus/pid 2>/dev/null
-pkill pamac-daemon 2>/dev/null; pkill polkitd 2>/dev/null; pkill dbus-daemon 2>/dev/null
-sleep 1
-mkdir -p /run/dbus
-dbus-daemon --system --fork 2>/dev/null
-sleep 1
-/usr/lib/polkit-1/polkitd --no-debug &>/dev/null &
-sleep 1
-/usr/bin/pamac-daemon &>/dev/null &
-sleep 2
-pamac remove --no-confirm --no-save "'"$pkg"'" 2>&1
-'
-local rc=$?
-if [[ $rc -eq 0 ]]; then
-echo "Successfully uninstalled $pkg"
-podman exec -i -u 0 "$CONTAINER_NAME" /usr/local/bin/distrobox-export-hook.sh 2>/dev/null || true
-else
-echo "Failed to uninstall $pkg (exit code: $rc)" >&2
-exit $rc
-fi
+    local pkg="$1"
+    if [[ -z "$pkg" ]]; then
+        echo "Error: No package specified." >&2
+        exit 1
+    fi
+    echo "Uninstalling $pkg from $CONTAINER_NAME..."
+    podman exec -i -u 0 "$CONTAINER_NAME" bash -c '
+        rm -f /run/dbus/pid 2>/dev/null
+        pkill pamac-daemon 2>/dev/null; pkill polkitd 2>/dev/null; pkill dbus-daemon 2>/dev/null
+        sleep 1
+        mkdir -p /run/dbus
+        dbus-daemon --system --fork 2>/dev/null
+        sleep 1
+        /usr/lib/polkit-1/polkitd --no-debug &>/dev/null &
+        sleep 1
+        /usr/bin/pamac-daemon &>/dev/null &
+        sleep 2
+        pamac remove --no-confirm --no-save "'"$pkg"'" 2>&1
+    '
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then
+        echo "Successfully uninstalled $pkg"
+        podman exec -i -u 0 "$CONTAINER_NAME" /usr/local/bin/distrobox-export-hook.sh 2>/dev/null || true
+    else
+        echo "Failed to uninstall $pkg (exit code: $rc)" >&2
+        exit $rc
+    fi
 }
 
 list_apps() {
-if [[ -f "$STATE_DIR/exported-apps.list" ]]; then
-while IFS= read -r desktop_path; do
-[[ -f "$desktop_path" ]] || continue
-local pkg
-pkg=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$desktop_path" 2>/dev/null | cut -d= -f2)
-local name
-name=$(grep '^Name=' "$desktop_path" 2>/dev/null | head -1 | cut -d= -f2)
-if [[ -n "$pkg" ]]; then
-echo "$name  [$pkg]"
-fi
-done < "$STATE_DIR/exported-apps.list"
-else
-echo "No pamac-managed applications found."
-fi
+    if [[ -f "$STATE_DIR/exported-apps.list" ]]; then
+        while IFS= read -r desktop_path; do
+            [[ -f "$desktop_path" ]] || continue
+            local pkg
+            pkg=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$desktop_path" 2>/dev/null | cut -d= -f2)
+            local name
+            name=$(grep '^Name=' "$desktop_path" 2>/dev/null | head -1 | cut -d= -f2)
+            if [[ -n "$pkg" ]]; then
+                echo "$name [$pkg]"
+            fi
+        done < "$STATE_DIR/exported-apps.list"
+    else
+        echo "No pamac-managed applications found."
+    fi
+}
+
+uninstall_by_appstream_id() {
+    local as_id="$1"
+    if [[ -z "$as_id" ]]; then
+        echo "Error: No AppStream ID specified." >&2
+        exit 1
+    fi
+
+    local desktop_id="${as_id}.desktop"
+    local desktop_file=""
+
+    for candidate in \
+        "$APP_DIR/${CONTAINER_NAME}-${desktop_id}" \
+        "$APP_DIR/${desktop_id}"; do
+        if [[ -f "$candidate" ]]; then
+            desktop_file="$candidate"
+            break
+        fi
+    done
+
+    if [[ -z "$desktop_file" ]]; then
+        for f in "$APP_DIR"/${CONTAINER_NAME}-*.desktop; do
+            [[ -f "$f" ]] || continue
+            local src_desktop
+            src_desktop=$(grep '^X-SteamOS-Pamac-SourceDesktop=' "$f" 2>/dev/null | cut -d= -f2)
+            if [[ -n "$src_desktop" ]]; then
+                local src_basename
+                src_basename=$(basename "$src_desktop" .desktop)
+                if [[ "$src_basename" == "$as_id" ]]; then
+                    desktop_file="$f"
+                    break
+                fi
+            fi
+            local src_app
+            src_app=$(grep '^X-SteamOS-Pamac-SourceApp=' "$f" 2>/dev/null | cut -d= -f2)
+            if [[ "$src_app" == "$as_id" ]]; then
+                desktop_file="$f"
+                break
+            fi
+        done
+    fi
+
+    if [[ -z "$desktop_file" ]]; then
+        echo "Error: No pamac-managed application found for AppStream ID: $as_id" >&2
+        echo "Managed apps:"
+        list_apps >&2
+        exit 1
+    fi
+
+    local pkg
+    pkg=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$desktop_file" 2>/dev/null | cut -d= -f2)
+    if [[ -z "$pkg" ]]; then
+        echo "Error: No X-SteamOS-Pamac-SourcePackage marker found in $desktop_file" >&2
+        exit 1
+    fi
+
+    local app_name
+    app_name=$(grep '^Name=' "$desktop_file" 2>/dev/null | head -1 | cut -d= -f2)
+
+    echo "Found pamac-managed app: $app_name (package: $pkg)"
+    uninstall_package "$pkg"
 }
 
 if [[ $# -eq 0 ]]; then
-show_help
-exit 0
+    show_help
+    exit 0
 fi
 
 case "$1" in
 --desktop-file)
-shift
-desktop_file="$1"
-if [[ -z "$desktop_file" ]]; then
-echo "Error: --desktop-file requires a file name argument" >&2
-exit 1
-fi
-full_path="$APP_DIR/$desktop_file"
-if [[ ! -f "$full_path" ]]; then
-echo "Error: Desktop file not found: $full_path" >&2
-exit 1
-fi
-pkg=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$full_path" 2>/dev/null | cut -d= -f2)
-if [[ -z "$pkg" ]]; then
-echo "Error: No X-SteamOS-Pamac-SourcePackage marker found in $full_path" >&2
-exit 1
-fi
-uninstall_package "$pkg"
-;;
+    shift
+    desktop_file="$1"
+    if [[ -z "$desktop_file" ]]; then
+        echo "Error: --desktop-file requires a file name argument" >&2
+        exit 1
+    fi
+    full_path="$APP_DIR/$desktop_file"
+    if [[ ! -f "$full_path" ]]; then
+        echo "Error: Desktop file not found: $full_path" >&2
+        exit 1
+    fi
+    pkg=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$full_path" 2>/dev/null | cut -d= -f2)
+    if [[ -z "$pkg" ]]; then
+        echo "Error: No X-SteamOS-Pamac-SourcePackage marker found in $full_path" >&2
+        exit 1
+    fi
+    uninstall_package "$pkg"
+    ;;
 --package)
-shift
-pkg="$1"
-if [[ -z "$pkg" ]]; then
-echo "Error: --package requires a package name argument" >&2
-exit 1
-fi
-uninstall_package "$pkg"
-;;
+    shift
+    pkg="$1"
+    if [[ -z "$pkg" ]]; then
+        echo "Error: --package requires a package name argument" >&2
+        exit 1
+    fi
+    uninstall_package "$pkg"
+    ;;
+--appstream-id)
+    shift
+    uninstall_by_appstream_id "$1"
+    ;;
 --list)
-list_apps
-;;
+    list_apps
+    ;;
 --help|-h)
-show_help
-;;
+    show_help
+    ;;
 *)
-echo "Error: Unknown option $1" >&2
-show_help
-exit 1
-;;
+    echo "Error: Unknown option $1" >&2
+    show_help
+    exit 1
+    ;;
 esac

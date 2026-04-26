@@ -2488,12 +2488,13 @@ APP_DIR="\$HOME/.local/share/applications"
 STATE_DIR="\$HOME/.local/share/steamos-pamac/\$CONTAINER_NAME"
 
 show_help() {
-echo "Usage: steamos-pamac-uninstall [options]"
-echo "Options:"
-echo "  --desktop-file FILE   Uninstall the package associated with the given desktop file"
-echo "  --package PKG         Uninstall a package by name from the container"
-echo "  --list                List all pamac-managed applications"
-echo "  --help                Show this help"
+    echo "Usage: steamos-pamac-uninstall [options]"
+    echo "Options:"
+    echo "  --desktop-file FILE   Uninstall the package associated with the given desktop file"
+    echo "  --package PKG         Uninstall a package by name from the container"
+    echo "  --appstream-id ID     Uninstall via AppStream component ID (maps to pamac package)"
+    echo "  --list                List all pamac-managed applications"
+    echo "  --help                Show this help"
 }
 
 uninstall_package() {
@@ -2527,20 +2528,82 @@ fi
 }
 
 list_apps() {
-if [[ -f "\$STATE_DIR/exported-apps.list" ]]; then
-while IFS= read -r desktop_path; do
-[[ -f "\$desktop_path" ]] || continue
-local pkg
-pkg=\$(grep '^X-SteamOS-Pamac-SourcePackage=' "\$desktop_path" 2>/dev/null | cut -d= -f2)
-local name
-name=\$(grep '^Name=' "\$desktop_path" 2>/dev/null | head -1 | cut -d= -f2)
-if [[ -n "\$pkg" ]]; then
-echo "\$name  [\$pkg]"
-fi
-done < "\$STATE_DIR/exported-apps.list"
-else
-echo "No pamac-managed applications found."
-fi
+    if [[ -f "\$STATE_DIR/exported-apps.list" ]]; then
+    while IFS= read -r desktop_path; do
+        [[ -f "\$desktop_path" ]] || continue
+        local pkg
+        pkg=\$(grep '^X-SteamOS-Pamac-SourcePackage=' "\$desktop_path" 2>/dev/null | cut -d= -f2)
+        local name
+        name=\$(grep '^Name=' "\$desktop_path" 2>/dev/null | head -1 | cut -d= -f2)
+        if [[ -n "\$pkg" ]]; then
+            echo "\$name [\$pkg]"
+        fi
+    done < "\$STATE_DIR/exported-apps.list"
+    else
+        echo "No pamac-managed applications found."
+    fi
+}
+
+uninstall_by_appstream_id() {
+    local as_id="\$1"
+    if [[ -z "\$as_id" ]]; then
+        echo "Error: No AppStream ID specified." >&2
+        exit 1
+    fi
+
+    local desktop_id="\${as_id}.desktop"
+    local desktop_file=""
+
+    for candidate in \\
+        "\$APP_DIR/${CONTAINER_NAME}-\${desktop_id}" \\
+        "\$APP_DIR/\${desktop_id}"; do
+        if [[ -f "\$candidate" ]]; then
+            desktop_file="\$candidate"
+            break
+        fi
+    done
+
+    if [[ -z "\$desktop_file" ]]; then
+        for f in "\$APP_DIR"/${CONTAINER_NAME}-*.desktop; do
+            [[ -f "\$f" ]] || continue
+            local src_desktop
+            src_desktop=\$(grep '^X-SteamOS-Pamac-SourceDesktop=' "\$f" 2>/dev/null | cut -d= -f2)
+            if [[ -n "\$src_desktop" ]]; then
+                local src_basename
+                src_basename=\$(basename "\$src_desktop" .desktop)
+                if [[ "\$src_basename" == "\$as_id" ]]; then
+                    desktop_file="\$f"
+                    break
+                fi
+            fi
+            local src_app
+            src_app=\$(grep '^X-SteamOS-Pamac-SourceApp=' "\$f" 2>/dev/null | cut -d= -f2)
+            if [[ "\$src_app" == "\$as_id" ]]; then
+                desktop_file="\$f"
+                break
+            fi
+        done
+    fi
+
+    if [[ -z "\$desktop_file" ]]; then
+        echo "Error: No pamac-managed application found for AppStream ID: \$as_id" >&2
+        echo "Managed apps:"
+        list_apps >&2
+        exit 1
+    fi
+
+    local pkg
+    pkg=\$(grep '^X-SteamOS-Pamac-SourcePackage=' "\$desktop_file" 2>/dev/null | cut -d= -f2)
+    if [[ -z "\$pkg" ]]; then
+        echo "Error: No X-SteamOS-Pamac-SourcePackage marker found in \$desktop_file" >&2
+        exit 1
+    fi
+
+    local app_name
+    app_name=\$(grep '^Name=' "\$desktop_file" 2>/dev/null | head -1 | cut -d= -f2)
+
+    echo "Found pamac-managed app: \$app_name (package: \$pkg)"
+    uninstall_package "\$pkg"
 }
 
 if [[ \$# -eq 0 ]]; then
@@ -2569,14 +2632,18 @@ fi
 uninstall_package "\$pkg"
 ;;
 --package)
-shift
-pkg="\$1"
-if [[ -z "\$pkg" ]]; then
-echo "Error: --package requires a package name argument" >&2
-exit 1
-fi
-uninstall_package "\$pkg"
-;;
+    shift
+    pkg="\$1"
+    if [[ -z "\$pkg" ]]; then
+        echo "Error: --package requires a package name argument" >&2
+        exit 1
+    fi
+    uninstall_package "\$pkg"
+    ;;
+--appstream-id)
+    shift
+    uninstall_by_appstream_id "\$1"
+    ;;
 --list)
 list_apps
 ;;
@@ -2590,8 +2657,174 @@ exit 1
 ;;
 esac
 UNINSTALL_EOF
-chmod +x "$uninstall_helper"
-log_info "Created uninstall helper: $uninstall_helper"
+    chmod +x "$uninstall_helper"
+    log_info "Created uninstall helper: $uninstall_helper"
+
+    local appstream_handler="$bin_dir/steamos-pamac-appstream"
+    cat > "$appstream_handler" << APPSTREAM_EOF
+#!/bin/bash
+set +e
+
+APP_DIR="\$HOME/.local/share/applications"
+UNINSTALL_HELPER="\$HOME/.local/bin/steamos-pamac-uninstall"
+LOG_FILE="\$HOME/.local/share/steamos-pamac/${CONTAINER_NAME}/appstream-handler.log"
+
+mkdir -p "\$(dirname "\$LOG_FILE")"
+
+log_msg() {
+    echo "\$(date): \$*" >> "\$LOG_FILE"
+}
+
+log_msg "appstream handler invoked with args: \$*"
+
+if [[ \$# -lt 1 ]]; then
+    log_msg "Error: No URL argument provided"
+    echo "Usage: steamos-pamac-appstream <appstream://component-id>" >&2
+    exit 1
+fi
+
+URL="\$1"
+log_msg "Received URL: \$URL"
+
+if [[ "\$URL" != appstream://* ]]; then
+    log_msg "Error: Not an appstream:// URL: \$URL"
+    echo "Error: Expected appstream:// URL, got: \$URL" >&2
+    exit 1
+fi
+
+COMPONENT_ID="\${URL#appstream://}"
+COMPONENT_ID="\${COMPONENT_ID%/}"
+log_msg "Extracted component ID: \$COMPONENT_ID"
+
+if [[ -z "\$COMPONENT_ID" ]]; then
+    log_msg "Error: Empty component ID"
+    echo "Error: Empty component ID in appstream URL" >&2
+    exit 1
+fi
+
+FOUND_PAMAC_APP=false
+
+for candidate in \\
+    "\$APP_DIR/${CONTAINER_NAME}-\${COMPONENT_ID}.desktop" \\
+    "\$APP_DIR/\${COMPONENT_ID}.desktop"; do
+    if [[ -f "\$candidate" ]]; then
+        if grep -q '^X-SteamOS-Pamac-Managed=true' "\$candidate" 2>/dev/null; then
+            FOUND_PAMAC_APP=true
+            log_msg "Found pamac-managed desktop file: \$candidate"
+            break
+        fi
+    fi
+done
+
+if [[ "\$FOUND_PAMAC_APP" != "true" ]]; then
+    for f in "\$APP_DIR"/${CONTAINER_NAME}-*.desktop; do
+        [[ -f "\$f" ]] || continue
+        if grep -q '^X-SteamOS-Pamac-Managed=true' "\$f" 2>/dev/null; then
+            local_src_desktop=\$(grep '^X-SteamOS-Pamac-SourceDesktop=' "\$f" 2>/dev/null | cut -d= -f2)
+            if [[ -n "\$local_src_desktop" ]]; then
+                local_basename=\$(basename "\$local_src_desktop" .desktop)
+                if [[ "\$local_basename" == "\$COMPONENT_ID" ]]; then
+                    FOUND_PAMAC_APP=true
+                    log_msg "Found pamac-managed app via SourceDesktop match: \$f"
+                    break
+                fi
+            fi
+            local_src_app=\$(grep '^X-SteamOS-Pamac-SourceApp=' "\$f" 2>/dev/null | cut -d= -f2)
+            if [[ "\$local_src_app" == "\$COMPONENT_ID" ]]; then
+                FOUND_PAMAC_APP=true
+                log_msg "Found pamac-managed app via SourceApp match: \$f"
+                break
+            fi
+        fi
+    done
+fi
+
+if [[ "\$FOUND_PAMAC_APP" == "true" ]]; then
+    log_msg "Routing to steamos-pamac-uninstall --appstream-id \$COMPONENT_ID"
+    if [[ -x "\$UNINSTALL_HELPER" ]]; then
+        exec "\$UNINSTALL_HELPER" --appstream-id "\$COMPONENT_ID"
+    else
+        log_msg "Error: Uninstall helper not found at \$UNINSTALL_HELPER"
+        echo "Error: Uninstall helper not found at \$UNINSTALL_HELPER" >&2
+        exit 1
+    fi
+fi
+
+log_msg "App \$COMPONENT_ID is not pamac-managed, passing to default handler"
+
+FALLBACK_HANDLER=""
+if command -v plasma-discover &>/dev/null; then
+    FALLBACK_HANDLER="plasma-discover"
+fi
+
+if [[ -z "\$FALLBACK_HANDLER" ]]; then
+    for candidate in \\
+        /usr/bin/plasma-discover \\
+        /usr/local/bin/plasma-discover \\
+        /usr/bin/xdg-open; do
+        if [[ -x "\$candidate" ]]; then
+            FALLBACK_HANDLER="\$candidate"
+            break
+        fi
+    done
+fi
+
+if [[ -n "\$FALLBACK_HANDLER" ]]; then
+    log_msg "Using fallback handler: \$FALLBACK_HANDLER \$URL"
+    exec "\$FALLBACK_HANDLER" "\$URL"
+else
+    log_msg "Error: No fallback handler found for \$URL"
+    echo "Error: No application found to handle appstream:// URLs" >&2
+    echo "Install plasma-discover or register an x-scheme-handler/appstream handler." >&2
+    exit 1
+fi
+APPSTREAM_EOF
+    chmod +x "$appstream_handler"
+    log_info "Created appstream URL handler: $appstream_handler"
+
+    local handler_desktop="$desktop_dir/steamos-pamac-appstream-handler.desktop"
+    cat > "$handler_desktop" << HANDLER_DESKTOP_EOF
+[Desktop Entry]
+Type=Application
+Name=SteamOS Pamac App Handler
+Comment=Handles appstream:// URLs for pamac-managed container applications
+Exec=${appstream_handler} %u
+NoDisplay=true
+MimeType=x-scheme-handler/appstream;
+HANDLER_DESKTOP_EOF
+    chmod 644 "$handler_desktop"
+    log_info "Created appstream handler desktop entry: $handler_desktop"
+
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        run_command update-desktop-database "$desktop_dir" 2>/dev/null || true
+    fi
+
+    if command -v xdg-mime >/dev/null 2>&1; then
+        run_command xdg-mime default steamos-pamac-appstream-handler.desktop x-scheme-handler/appstream 2>/dev/null || true
+        log_info "Registered as x-scheme-handler/appstream via xdg-mime"
+    else
+        local mimeapps="$HOME/.local/share/applications/mimeapps.list"
+        local mimeapps_updated=false
+        if [[ ! -f "$mimeapps" ]]; then
+            printf '%s\n' "[Default Applications]" "x-scheme-handler/appstream=steamos-pamac-appstream-handler.desktop" > "$mimeapps"
+            mimeapps_updated=true
+        else
+            if ! grep -q 'x-scheme-handler/appstream' "$mimeapps" 2>/dev/null; then
+                if grep -q '^\[Default Applications\]' "$mimeapps" 2>/dev/null; then
+                    run_command sed -i '/^\[Default Applications\]/a x-scheme-handler/appstream=steamos-pamac-appstream-handler.desktop' "$mimeapps"
+                else
+                    printf '%s\n' "[Default Applications]" "x-scheme-handler/appstream=steamos-pamac-appstream-handler.desktop" | run_command cat - "$mimeapps" > "$mimeapps.tmp" && run_command mv "$mimeapps.tmp" "$mimeapps"
+                fi
+                mimeapps_updated=true
+            else
+                run_command sed -i 's|^x-scheme-handler/appstream=.*|x-scheme-handler/appstream=steamos-pamac-appstream-handler.desktop|' "$mimeapps"
+                mimeapps_updated=true
+            fi
+        fi
+        if [[ "$mimeapps_updated" == "true" ]]; then
+            log_info "Registered as x-scheme-handler/appstream in mimeapps.list"
+        fi
+    fi
 
     if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
         log_info "Add '$bin_dir' to your PATH to use the CLI wrapper directly."

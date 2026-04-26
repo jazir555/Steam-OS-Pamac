@@ -167,14 +167,30 @@ test_prerequisites() {
 		pass "pamac CLI version: $ver"
 	fi
 
-	log_test "Verifying pamac-daemon can start..."
-	local daemon_test
-	daemon_test=$(pamac_exec "echo daemon_ok" 10 || true)
-	if [[ "$daemon_test" == *"daemon_ok"* ]]; then
-		pass "pamac-daemon bootstrap works"
-	else
-		fail "pamac-daemon bootstrap failed (search/install will fail)"
-	fi
+log_test "Verifying pamac-daemon can start..."
+local daemon_test
+daemon_test=$(pamac_exec "echo daemon_ok" 10 || true)
+if [[ "$daemon_test" == *"daemon_ok"* ]]; then
+pass "pamac-daemon bootstrap works"
+else
+fail "pamac-daemon bootstrap failed (search/install will fail)"
+fi
+
+local systemd_run_exists
+systemd_run_exists=$(container_exec "test -x /usr/local/sbin/systemd-run && echo true || echo false" || echo "false")
+if [[ "$systemd_run_exists" == "true" ]]; then
+pass "Fake systemd-run wrapper exists"
+else
+fail "Fake systemd-run wrapper NOT FOUND (AUR builds will fail)"
+fi
+
+local dbus_conf_exists
+dbus_conf_exists=$(container_exec "test -f /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf && echo true || echo false" || echo "false")
+if [[ "$dbus_conf_exists" == "true" ]]; then
+pass "D-Bus daemon policy config exists"
+else
+fail "D-Bus daemon policy config NOT FOUND (daemon may not register on bus)"
+fi
 }
 
 ###############################################################################

@@ -2113,9 +2113,9 @@ DESKTOP_EOF
         rm -f "$exported_desktop"
     fi
 
-    log_info "Writing clean pamac-manager desktop entry with proper integration markers..."
-    exported_desktop="$desktop_dir/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
-    cat > "$exported_desktop" << DESKTOP_EOF
+log_info "Writing clean pamac-manager desktop entry with proper integration markers..."
+exported_desktop="$desktop_dir/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
+cat > "$exported_desktop" << DESKTOP_EOF
 [Desktop Entry]
 Type=Application
 Name=Add/Remove Software (on ${CONTAINER_NAME})
@@ -2129,11 +2129,17 @@ StartupNotify=true
 StartupWMClass=pamac-manager
 NoDisplay=false
 DBusActivatable=false
+Actions=uninstall;
 X-SteamOS-Pamac-Managed=true
 X-SteamOS-Pamac-Container=${CONTAINER_NAME}
 X-SteamOS-Pamac-SourceApp=pamac-manager
 X-SteamOS-Pamac-SourceDesktop=org.manjaro.pamac.manager.desktop
 X-SteamOS-Pamac-SourcePackage=pamac-aur
+
+[Desktop Action uninstall]
+Name=Uninstall Packages
+Exec=${HOME}/.local/bin/steamos-pamac-uninstall --desktop-file "${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
+Icon=edit-delete
 DESKTOP_EOF
     chmod +x "$exported_desktop"
     log_success "Pamac desktop entry written: $exported_desktop"

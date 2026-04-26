@@ -2386,16 +2386,21 @@ should_export_desktop() {
     grep -Fxq "\$owner_pkg" "\$EXPLICIT_FILE"
 }
 
+get_exec_binary() {
+  local desktop_file="\$1"
+  grep '^Exec=' "\$desktop_file" 2>/dev/null | head -1 | sed 's/^Exec=//' | sed 's/ .*//' | sed 's|^.*/||'
+}
+
 annotate_desktop() {
-local desktop_file="\$1"
-local app_name="\$2"
-local export_name="\$3"
-local owner_pkg="\$4"
+  local desktop_file="\$1"
+  local app_name="\$2"
+  local export_name="\$3"
+  local owner_pkg="\$4"
 
-[[ -f "\$desktop_file" ]] || return 1
+  [[ -f "\$desktop_file" ]] || return 1
 
-if [[ "\$app_name" == "org.manjaro.pamac.manager" ]]; then
-cat > "\$desktop_file" << PAMAC_DESKTOP
+  if [[ "\$app_name" == "org.manjaro.pamac.manager" ]]; then
+    cat > "\$desktop_file" << PAMAC_DESKTOP
 [Desktop Entry]
 Type=Application
 Name=Add/Remove Software (on ${container_name})
@@ -2421,99 +2426,161 @@ Name=Uninstall Packages
 Exec=/home/${current_user}/.local/bin/steamos-pamac-uninstall --desktop-file ${container_name}-org.manjaro.pamac.manager.desktop
 Icon=edit-delete
 PAMAC_DESKTOP
-chmod +x "\$desktop_file"
-return 0
-fi
+    chmod +x "\$desktop_file"
+    return 0
+  fi
 
-sed -i \
--e '/^X-SteamOS-Pamac-Managed=/d' \
--e '/^X-SteamOS-Pamac-Container=/d' \
--e '/^X-SteamOS-Pamac-SourceApp=/d' \
--e '/^X-SteamOS-Pamac-SourceDesktop=/d' \
--e '/^X-SteamOS-Pamac-SourcePackage=/d' \
--e '/^Actions=/d' \
--e '/^\[Desktop Action uninstall\]/,${ /^Name=Uninstall/d; /^Exec=.*steamos-pamac-uninstall/d; /^Icon=edit-delete/d; /^\[Desktop Action/d; }' \
-"\$desktop_file"
-desktop_basename="\$(basename "\$desktop_file")"
-printf '\nActions=uninstall;\nX-SteamOS-Pamac-Managed=true\nX-SteamOS-Pamac-Container=%s\nX-SteamOS-Pamac-SourceApp=%s\nX-SteamOS-Pamac-SourceDesktop=%s.desktop\nX-SteamOS-Pamac-SourcePackage=%s\n\n[Desktop Action uninstall]\nName=Uninstall\nExec=/home/${current_user}/.local/bin/steamos-pamac-uninstall --desktop-file %s\nIcon=edit-delete\n' \
-"${container_name}" "\$export_name" "\$app_name" "\$owner_pkg" "\$desktop_basename" >> "\$desktop_file"
+  local tmp_file
+  tmp_file="\$(mktemp)"
+  {
+    local in_action=false
+    while IFS= read -r line || [[ -n "\$line" ]]; do
+      case "\$line" in
+        'X-SteamOS-Pamac-Managed='*) continue ;;
+        'X-SteamOS-Pamac-Container='*) continue ;;
+        'X-SteamOS-Pamac-SourceApp='*) continue ;;
+        'X-SteamOS-Pamac-SourceDesktop='*) continue ;;
+        'X-SteamOS-Pamac-SourcePackage='*) continue ;;
+        'Actions='*) continue ;;
+        '[Desktop Action uninstall]')
+          in_action=true
+          continue
+          ;;
+      esac
+      if \$in_action; then
+        case "\$line" in
+          'Name=Uninstall'|'Name=Uninstall '*|'Exec='*steamos-pamac-uninstall*|'Icon=edit-delete'|'['*)
+            if [[ "\$line" == '['* ]]; then
+              in_action=false
+              printf '%s\n' "\$line"
+            fi
+            continue
+            ;;
+        esac
+      fi
+      printf '%s\n' "\$line"
+    done < "\$desktop_file"
+  } > "\$tmp_file"
+  mv "\$tmp_file" "\$desktop_file"
+
+  desktop_basename="\$(basename "\$desktop_file")"
+  printf '\nActions=uninstall;\nX-SteamOS-Pamac-Managed=true\nX-SteamOS-Pamac-Container=%s\nX-SteamOS-Pamac-SourceApp=%s\nX-SteamOS-Pamac-SourceDesktop=%s.desktop\nX-SteamOS-Pamac-SourcePackage=%s\n\n[Desktop Action uninstall]\nName=Uninstall\nExec=/home/${current_user}/.local/bin/steamos-pamac-uninstall --desktop-file %s\nIcon=edit-delete\n' \
+    "${container_name}" "\$export_name" "\$app_name" "\$owner_pkg" "\$desktop_basename" >> "\$desktop_file"
 }
 
 run_distrobox_export() {
-    local app_name="\$1"
+  local app_name="\$1"
+  local fallback_name="\${2:-}"
 
-    local xdg_data_dirs="\${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
-    local xdg_data_home="\${XDG_DATA_HOME:-/home/${current_user}/.local/share}"
-    local user_path="\${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+  local xdg_data_dirs="\${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+  local xdg_data_home="\${XDG_DATA_HOME:-/home/${current_user}/.local/share}"
+  local user_path="\${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
 
+  local _do_export() {
+    local name="\$1"
     if [[ "\$(id -u)" -eq 0 ]]; then
-        sudo -Hu "${current_user}" \
-            env HOME="/home/${current_user}" \
-            XDG_DATA_DIRS="\$xdg_data_dirs" \
-            XDG_DATA_HOME="\$xdg_data_home" \
-            PATH="\$user_path" \
-            distrobox-export --app "\$app_name"
+      sudo -Hu "${current_user}" \
+        env HOME="/home/${current_user}" \
+        XDG_DATA_DIRS="\$xdg_data_dirs" \
+        XDG_DATA_HOME="\$xdg_data_home" \
+        PATH="\$user_path" \
+        distrobox-export --app "\$name" 2>/dev/null
     else
-        export HOME="/home/${current_user}"
-        export XDG_DATA_DIRS="\$xdg_data_dirs"
-        export XDG_DATA_HOME="\$xdg_data_home"
-        distrobox-export --app "\$app_name"
+      export HOME="/home/${current_user}"
+      export XDG_DATA_DIRS="\$xdg_data_dirs"
+      export XDG_DATA_HOME="\$xdg_data_home"
+      distrobox-export --app "\$name" 2>/dev/null
     fi
+  }
+
+  if _do_export "\$app_name"; then
+    return 0
+  fi
+
+  if [[ -n "\$fallback_name" && "\$fallback_name" != "\$app_name" ]]; then
+    echo "distrobox-export --app \$app_name failed, trying fallback: \$fallback_name" >> "\$EXPORT_LOG" 2>/dev/null
+    if _do_export "\$fallback_name"; then
+      return 0
+    fi
+  fi
+
+  return 1
 }
 
 if command -v distrobox-export >/dev/null 2>&1; then
-    exported=0
-    for desktop in /usr/share/applications/*.desktop; do
-        [[ -f "\$desktop" ]] || continue
-        app_name="\$(basename "\$desktop" .desktop)"
-        export_name="\$app_name"
-        [[ "\$app_name" == "org.manjaro.pamac.manager" ]] && export_name="pamac-manager"
-        owner_pkg="\$(pacman -Qoq "\$desktop" 2>/dev/null || true)"
-        should_export_desktop "\$desktop" "\$app_name" "\$owner_pkg" || continue
+  exported=0
+  for desktop in /usr/share/applications/*.desktop; do
+    [[ -f "\$desktop" ]] || continue
+    app_name="\$(basename "\$desktop" .desktop)"
+    export_name="\$app_name"
+    [[ "\$app_name" == "org.manjaro.pamac.manager" ]] && export_name="pamac-manager"
+    owner_pkg="\$(pacman -Qoq "\$desktop" 2>/dev/null || true)"
+    should_export_desktop "\$desktop" "\$app_name" "\$owner_pkg" || continue
 
-if run_distrobox_export "\$export_name" >/dev/null 2>&1; then
-host_desktop=""
-for candidate in "\$APP_DIR/${container_name}-\${app_name}.desktop" "\$APP_DIR/${container_name}-\${export_name}.desktop"; do
-if [[ -f "\$candidate" ]]; then
-host_desktop="\$candidate"
-break
-fi
-done
-if [[ -z "\$host_desktop" ]]; then
-host_desktop="\$(find "\$APP_DIR" -maxdepth 1 -name "${container_name}-*.desktop" -newer "\$EXPLICIT_FILE" -print -quit 2>/dev/null)"
-fi
-if [[ -n "\$host_desktop" && -f "\$host_desktop" ]]; then
-annotate_desktop "\$host_desktop" "\$app_name" "\$export_name" "\$owner_pkg" || true
-printf '%s\n' "\$host_desktop" >> "\$NEW_STATE_FILE"
-fi
-exported=\$((exported + 1))
-fi
-    done
-    echo "\$(date): Exported \$exported apps" >> "\$EXPORT_LOG"
+    exec_binary="\$(get_exec_binary "\$desktop")"
+    export_failed=false
+
+    if run_distrobox_export "\$export_name" "\$exec_binary"; then
+      host_desktop=""
+      for candidate in "\$APP_DIR/${container_name}-\${app_name}.desktop" "\$APP_DIR/${container_name}-\${export_name}.desktop" "\$APP_DIR/${container_name}-\${exec_binary}.desktop"; do
+        if [[ -f "\$candidate" ]]; then
+          host_desktop="\$candidate"
+          break
+        fi
+      done
+      if [[ -z "\$host_desktop" ]]; then
+        host_desktop="\$(find "\$APP_DIR" -maxdepth 1 -name "${container_name}-*.desktop" -newer "\$EXPLICIT_FILE" -print -quit 2>/dev/null)"
+      fi
+      if [[ -n "\$host_desktop" && -f "\$host_desktop" ]]; then
+        annotate_desktop "\$host_desktop" "\$app_name" "\$export_name" "\$owner_pkg" || true
+        printf '%s\n' "\$host_desktop" >> "\$NEW_STATE_FILE"
+      fi
+      exported=\$((exported + 1))
+    else
+      echo "Failed to export \$app_name (tried: \$export_name, \$exec_binary)" >> "\$EXPORT_LOG"
+    fi
+  done
+  echo "\$(date): Exported \$exported apps" >> "\$EXPORT_LOG"
 fi
 
 rm -f "\$APP_DIR/${container_name}.desktop" 2>/dev/null || true
 
 if [[ -f "\$STATE_FILE" ]]; then
-    while IFS= read -r old_export; do
-        [[ -n "\$old_export" ]] || continue
-        if [[ -f "\$old_export" ]]; then
-            printf '%s\n' "\$old_export" >> "\$NEW_STATE_FILE"
-        fi
-    done < "\$STATE_FILE"
+  while IFS= read -r old_export; do
+    [[ -n "\$old_export" ]] || continue
+    if [[ ! -f "\$old_export" ]]; then
+      echo "Removing state entry for missing file: \$old_export" >> "\$EXPORT_LOG"
+      continue
+    fi
+    local_source_pkg="\$(grep '^X-SteamOS-Pamac-SourcePackage=' "\$old_export" 2>/dev/null | cut -d= -f2-)"
+    if [[ -n "\$local_source_pkg" ]]; then
+      if ! pacman -Q "\$local_source_pkg" >/dev/null 2>&1; then
+        echo "Removing stale export (package \$local_source_pkg uninstalled): \$old_export" >> "\$EXPORT_LOG"
+        rm -f "\$old_export"
+        continue
+      fi
+    fi
+    printf '%s\n' "\$old_export" >> "\$NEW_STATE_FILE"
+  done < "\$STATE_FILE"
 fi
 
 while IFS= read -r existing_export; do
-    [[ -n "\$existing_export" ]] || continue
-    if grep -q '^X-SteamOS-Pamac-SourceApp=pamac-manager$' "\$existing_export" 2>/dev/null; then
-        echo "Preserving pamac-manager export: \$existing_export" >> "\$EXPORT_LOG"
-        printf '%s\n' "\$existing_export" >> "\$NEW_STATE_FILE"
-        continue
-    fi
-    if ! grep -Fxq "\$existing_export" "\$NEW_STATE_FILE" 2>/dev/null; then
-        echo "Removing stale container export: \$existing_export" >> "\$EXPORT_LOG"
-        rm -f "\$existing_export"
-    fi
+  [[ -n "\$existing_export" ]] || continue
+  if grep -q '^X-SteamOS-Pamac-SourceApp=pamac-manager$' "\$existing_export" 2>/dev/null; then
+    echo "Preserving pamac-manager export: \$existing_export" >> "\$EXPORT_LOG"
+    printf '%s\n' "\$existing_export" >> "\$NEW_STATE_FILE"
+    continue
+  fi
+  existing_source_pkg="\$(grep '^X-SteamOS-Pamac-SourcePackage=' "\$existing_export" 2>/dev/null | cut -d= -f2-)"
+  if [[ -n "\$existing_source_pkg" ]] && ! pacman -Q "\$existing_source_pkg" >/dev/null 2>&1; then
+    echo "Removing orphaned export (package \$existing_source_pkg uninstalled): \$existing_export" >> "\$EXPORT_LOG"
+    rm -f "\$existing_export"
+    continue
+  fi
+  if ! grep -Fxq "\$existing_export" "\$NEW_STATE_FILE" 2>/dev/null; then
+    echo "Removing stale container export: \$existing_export" >> "\$EXPORT_LOG"
+    rm -f "\$existing_export"
+  fi
 done < <(find "\$APP_DIR" -maxdepth 1 -type f -name "${container_name}-*.desktop" ! -name "${container_name}.desktop" 2>/dev/null | sort)
 
 sort -u "\$NEW_STATE_FILE" > "\$STATE_FILE"

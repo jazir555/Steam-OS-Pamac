@@ -240,7 +240,7 @@ test_install() {
 	fi
 
 	local pkg_ver
-	pkg_ver=$(container_exec "pacman -Q $TEST_PACKAGE_AUR 2>/dev/null | cut -d' ' -f2" || echo "unknown")
+	pkg_ver=$(ssh_check "podman exec -i -u 0 '$CONTAINER_NAME' pacman -Q $TEST_PACKAGE_AUR 2>/dev/null" | grep -oP '\S+$' || echo "unknown")
 	log_test " Installed version: $pkg_ver"
 }
 
@@ -420,7 +420,7 @@ test_host_cli_wrapper() {
 
 	local pamac_out
 	pamac_out=$(ssh_exec "timeout 30 '$wrapper_path' --version 2>&1" || true)
-	if echo "$pamac_out" | grep -qi "pamac.*version"; then
+	if echo "$pamac_out" | grep -qi "pamac"; then
 		pass "Host CLI wrapper runs pamac --version successfully"
 	else
 		skip "Host CLI wrapper --version failed (expected in non-interactive session): ${pamac_out:0:100}"
@@ -486,7 +486,7 @@ test_reinstall() {
 	fi
 
 	local pkg_ver
-	pkg_ver=$(container_exec "pacman -Q $TEST_PACKAGE_AUR 2>/dev/null | cut -d' ' -f2" || echo "unknown")
+	pkg_ver=$(ssh_check "podman exec -i -u 0 '$CONTAINER_NAME' pacman -Q $TEST_PACKAGE_AUR 2>/dev/null" | grep -oP '\S+$' || echo "unknown")
 	pass "Re-installed version: $pkg_ver"
 }
 

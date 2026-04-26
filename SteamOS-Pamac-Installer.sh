@@ -1562,7 +1562,7 @@ sed -i 's|<allow_inactive>auth_admin_keep</allow_inactive>|<allow_inactive>yes</
 sed -i 's|<allow_active>auth_admin_keep</allow_active>|<allow_active>yes</allow_active>|' "$pamac_policy"
 echo "Polkit policy patched: allow_any=yes, allow_inactive=yes, allow_active=yes"
 else
-echo "Warning: pamac polkit policy file not found at $pamac_policy"
+echo "Note: pamac polkit policy not yet installed (will be patched after pamac-aur install)."
 fi
 else
 echo "Functional systemd detected. Pamac daemon can be started with systemctl."
@@ -1899,6 +1899,8 @@ PAMAC_INSTALL_EOF
     read -r -d '' pamac_cfg <<'PAMAC_CFG_EOF' || true
 set -uo pipefail
 
+current_user="$1"
+
 echo "Configuring Pamac for AUR support..."
 if [[ -f /etc/pamac.conf ]]; then
     sed -i 's/^#EnableAUR/EnableAUR/' /etc/pamac.conf
@@ -1911,10 +1913,33 @@ if [[ -f /etc/pamac.conf ]]; then
         echo "CheckAURUpdates" >> /etc/pamac.conf
     fi
     echo "Pamac configuration updated for AUR support."
+
+echo "Setting BuildDirectory for AUR builds (writable by non-root)..."
+if grep -q '^BuildDirectory' /etc/pamac.conf; then
+sed -i 's|^BuildDirectory.*|BuildDirectory = /home/'"$current_user"'/\.pamac-build|' /etc/pamac.conf
 else
-    echo "Warning: /etc/pamac.conf not found. Creating minimal config."
-    mkdir -p /etc
-    printf 'EnableAUR\nCheckAURUpdates\nCheckAURVCSUpdates\n' > /etc/pamac.conf
+echo "BuildDirectory = /home/$current_user/.pamac-build" >> /etc/pamac.conf
+fi
+mkdir -p "/home/$current_user/.pamac-build"
+chown "$current_user:$current_user" "/home/$current_user/.pamac-build" 2>/dev/null || true
+echo "BuildDirectory set to /home/$current_user/.pamac-build"
+
+echo "Patching polkit policy for non-interactive authorization..."
+pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
+if [[ -f "$pamac_policy" ]]; then
+sed -i 's|<allow_any>auth_admin_keep</allow_any>|<allow_any>yes</allow_any>|' "$pamac_policy"
+sed -i 's|<allow_inactive>auth_admin_keep</allow_inactive>|<allow_inactive>yes</allow_inactive>|' "$pamac_policy"
+sed -i 's|<allow_active>auth_admin_keep</allow_active>|<allow_active>yes</allow_active>|' "$pamac_policy"
+echo "Polkit policy patched: allow_any=yes, allow_inactive=yes, allow_active=yes"
+else
+echo "Warning: pamac polkit policy file not found at $pamac_policy"
+fi
+else
+echo "Warning: /etc/pamac.conf not found. Creating minimal config."
+mkdir -p /etc
+printf 'EnableAUR\nCheckAURUpdates\nCheckAURVCSUpdates\nBuildDirectory = /home/'"$current_user"'/.pamac-build\n' > /etc/pamac.conf
+mkdir -p "/home/$current_user/.pamac-build"
+chown "$current_user:$current_user" "/home/$current_user/.pamac-build" 2>/dev/null || true
 fi
 
     echo "Syncing package database..."
@@ -1935,7 +1960,7 @@ else
 fi
 PAMAC_CFG_EOF
 
-    exec_container_script "$pamac_cfg" "pamac-config" || log_warn "Pamac configuration had minor issues."
+    exec_container_script "$pamac_cfg" "pamac-config" "$CURRENT_USER" || log_warn "Pamac configuration had minor issues."
 }
 
 install_gaming_packages() {

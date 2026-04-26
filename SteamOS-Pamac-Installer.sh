@@ -2489,7 +2489,7 @@ run_distrobox_export() {
   local xdg_data_home="\${XDG_DATA_HOME:-/home/${current_user}/.local/share}"
   local user_path="\${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
 
-  local _do_export() {
+  _do_export() {
     local name="\$1"
     if [[ "\$(id -u)" -eq 0 ]]; then
       sudo -Hu "${current_user}" \
@@ -2530,8 +2530,7 @@ if command -v distrobox-export >/dev/null 2>&1; then
     owner_pkg="\$(pacman -Qoq "\$desktop" 2>/dev/null || true)"
     should_export_desktop "\$desktop" "\$app_name" "\$owner_pkg" || continue
 
-    exec_binary="\$(get_exec_binary "\$desktop")"
-    export_failed=false
+  exec_binary="\$(get_exec_binary "\$desktop")"
 
   if run_distrobox_export "\$export_name" "\$exec_binary"; then
     host_desktop=""

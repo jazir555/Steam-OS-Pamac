@@ -117,7 +117,7 @@ check_desktop_file_format() {
 # 1. PREREQUISITES CHECK
 ###############################################################################
 test_prerequisites() {
-	log_test "=== 1/12: Prerequisites Check ==="
+	log_test "=== 1/14: Prerequisites Check ==="
 
 	if ssh_check "podman inspect '$CONTAINER_NAME' >/dev/null 2>&1"; then
 		pass "Container '$CONTAINER_NAME' exists"
@@ -181,7 +181,7 @@ test_prerequisites() {
 # 2. PAMAC SEARCH (AUR + repos)
 ###############################################################################
 test_search() {
-	log_test "=== 2/12: Pamac Search ==="
+	log_test "=== 2/14: Pamac Search ==="
 
 	local search_out
 	search_out=$(pamac_exec "pamac search $TEST_PACKAGE_AUR 2>/dev/null" 30 || true)
@@ -212,7 +212,7 @@ test_search() {
 # 3. PAMAC INSTALL AUR PACKAGE
 ###############################################################################
 test_install() {
-	log_test "=== 3/12: Pamac Install AUR Package ==="
+	log_test "=== 3/14: Pamac Install AUR Package ==="
 	cleanup_package "$TEST_PACKAGE_AUR"
 
 	local install_out
@@ -248,7 +248,7 @@ test_install() {
 # 4. VERIFY POST-INSTALL EXPORT HOOK
 ###############################################################################
 test_export_hook() {
-	log_test "=== 4/12: Post-Install Export Hook ==="
+	log_test "=== 4/14: Post-Install Export Hook ==="
 
 	local hook_exists
 	hook_exists=$(container_exec "test -x /usr/local/bin/distrobox-export-hook.sh && echo true || echo false" || echo "false")
@@ -284,7 +284,7 @@ test_export_hook() {
 # 5. VERIFY DESKTOP FILE INTEGRITY
 ###############################################################################
 test_desktop_file() {
-	log_test "=== 5/12: Desktop File Integrity ==="
+	log_test "=== 5/14: Desktop File Integrity ==="
 
 	local desktop_files
 	desktop_files=$(ssh_check "find /home/deck/.local/share/applications -maxdepth 1 -type f -name '${CONTAINER_NAME}-*.desktop' 2>/dev/null" || true)
@@ -316,7 +316,7 @@ test_desktop_file() {
 # 6. VERIFY ICON EXPORT
 ###############################################################################
 test_icons() {
-	log_test "=== 6/12: Icon Export ==="
+	log_test "=== 6/14: Icon Export ==="
 
 	local icon_found=false
 	for icon_path in \
@@ -350,7 +350,7 @@ test_icons() {
 # 7. VERIFY PAMAC MANAGER WRAPPER
 ###############################################################################
 test_pamac_manager_wrapper() {
-	log_test "=== 7/12: Pamac Manager Wrapper ==="
+	log_test "=== 7/14: Pamac Manager Wrapper ==="
 
 	local wrapper_exists
 	wrapper_exists=$(container_exec "test -x /usr/local/bin/pamac-manager-wrapper && echo true || echo false" || echo "false")
@@ -398,7 +398,7 @@ test_pamac_manager_wrapper() {
 # 8. TEST CLI WRAPPER FROM HOST
 ###############################################################################
 test_host_cli_wrapper() {
-	log_test "=== 8/12: Host CLI Wrapper ==="
+	log_test "=== 8/14: Host CLI Wrapper ==="
 
 	local wrapper_path="/home/deck/.local/bin/pamac-${CONTAINER_NAME}"
 	local wrapper_exists
@@ -439,7 +439,7 @@ test_host_cli_wrapper() {
 # 9. TEST PAMAC UNINSTALL
 ###############################################################################
 test_uninstall() {
-	log_test "=== 9/12: Pamac Uninstall ==="
+	log_test "=== 9/14: Pamac Uninstall ==="
 
 	local pkg_installed
 	pkg_installed=$(container_exec "pacman -Q ${TEST_PACKAGE_AUR} 2>/dev/null && echo yes || echo no" || echo "no")
@@ -469,7 +469,7 @@ test_uninstall() {
 # 10. TEST REINSTALL AND PERSISTENCE
 ###############################################################################
 test_reinstall() {
-	log_test "=== 10/12: Reinstall After Uninstall ==="
+	log_test "=== 10/14: Reinstall After Uninstall ==="
 
 	cleanup_package "$TEST_PACKAGE_AUR"
 
@@ -578,6 +578,120 @@ test_host_integration() {
 	pamac_grep=$(ssh_check "grep -q 'pamac-manager' /home/deck/.local/share/applications/arch-pamac-org.manjaro.pamac.manager.desktop 2>/dev/null && echo true || echo false" || echo "false")
 	if [[ "$pamac_grep" != "true" ]]; then
 		skip "Pamac desktop file not found at expected path"
+	fi
+}
+
+###############################################################################
+# 13. TEST UNINSTALL HELPER (steamos-pamac-uninstall)
+###############################################################################
+test_uninstall_helper() {
+	log_test "=== 13/14: Uninstall Helper ==="
+
+	local helper_path="/home/deck/.local/bin/steamos-pamac-uninstall"
+	local helper_exists
+	helper_exists=$(ssh_check "test -x '$helper_path' && echo true || echo false" || echo "false")
+	if [[ "$helper_exists" == "true" ]]; then
+		pass "steamos-pamac-uninstall exists and is executable"
+	else
+		fail "steamos-pamac-uninstall not found at $helper_path"
+		return 1
+	fi
+
+	local helper_help
+	helper_help=$(ssh_exec "timeout 5 '$helper_path' --help 2>&1" || true)
+	if echo "$helper_help" | grep -qi "\-\-package\|\-\-desktop-file\|\-\-list"; then
+		pass "Uninstall helper --help shows expected options"
+	else
+		fail "Uninstall helper --help output unexpected: ${helper_help:0:200}"
+	fi
+
+	local list_out
+	list_out=$(ssh_exec "timeout 10 '$helper_path' --list 2>&1" || true)
+	if echo "$list_out" | grep -qi "pamac\|No pamac-managed"; then
+		pass "Uninstall helper --list works"
+	else
+		skip "Uninstall helper --list output: ${list_out:0:100}"
+	fi
+
+	local pkg_installed
+	pkg_installed=$(container_exec "pacman -Q ${TEST_PACKAGE_AUR} 2>/dev/null && echo yes || echo no" || echo "no")
+	if [[ "$pkg_installed" != *"yes"* ]]; then
+		log_test "Installing $TEST_PACKAGE_AUR for uninstall helper test..."
+		pamac_exec "pamac install --no-confirm $TEST_PACKAGE_AUR 2>&1" 180 || true
+		pkg_installed=$(container_exec "pacman -Q ${TEST_PACKAGE_AUR} 2>/dev/null && echo yes || echo no" || echo "no")
+	fi
+
+	if [[ "$pkg_installed" == *"yes"* ]]; then
+		log_test "Testing uninstall via --package $TEST_PACKAGE_AUR..."
+		local uninstall_out
+		uninstall_out=$(ssh_exec "timeout 60 '$helper_path' --package $TEST_PACKAGE_AUR 2>&1" || true)
+		echo "$uninstall_out" | tail -5 >> "$TEST_LOG"
+
+		local still_installed
+		still_installed=$(container_exec "pacman -Q ${TEST_PACKAGE_AUR} 2>/dev/null && echo yes || echo no" || echo "no")
+		if [[ "$still_installed" == *"yes"* ]]; then
+			fail "Uninstall helper --package did not remove $TEST_PACKAGE_AUR (output: ${uninstall_out:0:300})"
+		else
+			pass "Uninstall helper --package successfully removed $TEST_PACKAGE_AUR"
+		fi
+	else
+		fail "Could not install $TEST_PACKAGE_AUR for uninstall helper test"
+	fi
+}
+
+###############################################################################
+# 14. TEST DESKTOP ACTION UNINSTALL
+###############################################################################
+test_desktop_action_uninstall() {
+	log_test "=== 14/14: Desktop Action Uninstall ==="
+
+	local pamac_desktop="/home/deck/.local/share/applications/arch-pamac-org.manjaro.pamac.manager.desktop"
+	local has_actions
+	has_actions=$(ssh_check "grep -q '^Actions=.*uninstall' '$pamac_desktop' 2>/dev/null && echo true || echo false" || echo "false")
+	if [[ "$has_actions" == "true" ]]; then
+		pass "Pamac desktop file has Actions=uninstall"
+	else
+		fail "Pamac desktop file missing Actions=uninstall"
+	fi
+
+	local has_desktop_action
+	has_desktop_action=$(ssh_check "grep -q '^\[Desktop Action uninstall\]' '$pamac_desktop' 2>/dev/null && echo true || echo false" || echo "false")
+	if [[ "$has_desktop_action" == "true" ]]; then
+		pass "Pamac desktop file has [Desktop Action uninstall] section"
+	else
+		fail "Pamac desktop file missing [Desktop Action uninstall] section"
+	fi
+
+	local uninstall_exec
+	uninstall_exec=$(ssh_check "grep -A3 '^\[Desktop Action uninstall\]' '$pamac_desktop' 2>/dev/null | grep '^Exec='" || echo "")
+	if echo "$uninstall_exec" | grep -q "steamos-pamac-uninstall"; then
+		pass "Desktop Action uninstall Exec points to steamos-pamac-uninstall"
+	else
+		fail "Desktop Action uninstall Exec incorrect: $uninstall_exec"
+	fi
+
+	local other_desktops
+	other_desktops=$(ssh_check "find /home/deck/.local/share/applications -maxdepth 1 -name 'arch-pamac-*.desktop' ! -name 'arch-pamac-org.manjaro.pamac.manager.desktop' -type f 2>/dev/null" || true)
+	if [[ -n "$other_desktops" ]]; then
+		local other_count
+		other_count=$(echo "$other_desktops" | wc -l)
+		log_test " Checking $other_count other exported desktop file(s) for uninstall action..."
+		local all_have_actions=true
+		while IFS= read -r other_file; do
+			local other_has_action
+			other_has_action=$(ssh_check "grep -q '^\[Desktop Action uninstall\]' '$other_file' 2>/dev/null && echo true || echo false" || echo "false")
+			if [[ "$other_has_action" != "true" ]]; then
+				log_test " WARNING: $(basename "$other_file") missing uninstall action"
+				all_have_actions=false
+			fi
+		done <<< "$other_desktops"
+		if [[ "$all_have_actions" == "true" ]]; then
+			pass "All exported desktop files have uninstall action"
+		else
+			skip "Some exported desktop files missing uninstall action (may need export hook re-run)"
+		fi
+	else
+		skip "No other exported desktop files to check"
 	fi
 }
 

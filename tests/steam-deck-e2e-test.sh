@@ -720,7 +720,7 @@ test_kde_uninstall_integration() {
   local appstream_handler="/home/deck/.local/bin/steamos-pamac-appstream"
   local kickeraction_handler="/home/deck/.local/bin/steamos-pamac-kickeraction-handler"
   local appstream_desktop="/home/deck/.local/share/applications/steamos-pamac-appstream-handler.desktop"
-  local kickeraction_desktop="/home/deck/.local/share/plasma/kickeractions/steamos-pamac-kickeraction.desktop"
+  local kickeraction_desktop="/home/deck/.local/share/plasma/kickeractions/steamos-pamac-uninstall.desktop"
   local uninstall_helper="/home/deck/.local/bin/steamos-pamac-uninstall"
 
   local ah_exists

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Service
+Name=SteamOS Pamac Uninstall Action
+X-KDE-OnlyForAppIds=
+Actions=uninstall;
+
+[Desktop Action uninstall]
+Name=Uninstall
+Icon=edit-delete
+Exec=/home/deck/.local/bin/steamos-pamac-kickeraction-handler %u

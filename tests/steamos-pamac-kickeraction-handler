@@ -1,0 +1,59 @@
+#!/bin/bash
+set +e
+
+APP_DIR="$HOME/.local/share/applications"
+UNINSTALL_HELPER="$HOME/.local/bin/steamos-pamac-uninstall"
+LOG_FILE="$HOME/.local/share/steamos-pamac/arch-pamac/kickeraction-handler.log"
+
+mkdir -p "$(dirname "$LOG_FILE")"
+
+log_msg() {
+    echo "$(date): $*" >> "$LOG_FILE"
+}
+
+DESKTOP_FILE_URL="$1"
+
+if [[ -z "$DESKTOP_FILE_URL" ]]; then
+    log_msg "Error: No desktop file URL argument provided"
+    exit 1
+fi
+
+DESKTOP_PATH="${DESKTOP_FILE_URL#file://}"
+DESKTOP_PATH="$(python3 -c "import urllib.parse, sys; print(urllib.parse.unquote(sys.argv[1]))" "$DESKTOP_PATH" 2>/dev/null || echo "$DESKTOP_PATH")"
+
+if [[ ! -f "$DESKTOP_PATH" ]]; then
+    DESKTOP_PATH="$APP_DIR/$(basename "$DESKTOP_PATH")"
+fi
+
+log_msg "Received desktop file: $DESKTOP_FILE_URL -> $DESKTOP_PATH"
+
+if [[ ! -f "$DESKTOP_PATH" ]]; then
+    log_msg "Error: Desktop file not found: $DESKTOP_PATH"
+    echo "Error: Desktop file not found: $DESKTOP_PATH" >&2
+    exit 1
+fi
+
+if ! grep -q '^X-SteamOS-Pamac-Managed=true' "$DESKTOP_PATH" 2>/dev/null; then
+    log_msg "App is not pamac-managed, ignoring: $DESKTOP_PATH"
+    exit 0
+fi
+
+SOURCE_PKG=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$DESKTOP_PATH" 2>/dev/null | cut -d= -f2)
+if [[ -z "$SOURCE_PKG" ]]; then
+    log_msg "Error: No X-SteamOS-Pamac-SourcePackage found in $DESKTOP_PATH"
+    echo "Error: Cannot determine package for this application." >&2
+    exit 1
+fi
+
+APP_NAME=$(grep '^Name=' "$DESKTOP_PATH" 2>/dev/null | head -1 | cut -d= -f2)
+DESKTOP_BASENAME=$(basename "$DESKTOP_PATH")
+
+log_msg "Uninstalling pamac-managed app: $APP_NAME (package: $SOURCE_PKG, desktop: $DESKTOP_BASENAME)"
+
+if [[ -x "$UNINSTALL_HELPER" ]]; then
+    exec "$UNINSTALL_HELPER" --desktop-file "$DESKTOP_BASENAME"
+else
+    log_msg "Error: Uninstall helper not found at $UNINSTALL_HELPER"
+    echo "Error: Uninstall helper not found at $UNINSTALL_HELPER" >&2
+    exit 1
+fi

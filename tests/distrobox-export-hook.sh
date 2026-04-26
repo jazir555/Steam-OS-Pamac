@@ -270,5 +270,42 @@ done < <(find "$APP_DIR" -maxdepth 1 -type f -name "arch-pamac-*.desktop" ! -nam
 sort -u "$NEW_STATE_FILE" > "$STATE_FILE"
 
 if command -v update-desktop-database >/dev/null 2>&1 && [[ -d "$APP_DIR" ]]; then
-  update-desktop-database "$APP_DIR" 2>/dev/null || true
+    update-desktop-database "$APP_DIR" 2>/dev/null || true
+fi
+
+KICKERACTION_DIR="/home/deck/.local/share/plasma/kickeractions"
+mkdir -p "$KICKERACTION_DIR"
+KICKERACTION_FILE="$KICKERACTION_DIR/steamos-pamac-uninstall.desktop"
+KICKERACTION_HANDLER="/home/deck/.local/bin/steamos-pamac-kickeraction-handler"
+
+MANAGED_IDS=""
+while IFS= read -r desktop_path; do
+    [[ -f "$desktop_path" ]] || continue
+    if grep -q '^X-SteamOS-Pamac-Managed=true' "$desktop_path" 2>/dev/null; then
+        storage_id=$(basename "$desktop_path" .desktop)
+        if [[ -n "$MANAGED_IDS" ]]; then
+            MANAGED_IDS="$MANAGED_IDS,$storage_id"
+        else
+            MANAGED_IDS="$storage_id"
+        fi
+    fi
+done < "$STATE_FILE" 2>/dev/null
+
+if [[ -n "$MANAGED_IDS" ]]; then
+    cat > "$KICKERACTION_FILE" << KICKERACTION_EOF
+[Desktop Entry]
+Type=Service
+Name=SteamOS Pamac Uninstall Action
+X-KDE-OnlyForAppIds=$MANAGED_IDS
+Actions=uninstall;
+
+[Desktop Action uninstall]
+Name=Uninstall
+Icon=edit-delete
+Exec=$KICKERACTION_HANDLER %u
+KICKERACTION_EOF
+    echo "$(date): Updated kickeraction with managed IDs: $MANAGED_IDS" >> "$EXPORT_LOG"
+else
+    rm -f "$KICKERACTION_FILE" 2>/dev/null
+    echo "$(date): No managed apps, removed kickeraction file" >> "$EXPORT_LOG"
 fi

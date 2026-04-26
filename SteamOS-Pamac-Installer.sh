@@ -2821,10 +2821,92 @@ HANDLER_DESKTOP_EOF
                 mimeapps_updated=true
             fi
         fi
-        if [[ "$mimeapps_updated" == "true" ]]; then
-            log_info "Registered as x-scheme-handler/appstream in mimeapps.list"
-        fi
+    if [[ "$mimeapps_updated" == "true" ]]; then
+        log_info "Registered as x-scheme-handler/appstream in mimeapps.list"
     fi
+    fi
+
+    local kickeraction_handler="$bin_dir/steamos-pamac-kickeraction-handler"
+    cat > "$kickeraction_handler" << KICKERACTION_EOF
+#!/bin/bash
+set +e
+
+APP_DIR="\$HOME/.local/share/applications"
+UNINSTALL_HELPER="\$HOME/.local/bin/steamos-pamac-uninstall"
+LOG_FILE="\$HOME/.local/share/steamos-pamac/${CONTAINER_NAME}/kickeraction-handler.log"
+
+mkdir -p "\$(dirname "\$LOG_FILE")"
+
+log_msg() {
+    echo "\$(date): \$*" >> "\$LOG_FILE"
+}
+
+DESKTOP_FILE_URL="\$1"
+
+if [[ -z "\$DESKTOP_FILE_URL" ]]; then
+    log_msg "Error: No desktop file URL argument provided"
+    exit 1
+fi
+
+DESKTOP_PATH="\${DESKTOP_FILE_URL#file://}"
+DESKTOP_PATH="\$(python3 -c "import urllib.parse, sys; print(urllib.parse.unquote(sys.argv[1]))" "\$DESKTOP_PATH" 2>/dev/null || echo "\$DESKTOP_PATH")"
+
+if [[ ! -f "\$DESKTOP_PATH" ]]; then
+    DESKTOP_PATH="\$APP_DIR/\$(basename "\$DESKTOP_PATH")"
+fi
+
+log_msg "Received desktop file: \$DESKTOP_FILE_URL -> \$DESKTOP_PATH"
+
+if [[ ! -f "\$DESKTOP_PATH" ]]; then
+    log_msg "Error: Desktop file not found: \$DESKTOP_PATH"
+    exit 1
+fi
+
+if ! grep -q '^X-SteamOS-Pamac-Managed=true' "\$DESKTOP_PATH" 2>/dev/null; then
+    log_msg "App is not pamac-managed, ignoring: \$DESKTOP_PATH"
+    exit 0
+fi
+
+SOURCE_PKG=\$(grep '^X-SteamOS-Pamac-SourcePackage=' "\$DESKTOP_PATH" 2>/dev/null | cut -d= -f2)
+if [[ -z "\$SOURCE_PKG" ]]; then
+    log_msg "Error: No X-SteamOS-Pamac-SourcePackage found in \$DESKTOP_PATH"
+    echo "Error: Cannot determine package for this application." >&2
+    exit 1
+fi
+
+APP_NAME=\$(grep '^Name=' "\$DESKTOP_PATH" 2>/dev/null | head -1 | cut -d= -f2)
+DESKTOP_BASENAME=\$(basename "\$DESKTOP_PATH")
+
+log_msg "Uninstalling pamac-managed app: \$APP_NAME (package: \$SOURCE_PKG, desktop: \$DESKTOP_BASENAME)"
+
+if [[ -x "\$UNINSTALL_HELPER" ]]; then
+    exec "\$UNINSTALL_HELPER" --desktop-file "\$DESKTOP_BASENAME"
+else
+    log_msg "Error: Uninstall helper not found at \$UNINSTALL_HELPER"
+    echo "Error: Uninstall helper not found at \$UNINSTALL_HELPER" >&2
+    exit 1
+fi
+KICKERACTION_EOF
+    chmod +x "$kickeraction_handler"
+    log_info "Created kickeraction handler: $kickeraction_handler"
+
+    local kickeraction_dir="$HOME/.local/share/plasma/kickeractions"
+    mkdir -p "$kickeraction_dir"
+    local kickeraction_desktop="$kickeraction_dir/steamos-pamac-uninstall.desktop"
+    cat > "$kickeraction_desktop" << KICKERACTION_DESKTOP_EOF
+[Desktop Entry]
+Type=Service
+Name=SteamOS Pamac Uninstall Action
+X-KDE-OnlyForAppIds=
+Actions=uninstall;
+
+[Desktop Action uninstall]
+Name=Uninstall
+Icon=edit-delete
+Exec=${kickeraction_handler} %u
+KICKERACTION_DESKTOP_EOF
+    chmod 644 "$kickeraction_desktop"
+    log_info "Created kickeraction desktop: $kickeraction_desktop"
 
     if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
         log_info "Add '$bin_dir' to your PATH to use the CLI wrapper directly."
@@ -3132,7 +3214,44 @@ done < <(find "\$APP_DIR" -maxdepth 1 -type f -name "${container_name}-*.desktop
 sort -u "\$NEW_STATE_FILE" > "\$STATE_FILE"
 
 if command -v update-desktop-database >/dev/null 2>&1 && [[ -d "\$APP_DIR" ]]; then
-    update-desktop-database "\$APP_DIR" 2>/dev/null || true
+update-desktop-database "\$APP_DIR" 2>/dev/null || true
+fi
+
+KICKERACTION_DIR="/home/${current_user}/.local/share/plasma/kickeractions"
+mkdir -p "\$KICKERACTION_DIR"
+KICKERACTION_FILE="\$KICKERACTION_DIR/steamos-pamac-uninstall.desktop"
+KICKERACTION_HANDLER="/home/${current_user}/.local/bin/steamos-pamac-kickeraction-handler"
+
+MANAGED_IDS=""
+while IFS= read -r desktop_path; do
+[[ -f "\$desktop_path" ]] || continue
+if grep -q '^X-SteamOS-Pamac-Managed=true' "\$desktop_path" 2>/dev/null; then
+    storage_id=\$(basename "\$desktop_path" .desktop)
+    if [[ -n "\$MANAGED_IDS" ]]; then
+        MANAGED_IDS="\$MANAGED_IDS,\$storage_id"
+    else
+        MANAGED_IDS="\$storage_id"
+    fi
+fi
+done < "\$STATE_FILE" 2>/dev/null
+
+if [[ -n "\$MANAGED_IDS" ]]; then
+cat > "\$KICKERACTION_FILE" << KICKERACTION_EOF
+[Desktop Entry]
+Type=Service
+Name=SteamOS Pamac Uninstall Action
+X-KDE-OnlyForAppIds=\$MANAGED_IDS
+Actions=uninstall;
+
+[Desktop Action uninstall]
+Name=Uninstall
+Icon=edit-delete
+Exec=\$KICKERACTION_HANDLER %u
+KICKERACTION_EOF
+echo "\$(date): Updated kickeraction with managed IDs: \$MANAGED_IDS" >> "\$EXPORT_LOG"
+else
+rm -f "\$KICKERACTION_FILE" 2>/dev/null
+echo "\$(date): No managed apps, removed kickeraction file" >> "\$EXPORT_LOG"
 fi
 HOOKSCRIPT
 

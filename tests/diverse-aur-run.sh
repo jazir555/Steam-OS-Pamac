@@ -59,11 +59,16 @@ test_package() {
   log_test " Searching for $pkg..."
   local search_out
   search_out=$(pamac_exec "pamac search $pkg 2>/dev/null" 30 || true)
-  if echo "$search_out" | grep -qi "$pkg"; then
-    pass "[$pkg] Found in AUR/repo search"
+  if echo "$search_out" | grep -q "^${pkg} "; then
+    pass "[$pkg] Found in search"
   else
-    fail "[$pkg] NOT found in search (output: ${search_out:0:200})"
-    return 1
+    search_out=$(pamac_exec "pamac info $pkg 2>/dev/null" 15 || true)
+    if echo "$search_out" | grep -qi "^Name.*:.*${pkg}"; then
+      pass "[$pkg] Found via pamac info"
+    else
+      fail "[$pkg] NOT found in search or info (output: ${search_out:0:200})"
+      return 1
+    fi
   fi
 
   log_test "  Installing $pkg..."
@@ -205,7 +210,7 @@ echo ""
 
 # Clean up all previously installed test packages first
 log_test "=== Cleaning up previous test packages ==="
-for pkg in neofetch figlet lazygit ripgrep bat fd github-cli ttf-ms-fonts mousepad yt-dlp btop librewolf-bin heroic-games-launcher-bin; do
+for pkg in neofetch figlet lazygit ripgrep celluloid fd github-cli ttf-ms-fonts mousepad yt-dlp btop librewolf-bin heroic-games-launcher-bin; do
   pamac_exec "pamac remove --no-confirm --no-save $pkg 2>&1" 30 || true
 done
 pamac_exec "pamac remove --no-confirm --unneeded 2>&1" 30 || true
@@ -217,8 +222,9 @@ echo ""
 # 2. cli-text       - figlet (AUR, C program, no desktop)
 # 3. go-gui-tui     - lazygit (AUR, Go binary, has desktop in AUR PKGBUILD but not in package)
 # 4. rust-cli-bin   - ripgrep (extra repo, Rust binary, no desktop)
-# 5. rust-cli-bin   - bat (extra repo, Rust binary, no desktop)
-# 6. go-cli-bin     - github-cli (extra repo, Go binary, has desktop)
+# 5. rust-cli-bin - bat (extra repo, Rust binary, no desktop - CLI only, hard to search)
+# 5b. gui-gtk-aur - celluloid (AUR/extra, GTK frontend for mpv, has desktop)
+# 6. go-cli-bin - github-cli (extra repo, Go binary, no desktop - CLI only)
 # 7. font           - ttf-ms-fonts (AUR, font package, no desktop)
 # 8. gui-gtk        - mousepad (extra repo/AUR, GTK GUI, has desktop with org.xfce prefix)
 # 9. python-cli     - yt-dlp (AUR, Python script, no desktop)
@@ -231,8 +237,8 @@ test_package "neofetch" "cli-info" "neofetch" "false" 120
 test_package "figlet" "cli-text" "figlet" "false" 120
 test_package "lazygit" "go-gui-tui" "lazygit" "false" 180
 test_package "ripgrep" "rust-cli-bin" "rg" "false" 120
-test_package "bat" "rust-cli-bin" "bat" "false" 120
-test_package "github-cli" "go-cli-bin" "gh" "true" 120
+test_package "celluloid" "gui-gtk-aur" "celluloid" "true" 300
+test_package "github-cli" "go-cli-bin" "gh" "false" 120
 test_package "ttf-ms-fonts" "font" "none" "false" 180
 test_package "mousepad" "gui-gtk" "mousepad" "true" 300
 test_package "yt-dlp" "python-cli" "yt-dlp" "false" 300

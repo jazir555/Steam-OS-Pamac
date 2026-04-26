@@ -43,6 +43,10 @@ distrobox_exec() {
   ssh_check "timeout $timeout_sec distrobox-enter $CONTAINER_NAME -- bash -c '$cmd'"
 }
 
+run_export_hook() {
+  distrobox_exec "env XDG_DATA_DIRS=/usr/local/share:/usr/share XDG_DATA_HOME=/home/deck/.local/share /usr/local/bin/distrobox-export-hook.sh" 30 || true
+}
+
 test_package() {
   local pkg="$1"
   local category="$2"
@@ -52,13 +56,13 @@ test_package() {
 
   log_test "=== Package: $pkg ($category) ==="
 
-  log_test "  Searching for $pkg..."
+  log_test " Searching for $pkg..."
   local search_out
-  search_out=$(pamac_exec "pamac search --aur $pkg 2>/dev/null" 30 || true)
+  search_out=$(pamac_exec "pamac search $pkg 2>/dev/null" 30 || true)
   if echo "$search_out" | grep -qi "$pkg"; then
-    pass "[$pkg] Found in AUR"
+    pass "[$pkg] Found in AUR/repo search"
   else
-    fail "[$pkg] NOT found in AUR (output: ${search_out:0:200})"
+    fail "[$pkg] NOT found in search (output: ${search_out:0:200})"
     return 1
   fi
 
@@ -108,13 +112,17 @@ test_package() {
   fi
 
   if [[ "$has_desktop" == "true" ]]; then
-    log_test "  Checking desktop file export..."
+    log_test "  Running export hook..."
+    run_export_hook
+
+    log_test " Checking desktop file export..."
     local desktop_found
     desktop_found=$(ssh_check "grep -rl 'SourcePackage=$pkg' /home/deck/.local/share/applications/ 2>/dev/null | head -1" || true)
     if [[ -z "$desktop_found" ]]; then
-      log_test "  Running export hook..."
-      distrobox_exec "env XDG_DATA_DIRS=/usr/local/share:/usr/share XDG_DATA_HOME=/home/deck/.local/share /usr/local/bin/distrobox-export-hook.sh" 30 || true
-      desktop_found=$(ssh_check "grep -rl 'SourcePackage=$pkg' /home/deck/.local/share/applications/ 2>/dev/null | head -1" || true)
+      desktop_found=$(ssh_check "podman exec -i $CONTAINER_NAME grep -rl 'SourcePackage=$pkg' /run/host/home/deck/.local/share/applications/ 2>/dev/null | head -1" || true)
+      if [[ -n "$desktop_found" ]]; then
+        desktop_found=$(echo "$desktop_found" | sed 's|/run/host||')
+      fi
     fi
     if [[ -n "$desktop_found" ]]; then
       pass "[$pkg] Desktop file exported: $(basename "$desktop_found")"
@@ -155,12 +163,15 @@ test_package() {
   pamac_exec "pamac remove --no-confirm --unneeded 2>&1" 30 || true
 
   if [[ "$has_desktop" == "true" ]]; then
-    log_test "  Checking desktop cleanup after uninstall..."
-    distrobox_exec "env XDG_DATA_DIRS=/usr/local/share:/usr/share XDG_DATA_HOME=/home/deck/.local/share /usr/local/bin/distrobox-export-hook.sh" 30 || true
-    local desktop_still
-    desktop_still=$(ssh_check "grep -rl 'SourcePackage=$pkg' /home/deck/.local/share/applications/ 2>/dev/null | head -1" || true)
+      log_test " Checking desktop cleanup after uninstall..."
+      run_export_hook
+      local desktop_still
+      desktop_still=$(ssh_check "grep -rl 'SourcePackage=$pkg' /home/deck/.local/share/applications/ 2>/dev/null | head -1" || true)
+      if [[ -z "$desktop_still" ]]; then
+        desktop_still=$(ssh_check "podman exec -i $CONTAINER_NAME grep -rl 'SourcePackage=$pkg' /run/host/home/deck/.local/share/applications/ 2>/dev/null | head -1" || true)
+      fi
     if [[ -z "$desktop_still" ]]; then
-      pass "[$pkg] Desktop file cleaned up"
+      pass "[$pkg] Desktop file cleaned up after uninstall"
     else
       fail "[$pkg] Desktop file still exists after cleanup"
     fi
@@ -169,7 +180,7 @@ test_package() {
   echo ""
 }
 
-echo "=== Diverse AUR Package Test ==="
+echo "=== Diverse AUR Package Test v2 ==="
 echo "Date: $(date)"
 echo ""
 
@@ -192,20 +203,43 @@ else
 fi
 echo ""
 
-# Format: package_name category binary_name has_desktop_file timeout
+# Clean up all previously installed test packages first
+log_test "=== Cleaning up previous test packages ==="
+for pkg in neofetch figlet lazygit ripgrep bat fd github-cli ttf-ms-fonts mousepad yt-dlp btop librewolf-bin heroic-games-launcher-bin; do
+  pamac_exec "pamac remove --no-confirm --no-save $pkg 2>&1" 30 || true
+done
+pamac_exec "pamac remove --no-confirm --unneeded 2>&1" 30 || true
+run_export_hook
+echo ""
+
+# Categories covered:
+# 1. cli-info       - neofetch (AUR, shell script, no desktop)
+# 2. cli-text       - figlet (AUR, C program, no desktop)
+# 3. go-gui-tui     - lazygit (AUR, Go binary, has desktop in AUR PKGBUILD but not in package)
+# 4. rust-cli-bin   - ripgrep (extra repo, Rust binary, no desktop)
+# 5. rust-cli-bin   - bat (extra repo, Rust binary, no desktop)
+# 6. go-cli-bin     - github-cli (extra repo, Go binary, has desktop)
+# 7. font           - ttf-ms-fonts (AUR, font package, no desktop)
+# 8. gui-gtk        - mousepad (extra repo/AUR, GTK GUI, has desktop with org.xfce prefix)
+# 9. python-cli     - yt-dlp (AUR, Python script, no desktop)
+# 10. cpp-tui       - btop (AUR, C++ TUI, has desktop)
+# 11. gui-qt-bin    - librewolf-bin (AUR, Qt/GTK GUI binary, has desktop)
+# 12. gui-electron  - heroic-games-launcher-bin (AUR, Electron GUI, has desktop)
+# 13. rust-cli-bin  - fd (extra repo, Rust binary, no desktop)
+
 test_package "neofetch" "cli-info" "neofetch" "false" 120
 test_package "figlet" "cli-text" "figlet" "false" 120
-test_package "lazygit" "go-gui-tui" "lazygit" "true" 180
-test_package "ripgrep-bin" "rust-cli-bin" "rg" "false" 120
-test_package "bat-bin" "rust-cli-bin" "bat" "false" 120
-test_package "ttf-imp-ink-original" "font" "none" "false" 180
+test_package "lazygit" "go-gui-tui" "lazygit" "false" 180
+test_package "ripgrep" "rust-cli-bin" "rg" "false" 120
+test_package "bat" "rust-cli-bin" "bat" "false" 120
+test_package "github-cli" "go-cli-bin" "gh" "true" 120
+test_package "ttf-ms-fonts" "font" "none" "false" 180
 test_package "mousepad" "gui-gtk" "mousepad" "true" 300
 test_package "yt-dlp" "python-cli" "yt-dlp" "false" 300
-test_package "github-cli-bin" "go-cli-bin" "gh" "true" 120
-test_package "fd-bin" "rust-cli-bin" "fd" "false" 120
 test_package "btop" "cpp-tui" "btop" "true" 300
 test_package "librewolf-bin" "gui-qt-bin" "librewolf" "true" 300
 test_package "heroic-games-launcher-bin" "gui-electron-bin" "heroic" "true" 300
+test_package "fd" "rust-cli-bin" "fd" "false" 120
 
 echo "=== Final DB Integrity Check ==="
 db_check=$(container_exec "pacman -Dk 2>&1" || true)
@@ -219,7 +253,7 @@ fi
 echo ""
 
 echo "========================================"
-echo " Diverse AUR Package Test Results"
+echo " Diverse AUR Package Test Results v2"
 echo "========================================"
 echo " Passed:  $PASS"
 echo " Failed:  $FAIL"

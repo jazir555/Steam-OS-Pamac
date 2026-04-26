@@ -2391,6 +2391,16 @@ get_exec_binary() {
   grep '^Exec=' "\$desktop_file" 2>/dev/null | head -1 | sed 's/^Exec=//' | sed 's/ .*//' | sed 's|^.*/||'
 }
 
+_fix_desktop_permissions() {
+  local desktop_file="\$1"
+  if [[ "\$(id -u)" -eq 0 ]]; then
+    local _host_uid
+    _host_uid="\$(id -u ${current_user} 2>/dev/null || echo 1000)"
+    chown "\$_host_uid:\$_host_uid" "\$desktop_file" 2>/dev/null || true
+  fi
+  chmod 644 "\$desktop_file" 2>/dev/null || true
+}
+
 annotate_desktop() {
   local desktop_file="\$1"
   local app_name="\$2"
@@ -2398,6 +2408,8 @@ annotate_desktop() {
   local owner_pkg="\$4"
 
   [[ -f "\$desktop_file" ]] || return 1
+
+  _fix_desktop_permissions "\$desktop_file"
 
   if [[ "\$app_name" == "org.manjaro.pamac.manager" ]]; then
     cat > "\$desktop_file" << PAMAC_DESKTOP
@@ -2426,7 +2438,7 @@ Name=Uninstall Packages
 Exec=/home/${current_user}/.local/bin/steamos-pamac-uninstall --desktop-file ${container_name}-org.manjaro.pamac.manager.desktop
 Icon=edit-delete
 PAMAC_DESKTOP
-    chmod +x "\$desktop_file"
+    _fix_desktop_permissions "\$desktop_file"
     return 0
   fi
 
@@ -2466,6 +2478,7 @@ PAMAC_DESKTOP
   desktop_basename="\$(basename "\$desktop_file")"
   printf '\nActions=uninstall;\nX-SteamOS-Pamac-Managed=true\nX-SteamOS-Pamac-Container=%s\nX-SteamOS-Pamac-SourceApp=%s\nX-SteamOS-Pamac-SourceDesktop=%s.desktop\nX-SteamOS-Pamac-SourcePackage=%s\n\n[Desktop Action uninstall]\nName=Uninstall\nExec=/home/${current_user}/.local/bin/steamos-pamac-uninstall --desktop-file %s\nIcon=edit-delete\n' \
     "${container_name}" "\$export_name" "\$app_name" "\$owner_pkg" "\$desktop_basename" >> "\$desktop_file"
+  _fix_desktop_permissions "\$desktop_file"
 }
 
 run_distrobox_export() {
@@ -2520,19 +2533,23 @@ if command -v distrobox-export >/dev/null 2>&1; then
     exec_binary="\$(get_exec_binary "\$desktop")"
     export_failed=false
 
-    if run_distrobox_export "\$export_name" "\$exec_binary"; then
-      host_desktop=""
-      for candidate in "\$APP_DIR/${container_name}-\${app_name}.desktop" "\$APP_DIR/${container_name}-\${export_name}.desktop" "\$APP_DIR/${container_name}-\${exec_binary}.desktop"; do
-        if [[ -f "\$candidate" ]]; then
-          host_desktop="\$candidate"
-          break
-        fi
-      done
-      if [[ -z "\$host_desktop" ]]; then
-        host_desktop="\$(find "\$APP_DIR" -maxdepth 1 -name "${container_name}-*.desktop" -newer "\$EXPLICIT_FILE" -print -quit 2>/dev/null)"
+  if run_distrobox_export "\$export_name" "\$exec_binary"; then
+    host_desktop=""
+    for candidate in "\$APP_DIR/${container_name}-\${app_name}.desktop" "\$APP_DIR/${container_name}-\${export_name}.desktop" "\$APP_DIR/${container_name}-\${exec_binary}.desktop"; do
+      if [[ -f "\$candidate" ]]; then
+        _fix_desktop_permissions "\$candidate"
+        host_desktop="\$candidate"
+        break
       fi
-      if [[ -n "\$host_desktop" && -f "\$host_desktop" ]]; then
-        annotate_desktop "\$host_desktop" "\$app_name" "\$export_name" "\$owner_pkg" || true
+    done
+    if [[ -z "\$host_desktop" ]]; then
+      host_desktop="\$(find "\$APP_DIR" -maxdepth 1 -name "${container_name}-*.desktop" -newer "\$EXPLICIT_FILE" -print -quit 2>/dev/null)"
+      if [[ -n "\$host_desktop" ]]; then
+        _fix_desktop_permissions "\$host_desktop"
+      fi
+    fi
+    if [[ -n "\$host_desktop" && -f "\$host_desktop" ]]; then
+      annotate_desktop "\$host_desktop" "\$app_name" "\$export_name" "\$owner_pkg" || true
         printf '%s\n' "\$host_desktop" >> "\$NEW_STATE_FILE"
       fi
       exported=\$((exported + 1))
@@ -2545,6 +2562,11 @@ fi
 
 rm -f "\$APP_DIR/${container_name}.desktop" 2>/dev/null || true
 
+for f in "\$APP_DIR"/${container_name}-*.desktop; do
+  [[ -f "\$f" ]] || continue
+  _fix_desktop_permissions "\$f"
+done
+
 if [[ -f "\$STATE_FILE" ]]; then
   while IFS= read -r old_export; do
     [[ -n "\$old_export" ]] || continue
@@ -2556,6 +2578,11 @@ if [[ -f "\$STATE_FILE" ]]; then
     if [[ -n "\$local_source_pkg" ]]; then
       if ! pacman -Q "\$local_source_pkg" >/dev/null 2>&1; then
         echo "Removing stale export (package \$local_source_pkg uninstalled): \$old_export" >> "\$EXPORT_LOG"
+        rm -f "\$old_export"
+        continue
+      fi
+      if ! grep -Fxq "\$local_source_pkg" "\$EXPLICIT_FILE" 2>/dev/null; then
+        echo "Removing dependency export (package \$local_source_pkg not explicitly installed): \$old_export" >> "\$EXPORT_LOG"
         rm -f "\$old_export"
         continue
       fi
@@ -2572,10 +2599,17 @@ while IFS= read -r existing_export; do
     continue
   fi
   existing_source_pkg="\$(grep '^X-SteamOS-Pamac-SourcePackage=' "\$existing_export" 2>/dev/null | cut -d= -f2-)"
-  if [[ -n "\$existing_source_pkg" ]] && ! pacman -Q "\$existing_source_pkg" >/dev/null 2>&1; then
-    echo "Removing orphaned export (package \$existing_source_pkg uninstalled): \$existing_export" >> "\$EXPORT_LOG"
-    rm -f "\$existing_export"
-    continue
+  if [[ -n "\$existing_source_pkg" ]]; then
+    if ! pacman -Q "\$existing_source_pkg" >/dev/null 2>&1; then
+      echo "Removing orphaned export (package \$existing_source_pkg uninstalled): \$existing_export" >> "\$EXPORT_LOG"
+      rm -f "\$existing_export"
+      continue
+    fi
+    if ! grep -Fxq "\$existing_source_pkg" "\$EXPLICIT_FILE" 2>/dev/null; then
+      echo "Removing dependency export (package \$existing_source_pkg not explicitly installed): \$existing_export" >> "\$EXPORT_LOG"
+      rm -f "\$existing_export"
+      continue
+    fi
   fi
   if ! grep -Fxq "\$existing_export" "\$NEW_STATE_FILE" 2>/dev/null; then
     echo "Removing stale container export: \$existing_export" >> "\$EXPORT_LOG"

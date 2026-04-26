@@ -494,7 +494,7 @@ test_reinstall() {
 # 11. TEST PACMAN DB INTEGRITY
 ###############################################################################
 test_db_integrity() {
-	log_test "=== 11/12: Pacman DB Integrity ==="
+	log_test "=== 11/14: Pacman DB Integrity ==="
 
     local db_check
     db_check=$(container_exec "pacman -Dk 2>&1" || true)
@@ -534,7 +534,7 @@ test_db_integrity() {
 # 12. TEST HOST INTEGRATION (desktop, state, uninstall path)
 ###############################################################################
 test_host_integration() {
-	log_test "=== 12/12: Host Integration ==="
+	log_test "=== 12/14: Host Integration ==="
 
 	local state_dir_exists
 	state_dir_exists=$(ssh_check "test -d /home/deck/.local/share/steamos-pamac/$CONTAINER_NAME && echo true || echo false" || echo "false")
@@ -599,7 +599,7 @@ test_uninstall_helper() {
 
 	local helper_help
 	helper_help=$(ssh_exec "timeout 5 '$helper_path' --help 2>&1" || true)
-	if echo "$helper_help" | grep -qi "\-\-package\|\-\-desktop-file\|\-\-list"; then
+	if echo "$helper_help" | grep -qi -- '--package\|--desktop-file\|--list'; then
 		pass "Uninstall helper --help shows expected options"
 	else
 		fail "Uninstall helper --help output unexpected: ${helper_help:0:200}"
@@ -736,6 +736,10 @@ main() {
 	test_db_integrity
 	echo "" | tee -a "$TEST_LOG"
 	test_host_integration
+	echo "" | tee -a "$TEST_LOG"
+	test_uninstall_helper
+	echo "" | tee -a "$TEST_LOG"
+	test_desktop_action_uninstall
 	echo "" | tee -a "$TEST_LOG"
 	print_summary
 

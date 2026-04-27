@@ -807,10 +807,12 @@ test_kde_uninstall_integration() {
     fail "steamos-pamac-uninstall missing --appstream-id option"
   fi
 
-  local non_pamac_desktop="/home/deck/.local/share/applications/org.kde.dolphin.desktop"
-  local non_pamac_exists
-  non_pamac_exists=$(ssh_check "test -f '$non_pamac_desktop' && echo true || echo false" || echo "false")
-  if [[ "$non_pamac_exists" == "true" ]]; then
+  local non_pamac_desktop
+  non_pamac_desktop=$(ssh_check "ls /usr/share/applications/org.kde.dolphin.desktop /usr/share/applications/btop.desktop /usr/share/applications/firewall-config.desktop 2>/dev/null | head -1" || true)
+  if [[ -z "$non_pamac_desktop" ]]; then
+    non_pamac_desktop=$(ssh_check "ls /home/deck/.local/share/applications/*.desktop 2>/dev/null | grep -v arch-pamac | head -1" || true)
+  fi
+  if [[ -n "$non_pamac_desktop" ]]; then
     local kh_ignores
     kh_ignores=$(ssh_exec "timeout 5 '$kickeraction_handler' 'file://$non_pamac_desktop' 2>&1; echo EXIT:\$?" || true)
     if echo "$kh_ignores" | grep -q "EXIT:0"; then

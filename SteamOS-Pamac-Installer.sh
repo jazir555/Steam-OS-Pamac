@@ -3226,12 +3226,12 @@ MANAGED_IDS=""
 while IFS= read -r desktop_path; do
 [[ -f "\$desktop_path" ]] || continue
 if grep -q '^X-SteamOS-Pamac-Managed=true' "\$desktop_path" 2>/dev/null; then
-    storage_id=\$(basename "\$desktop_path" .desktop)
-    if [[ -n "\$MANAGED_IDS" ]]; then
-        MANAGED_IDS="\$MANAGED_IDS,\$storage_id"
-    else
-        MANAGED_IDS="\$storage_id"
-    fi
+storage_id=\$(basename "\$desktop_path" .desktop)
+if [[ -n "\$MANAGED_IDS" ]]; then
+MANAGED_IDS="\${MANAGED_IDS};\${storage_id}"
+else
+MANAGED_IDS="\$storage_id"
+fi
 fi
 done < "\$STATE_FILE" 2>/dev/null
 

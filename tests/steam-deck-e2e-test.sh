@@ -799,6 +799,14 @@ test_kde_uninstall_integration() {
     skip "X-KDE-OnlyForAppIds is empty (no managed apps or export hook not yet run)"
   fi
 
+  local kd_separator
+  kd_separator=$(ssh_check "grep '^X-KDE-OnlyForAppIds=' '$kickeraction_desktop' 2>/dev/null | grep -c ',' || echo 0")
+  if [[ "$kd_separator" -eq 0 ]]; then
+    pass "X-KDE-OnlyForAppIds uses semicolon separator (not comma)"
+  else
+    fail "X-KDE-OnlyForAppIds uses comma separator — KDE expects semicolons"
+  fi
+
   local helper_has_appstream
   helper_has_appstream=$(ssh_check "grep -q -- '--appstream-id' '$uninstall_helper' 2>/dev/null && echo true || echo false" || echo "false")
   if [[ "$helper_has_appstream" == "true" ]]; then

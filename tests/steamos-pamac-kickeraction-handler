@@ -2,6 +2,7 @@
 set +e
 
 APP_DIR="$HOME/.local/share/applications"
+STATE_DIR="$HOME/.local/share/steamos-pamac/arch-pamac"
 UNINSTALL_HELPER="$HOME/.local/bin/steamos-pamac-uninstall"
 LOG_FILE="$HOME/.local/share/steamos-pamac/arch-pamac/kickeraction-handler.log"
 
@@ -10,6 +11,9 @@ mkdir -p "$(dirname "$LOG_FILE")"
 log_msg() {
     echo "$(date): $*" >> "$LOG_FILE"
 }
+
+log_msg "=== kickeraction-handler invoked: $* ==="
+log_msg "HOME=$HOME PATH=$PATH USER=$(whoami 2>/dev/null || id -un)"
 
 DESKTOP_FILE_URL="$1"
 
@@ -51,7 +55,22 @@ DESKTOP_BASENAME=$(basename "$DESKTOP_PATH")
 log_msg "Uninstalling pamac-managed app: $APP_NAME (package: $SOURCE_PKG, desktop: $DESKTOP_BASENAME)"
 
 if [[ -x "$UNINSTALL_HELPER" ]]; then
-    exec "$UNINSTALL_HELPER" --desktop-file "$DESKTOP_BASENAME"
+    log_msg "Launching uninstall helper: $UNINSTALL_HELPER --desktop-file $DESKTOP_BASENAME"
+    UNINSTALL_LOG="$STATE_DIR/kickeraction-uninstall-$(date +%s).log"
+    "$UNINSTALL_HELPER" --desktop-file "$DESKTOP_BASENAME" > "$UNINSTALL_LOG" 2>&1
+    rc=$?
+    log_msg "Uninstall helper exited with code: $rc"
+    while IFS= read -r line; do
+        log_msg "uninstall-helper: $line"
+    done < "$UNINSTALL_LOG"
+    rm -f "$UNINSTALL_LOG"
+    if [[ $rc -ne 0 ]]; then
+        log_msg "Uninstall FAILED for $APP_NAME"
+        kdialog --error "Failed to uninstall $APP_NAME. Check log: $LOG_FILE" 2>/dev/null || true
+    else
+        log_msg "Uninstall SUCCEEDED for $APP_NAME"
+    fi
+    exit $rc
 else
     log_msg "Error: Uninstall helper not found at $UNINSTALL_HELPER"
     echo "Error: Uninstall helper not found at $UNINSTALL_HELPER" >&2

@@ -3,6 +3,17 @@ set +e
 CONTAINER_NAME="arch-pamac"
 APP_DIR="$HOME/.local/share/applications"
 STATE_DIR="$HOME/.local/share/steamos-pamac/$CONTAINER_NAME"
+LOG_FILE="$STATE_DIR/uninstall-helper.log"
+
+mkdir -p "$STATE_DIR"
+
+_log() {
+    echo "$(date): $*" >> "$LOG_FILE"
+}
+
+_log "=== steamos-pamac-uninstall invoked: $* ==="
+_log "HOME=$HOME PATH=$PATH USER=$(whoami 2>/dev/null || id -un)"
+_log "podman=$(command -v podman 2>/dev/null || echo NOT_FOUND)"
 
 show_help() {
     echo "Usage: steamos-pamac-uninstall [options]"
@@ -15,33 +26,51 @@ show_help() {
 }
 
 uninstall_package() {
-    local pkg="$1"
-    if [[ -z "$pkg" ]]; then
-        echo "Error: No package specified." >&2
-        exit 1
-    fi
-    echo "Uninstalling $pkg from $CONTAINER_NAME..."
-    podman exec -i -u 0 "$CONTAINER_NAME" bash -c '
-        rm -f /run/dbus/pid 2>/dev/null
-        pkill pamac-daemon 2>/dev/null; pkill polkitd 2>/dev/null; pkill dbus-daemon 2>/dev/null
-        sleep 1
-        mkdir -p /run/dbus
-        dbus-daemon --system --fork 2>/dev/null
-        sleep 1
-        /usr/lib/polkit-1/polkitd --no-debug &>/dev/null &
-        sleep 1
-        /usr/bin/pamac-daemon &>/dev/null &
-        sleep 2
-        pamac remove --no-confirm --no-save "'"$pkg"'" 2>&1
-    '
-    local rc=$?
-    if [[ $rc -eq 0 ]]; then
-        echo "Successfully uninstalled $pkg"
-        podman exec -i -u 0 "$CONTAINER_NAME" /usr/local/bin/distrobox-export-hook.sh 2>/dev/null || true
-    else
-        echo "Failed to uninstall $pkg (exit code: $rc)" >&2
-        exit $rc
-    fi
+  local pkg="$1"
+  if [[ -z "$pkg" ]]; then
+    echo "Error: No package specified." >&2
+    _log "Error: No package specified"
+    exit 1
+  fi
+  echo "Uninstalling $pkg from $CONTAINER_NAME..."
+  _log "Uninstalling $pkg from $CONTAINER_NAME..."
+
+  if ! command -v podman >/dev/null 2>&1; then
+    _log "Error: podman not found in PATH"
+    echo "Error: podman not found in PATH" >&2
+    exit 1
+  fi
+
+  _log "Running podman exec for pamac remove..."
+  local remove_output
+  remove_output=$(podman exec -i -u 0 "$CONTAINER_NAME" bash -c '
+    rm -f /run/dbus/pid 2>/dev/null
+    pkill pamac-daemon 2>/dev/null; pkill polkitd 2>/dev/null; pkill dbus-daemon 2>/dev/null
+    sleep 1
+    mkdir -p /run/dbus
+    dbus-daemon --system --fork 2>/dev/null
+    sleep 1
+    /usr/lib/polkit-1/polkitd --no-debug &>/dev/null &
+    sleep 1
+    /usr/bin/pamac-daemon &>/dev/null &
+    sleep 2
+    pamac remove --no-confirm --no-save "'"$pkg"'" 2>&1
+  ' 2>&1)
+  local rc=$?
+  _log "podman exec exit code: $rc"
+  _log "podman exec output: ${remove_output:0:500}"
+
+  if [[ $rc -eq 0 ]]; then
+    echo "Successfully uninstalled $pkg"
+    _log "Successfully uninstalled $pkg"
+    _log "Running export hook..."
+    podman exec -i -u 0 "$CONTAINER_NAME" /usr/local/bin/distrobox-export-hook.sh 2>/dev/null || true
+    _log "Export hook done"
+  else
+    echo "Failed to uninstall $pkg (exit code: $rc)" >&2
+    _log "Failed to uninstall $pkg (exit code: $rc)"
+    exit $rc
+  fi
 }
 
 list_apps() {

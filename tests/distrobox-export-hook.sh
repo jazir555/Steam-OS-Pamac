@@ -278,18 +278,18 @@ mkdir -p "$KICKERACTION_DIR"
 KICKERACTION_FILE="$KICKERACTION_DIR/steamos-pamac-uninstall.desktop"
 KICKERACTION_HANDLER="/home/deck/.local/bin/steamos-pamac-kickeraction-handler"
 
-MANAGED_IDS=""
-while IFS= read -r desktop_path; do
-    [[ -f "$desktop_path" ]] || continue
-    if grep -q '^X-SteamOS-Pamac-Managed=true' "$desktop_path" 2>/dev/null; then
-        storage_id=$(basename "$desktop_path" .desktop)
-        if [[ -n "$MANAGED_IDS" ]]; then
-            MANAGED_IDS="$MANAGED_IDS,$storage_id"
-        else
-            MANAGED_IDS="$storage_id"
+    MANAGED_IDS=""
+    while IFS= read -r desktop_path; do
+        [[ -f "$desktop_path" ]] || continue
+        if grep -q '^X-SteamOS-Pamac-Managed=true' "$desktop_path" 2>/dev/null; then
+            storage_id=$(basename "$desktop_path" .desktop)
+            if [[ -n "$MANAGED_IDS" ]]; then
+                MANAGED_IDS="${MANAGED_IDS};${storage_id}"
+            else
+                MANAGED_IDS="$storage_id"
+            fi
         fi
-    fi
-done < "$STATE_FILE" 2>/dev/null
+    done < "$STATE_FILE" 2>/dev/null
 
 if [[ -n "$MANAGED_IDS" ]]; then
     cat > "$KICKERACTION_FILE" << KICKERACTION_EOF

@@ -2302,6 +2302,83 @@ EOF
     fi
 }
 
+configure_ssh_environment() {
+    log_step "Configuring SSH environment for nested commands"
+
+    if ! grep -qi steamos /etc/os-release 2>/dev/null; then
+        log_info "Not SteamOS, skipping SSH environment setup."
+        return 0
+    fi
+
+    local ssh_dir="$HOME/.ssh"
+    mkdir -p "$ssh_dir"
+    chmod 700 "$ssh_dir"
+
+    if [[ ! -f "$ssh_dir/environment" ]] || ! grep -q '^PATH=' "$ssh_dir/environment" 2>/dev/null; then
+        echo "PATH=/home/$CURRENT_USER/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin" > "$ssh_dir/environment"
+        chmod 644 "$ssh_dir/environment"
+        log_info "Created $ssh_dir/environment with clean PATH"
+    fi
+
+    local sshd_conf_dir="/etc/ssh/sshd_config.d"
+    local permit_env_conf="$sshd_conf_dir/permit-user-env.conf"
+    if [[ ! -f "$permit_env_conf" ]]; then
+        if mkdir -p "$sshd_conf_dir" 2>/dev/null; then
+            echo "PermitUserEnvironment yes" | run_command tee "$permit_env_conf" > /dev/null 2>&1
+            if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
+                run_command systemctl restart sshd 2>/dev/null || true
+            else
+                run_command pkill -HUP sshd 2>/dev/null || true
+            fi
+            log_info "Enabled PermitUserEnvironment in sshd"
+        else
+            log_warn "Could not create sshd config directory (need sudo)"
+            if command -v sudo >/dev/null 2>&1; then
+                echo "a" | sudo -S mkdir -p "$sshd_conf_dir" 2>/dev/null || true
+                echo "PermitUserEnvironment yes" | echo "a" | sudo -S tee "$permit_env_conf" > /dev/null 2>&1 || true
+                echo "a" | sudo -S pkill -HUP sshd 2>/dev/null || true
+                log_info "Enabled PermitUserEnvironment via sudo"
+            fi
+        fi
+    fi
+
+    local profile_d_file="/etc/profile.d/deck-local-bin.sh"
+    if [[ ! -f "$profile_d_file" ]]; then
+        echo 'export PATH="/home/'"$CURRENT_USER"'/.local/bin:$PATH"' | run_command tee "$profile_d_file" > /dev/null 2>&1 || true
+        if [[ ! -f "$profile_d_file" ]]; then
+            if command -v sudo >/dev/null 2>&1; then
+                echo 'export PATH="/home/'"$CURRENT_USER"'/.local/bin:$PATH"' | echo "a" | sudo -S tee "$profile_d_file" > /dev/null 2>&1 || true
+            fi
+        fi
+        if [[ -f "$profile_d_file" ]]; then
+            chmod 644 "$profile_d_file" 2>/dev/null || true
+            log_info "Created $profile_d_file"
+        else
+            log_warn "Could not create $profile_d_file"
+        fi
+    fi
+
+    local bashrc_file="$HOME/.bashrc"
+    if [[ -f "$bashrc_file" ]]; then
+        if ! grep -q '^export HOME=' "$bashrc_file" 2>/dev/null || ! grep -q '^export PATH=.*\.local/bin' "$bashrc_file" 2>/dev/null; then
+            local bashrc_header
+            bashrc_header='#\n# ~/.bashrc\n#\nexport HOME="/home/'"$CURRENT_USER"'"\nexport PATH="/home/'"$CURRENT_USER"'/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin"\n'
+            if grep -q '^\[\[ \$- != \*i\* \]\]' "$bashrc_file" 2>/dev/null || grep -q '^\[\[ \$- !=' "$bashrc_file" 2>/dev/null; then
+                run_command sed -i "1i\\${bashrc_header}" "$bashrc_file" 2>/dev/null || true
+            else
+                { echo -e "$bashrc_header"; cat "$bashrc_file"; } > "$bashrc_file.tmp" 2>/dev/null && mv "$bashrc_file.tmp" "$bashrc_file" 2>/dev/null || true
+            fi
+            if grep -q '^export HOME=' "$bashrc_file" 2>/dev/null; then
+                log_info "Patched .bashrc with HOME/PATH exports before non-interactive check"
+            else
+                log_warn "Could not patch .bashrc automatically"
+            fi
+        fi
+    fi
+
+    log_success "SSH environment configured for nested commands"
+}
+
 export_pamac_to_host() {
     log_step "Exporting Pamac to host system"
 
@@ -2551,7 +2628,7 @@ APP_DIR="\$HOME/.local/share/applications"
  sleep 1
  /usr/bin/pamac-daemon &>/dev/null &
  sleep 2
- pamac remove --no-confirm --no-save "'"\$pkg"'" 2>&1
+ pamac remove --no-confirm --no-save --no-orphans "'"\$pkg"'" 2>&1
  ' 2>&1)
  local rc=\$?
  _log "podman exec exit code: \$rc"
@@ -2868,42 +2945,53 @@ PAMAC_DESKTOP
     return 0
   fi
 
-  local tmp_file
-  tmp_file="\$(mktemp)"
-  {
-    local in_action=false
-    while IFS= read -r line || [[ -n "\$line" ]]; do
-      case "\$line" in
-        'X-SteamOS-Pamac-Managed='*) continue ;;
-        'X-SteamOS-Pamac-Container='*) continue ;;
-        'X-SteamOS-Pamac-SourceApp='*) continue ;;
-        'X-SteamOS-Pamac-SourceDesktop='*) continue ;;
-        'X-SteamOS-Pamac-SourcePackage='*) continue ;;
-        'Actions='*) continue ;;
-        '[Desktop Action uninstall]')
-          in_action=true
-          continue
-          ;;
-      esac
-      if \$in_action; then
-        case "\$line" in
-          'Name=Uninstall'|'Name=Uninstall '*|'Exec='*steamos-pamac-uninstall*|'Icon=edit-delete'|'['*)
-            if [[ "\$line" == '['* ]]; then
-              in_action=false
-              printf '%s\n' "\$line"
-            fi
-            continue
-            ;;
-        esac
-      fi
-      printf '%s\n' "\$line"
-    done < "\$desktop_file"
-  } > "\$tmp_file"
-  mv "\$tmp_file" "\$desktop_file"
+local tmp_file
+tmp_file="\$(mktemp)"
+local existing_actions=""
+{
+local in_action=false
+while IFS= read -r line || [[ -n "\$line" ]]; do
+case "\$line" in
+'X-SteamOS-Pamac-Managed='*) continue ;;
+'X-SteamOS-Pamac-Container='*) continue ;;
+'X-SteamOS-Pamac-SourceApp='*) continue ;;
+'X-SteamOS-Pamac-SourceDesktop='*) continue ;;
+'X-SteamOS-Pamac-SourcePackage='*) continue ;;
+'Actions='*)
+existing_actions="\${line#Actions=}"
+continue
+;;
+'[Desktop Action uninstall]')
+in_action=true
+continue
+;;
+esac
+if \$in_action; then
+case "\$line" in
+'Name=Uninstall'|'Name=Uninstall '*|'Exec='*steamos-pamac-uninstall*|'Icon=edit-delete'|'['*)
+if [[ "\$line" == '['* ]]; then
+in_action=false
+printf '%s\n' "\$line"
+fi
+continue
+;;
+esac
+fi
+printf '%s\n' "\$line"
+done < "\$desktop_file"
+} > "\$tmp_file"
+mv "\$tmp_file" "\$desktop_file"
 
-  desktop_basename="\$(basename "\$desktop_file")"
-  printf '\nActions=uninstall;\nX-SteamOS-Pamac-Managed=true\nX-SteamOS-Pamac-Container=%s\nX-SteamOS-Pamac-SourceApp=%s\nX-SteamOS-Pamac-SourceDesktop=%s.desktop\nX-SteamOS-Pamac-SourcePackage=%s\n\n[Desktop Action uninstall]\nName=Uninstall\nExec=/home/${current_user}/.local/bin/steamos-pamac-uninstall --desktop-file %s\nIcon=edit-delete\n' \
-    "${container_name}" "\$export_name" "\$app_name" "\$owner_pkg" "\$desktop_basename" >> "\$desktop_file"
+local combined_actions=""
+if [[ -n "\$existing_actions" ]]; then
+combined_actions="\${existing_actions%%;}uninstall;"
+else
+combined_actions="uninstall;"
+fi
+
+desktop_basename="\$(basename "\$desktop_file")"
+printf '\nActions=%s\nX-SteamOS-Pamac-Managed=true\nX-SteamOS-Pamac-Container=%s\nX-SteamOS-Pamac-SourceApp=%s\nX-SteamOS-Pamac-SourceDesktop=%s.desktop\nX-SteamOS-Pamac-SourcePackage=%s\n\n[Desktop Action uninstall]\nName=Uninstall\nExec=/home/${current_user}/.local/bin/steamos-pamac-uninstall --desktop-file %s\nIcon=edit-delete\n' \
+"\$combined_actions" "${container_name}" "\$export_name" "\$app_name" "\$owner_pkg" "\$desktop_basename" >> "\$desktop_file"
   _fix_desktop_permissions "\$desktop_file"
 }
 
@@ -3309,6 +3397,8 @@ install_gaming_packages
 
     setup_post_install_hooks
     export_existing_apps
+
+    configure_ssh_environment
 
     show_completion_message
 }

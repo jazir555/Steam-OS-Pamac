@@ -53,7 +53,7 @@ uninstall_package() {
     sleep 1
     /usr/bin/pamac-daemon &>/dev/null &
     sleep 2
-    pamac remove --no-confirm --no-save "'"$pkg"'" 2>&1
+    pamac remove --no-confirm --no-save --no-orphans "'"$pkg"'" 2>&1
   ' 2>&1)
   local rc=$?
   _log "podman exec exit code: $rc"

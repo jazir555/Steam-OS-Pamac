@@ -88,11 +88,10 @@ pamac_exec() {
 }
 
 cleanup_package() {
-	local pkg="$1"
-	log_test "Cleanup: removing $pkg if installed..."
-	pamac_exec "pamac remove --no-confirm $pkg 2>/dev/null || true" 60 || true
-	pamac_exec "pamac remove --no-confirm --unneeded 2>/dev/null || true" 30 || true
-	container_exec "pacman -Qs '^${pkg}$' >/dev/null 2>&1 && pacman -Rdd --noconfirm '${pkg}' 2>/dev/null || true" || true
+    local pkg="$1"
+    log_test "Cleanup: removing $pkg if installed..."
+    pamac_exec "pamac remove --no-confirm --no-orphans $pkg 2>/dev/null || true" 60 || true
+    container_exec "pacman -Qs '^${pkg}$' >/dev/null 2>&1 && pacman -Rdd --noconfirm '${pkg}' 2>/dev/null || true" || true
 }
 
 check_desktop_file_format() {
@@ -817,21 +816,26 @@ test_kde_uninstall_integration() {
     skip "Non-pamac desktop file not found for kickeraction ignore test"
   fi
 
-  local managed_desktops
-  managed_desktops=$(ssh_check "grep -rl '^X-SteamOS-Pamac-Managed=true' /home/deck/.local/share/applications/arch-pamac-*.desktop 2>/dev/null | head -1" || true)
-  if [[ -n "$managed_desktops" ]]; then
-    local managed_basename
-    managed_basename=$(basename "$managed_desktops")
-    local kh_routes
-    kh_routes=$(ssh_exec "timeout 5 '$kickeraction_handler' 'file://$managed_desktops' 2>&1" || true)
-    if echo "$kh_routes" | grep -qi "Uninstalling\|uninstall_package\|steamos-pamac-uninstall"; then
-      pass "Kickeraction handler routes pamac-managed app to uninstall helper"
-    else
-      skip "Kickeraction handler output for managed app: ${kh_routes:0:200}"
-    fi
-  else
-    skip "No pamac-managed desktop files found for kickeraction route test"
-  fi
+local mock_desktop="/home/deck/.local/share/applications/arch-pamac-e2e-mock-test.desktop"
+ssh_exec "cat > '$mock_desktop' << 'MOCKEOF'
+[Desktop Entry]
+Name=E2E Mock Test App
+Type=Application
+Exec=/bin/true
+X-SteamOS-Pamac-Managed=true
+X-SteamOS-Pamac-SourcePackage=e2e-mock-dummy-pkg
+X-SteamOS-Pamac-Container=arch-pamac
+MOCKEOF" || true
+
+local kh_routes
+kh_routes=$(ssh_exec "timeout 15 '$kickeraction_handler' 'file://$mock_desktop' 2>&1; cat /home/deck/.local/share/steamos-pamac/arch-pamac/kickeraction-handler.log 2>/dev/null | tail -10" || true)
+if echo "$kh_routes" | grep -qi "pamac-managed app\|Uninstalling\|uninstall helper\|steamos-pamac-uninstall\|SourcePackage"; then
+    pass "Kickeraction handler routes pamac-managed app to uninstall helper"
+else
+    skip "Kickeraction handler output for managed app: ${kh_routes:0:200}"
+fi
+
+ssh_exec "rm -f '$mock_desktop'" || true
 
  local log_dir
  log_dir=$(ssh_check "test -d /home/deck/.local/share/steamos-pamac/arch-pamac && echo true || echo false" || echo "false")

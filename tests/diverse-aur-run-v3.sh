@@ -185,9 +185,7 @@ echo "Date: $(date)"
 echo ""
 
 echo "=== Daemon Check ==="
-echo "DEBUG: About to capture pamac_ver..."
 capture_exec pamac_ver podman exec -u 0 "$CONTAINER_NAME" pamac --version
-echo "DEBUG: pamac_ver='$pamac_ver'"
 pamac_ver="$(echo "$pamac_ver" | head -1 || true)"
 if [[ -n "$pamac_ver" ]]; then
 echo "Daemon OK ($pamac_ver)"

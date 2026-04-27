@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euo pipefail
+set +e
 
 SSH_HOST="deck@192.168.2.111"
 CONTAINER_NAME="arch-pamac"
@@ -63,12 +63,12 @@ ssh_check() {
 
 container_exec() {
 	local cmd="${1//\'/\\\'}"
-	ssh_check "podman exec -i -u 0 '$CONTAINER_NAME' bash -c '$cmd' 2>&1"
+	ssh_check "podman exec -u 0 '$CONTAINER_NAME' bash -c '$cmd' 2>&1"
 }
 
 container_user_exec() {
 	local cmd="${1//\'/\\\'}"
-	ssh_check "podman exec -i -u deck '$CONTAINER_NAME' bash -c '$cmd' 2>&1"
+	ssh_check "podman exec -u deck '$CONTAINER_NAME' bash -c '$cmd' 2>&1"
 }
 
 distrobox_exec() {
@@ -84,7 +84,7 @@ distrobox_exec() {
 pamac_exec() {
     local cmd="${1//\'/\\\'}"
     local timeout_sec="${2:-120}"
-    ssh_check "timeout $timeout_sec podman exec -i -u 0 '$CONTAINER_NAME' bash -c 'rm -f /run/dbus/pid 2>/dev/null; pkill pamac-daemon 2>/dev/null; pkill polkitd 2>/dev/null; pkill dbus-daemon 2>/dev/null; sleep 1; mkdir -p /run/dbus; dbus-daemon --system --fork 2>/dev/null; sleep 1; /usr/lib/polkit-1/polkitd --no-debug &>/dev/null & sleep 1; /usr/bin/pamac-daemon &>/dev/null & sleep 2; $cmd' 2>&1"
+    ssh_check "timeout $timeout_sec podman exec -u 0 '$CONTAINER_NAME' bash -c 'rm -f /run/dbus/pid 2>/dev/null; pkill pamac-daemon 2>/dev/null; pkill polkitd 2>/dev/null; pkill dbus-daemon 2>/dev/null; sleep 1; mkdir -p /run/dbus; dbus-daemon --system --fork 2>/dev/null; sleep 1; /usr/lib/polkit-1/polkitd --no-debug &>/dev/null & sleep 1; /usr/bin/pamac-daemon &>/dev/null & sleep 2; $cmd' 2>&1"
 }
 
 cleanup_package() {
@@ -157,7 +157,7 @@ test_prerequisites() {
 	fi
 
 	local container_ok
-	container_ok=$(ssh_check "podman exec -i -u 0 '$CONTAINER_NAME' bash -c 'echo ok' 2>/dev/null" | grep -c ok || echo 0)
+	container_ok=$(ssh_check "podman exec -u 0 '$CONTAINER_NAME' bash -c 'echo ok' 2>/dev/null" | grep -c ok || echo 0)
 	if [[ "$container_ok" -gt 0 ]]; then
 		pass "Container is usable (exec works)"
 	else
@@ -286,7 +286,7 @@ test_install() {
 	fi
 
 	local pkg_ver
-	pkg_ver=$(ssh_check "podman exec -i -u 0 '$CONTAINER_NAME' pacman -Q $TEST_PACKAGE_AUR 2>/dev/null" | grep -oP '\S+$' || echo "unknown")
+	pkg_ver=$(ssh_check "podman exec -u 0 '$CONTAINER_NAME' pacman -Q $TEST_PACKAGE_AUR 2>/dev/null" | grep -oP '\S+$' || echo "unknown")
 	log_test " Installed version: $pkg_ver"
 }
 
@@ -532,7 +532,7 @@ test_reinstall() {
 	fi
 
 	local pkg_ver
-	pkg_ver=$(ssh_check "podman exec -i -u 0 '$CONTAINER_NAME' pacman -Q $TEST_PACKAGE_AUR 2>/dev/null" | grep -oP '\S+$' || echo "unknown")
+	pkg_ver=$(ssh_check "podman exec -u 0 '$CONTAINER_NAME' pacman -Q $TEST_PACKAGE_AUR 2>/dev/null" | grep -oP '\S+$' || echo "unknown")
 	pass "Re-installed version: $pkg_ver"
 }
 

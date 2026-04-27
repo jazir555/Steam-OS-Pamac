@@ -165,7 +165,7 @@ test_package() {
     fail "[$pkg] Still installed after remove"
     container_exec "pacman -Rdd --noconfirm $pkg 2>/dev/null || true" || true
   fi
-  pamac_exec "pamac remove --no-confirm --unneeded 2>&1" 30 || true
+	pamac_exec "pamac remove --no-confirm --no-orphans 2>&1" 30 || true
 
   if [[ "$has_desktop" == "true" ]]; then
       log_test " Checking desktop cleanup after uninstall..."
@@ -213,7 +213,7 @@ log_test "=== Cleaning up previous test packages ==="
 for pkg in neofetch figlet lazygit ripgrep celluloid fd github-cli ttf-ms-fonts mousepad yt-dlp btop librewolf-bin heroic-games-launcher-bin; do
   pamac_exec "pamac remove --no-confirm --no-save $pkg 2>&1" 30 || true
 done
-pamac_exec "pamac remove --no-confirm --unneeded 2>&1" 30 || true
+pamac_exec "pamac remove --no-confirm --no-orphans 2>&1" 30 || true
 run_export_hook
 echo ""
 

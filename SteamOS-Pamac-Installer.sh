@@ -2982,16 +2982,47 @@ done < "\$desktop_file"
 } > "\$tmp_file"
 mv "\$tmp_file" "\$desktop_file"
 
-local combined_actions=""
-if [[ -n "\$existing_actions" ]]; then
-combined_actions="\${existing_actions%%;}uninstall;"
-else
-combined_actions="uninstall;"
-fi
+	local combined_actions=""
+	if [[ -n "\$existing_actions" ]]; then
+		local stripped="\${existing_actions%%;}"
+		combined_actions="\${stripped};uninstall;"
+	else
+		combined_actions="uninstall;"
+	fi
 
-desktop_basename="\$(basename "\$desktop_file")"
-printf '\nActions=%s\nX-SteamOS-Pamac-Managed=true\nX-SteamOS-Pamac-Container=%s\nX-SteamOS-Pamac-SourceApp=%s\nX-SteamOS-Pamac-SourceDesktop=%s.desktop\nX-SteamOS-Pamac-SourcePackage=%s\n\n[Desktop Action uninstall]\nName=Uninstall\nExec=/home/${current_user}/.local/bin/steamos-pamac-uninstall --desktop-file %s\nIcon=edit-delete\n' \
-"\$combined_actions" "${container_name}" "\$export_name" "\$app_name" "\$owner_pkg" "\$desktop_basename" >> "\$desktop_file"
+	desktop_basename="\$(basename "\$desktop_file")"
+
+	# Insert Actions= key into [Desktop Entry] section (before first [Desktop Action...])
+	# and append X-SteamOS markers + [Desktop Action uninstall] at the end
+	local actions_inserted=false
+	tmp_file="\$(mktemp)"
+	{
+		while IFS= read -r line || [[ -n "\$line" ]]; do
+			if ! \$actions_inserted && [[ "\$line" == '[Desktop Action'* ]]; then
+				printf 'Actions=%s\n' "\$combined_actions"
+				printf 'X-SteamOS-Pamac-Managed=true\n'
+				printf 'X-SteamOS-Pamac-Container=%s\n' "${container_name}"
+				printf 'X-SteamOS-Pamac-SourceApp=%s\n' "\$export_name"
+				printf 'X-SteamOS-Pamac-SourceDesktop=%s.desktop\n' "\$app_name"
+				printf 'X-SteamOS-Pamac-SourcePackage=%s\n' "\$owner_pkg"
+				printf '\n'
+				actions_inserted=true
+			fi
+			printf '%s\n' "\$line"
+		done < "\$desktop_file"
+
+		if ! \$actions_inserted; then
+			printf 'Actions=%s\n' "\$combined_actions"
+			printf 'X-SteamOS-Pamac-Managed=true\n'
+			printf 'X-SteamOS-Pamac-Container=%s\n' "${container_name}"
+			printf 'X-SteamOS-Pamac-SourceApp=%s\n' "\$export_name"
+			printf 'X-SteamOS-Pamac-SourceDesktop=%s.desktop\n' "\$app_name"
+			printf 'X-SteamOS-Pamac-SourcePackage=%s\n' "\$owner_pkg"
+		fi
+
+		printf '\n[Desktop Action uninstall]\nName=Uninstall\nExec=/home/${current_user}/.local/bin/steamos-pamac-uninstall --desktop-file %s\nIcon=edit-delete\n' "\$desktop_basename"
+	} > "\$tmp_file"
+	mv "\$tmp_file" "\$desktop_file"
   _fix_desktop_permissions "\$desktop_file"
 }
 

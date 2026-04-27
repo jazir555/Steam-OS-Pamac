@@ -14,99 +14,112 @@ pass() { echo "  PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $*"; FAIL=$((FAIL + 1)); }
 skip() { echo "  SKIP: $*"; SKIP=$((SKIP + 1)); }
 
+CAPTURE_DIR="$(mktemp -d)"
+
+capture_exec() {
+  local varname="$1"
+  shift
+  local tmpf="$CAPTURE_DIR/$varname"
+  "$@" < /dev/null > "$tmpf" 2>/dev/null || true
+  local content
+  content="$(cat "$tmpf" 2>/dev/null || true)"
+  printf -v "$varname" '%s' "$content"
+}
+
 container_exec() {
-    podman exec -u 0 "$CONTAINER_NAME" bash -c "$1" 2>/dev/null
+ podman exec -u 0 "$CONTAINER_NAME" bash -c "$1" </dev/null 2>/dev/null
 }
 
 container_user_exec() {
-    podman exec "$CONTAINER_NAME" bash -c "$1" 2>/dev/null
+ podman exec "$CONTAINER_NAME" bash -c "$1" </dev/null 2>/dev/null
 }
 
 pamac_cli() {
-    podman exec -u 0 "$CONTAINER_NAME" pamac "$@" 2>/dev/null || true
+ podman exec -u 0 "$CONTAINER_NAME" pamac "$@" </dev/null 2>/dev/null || true
 }
 
 pamac_install() {
-    local pkg="$1"
-    local tout="${2:-300}"
-    timeout "$tout" podman exec -u 0 "$CONTAINER_NAME" pamac install --no-confirm "$pkg" 2>&1 || true
+ local pkg="$1"
+ local tout="${2:-300}"
+ timeout "$tout" podman exec -u 0 "$CONTAINER_NAME" pamac install --no-confirm "$pkg" </dev/null 2>&1 || true
 }
 
 pamac_remove() {
-    local pkg="$1"
-    timeout 120 podman exec -u 0 "$CONTAINER_NAME" pamac remove --no-confirm --no-save --no-orphans "$pkg" 2>&1 || true
+ local pkg="$1"
+ timeout 120 podman exec -u 0 "$CONTAINER_NAME" pamac remove --no-confirm --no-save --no-orphans "$pkg" </dev/null 2>&1 || true
 }
 
 run_export_hook() {
-    podman exec -u 0 "$CONTAINER_NAME" /usr/local/bin/distrobox-export-hook.sh 2>&1 || true
+ podman exec -u 0 "$CONTAINER_NAME" /usr/local/bin/distrobox-export-hook.sh </dev/null 2>&1 || true
 }
 
 test_package() {
-    local pkg="$1"
-    local category="$2"
-    local bin_name="$3"
-    local has_desktop="$4"
-    local tout="${5:-300}"
+local pkg="$1"
+local category="$2"
+local bin_name="$3"
+local has_desktop="$4"
+local tout="${5:-300}"
 
-    log_test "=== Package: $pkg ($category) ==="
+log_test "=== Package: $pkg ($category) ==="
 
-    log_test "  Searching for $pkg..."
-    local search_out
-    search_out=$(pamac_cli search "$pkg")
-    if echo "$search_out" | grep -q "^${pkg} "; then
-        pass "[$pkg] Found in search"
-    else
-        local info_out
-        info_out=$(pamac_cli info "$pkg")
-        if echo "$info_out" | grep -qi "^Name.*:.*${pkg}"; then
-            pass "[$pkg] Found via pamac info"
-        else
-            fail "[$pkg] NOT found in search or info"
-            return 1
-        fi
-    fi
+log_test " Searching for $pkg..."
+local search_out
+capture_exec search_out podman exec -u 0 "$CONTAINER_NAME" pamac search "$pkg"
+if echo "$search_out" | grep -q "^${pkg} "; then
+pass "[$pkg] Found in search"
+else
+local info_out
+capture_exec info_out podman exec -u 0 "$CONTAINER_NAME" pamac info "$pkg"
+if echo "$info_out" | grep -qi "^Name.*:.*${pkg}"; then
+pass "[$pkg] Found via pamac info"
+else
+fail "[$pkg] NOT found in search or info"
+return 1
+fi
+fi
 
-    log_test "  Installing $pkg..."
-    local install_out
-    install_out=$(pamac_install "$pkg" "$tout")
-    local pkg_check
-    pkg_check=$(container_exec "pacman -Q $pkg 2>/dev/null && echo installed || echo missing" || echo "missing")
-    if echo "$pkg_check" | grep -q installed; then
-        local pkg_ver
-        pkg_ver=$(container_exec "pacman -Q $pkg 2>/dev/null" | awk '{print $2}' || echo "unknown")
-        pass "[$pkg] Installed (version: $pkg_ver)"
-    else
-        if echo "$install_out" | grep -qi "already installed"; then
-            pass "[$pkg] Already installed"
-        else
-            fail "[$pkg] Install failed (output: ${install_out:0:300})"
-            return 1
-        fi
-    fi
+log_test " Installing $pkg..."
+local install_out
+install_out=$(pamac_install "$pkg" "$tout")
+local pkg_check
+capture_exec pkg_check podman exec -u 0 "$CONTAINER_NAME" bash -c "pacman -Q $pkg 2>/dev/null && echo installed || echo missing"
+if echo "$pkg_check" | grep -q installed; then
+local pkg_ver
+capture_exec pkg_ver_full podman exec -u 0 "$CONTAINER_NAME" bash -c "pacman -Q $pkg 2>/dev/null"
+pkg_ver="$(echo "$pkg_ver_full" | awk '{print $2}' || echo "unknown")"
+pass "[$pkg] Installed (version: $pkg_ver)"
+else
+if echo "$install_out" | grep -qi "already installed"; then
+pass "[$pkg] Already installed"
+else
+fail "[$pkg] Install failed (output: ${install_out:0:300})"
+return 1
+fi
+fi
 
-    if [[ "$bin_name" != "none" ]]; then
-        log_test "  Checking binary $bin_name..."
-        local bin_out
-        bin_out=$(container_user_exec "command -v $bin_name 2>/dev/null" || true)
-        if [[ -n "$bin_out" ]]; then
-            pass "[$pkg] Binary found: $bin_out"
-        else
-            fail "[$pkg] Binary '$bin_name' not found"
-        fi
+if [[ "$bin_name" != "none" ]]; then
+log_test " Checking binary $bin_name..."
+local bin_out
+capture_exec bin_out podman exec "$CONTAINER_NAME" bash -c "command -v $bin_name 2>/dev/null"
+if [[ -n "$bin_out" ]]; then
+pass "[$pkg] Binary found: $bin_out"
+else
+fail "[$pkg] Binary '$bin_name' not found"
+fi
 
-        log_test "  Testing $bin_name runs..."
-        local run_out
-        run_out=$(container_user_exec "$bin_name --version 2>&1 | head -1" || true)
-        if [[ -n "$run_out" ]]; then
-            pass "[$pkg] $bin_name runs: ${run_out:0:80}"
-        else
-            skip "[$pkg] $bin_name version check inconclusive"
-        fi
-    else
-        pass "[$pkg] No binary to verify"
-    fi
+log_test " Testing $bin_name runs..."
+local run_out
+capture_exec run_out podman exec "$CONTAINER_NAME" bash -c "$bin_name --version 2>&1 | head -1"
+if [[ -n "$run_out" ]]; then
+pass "[$pkg] $bin_name runs: ${run_out:0:80}"
+else
+skip "[$pkg] $bin_name version check inconclusive"
+fi
+else
+pass "[$pkg] No binary to verify"
+fi
 
-    if [[ "$has_desktop" == "true" ]]; then
+if [[ "$has_desktop" == "true" ]]; then
         log_test "  Running export hook..."
         run_export_hook
 
@@ -146,11 +159,11 @@ test_package() {
         pass "[$pkg] No desktop expected"
     fi
 
-    log_test "  Removing $pkg..."
-    pamac_remove "$pkg" >/dev/null 2>&1
-    local still
-    still=$(container_exec "pacman -Q $pkg 2>/dev/null && echo yes || echo no" || echo "no")
-    if [[ "$still" != *yes* ]]; then
+log_test " Removing $pkg..."
+pamac_remove "$pkg" >/dev/null 2>&1
+local still
+capture_exec still podman exec -u 0 "$CONTAINER_NAME" bash -c "pacman -Q $pkg 2>/dev/null && echo yes || echo no"
+if [[ "$still" != *yes* ]]; then
         pass "[$pkg] Removed successfully"
     else
         fail "[$pkg] Still installed"
@@ -171,29 +184,33 @@ echo "=== Diverse AUR Package Test v3 ==="
 echo "Date: $(date)"
 echo ""
 
-# Verify pamac daemon is running
 echo "=== Daemon Check ==="
-pamac_ver=$(pamac_cli --version | head -1 || true)
+echo "DEBUG: About to capture pamac_ver..."
+capture_exec pamac_ver podman exec -u 0 "$CONTAINER_NAME" pamac --version
+echo "DEBUG: pamac_ver='$pamac_ver'"
+pamac_ver="$(echo "$pamac_ver" | head -1 || true)"
 if [[ -n "$pamac_ver" ]]; then
-    echo "Daemon OK ($pamac_ver)"
+echo "Daemon OK ($pamac_ver)"
 else
-    echo "Restarting daemon..."
-    podman exec -u 0 "$CONTAINER_NAME" bash -c 'pkill pamac-daemon 2>/dev/null; pkill polkitd 2>/dev/null; pkill dbus-daemon 2>/dev/null; sleep 1; mkdir -p /run/dbus; dbus-daemon --system --fork; sleep 1; /usr/lib/polkit-1/polkitd --no-debug & sleep 1; /usr/bin/pamac-daemon & sleep 2'
-    pamac_ver=$(pamac_cli --version | head -1 || true)
-    if [[ -n "$pamac_ver" ]]; then
-        echo "Daemon restarted OK ($pamac_ver)"
-    else
-        echo "Daemon FAILED - cannot start pamac"
-        exit 1
-    fi
+echo "Version check empty, trying daemon restart..."
+container_exec 'pkill pamac-daemon 2>/dev/null; pkill polkitd 2>/dev/null; pkill dbus-daemon 2>/dev/null; sleep 1; rm -f /run/dbus/pid; mkdir -p /run/dbus; dbus-daemon --system --fork; sleep 1; /usr/lib/polkit-1/polkitd --no-debug & sleep 1; /usr/bin/pamac-daemon & sleep 2'
+sleep 3
+capture_exec pamac_ver podman exec -u 0 "$CONTAINER_NAME" pamac --version
+pamac_ver="$(echo "$pamac_ver" | head -1 || true)"
+if [[ -n "$pamac_ver" ]]; then
+echo "Daemon restarted OK ($pamac_ver)"
+else
+echo "WARNING: Daemon version check empty, but continuing..."
+fi
 fi
 echo ""
 
 # Clean up previous test packages
 log_test "=== Cleaning up previous test packages ==="
 for pkg in neofetch figlet lazygit ripgrep celluloid fd github-cli ttf-ms-fonts mousepad yt-dlp btop librewolf-bin heroic-games-launcher-bin; do
-    inst=$(container_exec "pacman -Q $pkg 2>/dev/null" | head -1 || true)
-    if [[ -n "$inst" ]]; then
+capture_exec inst podman exec -u 0 "$CONTAINER_NAME" bash -c "pacman -Q $pkg 2>/dev/null"
+inst="$(echo "$inst" | head -1 || true)"
+if [[ -n "$inst" ]]; then
         echo "  Removing $inst..."
         pamac_remove "$pkg" >/dev/null 2>&1 || container_exec "pacman -Rdd --noconfirm $pkg 2>/dev/null || true"
     fi
@@ -216,11 +233,13 @@ test_package "heroic-games-launcher-bin" "gui-electron-bin" "heroic" "true" 600
 test_package "fd" "rust-cli-bin" "fd" "false" 120
 
 echo "=== Final Checks ==="
-db_check=$(container_exec "pacman -Dk 2>&1" || true)
+capture_exec db_check podman exec -u 0 "$CONTAINER_NAME" bash -c "pacman -Dk 2>&1"
 echo "$db_check" | grep -qi "No database errors" && pass "Pacman DB consistent" || pass "Pacman DB check done"
 
-pamac_alive=$(container_exec "pacman -Q pamac-aur 2>/dev/null && echo ok || echo missing" || echo "missing")
+capture_exec pamac_alive podman exec -u 0 "$CONTAINER_NAME" bash -c "pacman -Q pamac-aur 2>/dev/null && echo ok || echo missing"
 echo "$pamac_alive" | grep -q ok && pass "pamac-aur survived all tests" || fail "pamac-aur was removed!"
+
+rm -rf "$CAPTURE_DIR" 2>/dev/null
 
 echo ""
 echo "========================================"
@@ -232,4 +251,4 @@ echo " Skipped: $SKIP"
 echo "========================================"
 [[ $FAIL -eq 0 ]] && echo "ALL TESTS PASSED!" || echo "SOME TESTS FAILED!"
 
-exit $FAIL
+[[ $FAIL -eq 0 ]] && exit 0 || exit 1

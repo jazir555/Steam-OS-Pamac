@@ -2966,18 +2966,26 @@ in_action=true
 continue
 ;;
 esac
-if \$in_action; then
-case "\$line" in
-'Name=Uninstall'|'Name=Uninstall '*|'Exec='*steamos-pamac-uninstall*|'Icon=edit-delete'|'['*)
-if [[ "\$line" == '['* ]]; then
-in_action=false
-printf '%s\n' "\$line"
-fi
-continue
-;;
-esac
-fi
-printf '%s\n' "\$line"
+ if \$in_action; then
+ case "\$line" in
+ 'Name=Uninstall'|'Name=Uninstall '*|'Exec='*steamos-pamac-uninstall*|'Icon=edit-delete'|'['*)
+ if [[ "\$line" == '['* ]]; then
+ in_action=false
+ printf '%s\n' "\$line"
+ fi
+ continue
+ ;;
+ esac
+ fi
+ if [[ "\$line" == '['Desktop\ Action* ]]; then
+ in_action=true
+ fi
+ if \$in_action; then
+ case "\$line" in
+ 'StartupWMClass='*) continue ;;
+ esac
+ fi
+ printf '%s\n' "\$line"
 done < "\$desktop_file"
 } > "\$tmp_file"
 mv "\$tmp_file" "\$desktop_file"

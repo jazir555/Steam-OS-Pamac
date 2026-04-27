@@ -20,8 +20,7 @@ show_help() {
     echo "Options:"
     echo "  --desktop-file FILE   Uninstall the package associated with the given desktop file"
     echo "  --package PKG         Uninstall a package by name from the container"
-    echo "  --appstream-id ID     Uninstall via AppStream component ID (maps to pamac package)"
-    echo "  --list                List all pamac-managed applications"
+ echo " --list List all pamac-managed applications"
     echo "  --help                Show this help"
 }
 
@@ -90,68 +89,6 @@ list_apps() {
     fi
 }
 
-uninstall_by_appstream_id() {
-    local as_id="$1"
-    if [[ -z "$as_id" ]]; then
-        echo "Error: No AppStream ID specified." >&2
-        exit 1
-    fi
-
-    local desktop_id="${as_id}.desktop"
-    local desktop_file=""
-
-    for candidate in \
-        "$APP_DIR/${CONTAINER_NAME}-${desktop_id}" \
-        "$APP_DIR/${desktop_id}"; do
-        if [[ -f "$candidate" ]]; then
-            desktop_file="$candidate"
-            break
-        fi
-    done
-
-    if [[ -z "$desktop_file" ]]; then
-        for f in "$APP_DIR"/${CONTAINER_NAME}-*.desktop; do
-            [[ -f "$f" ]] || continue
-            local src_desktop
-            src_desktop=$(grep '^X-SteamOS-Pamac-SourceDesktop=' "$f" 2>/dev/null | cut -d= -f2)
-            if [[ -n "$src_desktop" ]]; then
-                local src_basename
-                src_basename=$(basename "$src_desktop" .desktop)
-                if [[ "$src_basename" == "$as_id" ]]; then
-                    desktop_file="$f"
-                    break
-                fi
-            fi
-            local src_app
-            src_app=$(grep '^X-SteamOS-Pamac-SourceApp=' "$f" 2>/dev/null | cut -d= -f2)
-            if [[ "$src_app" == "$as_id" ]]; then
-                desktop_file="$f"
-                break
-            fi
-        done
-    fi
-
-    if [[ -z "$desktop_file" ]]; then
-        echo "Error: No pamac-managed application found for AppStream ID: $as_id" >&2
-        echo "Managed apps:"
-        list_apps >&2
-        exit 1
-    fi
-
-    local pkg
-    pkg=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$desktop_file" 2>/dev/null | cut -d= -f2)
-    if [[ -z "$pkg" ]]; then
-        echo "Error: No X-SteamOS-Pamac-SourcePackage marker found in $desktop_file" >&2
-        exit 1
-    fi
-
-    local app_name
-    app_name=$(grep '^Name=' "$desktop_file" 2>/dev/null | head -1 | cut -d= -f2)
-
-    echo "Found pamac-managed app: $app_name (package: $pkg)"
-    uninstall_package "$pkg"
-}
-
 if [[ $# -eq 0 ]]; then
     show_help
     exit 0
@@ -185,12 +122,8 @@ case "$1" in
         exit 1
     fi
     uninstall_package "$pkg"
-    ;;
---appstream-id)
-    shift
-    uninstall_by_appstream_id "$1"
-    ;;
---list)
+ ;;
+ --list)
     list_apps
     ;;
 --help|-h)

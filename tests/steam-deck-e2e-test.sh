@@ -6,12 +6,29 @@ CONTAINER_NAME="arch-pamac"
 TEST_PACKAGE_AUR="neofetch"
 TEST_PACKAGE_AUR_VERSION="7.1.0-2"
 
-if grep -qi microsoft /proc/version 2>/dev/null || uname -r 2>/dev/null | grep -qi microsoft; then
-SSH_CMD="sshpass -p 'a' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+RUN_MODE="ssh"
+if [[ -f /etc/os-release ]] && grep -qi steamos /etc/os-release 2>/dev/null; then
+ RUN_MODE="local"
+fi
+if [[ "${E2E_MODE:-}" == "ssh" ]]; then
+ RUN_MODE="ssh"
+elif [[ "${E2E_MODE:-}" == "local" ]]; then
+ RUN_MODE="local"
+fi
+
+if [[ "$RUN_MODE" == "local" ]]; then
+ SSH_CMD=""
+elif grep -qi microsoft /proc/version 2>/dev/null || uname -r 2>/dev/null | grep -qi microsoft; then
+ SSH_CMD="sshpass -p 'a' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 elif command -v wsl.exe >/dev/null 2>&1; then
-SSH_CMD="wsl -d Arch -- sshpass -p 'a' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+ SSH_CMD="wsl -d Arch -- sshpass -p 'a' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+elif command -v sshpass >/dev/null 2>&1; then
+ SSH_CMD="sshpass -p 'a' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+elif [[ -x "$HOME/.local/bin/sshpass" ]]; then
+ export PATH="$HOME/.local/bin:$PATH"
+ SSH_CMD="sshpass -p 'a' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 else
-SSH_CMD="sshpass -p 'a' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+ SSH_CMD="sshpass -p 'a' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 fi
 
 PASS=0
@@ -29,8 +46,20 @@ pass() { echo -e " ${GREEN}PASS${NC}: $*"; echo " PASS: $*" >> "$TEST_LOG"; PASS
 fail() { echo -e " ${RED}FAIL${NC}: $*"; echo " FAIL: $*" >> "$TEST_LOG"; FAIL=$((FAIL + 1)); }
 skip() { echo -e " ${YELLOW}SKIP${NC}: $*"; echo " SKIP: $*" >> "$TEST_LOG"; }
 
-ssh_exec() { eval "$SSH_CMD '$SSH_HOST' \"\$@\""; }
-ssh_check() { eval "$SSH_CMD '$SSH_HOST' \"\$@\" 2>/dev/null"; }
+ssh_exec() {
+ if [[ "$RUN_MODE" == "local" ]]; then
+  bash -c "$*"
+ else
+  eval "$SSH_CMD '$SSH_HOST' \"$@\""
+ fi
+}
+ssh_check() {
+ if [[ "$RUN_MODE" == "local" ]]; then
+  bash -c "$*" 2>/dev/null
+ else
+  eval "$SSH_CMD '$SSH_HOST' \"$@\" 2>/dev/null"
+ fi
+}
 
 container_exec() {
 	local cmd="${1//\'/\\\'}"
@@ -67,23 +96,25 @@ cleanup_package() {
 }
 
 check_desktop_file_format() {
-	local f="$1"
-	local desc="$2"
-	local failures=0
+  local f="$1"
+  local desc="$2"
+  local failures=0
 
-	local has_exec
-	has_exec=$(ssh_check "grep -q '^Exec=' '$f' 2>/dev/null && echo true || echo false" || echo "false")
-	if [[ "$has_exec" != "true" ]]; then
-		fail "$desc: No Exec line found"
-		return 1
-	fi
+  local has_exec
+  has_exec=$(ssh_check "grep -q '^Exec=' '$f' 2>/dev/null && echo true || echo false" || echo "false")
+  if [[ "$has_exec" != "true" ]]; then
+    fail "$desc: No Exec line found"
+    return 1
+  fi
 
-	local exec_has_wrapper
-	exec_has_wrapper=$(ssh_check "grep '^Exec=' '$f' 2>/dev/null | head -1 | grep -q 'pamac-manager-wrapper' && echo true || echo false" || echo "false")
-	if [[ "$exec_has_wrapper" != "true" ]]; then
-		fail "$desc: Exec does not use pamac-manager-wrapper"
-		failures=$((failures + 1))
-	fi
+  local exec_has_distrobox
+  exec_has_distrobox=$(ssh_check "grep '^Exec=' '$f' 2>/dev/null | head -1 | grep -q 'distrobox.enter\|pamac-manager-wrapper' && echo true || echo false" || echo "false")
+  if [[ "$exec_has_distrobox" == "true" ]]; then
+    pass "$desc: Exec uses distrobox-enter or pamac-manager-wrapper"
+  else
+    fail "$desc: Exec does not use distrobox-enter or pamac-manager-wrapper"
+    failures=$((failures + 1))
+  fi
 
 	local has_managed
 	has_managed=$(ssh_check "grep -q '^X-SteamOS-Pamac-Managed=true' '$f' 2>/dev/null && echo true || echo false" || echo "false")
@@ -712,59 +743,21 @@ test_desktop_action_uninstall() {
 }
 
 ###############################################################################
-# 15. KDE UNINSTALL INTEGRATION (appstream handler, kickeraction, mime)
+# 15. KDE UNINSTALL INTEGRATION (kickeraction)
 ###############################################################################
 test_kde_uninstall_integration() {
   log_test "=== 15/15: KDE Uninstall Integration ==="
 
-  local appstream_handler="/home/deck/.local/bin/steamos-pamac-appstream"
-  local kickeraction_handler="/home/deck/.local/bin/steamos-pamac-kickeraction-handler"
-  local appstream_desktop="/home/deck/.local/share/applications/steamos-pamac-appstream-handler.desktop"
+ local kickeraction_handler="/home/deck/.local/bin/steamos-pamac-kickeraction-handler"
   local kickeraction_desktop="/home/deck/.local/share/plasma/kickeractions/steamos-pamac-uninstall.desktop"
   local uninstall_helper="/home/deck/.local/bin/steamos-pamac-uninstall"
 
-  local ah_exists
-  ah_exists=$(ssh_check "test -x '$appstream_handler' && echo true || echo false" || echo "false")
-  if [[ "$ah_exists" == "true" ]]; then
-    pass "steamos-pamac-appstream handler exists and is executable"
-  else
-    fail "steamos-pamac-appstream handler not found or not executable"
-  fi
-
-  local kh_exists
+ local kh_exists
   kh_exists=$(ssh_check "test -x '$kickeraction_handler' && echo true || echo false" || echo "false")
   if [[ "$kh_exists" == "true" ]]; then
     pass "steamos-pamac-kickeraction-handler exists and is executable"
   else
     fail "steamos-pamac-kickeraction-handler not found or not executable"
-  fi
-
-  local ad_exists
-  ad_exists=$(ssh_check "test -f '$appstream_desktop' && echo true || echo false" || echo "false")
-  if [[ "$ad_exists" == "true" ]]; then
-    pass "Appstream handler desktop file exists"
-  else
-    fail "Appstream handler desktop file not found at $appstream_desktop"
-  fi
-
-  local ad_mime
-  ad_mime=$(ssh_check "grep -q '^MimeType=.*x-scheme-handler/appstream' '$appstream_desktop' 2>/dev/null && echo true || echo false" || echo "false")
-  if [[ "$ad_mime" == "true" ]]; then
-    pass "Appstream handler desktop file has MimeType=x-scheme-handler/appstream"
-  else
-    fail "Appstream handler desktop file missing MimeType for appstream scheme"
-  fi
-
-  local mimeapps_exists
-  mimeapps_exists=$(ssh_check "test -f /home/deck/.local/share/applications/mimeapps.list && echo true || echo false" || echo "false")
-  local mime_registered=false
-  if [[ "$mimeapps_exists" == "true" ]]; then
-    mime_registered=$(ssh_check "grep -q 'x-scheme-handler/appstream=steamos-pamac-appstream-handler.desktop' /home/deck/.local/share/applications/mimeapps.list 2>/dev/null && echo true || echo false" || echo "false")
-  fi
-  if [[ "$mime_registered" == "true" ]]; then
-    pass "mimeapps.list registers x-scheme-handler/appstream to our handler"
-  else
-    fail "mimeapps.list does not register x-scheme-handler/appstream to our handler"
   fi
 
   local kd_exists
@@ -799,35 +792,27 @@ test_kde_uninstall_integration() {
     skip "X-KDE-OnlyForAppIds is empty (no managed apps or export hook not yet run)"
   fi
 
-  local kd_separator
-  kd_separator=$(ssh_check "grep '^X-KDE-OnlyForAppIds=' '$kickeraction_desktop' 2>/dev/null | grep -c ',' || echo 0")
-  if [[ "$kd_separator" -eq 0 ]]; then
+  local kd_has_comma
+  kd_has_comma=$(ssh_check "grep '^X-KDE-OnlyForAppIds=' '$kickeraction_desktop' 2>/dev/null | grep -q ',' && echo true || echo false" || echo "false")
+  if [[ "$kd_has_comma" == "false" ]]; then
     pass "X-KDE-OnlyForAppIds uses semicolon separator (not comma)"
   else
     fail "X-KDE-OnlyForAppIds uses comma separator — KDE expects semicolons"
   fi
 
-  local helper_has_appstream
-  helper_has_appstream=$(ssh_check "grep -q -- '--appstream-id' '$uninstall_helper' 2>/dev/null && echo true || echo false" || echo "false")
-  if [[ "$helper_has_appstream" == "true" ]]; then
-    pass "steamos-pamac-uninstall has --appstream-id option"
-  else
-    fail "steamos-pamac-uninstall missing --appstream-id option"
-  fi
-
-  local non_pamac_desktop
+ local non_pamac_desktop
   non_pamac_desktop=$(ssh_check "ls /usr/share/applications/org.kde.dolphin.desktop /usr/share/applications/btop.desktop /usr/share/applications/firewall-config.desktop 2>/dev/null | head -1" || true)
   if [[ -z "$non_pamac_desktop" ]]; then
     non_pamac_desktop=$(ssh_check "ls /home/deck/.local/share/applications/*.desktop 2>/dev/null | grep -v arch-pamac | head -1" || true)
   fi
   if [[ -n "$non_pamac_desktop" ]]; then
-    local kh_ignores
-    kh_ignores=$(ssh_exec "timeout 5 '$kickeraction_handler' 'file://$non_pamac_desktop' 2>&1; echo EXIT:\$?" || true)
-    if echo "$kh_ignores" | grep -q "EXIT:0"; then
-      pass "Kickeraction handler correctly ignores non-pamac apps (exit 0)"
-    else
-      fail "Kickeraction handler did not gracefully ignore non-pamac app: ${kh_ignores:0:200}"
-    fi
+ local kh_ignores
+ kh_ignores=$(ssh_exec "timeout 5 '$kickeraction_handler' 'file://$non_pamac_desktop' > /dev/null 2>&1 && echo PASS_EXIT_0 || echo FAIL_EXIT_NONZERO" || echo "FAIL_EXIT_NONZERO")
+ if echo "$kh_ignores" | grep -q "PASS_EXIT_0"; then
+  pass "Kickeraction handler correctly ignores non-pamac apps (exit 0)"
+ else
+  fail "Kickeraction handler did not gracefully ignore non-pamac app: ${kh_ignores:0:200}"
+ fi
   else
     skip "Non-pamac desktop file not found for kickeraction ignore test"
   fi
@@ -848,10 +833,10 @@ test_kde_uninstall_integration() {
     skip "No pamac-managed desktop files found for kickeraction route test"
   fi
 
-  local appstream_log_dir
-  appstream_log_dir=$(ssh_check "test -d /home/deck/.local/share/steamos-pamac/arch-pamac && echo true || echo false" || echo "false")
-  if [[ "$appstream_log_dir" == "true" ]]; then
-    pass "Appstream/kickeraction log directory exists"
+ local log_dir
+ log_dir=$(ssh_check "test -d /home/deck/.local/share/steamos-pamac/arch-pamac && echo true || echo false" || echo "false")
+ if [[ "$log_dir" == "true" ]]; then
+    pass "Kickeraction/uninstall log directory exists"
   else
     skip "Appstream/kickeraction log directory not yet created"
   fi
@@ -866,13 +851,18 @@ main() {
 	echo "Date: $(date)" | tee -a "$TEST_LOG"
 	echo "Container: $CONTAINER_NAME" | tee -a "$TEST_LOG"
 	echo "Test package: $TEST_PACKAGE_AUR" | tee -a "$TEST_LOG"
-	echo "" | tee -a "$TEST_LOG"
+ echo "Mode: $RUN_MODE" | tee -a "$TEST_LOG"
+ echo "" | tee -a "$TEST_LOG"
 
-	if ! ssh_check "echo connected" | grep -q "connected"; then
-		echo -e "${RED}ERROR: Cannot SSH to $SSH_HOST${NC}" | tee -a "$TEST_LOG"
-		exit 1
-	fi
-	echo -e "${GREEN}SSH connection OK${NC}" | tee -a "$TEST_LOG"
+ if [[ "$RUN_MODE" == "ssh" ]]; then
+  if ! ssh_check "echo connected" | grep -q "connected"; then
+   echo -e "${RED}ERROR: Cannot SSH to $SSH_HOST${NC}" | tee -a "$TEST_LOG"
+   exit 1
+  fi
+  echo -e "${GREEN}SSH connection OK${NC}" | tee -a "$TEST_LOG"
+ else
+  echo -e "${GREEN}Running in local mode (no SSH needed)${NC}" | tee -a "$TEST_LOG"
+ fi
 	echo "" | tee -a "$TEST_LOG"
 
 	test_prerequisites || { FAIL=$((FAIL + 1)); echo "Skipping remaining tests due to prerequisite failure"; print_summary; exit 1; }

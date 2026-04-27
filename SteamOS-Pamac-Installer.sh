@@ -2111,8 +2111,8 @@ BUILD_EOF
 install_pamac() {
     log_step "Installing Pamac package manager"
 
-    if container_user_exec bash -c "command -v pamac-manager >/dev/null 2>&1" 2>/dev/null; then
-        log_info "Pamac is already installed."
+    if container_user_exec bash -c "command -v pamac-manager >/dev/null 2>&1 && command -v pamac >/dev/null 2>&1" 2>/dev/null; then
+        log_info "Pamac is already installed (manager + CLI)."
         return 0
     fi
 
@@ -2128,26 +2128,36 @@ rm -f /var/lib/pacman/db.lck
 echo "Installing pamac-aur from AUR..."
 pamac_installed=false
 for attempt in 1 2 3; do
-if sudo -Hu "$current_user" bash -lc "yay -S --noconfirm --needed --noprogressbar pamac-aur"; then
-pamac_installed=true
-break
-fi
-echo "yay install attempt $attempt failed. Retrying in 5 seconds..."
-_safe_sleep 5
-sudo -Hu "$current_user" bash -lc "yay -Y --gendb" 2>/dev/null || true
-rm -f /var/lib/pacman/db.lck
+    if sudo -Hu "$current_user" bash -lc "yay -S --noconfirm --needed --noprogressbar pamac-aur"; then
+        pamac_installed=true
+        break
+    fi
+    echo "yay install attempt $attempt failed. Retrying in 5 seconds..."
+    _safe_sleep 5
+    sudo -Hu "$current_user" bash -lc "yay -Y --gendb" 2>/dev/null || true
+    rm -f /var/lib/pacman/db.lck
 done
 
 if [[ "$pamac_installed" != "true" ]]; then
-echo "Error: pamac-aur install failed after 3 attempts."
-exit 1
+    echo "Error: pamac-aur install failed after 3 attempts."
+    exit 1
+fi
+
+if ! command -v pamac >/dev/null 2>&1; then
+    echo "pamac CLI not found after yay reported success. Retrying without --needed..."
+    rm -f /var/lib/pacman/db.lck
+    sudo -Hu "$current_user" bash -lc "yay -S --noconfirm --noprogressbar pamac-aur" || true
 fi
 
 if ! command -v pamac-manager >/dev/null 2>&1; then
-echo "Error: pamac-manager not found after install."
-exit 1
+    echo "Error: pamac-manager not found after install."
+    exit 1
 fi
-echo "pamac-manager installed successfully."
+if ! command -v pamac >/dev/null 2>&1; then
+    echo "Error: pamac CLI not found after install."
+    exit 1
+fi
+echo "pamac-manager and pamac CLI installed successfully."
 PAMAC_INSTALL_EOF
 
     if ! exec_container_script "$pamac_install" "pamac-install" "$CURRENT_USER"; then
@@ -2169,10 +2179,15 @@ PAMAC_INSTALL_EOF
         fi
     fi
 
-    if ! container_user_exec bash -c "command -v pamac-manager >/dev/null 2>&1" 2>/dev/null; then
-        log_error "pamac-manager not found after installation. Disk or network issue?"
-        return 1
-    fi
+if ! container_user_exec bash -c "command -v pamac-manager >/dev/null 2>&1" 2>/dev/null; then
+    log_error "pamac-manager not found after installation. Disk or network issue?"
+    return 1
+fi
+
+if ! container_user_exec bash -c "command -v pamac >/dev/null 2>&1" 2>/dev/null; then
+    log_error "pamac CLI not found after installation. pamac-aur may not have installed correctly."
+    return 1
+fi
 
     log_info "Stage 2/2: Configuring Pamac..."
     local pamac_cfg

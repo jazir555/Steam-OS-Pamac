@@ -8,7 +8,7 @@ LOG_FILE="$STATE_DIR/uninstall-helper.log"
 mkdir -p "$STATE_DIR"
 
 _log() {
-    echo "$(date): $*" >> "$LOG_FILE"
+echo "$(date): $*" >> "$LOG_FILE"
 }
 
 _log "=== steamos-pamac-uninstall invoked: $* ==="
@@ -16,122 +16,122 @@ _log "HOME=$HOME PATH=$PATH USER=$(whoami 2>/dev/null || id -un)"
 _log "podman=$(command -v podman 2>/dev/null || echo NOT_FOUND)"
 
 show_help() {
-    echo "Usage: steamos-pamac-uninstall [options]"
-    echo "Options:"
-    echo "  --desktop-file FILE   Uninstall the package associated with the given desktop file"
-    echo "  --package PKG         Uninstall a package by name from the container"
- echo " --list List all pamac-managed applications"
-    echo "  --help                Show this help"
+echo "Usage: steamos-pamac-uninstall [options]"
+echo "Options:"
+echo " --desktop-file FILE Uninstall the package associated with the given desktop file"
+echo " --package PKG Uninstall a package by name from the container"
+echo " --list List all pamac-managed applications"
+echo " --help Show this help"
 }
 
 uninstall_package() {
-  local pkg="$1"
-  if [[ -z "$pkg" ]]; then
-    echo "Error: No package specified." >&2
-    _log "Error: No package specified"
-    exit 1
-  fi
-  echo "Uninstalling $pkg from $CONTAINER_NAME..."
-  _log "Uninstalling $pkg from $CONTAINER_NAME..."
+local pkg="$1"
+if [[ -z "$pkg" ]]; then
+echo "Error: No package specified." >&2
+_log "Error: No package specified"
+exit 1
+fi
+echo "Uninstalling $pkg from $CONTAINER_NAME..."
+_log "Uninstalling $pkg from $CONTAINER_NAME..."
 
-  if ! command -v podman >/dev/null 2>&1; then
-    _log "Error: podman not found in PATH"
-    echo "Error: podman not found in PATH" >&2
-    exit 1
-  fi
+if ! command -v podman >/dev/null 2>&1; then
+_log "Error: podman not found in PATH"
+echo "Error: podman not found in PATH" >&2
+exit 1
+fi
 
-  _log "Running podman exec for pamac remove..."
-  local remove_output
-  remove_output=$(podman exec -i -u 0 "$CONTAINER_NAME" bash -c '
-    rm -f /run/dbus/pid 2>/dev/null
-    pkill pamac-daemon 2>/dev/null; pkill polkitd 2>/dev/null; pkill dbus-daemon 2>/dev/null
-    sleep 1
-    mkdir -p /run/dbus
-    dbus-daemon --system --fork 2>/dev/null
-    sleep 1
-    /usr/lib/polkit-1/polkitd --no-debug &>/dev/null &
-    sleep 1
-    /usr/bin/pamac-daemon &>/dev/null &
-    sleep 2
-    pamac remove --no-confirm --no-save --no-orphans "'"$pkg"'" 2>&1
-  ' 2>&1)
-  local rc=$?
-  _log "podman exec exit code: $rc"
-  _log "podman exec output: ${remove_output:0:500}"
+_log "Running podman exec for pamac remove..."
+local remove_output
+remove_output=$(podman exec -u 0 "$CONTAINER_NAME" bash -c '
+rm -f /run/dbus/pid 2>/dev/null
+pkill pamac-daemon 2>/dev/null; pkill polkitd 2>/dev/null; pkill dbus-daemon 2>/dev/null
+sleep 1
+mkdir -p /run/dbus
+dbus-daemon --system --fork 2>/dev/null
+sleep 1
+/usr/lib/polkit-1/polkitd --no-debug &>/dev/null &
+sleep 1
+/usr/bin/pamac-daemon &>/dev/null &
+sleep 2
+pamac remove --no-confirm --no-save --no-orphans "'"$pkg"'" 2>&1
+' </dev/null 2>&1)
+local rc=$?
+_log "podman exec exit code: $rc"
+_log "podman exec output: ${remove_output:0:500}"
 
-  if [[ $rc -eq 0 ]]; then
-    echo "Successfully uninstalled $pkg"
-    _log "Successfully uninstalled $pkg"
-    _log "Running export hook..."
-    podman exec -i -u 0 "$CONTAINER_NAME" /usr/local/bin/distrobox-export-hook.sh 2>/dev/null || true
-    _log "Export hook done"
-  else
-    echo "Failed to uninstall $pkg (exit code: $rc)" >&2
-    _log "Failed to uninstall $pkg (exit code: $rc)"
-    exit $rc
-  fi
+if [[ $rc -eq 0 ]]; then
+echo "Successfully uninstalled $pkg"
+_log "Successfully uninstalled $pkg"
+_log "Running export hook..."
+podman exec -u 0 "$CONTAINER_NAME" /usr/local/bin/distrobox-export-hook.sh </dev/null 2>/dev/null || true
+_log "Export hook done"
+else
+echo "Failed to uninstall $pkg (exit code: $rc)" >&2
+_log "Failed to uninstall $pkg (exit code: $rc)"
+exit $rc
+fi
 }
 
 list_apps() {
-    if [[ -f "$STATE_DIR/exported-apps.list" ]]; then
-        while IFS= read -r desktop_path; do
-            [[ -f "$desktop_path" ]] || continue
-            local pkg
-            pkg=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$desktop_path" 2>/dev/null | cut -d= -f2)
-            local name
-            name=$(grep '^Name=' "$desktop_path" 2>/dev/null | head -1 | cut -d= -f2)
-            if [[ -n "$pkg" ]]; then
-                echo "$name [$pkg]"
-            fi
-        done < "$STATE_DIR/exported-apps.list"
-    else
-        echo "No pamac-managed applications found."
-    fi
+if [[ -f "$STATE_DIR/exported-apps.list" ]]; then
+while IFS= read -r desktop_path; do
+[[ -f "$desktop_path" ]] || continue
+local pkg
+pkg=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$desktop_path" 2>/dev/null | cut -d= -f2)
+local name
+name=$(grep '^Name=' "$desktop_path" 2>/dev/null | head -1 | cut -d= -f2)
+if [[ -n "$pkg" ]]; then
+echo "$name [$pkg]"
+fi
+done < "$STATE_DIR/exported-apps.list"
+else
+echo "No pamac-managed applications found."
+fi
 }
 
 if [[ $# -eq 0 ]]; then
-    show_help
-    exit 0
+show_help
+exit 0
 fi
 
 case "$1" in
 --desktop-file)
-    shift
-    desktop_file="$1"
-    if [[ -z "$desktop_file" ]]; then
-        echo "Error: --desktop-file requires a file name argument" >&2
-        exit 1
-    fi
-    full_path="$APP_DIR/$desktop_file"
-    if [[ ! -f "$full_path" ]]; then
-        echo "Error: Desktop file not found: $full_path" >&2
-        exit 1
-    fi
-    pkg=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$full_path" 2>/dev/null | cut -d= -f2)
-    if [[ -z "$pkg" ]]; then
-        echo "Error: No X-SteamOS-Pamac-SourcePackage marker found in $full_path" >&2
-        exit 1
-    fi
-    uninstall_package "$pkg"
-    ;;
+shift
+desktop_file="$1"
+if [[ -z "$desktop_file" ]]; then
+echo "Error: --desktop-file requires a file name argument" >&2
+exit 1
+fi
+full_path="$APP_DIR/$desktop_file"
+if [[ ! -f "$full_path" ]]; then
+echo "Error: Desktop file not found: $full_path" >&2
+exit 1
+fi
+pkg=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$full_path" 2>/dev/null | cut -d= -f2)
+if [[ -z "$pkg" ]]; then
+echo "Error: No X-SteamOS-Pamac-SourcePackage marker found in $full_path" >&2
+exit 1
+fi
+uninstall_package "$pkg"
+;;
 --package)
-    shift
-    pkg="$1"
-    if [[ -z "$pkg" ]]; then
-        echo "Error: --package requires a package name argument" >&2
-        exit 1
-    fi
-    uninstall_package "$pkg"
- ;;
- --list)
-    list_apps
-    ;;
+shift
+pkg="$1"
+if [[ -z "$pkg" ]]; then
+echo "Error: --package requires a package name argument" >&2
+exit 1
+fi
+uninstall_package "$pkg"
+;;
+--list)
+list_apps
+;;
 --help|-h)
-    show_help
-    ;;
+show_help
+;;
 *)
-    echo "Error: Unknown option $1" >&2
-    show_help
-    exit 1
-    ;;
+echo "Error: Unknown option $1" >&2
+show_help
+exit 1
+;;
 esac

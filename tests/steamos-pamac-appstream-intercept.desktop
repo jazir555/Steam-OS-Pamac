@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=SteamOS Pamac AppStream Handler
+NoDisplay=true
+MimeType=x-scheme-handler/appstream;
+Exec=/home/deck/.local/bin/steamos-pamac-appstream-intercept %u

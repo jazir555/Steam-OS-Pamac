@@ -1,0 +1,138 @@
+#!/bin/bash
+set +e
+export HOME="/home/deck"
+export PATH="/home/deck/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin"
+
+APP_DIR="$HOME/.local/share/applications"
+STATE_DIR="$HOME/.local/share/steamos-pamac/arch-pamac"
+UNINSTALL_HELPER="$HOME/.local/bin/steamos-pamac-uninstall"
+LOG_FILE="$STATE_DIR/appstream-handler.log"
+
+mkdir -p "$STATE_DIR"
+
+log_msg() {
+echo "$(date): $*" >> "$LOG_FILE"
+}
+
+_setup_display_env() {
+[[ -n "$DISPLAY" ]] || export DISPLAY=":0"
+[[ -n "$XDG_RUNTIME_DIR" ]] || export XDG_RUNTIME_DIR="/run/user/1000"
+[[ -n "$DBUS_SESSION_BUS_ADDRESS" ]] || export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/1000/bus"
+
+if [[ -z "$WAYLAND_DISPLAY" ]]; then
+if [[ -e /run/user/1000/wayland-0 ]]; then
+export WAYLAND_DISPLAY="wayland-0"
+elif [[ -S /run/user/1000/wayland-0 ]]; then
+export WAYLAND_DISPLAY="wayland-0"
+fi
+fi
+
+if [[ -n "$XDG_RUNTIME_DIR" && ! -d "$XDG_RUNTIME_DIR" ]]; then
+mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null
+fi
+}
+
+log_msg "=== appstream-handler invoked: $* ==="
+log_msg "Initial env: DISPLAY=$DISPLAY WAYLAND=$WAYLAND_DISPLAY XDG=$XDG_RUNTIME_DIR DBUS=$DBUS_SESSION_BUS_ADDRESS"
+
+_setup_display_env
+
+log_msg "After setup: DISPLAY=$DISPLAY WAYLAND=$WAYLAND_DISPLAY XDG=$XDG_RUNTIME_DIR DBUS=$DBUS_SESSION_BUS_ADDRESS"
+
+APPSTREAM_URL="$1"
+
+if [[ -z "$APPSTREAM_URL" ]]; then
+log_msg "Error: No URL argument provided, falling through to Discover"
+exec plasma-discover "$@"
+fi
+
+COMPONENT_ID="${APPSTREAM_URL#appstream://}"
+
+if [[ -z "$COMPONENT_ID" ]]; then
+log_msg "Error: Empty component ID, falling through to Discover"
+exec plasma-discover "$@"
+fi
+
+log_msg "Component ID: $COMPONENT_ID"
+
+FOUND_DESKTOP=""
+
+for desktop_file in "$APP_DIR"/arch-pamac-*.desktop; do
+[[ -f "$desktop_file" ]] || continue
+
+SOURCE_DESKTOP=$(grep '^X-SteamOS-Pamac-SourceDesktop=' "$desktop_file" 2>/dev/null | cut -d= -f2)
+
+if [[ "$SOURCE_DESKTOP" == "$COMPONENT_ID" ]]; then
+FOUND_DESKTOP="$desktop_file"
+log_msg "Found matching pamac-managed app: $desktop_file (source: $SOURCE_DESKTOP)"
+break
+fi
+
+BASENAME=$(basename "$desktop_file" .desktop)
+ENTRY_NAME="${BASENAME#arch-pamac-}"
+if [[ "$ENTRY_NAME" == "${COMPONENT_ID%.desktop}" ]]; then
+FOUND_DESKTOP="$desktop_file"
+log_msg "Found matching pamac-managed app by entry name: $desktop_file"
+break
+fi
+done
+
+if [[ -n "$FOUND_DESKTOP" ]]; then
+log_msg "Routing to pamac uninstall handler for: $(basename "$FOUND_DESKTOP")"
+
+SOURCE_PKG=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$FOUND_DESKTOP" 2>/dev/null | cut -d= -f2)
+APP_NAME=$(grep '^Name=' "$FOUND_DESKTOP" 2>/dev/null | head -1 | cut -d= -f2)
+DESKTOP_BASENAME=$(basename "$FOUND_DESKTOP")
+
+CONFIRMED=false
+if command -v kdialog >/dev/null 2>&1; then
+log_msg "Attempting kdialog confirmation..."
+kdialog --yesno "Remove $APP_NAME? This was installed via Pamac (AUR)." --title "Uninstall" 2>>"$LOG_FILE"
+KDIALOG_RC=$?
+log_msg "kdialog exit code: $KDIALOG_RC"
+if [[ $KDIALOG_RC -eq 0 ]]; then
+CONFIRMED=true
+else
+log_msg "User cancelled uninstall (kdialog rc=$KDIALOG_RC)"
+exit 0
+fi
+else
+log_msg "kdialog not found, proceeding without confirmation"
+CONFIRMED=true
+fi
+
+if $CONFIRMED; then
+log_msg "Starting uninstall for $DESKTOP_BASENAME..."
+UNINSTALL_LOG="$STATE_DIR/uninstall-$(date +%s).log"
+
+systemd-run --user --scope -u "steamos-pamac-uninstall-$(date +%s)" \
+bash -c "
+export HOME=/home/deck
+export PATH=/home/deck/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin
+export DISPLAY=$DISPLAY
+export WAYLAND_DISPLAY=$WAYLAND_DISPLAY
+export XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR
+export DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS
+
+'$UNINSTALL_HELPER' --desktop-file '$DESKTOP_BASENAME' > '$UNINSTALL_LOG' 2>&1
+rc=\$?
+echo \"Exit code: \$rc\" >> '$UNINSTALL_LOG'
+
+if [ \$rc -eq 0 ]; then
+update-desktop-database '$APP_DIR' 2>/dev/null
+kbuildsycoca6 2>/dev/null
+qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.refreshCurrentShell 2>/dev/null || true
+notify-send -i edit-delete 'Uninstalled' '$APP_NAME has been removed.' 2>/dev/null
+else
+notify-send -i dialog-error 'Uninstall Failed' 'Could not remove $APP_NAME. See log for details.' 2>/dev/null
+fi
+" &>/dev/null &
+
+disown
+log_msg "Uninstall launched in background scope"
+fi
+exit 0
+else
+log_msg "No pamac-managed app found for component: $COMPONENT_ID, passing to Discover"
+exec plasma-discover "$@"
+fi

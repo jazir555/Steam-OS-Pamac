@@ -1,0 +1,42 @@
+#!/bin/bash
+# Intercept appstream:// URL handler for pamac-managed apps
+# For non-pamac apps, delegate to Discover
+
+APP_DIR="$HOME/.local/share/applications"
+LOG_FILE="$HOME/.local/share/steamos-pamac/arch-pamac/appstream-handler.log"
+DISCOVER="/usr/bin/plasma-discover"
+
+mkdir -p "$(dirname "$LOG_FILE")"
+
+log_msg() {
+echo "$(date): $*" >> "$LOG_FILE"
+}
+
+URL="$1"
+log_msg "=== appstream-intercept invoked: $* ==="
+
+if [[ -z "$URL" ]]; then
+log_msg "No URL provided, launching Discover"
+exec "$DISCOVER" 2>/dev/null || exit 1
+fi
+
+APPSTREAM_ID="${URL#appstream://}"
+log_msg "AppStream component ID: $APPSTREAM_ID"
+
+for desktop in "$APP_DIR"/arch-pamac-*.desktop; do
+[[ -f "$desktop" ]] || continue
+if grep -q '^X-SteamOS-Pamac-Managed=true' "$desktop" 2>/dev/null; then
+SOURCE_PKG=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$desktop" 2>/dev/null | cut -d= -f2)
+APP_NAME=$(grep '^Name=' "$desktop" 2>/dev/null | head -1 | cut -d= -f2)
+DESKTOP_BASENAME=$(basename "$desktop")
+log_msg "Found pamac-managed app: $APP_NAME (package: $SOURCE_PKG)"
+if [[ -n "$SOURCE_PKG" ]]; then
+log_msg "Launching pamac uninstall for $SOURCE_PKG"
+nohup "$HOME/.local/bin/steamos-pamac-uninstall" --desktop-file "$DESKTOP_BASENAME" </dev/null >>"$LOG_FILE" 2>&1 &
+exit 0
+fi
+fi
+done
+
+log_msg "No pamac-managed app found for $APPSTREAM_ID, delegating to Discover"
+exec "$DISCOVER" "$URL" 2>/dev/null || exit 1

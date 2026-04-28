@@ -4,16 +4,15 @@ set +e
 APP_DIR="$HOME/.local/share/applications"
 STATE_DIR="$HOME/.local/share/steamos-pamac/arch-pamac"
 UNINSTALL_HELPER="$HOME/.local/bin/steamos-pamac-uninstall"
-LOG_FILE="$HOME/.local/share/steamos-pamac/arch-pamac/kickeraction-handler.log"
+LOG_FILE="$STATE_DIR/kickeraction-handler.log"
 
-mkdir -p "$(dirname "$LOG_FILE")"
+mkdir -p "$STATE_DIR"
 
 log_msg() {
     echo "$(date): $*" >> "$LOG_FILE"
 }
 
 log_msg "=== kickeraction-handler invoked: $* ==="
-log_msg "HOME=$HOME PATH=$PATH USER=$(whoami 2>/dev/null || id -un)"
 
 DESKTOP_FILE_URL="$1"
 
@@ -33,7 +32,6 @@ log_msg "Received desktop file: $DESKTOP_FILE_URL -> $DESKTOP_PATH"
 
 if [[ ! -f "$DESKTOP_PATH" ]]; then
     log_msg "Error: Desktop file not found: $DESKTOP_PATH"
-    echo "Error: Desktop file not found: $DESKTOP_PATH" >&2
     exit 1
 fi
 
@@ -45,7 +43,6 @@ fi
 SOURCE_PKG=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$DESKTOP_PATH" 2>/dev/null | cut -d= -f2)
 if [[ -z "$SOURCE_PKG" ]]; then
     log_msg "Error: No X-SteamOS-Pamac-SourcePackage found in $DESKTOP_PATH"
-    echo "Error: Cannot determine package for this application." >&2
     exit 1
 fi
 
@@ -54,25 +51,34 @@ DESKTOP_BASENAME=$(basename "$DESKTOP_PATH")
 
 log_msg "Uninstalling pamac-managed app: $APP_NAME (package: $SOURCE_PKG, desktop: $DESKTOP_BASENAME)"
 
-if [[ -x "$UNINSTALL_HELPER" ]]; then
-    log_msg "Launching uninstall helper: $UNINSTALL_HELPER --desktop-file $DESKTOP_BASENAME"
-    UNINSTALL_LOG="$STATE_DIR/kickeraction-uninstall-$(date +%s).log"
-    "$UNINSTALL_HELPER" --desktop-file "$DESKTOP_BASENAME" > "$UNINSTALL_LOG" 2>&1
-    rc=$?
-    log_msg "Uninstall helper exited with code: $rc"
-    while IFS= read -r line; do
-        log_msg "uninstall-helper: $line"
-    done < "$UNINSTALL_LOG"
-    rm -f "$UNINSTALL_LOG"
-    if [[ $rc -ne 0 ]]; then
-        log_msg "Uninstall FAILED for $APP_NAME"
-        kdialog --error "Failed to uninstall $APP_NAME. Check log: $LOG_FILE" 2>/dev/null || true
+UNINSTALL_LOG="$STATE_DIR/kickeraction-uninstall-$(date +%s).log"
+log_msg "Spawning uninstall via systemd-run in separate scope"
+
+systemd-run --user --scope -u "steamos-pamac-uninstall-$(date +%s)" \
+    bash -c "
+    export HOME=/home/deck
+    export PATH=/home/deck/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin
+    export DISPLAY=:0
+    export XDG_RUNTIME_DIR=/run/user/1000
+    export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+
+    '$UNINSTALL_HELPER' --desktop-file '$DESKTOP_BASENAME' > '$UNINSTALL_LOG' 2>&1
+    rc=\$?
+    echo \"Exit code: \$rc\" >> '$UNINSTALL_LOG'
+
+    if [ \$rc -eq 0 ]; then
+        # Refresh KDE's service cache so the icon disappears from the menu
+        update-desktop-database '$APP_DIR' 2>/dev/null
+        kbuildsycoca6 2>/dev/null
+        # Signal plasmashell to refresh
+        qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.refreshCurrentShell 2>/dev/null || true
+        # Also try via KDE's kconf update mechanism
+        qdbus org.kde.kded6 /modules/proxyscout refresh 2>/dev/null || true
+        notify-send -i edit-delete 'Uninstalled' '$APP_NAME has been removed.' 2>/dev/null
     else
-        log_msg "Uninstall SUCCEEDED for $APP_NAME"
+        notify-send -i dialog-error 'Uninstall Failed' 'Could not remove $APP_NAME. See log for details.' 2>/dev/null
     fi
-    exit $rc
-else
-    log_msg "Error: Uninstall helper not found at $UNINSTALL_HELPER"
-    echo "Error: Uninstall helper not found at $UNINSTALL_HELPER" >&2
-    exit 1
-fi
+    " &>/dev/null &
+
+disown
+exit 0

@@ -1,7 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=SteamOS Pamac App Handler
-Comment=Handles appstream:// URLs for pamac-managed container applications
-Exec=/home/deck/.local/bin/steamos-pamac-appstream %u
-NoDisplay=true
-MimeType=x-scheme-handler/appstream;

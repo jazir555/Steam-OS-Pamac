@@ -1,9 +1,0 @@
-#
-# ~/.bashrc
-#
-
-export HOME="/home/deck"
-export PATH="/home/deck/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin"
-
-# If not running interactively, don't do anything
-[[ $- != *i* ]] && return

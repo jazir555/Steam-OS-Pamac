@@ -418,8 +418,9 @@ repair_podman() {
         return 0
     fi
 
-    log_warn "Podman database may be corrupted. Attempting system reset..."
-    local reset_output
+log_warn "Podman database may be corrupted. Attempting system reset..."
+log_warn "WARNING: 'podman system reset --force' will remove ALL containers, images, and volumes — not just the Pamac container. Any other distroboxes or podman workloads will be lost."
+local reset_output
     reset_output=$(podman system reset --force 2>&1) && rc=0 || rc=$?
     log_debug "podman system reset: $reset_output"
 
@@ -1037,8 +1038,9 @@ if [[ "$keyring_init_ok" == "true" ]]; then
     if pacman-key --populate archlinux 2>/dev/null; then
         echo "Keyring populated successfully."
     else
-        echo "Warning: pacman-key --populate failed."
-        echo "Falling back to SigLevel=Never."
+echo "Warning: pacman-key --populate failed."
+echo "Falling back to SigLevel=Never."
+echo "SECURITY WARNING: PGP signature verification is now DISABLED. Packages will be installed without cryptographic verification, which makes them vulnerable to tampering or man-in-the-middle attacks. This is a last resort for environments with broken GPG/entropy."
         if command -v sed >/dev/null 2>&1; then
             sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
             if ! grep -q '^SigLevel' /etc/pacman.conf; then
@@ -1050,6 +1052,7 @@ if [[ "$keyring_init_ok" == "true" ]]; then
     fi
 else
     echo "Falling back to SigLevel=Never to allow package installation without PGP verification."
+echo "SECURITY WARNING: PGP signature verification is now DISABLED. Packages will be installed without cryptographic verification, which makes them vulnerable to tampering or man-in-the-middle attacks. This is a last resort for environments with broken GPG/entropy."
     if command -v sed >/dev/null 2>&1; then
         sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
         if ! grep -q '^SigLevel' /etc/pacman.conf; then
@@ -1473,6 +1476,8 @@ local critical_script
 read -r -d '' critical_script <<'CRITICAL_EOF' || true
 set -uo pipefail
 
+HOST_USER="$1"
+
 echo "Installing Pamac bootstrap helper..."
 cat > /usr/local/bin/pamac-session-bootstrap.sh << 'BOOTSTRAP'
 #!/bin/bash
@@ -1561,15 +1566,15 @@ done
 if [[ ${#CMD_ARGS[@]} -eq 0 ]]; then exit 1; fi
 if [[ -n "$WORK_DIR" ]]; then
 mkdir -p "$WORK_DIR" 2>/dev/null || true
-if $DYNAMIC_USER; then chown deck:deck "$WORK_DIR" 2>/dev/null || true; fi
+if $DYNAMIC_USER; then chown HOST_USER_PLACEHOLDER:HOST_USER_PLACEHOLDER "$WORK_DIR" 2>/dev/null || true; fi
 fi
 if [[ -n "$CACHE_DIR" ]]; then
 CACHE_FULL="/var/cache/$CACHE_DIR"
 mkdir -p "$CACHE_FULL" 2>/dev/null || true
-if $DYNAMIC_USER; then chown -R deck:deck "$CACHE_FULL" 2>/dev/null || true; fi
+if $DYNAMIC_USER; then chown -R HOST_USER_PLACEHOLDER:HOST_USER_PLACEHOLDER "$CACHE_FULL" 2>/dev/null || true; fi
 fi
 if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
-BUILD_USER="deck"
+BUILD_USER="HOST_USER_PLACEHOLDER"
 if ! id "$BUILD_USER" >/dev/null 2>&1; then BUILD_USER="nobody"; fi
 if [[ -n "$WORK_DIR" ]]; then
 exec sudo -u "$BUILD_USER" -H -- bash -c "cd '$WORK_DIR' 2>/dev/null; exec ${CMD_ARGS[*]}"
@@ -1582,6 +1587,7 @@ exec "${CMD_ARGS[@]}"
 fi
 SYSTEMD_RUN_FAKE
 chmod +x /usr/local/sbin/systemd-run
+sed -i "s/HOST_USER_PLACEHOLDER/$HOST_USER/g" /usr/local/sbin/systemd-run
 echo "Fake systemd-run installed at /usr/local/sbin/systemd-run."
 
 printf '%s\n' '#!/bin/bash' \
@@ -1620,12 +1626,12 @@ echo "D-Bus system policy for pamac-daemon created."
 echo "Critical helpers setup finished."
 CRITICAL_EOF
 
-if ! exec_container_script "$critical_script" "critical-helpers"; then
+if ! exec_container_script "$critical_script" "critical-helpers" "$CURRENT_USER"; then
 log_warn "Critical helpers setup had issues, retrying..."
 container_start 2>/dev/null || true
 sleep 3
 if container_is_usable; then
-if ! exec_container_script "$critical_script" "critical-helpers-retry"; then
+if ! exec_container_script "$critical_script" "critical-helpers-retry" "$CURRENT_USER"; then
 log_warn "Critical helpers retry also failed. Will verify and repair after base setup."
 _ok=false
 fi
@@ -1678,6 +1684,8 @@ log_info "Repairing ${#missing_items[@]} missing critical item(s): ${missing_ite
 local repair_script
 read -r -d '' repair_script <<'REPAIR_EOF' || true
 set -uo pipefail
+
+HOST_USER="$1"
 
 repaired=0
 
@@ -1774,15 +1782,15 @@ done
 if [[ ${#CMD_ARGS[@]} -eq 0 ]]; then exit 1; fi
 if [[ -n "$WORK_DIR" ]]; then
 mkdir -p "$WORK_DIR" 2>/dev/null || true
-if $DYNAMIC_USER; then chown deck:deck "$WORK_DIR" 2>/dev/null || true; fi
+if $DYNAMIC_USER; then chown HOST_USER_PLACEHOLDER:HOST_USER_PLACEHOLDER "$WORK_DIR" 2>/dev/null || true; fi
 fi
 if [[ -n "$CACHE_DIR" ]]; then
 CACHE_FULL="/var/cache/$CACHE_DIR"
 mkdir -p "$CACHE_FULL" 2>/dev/null || true
-if $DYNAMIC_USER; then chown -R deck:deck "$CACHE_FULL" 2>/dev/null || true; fi
+if $DYNAMIC_USER; then chown -R HOST_USER_PLACEHOLDER:HOST_USER_PLACEHOLDER "$CACHE_FULL" 2>/dev/null || true; fi
 fi
 if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
-BUILD_USER="deck"
+BUILD_USER="HOST_USER_PLACEHOLDER"
 if ! id "$BUILD_USER" >/dev/null 2>&1; then BUILD_USER="nobody"; fi
 if [[ -n "$WORK_DIR" ]]; then
 exec sudo -u "$BUILD_USER" -H -- bash -c "cd '$WORK_DIR' 2>/dev/null; exec ${CMD_ARGS[*]}"
@@ -1795,6 +1803,7 @@ exec "${CMD_ARGS[@]}"
 fi
 SYSTEMD_RUN_FAKE
 chmod +x /usr/local/sbin/systemd-run
+sed -i "s/HOST_USER_PLACEHOLDER/$HOST_USER/g" /usr/local/sbin/systemd-run
 repaired=$((repaired + 1))
 echo "Fake systemd-run repaired."
 
@@ -1842,7 +1851,7 @@ REPAIR_EOF
 
 local repair_ok=false
 for attempt in 1 2 3; do
-if exec_container_script "$repair_script" "critical-helpers-repair-attempt-$attempt"; then
+if exec_container_script "$repair_script" "critical-helpers-repair-attempt-$attempt" "$CURRENT_USER"; then
 repair_ok=true
 break
 fi

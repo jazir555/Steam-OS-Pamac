@@ -2341,24 +2341,34 @@ configure_ssh_environment() {
             fi
             log_info "Enabled PermitUserEnvironment in sshd"
         else
-            log_warn "Could not create sshd config directory (need sudo)"
-            if command -v sudo >/dev/null 2>&1; then
-                echo "a" | sudo -S mkdir -p "$sshd_conf_dir" 2>/dev/null || true
-                echo "PermitUserEnvironment yes" | echo "a" | sudo -S tee "$permit_env_conf" > /dev/null 2>&1 || true
-                echo "a" | sudo -S pkill -HUP sshd 2>/dev/null || true
-                log_info "Enabled PermitUserEnvironment via sudo"
-            fi
+log_warn "Could not create sshd config directory (need sudo)"
+if command -v sudo >/dev/null 2>&1; then
+if sudo -n true 2>/dev/null; then
+sudo -n mkdir -p "$sshd_conf_dir" 2>/dev/null || true
+echo "PermitUserEnvironment yes" | sudo -n tee "$permit_env_conf" > /dev/null 2>&1 || true
+sudo -n pkill -HUP sshd 2>/dev/null || true
+log_info "Enabled PermitUserEnvironment via sudo (NOPASSWD)"
+else
+log_warn "sudo requires a password and this step cannot proceed non-interactively. To enable SSH PermitUserEnvironment manually, run:"
+log_warn "  sudo mkdir -p $sshd_conf_dir && echo 'PermitUserEnvironment yes' | sudo tee $permit_env_conf && sudo pkill -HUP sshd"
+fi
+fi
         fi
     fi
 
     local profile_d_file="/etc/profile.d/deck-local-bin.sh"
     if [[ ! -f "$profile_d_file" ]]; then
         echo 'export PATH="/home/'"$CURRENT_USER"'/.local/bin:$PATH"' | run_command tee "$profile_d_file" > /dev/null 2>&1 || true
-        if [[ ! -f "$profile_d_file" ]]; then
-            if command -v sudo >/dev/null 2>&1; then
-                echo 'export PATH="/home/'"$CURRENT_USER"'/.local/bin:$PATH"' | echo "a" | sudo -S tee "$profile_d_file" > /dev/null 2>&1 || true
-            fi
-        fi
+if [[ ! -f "$profile_d_file" ]]; then
+if command -v sudo >/dev/null 2>&1; then
+if sudo -n true 2>/dev/null; then
+echo 'export PATH="/home/'"$CURRENT_USER"'/.local/bin:$PATH"' | sudo -n tee "$profile_d_file" > /dev/null 2>&1 || true
+else
+log_warn "sudo requires a password and this step cannot proceed non-interactively. To create $profile_d_file manually, run:"
+log_warn "  echo 'export PATH=\"/home/$CURRENT_USER/.local/bin:\$PATH\"' | sudo tee $profile_d_file"
+fi
+fi
+fi
         if [[ -f "$profile_d_file" ]]; then
             chmod 644 "$profile_d_file" 2>/dev/null || true
             log_info "Created $profile_d_file"

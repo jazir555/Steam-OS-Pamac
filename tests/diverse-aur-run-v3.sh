@@ -45,8 +45,9 @@ pamac_install() {
 }
 
 pamac_remove() {
- local pkg="$1"
- timeout 120 podman exec -u 0 "$CONTAINER_NAME" pamac remove --no-confirm --no-save --no-orphans "$pkg" </dev/null 2>&1 || true
+local pkg="$1"
+podman start "$CONTAINER_NAME" 2>/dev/null || true
+timeout 120 podman exec -u 0 "$CONTAINER_NAME" bash -c "rm -f /var/lib/pacman/db.lck 2>/dev/null; pacman -Rns --noconfirm '$pkg' 2>&1" </dev/null 2>&1 || true
 }
 
 run_export_hook() {

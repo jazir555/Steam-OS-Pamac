@@ -88,10 +88,10 @@ pamac_exec() {
 }
 
 cleanup_package() {
-    local pkg="$1"
-    log_test "Cleanup: removing $pkg if installed..."
-    pamac_exec "pamac remove --no-confirm --no-orphans $pkg 2>/dev/null || true" 60 || true
-    container_exec "pacman -Qs '^${pkg}$' >/dev/null 2>&1 && pacman -Rdd --noconfirm '${pkg}' 2>/dev/null || true" || true
+local pkg="$1"
+log_test "Cleanup: removing $pkg if installed..."
+ssh_check "podman start '$CONTAINER_NAME' 2>/dev/null || true" || true
+ssh_check "podman exec -u 0 '$CONTAINER_NAME' bash -c 'rm -f /var/lib/pacman/db.lck 2>/dev/null; pacman -Rns --noconfirm $pkg 2>/dev/null || true'" 60 || true
 }
 
 check_desktop_file_format() {
@@ -494,21 +494,17 @@ test_uninstall() {
 		return 0
 	fi
 
-	local remove_out
-	remove_out=$(pamac_exec "pamac remove --no-confirm --no-save $TEST_PACKAGE_AUR 2>&1" 60 || true)
-	echo "$remove_out" | tail -10 >> "$TEST_LOG"
+local remove_out
+remove_out=$(ssh_check "podman exec -u 0 '$CONTAINER_NAME' bash -c 'rm -f /var/lib/pacman/db.lck 2>/dev/null; pacman -Rns --noconfirm $TEST_PACKAGE_AUR 2>&1'" 60 || true)
+echo "$remove_out" | tail -10 >> "$TEST_LOG"
 
-	local still_installed
-	still_installed=$(container_exec "pacman -Q ${TEST_PACKAGE_AUR} 2>/dev/null && echo yes || echo no" || echo "no")
-	if [[ "$still_installed" == *"yes"* ]]; then
-		fail "Package $TEST_PACKAGE_AUR still present after pamac remove"
-	else
-		pass "Package $TEST_PACKAGE_AUR successfully removed via pamac"
-	fi
-
-	local cleanup_out
-	cleanup_out=$(pamac_exec "pamac remove --no-confirm --unneeded 2>&1" 30 || true)
-	echo "Orphan cleanup: ${cleanup_out:0:200}" >> "$TEST_LOG"
+local still_installed
+still_installed=$(container_exec "pacman -Q ${TEST_PACKAGE_AUR} 2>/dev/null && echo yes || echo no" || echo "no")
+if [[ "$still_installed" == *"yes"* ]]; then
+fail "Package $TEST_PACKAGE_AUR still present after pacman -Rns"
+else
+pass "Package $TEST_PACKAGE_AUR successfully removed via pacman -Rns"
+fi
 }
 
 ###############################################################################
@@ -742,108 +738,86 @@ test_desktop_action_uninstall() {
 }
 
 ###############################################################################
-# 15. KDE UNINSTALL INTEGRATION (kickeraction)
+# 15. KDE UNINSTALL INTEGRATION (appstream intercept handler)
 ###############################################################################
 test_kde_uninstall_integration() {
-  log_test "=== 15/15: KDE Uninstall Integration ==="
+log_test "=== 15/15: KDE Uninstall Integration (Appstream Handler) ==="
 
- local kickeraction_handler="/home/deck/.local/bin/steamos-pamac-kickeraction-handler"
-  local kickeraction_desktop="/home/deck/.local/share/plasma/kickeractions/steamos-pamac-uninstall.desktop"
-  local uninstall_helper="/home/deck/.local/bin/steamos-pamac-uninstall"
+local appstream_handler="/home/deck/.local/bin/steamos-pamac-appstream-handler"
+local appstream_handler_desktop="/home/deck/.local/share/applications/steamos-pamac-appstream-handler.desktop"
+local uninstall_helper="/home/deck/.local/bin/steamos-pamac-uninstall"
 
- local kh_exists
-  kh_exists=$(ssh_check "test -x '$kickeraction_handler' && echo true || echo false" || echo "false")
-  if [[ "$kh_exists" == "true" ]]; then
-    pass "steamos-pamac-kickeraction-handler exists and is executable"
-  else
-    fail "steamos-pamac-kickeraction-handler not found or not executable"
-  fi
-
-  local kd_exists
-  kd_exists=$(ssh_check "test -f '$kickeraction_desktop' && echo true || echo false" || echo "false")
-  if [[ "$kd_exists" == "true" ]]; then
-    pass "Kickeraction desktop file exists in kickeractions directory"
-  else
-    skip "Kickeraction desktop file not found (will be created when apps are exported)"
-  fi
-
-  local kd_type
-  kd_type=$(ssh_check "grep -q '^Type=Service' '$kickeraction_desktop' 2>/dev/null && echo true || echo false" || echo "false")
-  if [[ "$kd_type" == "true" ]]; then
-    pass "Kickeraction desktop file has Type=Service"
-  else
-    fail "Kickeraction desktop file missing Type=Service"
-  fi
-
-  local kd_action
-  kd_action=$(ssh_check "grep -q '^Actions=.*uninstall' '$kickeraction_desktop' 2>/dev/null && echo true || echo false" || echo "false")
-  if [[ "$kd_action" == "true" ]]; then
-    pass "Kickeraction desktop file has Actions=uninstall"
-  else
-    fail "Kickeraction desktop file missing Actions=uninstall"
-  fi
-
-  local kd_onlyfor
-  kd_onlyfor=$(ssh_check "grep '^X-KDE-OnlyForAppIds=' '$kickeraction_desktop' 2>/dev/null | cut -d= -f2" || echo "")
-  if [[ -n "$kd_onlyfor" ]]; then
-    pass "X-KDE-OnlyForAppIds is populated: ${kd_onlyfor:0:80}"
-  else
-    skip "X-KDE-OnlyForAppIds is empty (no managed apps or export hook not yet run)"
-  fi
-
-  local kd_has_comma
-  kd_has_comma=$(ssh_check "grep '^X-KDE-OnlyForAppIds=' '$kickeraction_desktop' 2>/dev/null | grep -q ',' && echo true || echo false" || echo "false")
-  if [[ "$kd_has_comma" == "false" ]]; then
-    pass "X-KDE-OnlyForAppIds uses semicolon separator (not comma)"
-  else
-    fail "X-KDE-OnlyForAppIds uses comma separator — KDE expects semicolons"
-  fi
-
- local non_pamac_desktop
-  non_pamac_desktop=$(ssh_check "ls /usr/share/applications/org.kde.dolphin.desktop /usr/share/applications/btop.desktop /usr/share/applications/firewall-config.desktop 2>/dev/null | head -1" || true)
-  if [[ -z "$non_pamac_desktop" ]]; then
-    non_pamac_desktop=$(ssh_check "ls /home/deck/.local/share/applications/*.desktop 2>/dev/null | grep -v arch-pamac | head -1" || true)
-  fi
-  if [[ -n "$non_pamac_desktop" ]]; then
- local kh_ignores
- kh_ignores=$(ssh_exec "timeout 5 '$kickeraction_handler' 'file://$non_pamac_desktop' > /dev/null 2>&1 && echo PASS_EXIT_0 || echo FAIL_EXIT_NONZERO" || echo "FAIL_EXIT_NONZERO")
- if echo "$kh_ignores" | grep -q "PASS_EXIT_0"; then
-  pass "Kickeraction handler correctly ignores non-pamac apps (exit 0)"
- else
-  fail "Kickeraction handler did not gracefully ignore non-pamac app: ${kh_ignores:0:200}"
- fi
-  else
-    skip "Non-pamac desktop file not found for kickeraction ignore test"
-  fi
-
-local mock_desktop="/home/deck/.local/share/applications/arch-pamac-e2e-mock-test.desktop"
-ssh_exec "cat > '$mock_desktop' << 'MOCKEOF'
-[Desktop Entry]
-Name=E2E Mock Test App
-Type=Application
-Exec=/bin/true
-X-SteamOS-Pamac-Managed=true
-X-SteamOS-Pamac-SourcePackage=e2e-mock-dummy-pkg
-X-SteamOS-Pamac-Container=arch-pamac
-MOCKEOF" || true
-
-local kh_routes
-kh_routes=$(ssh_exec "timeout 15 '$kickeraction_handler' 'file://$mock_desktop' 2>&1; cat /home/deck/.local/share/steamos-pamac/arch-pamac/kickeraction-handler.log 2>/dev/null | tail -10" || true)
-if echo "$kh_routes" | grep -qi "pamac-managed app\|Uninstalling\|uninstall helper\|steamos-pamac-uninstall\|SourcePackage"; then
-    pass "Kickeraction handler routes pamac-managed app to uninstall helper"
+local ah_exists
+ah_exists=$(ssh_check "test -x '$appstream_handler' && echo true || echo false" || echo "false")
+if [[ "$ah_exists" == "true" ]]; then
+pass "steamos-pamac-appstream-handler exists and is executable"
 else
-    skip "Kickeraction handler output for managed app: ${kh_routes:0:200}"
+fail "steamos-pamac-appstream-handler not found or not executable"
 fi
 
-ssh_exec "rm -f '$mock_desktop'" || true
+local ahd_exists
+ahd_exists=$(ssh_check "test -f '$appstream_handler_desktop' && echo true || echo false" || echo "false")
+if [[ "$ahd_exists" == "true" ]]; then
+pass "Appstream handler desktop file exists"
+else
+fail "Appstream handler desktop file not found"
+fi
 
- local log_dir
- log_dir=$(ssh_check "test -d /home/deck/.local/share/steamos-pamac/arch-pamac && echo true || echo false" || echo "false")
- if [[ "$log_dir" == "true" ]]; then
-    pass "Kickeraction/uninstall log directory exists"
-  else
-    skip "Appstream/kickeraction log directory not yet created"
-  fi
+local ahd_mime
+ahd_mime=$(ssh_check "grep -q 'x-scheme-handler/appstream' '$appstream_handler_desktop' 2>/dev/null && echo true || echo false" || echo "false")
+if [[ "$ahd_mime" == "true" ]]; then
+pass "Appstream handler desktop file has MimeType=x-scheme-handler/appstream"
+else
+fail "Appstream handler desktop file missing MimeType"
+fi
+
+local ahd_pref
+ahd_pref=$(ssh_check "grep -q 'InitialPreference=10' '$appstream_handler_desktop' 2>/dev/null && echo true || echo false" || echo "false")
+if [[ "$ahd_pref" == "true" ]]; then
+pass "Appstream handler has InitialPreference=10 (beats Discover's 5)"
+else
+fail "Appstream handler missing InitialPreference=10"
+fi
+
+local mime_default
+mime_default=$(ssh_check "xdg-mime query default x-scheme-handler/appstream 2>/dev/null" || echo "")
+if [[ "$mime_default" == "steamos-pamac-appstream-handler.desktop" ]]; then
+pass "Appstream handler is registered as default for x-scheme-handler/appstream"
+else
+fail "Appstream handler is NOT the default (got: $mime_default)"
+fi
+
+local kickeraction_exists
+kickeraction_exists=$(ssh_check "test -f /home/deck/.local/share/plasma/kickeractions/steamos-pamac-uninstall.desktop && echo true || echo false" || echo "false")
+if [[ "$kickeraction_exists" == "false" ]]; then
+pass "Old kickeraction file is removed (no duplicate menu items)"
+else
+fail "Old kickeraction file still exists — will cause duplicate uninstall menu items"
+fi
+
+local handler_routes_pamac
+handler_routes_pamac=$(ssh_exec "export HOME=/home/deck; export PATH=/home/deck/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin; timeout 5 '$appstream_handler' 'appstream://io.github.celluloid_player.Celluloid' 2>&1; cat /home/deck/.local/share/steamos-pamac/arch-pamac/appstream-handler.log 2>/dev/null | tail -5" || true)
+if echo "$handler_routes_pamac" | grep -qi "pamac-managed app\|Routing to pamac uninstall\|Found matching"; then
+pass "Appstream handler routes pamac-managed app to uninstall helper"
+else
+skip "Appstream handler routing test: ${handler_routes_pamac:0:200}"
+fi
+
+local handler_falls_through
+handler_falls_through=$(ssh_exec "export HOME=/home/deck; export PATH=/home/deck/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin; timeout 5 '$appstream_handler' 'appstream://org.kde.gwenview' 2>&1; cat /home/deck/.local/share/steamos-pamac/arch-pamac/appstream-handler.log 2>/dev/null | tail -3" || true)
+if echo "$handler_falls_through" | grep -qi "passing to Discover\|No pamac-managed app"; then
+pass "Appstream handler falls through to Discover for non-pamac apps"
+else
+skip "Appstream handler fallthrough test: ${handler_falls_through:0:200}"
+fi
+
+local log_dir
+log_dir=$(ssh_check "test -d /home/deck/.local/share/steamos-pamac/arch-pamac && echo true || echo false" || echo "false")
+if [[ "$log_dir" == "true" ]]; then
+pass "Appstream/uninstall log directory exists"
+else
+skip "Appstream/uninstall log directory not yet created"
+fi
 }
 
 ###############################################################################

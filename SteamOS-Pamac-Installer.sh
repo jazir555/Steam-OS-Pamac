@@ -2575,10 +2575,12 @@ local uninstall_helper="$bin_dir/steamos-pamac-uninstall"
 cat > "$uninstall_helper" << UNINSTALL_EOF
 #!/bin/bash
 set +e
+export HOME="/home/${current_user}"
+export PATH="/home/${current_user}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin"
 CONTAINER_NAME="${CONTAINER_NAME}"
 APP_DIR="\$HOME/.local/share/applications"
- STATE_DIR="\$HOME/.local/share/steamos-pamac/\$CONTAINER_NAME"
- LOG_FILE="\$STATE_DIR/uninstall-helper.log"
+STATE_DIR="\$HOME/.local/share/steamos-pamac/\$CONTAINER_NAME"
+LOG_FILE="\$STATE_DIR/uninstall-helper.log"
 
  mkdir -p "\$STATE_DIR"
 
@@ -2615,36 +2617,33 @@ APP_DIR="\$HOME/.local/share/applications"
  exit 1
  fi
 
- _log "Running podman exec for pamac remove..."
- local remove_output
- remove_output=\$(podman exec -i -u 0 "\$CONTAINER_NAME" bash -c '
- rm -f /run/dbus/pid 2>/dev/null
- pkill pamac-daemon 2>/dev/null; pkill polkitd 2>/dev/null; pkill dbus-daemon 2>/dev/null
- sleep 1
- mkdir -p /run/dbus
- dbus-daemon --system --fork 2>/dev/null
- sleep 1
- /usr/lib/polkit-1/polkitd --no-debug &>/dev/null &
- sleep 1
- /usr/bin/pamac-daemon &>/dev/null &
- sleep 2
- pamac remove --no-confirm --no-save --no-orphans "'"\$pkg"'" 2>&1
- ' 2>&1)
- local rc=\$?
- _log "podman exec exit code: \$rc"
- _log "podman exec output: \${remove_output:0:500}"
+_log "Starting container if stopped..."
+podman start "\$CONTAINER_NAME" 2>/dev/null || true
 
- if [[ \$rc -eq 0 ]]; then
- echo "Successfully uninstalled \$pkg"
- _log "Successfully uninstalled \$pkg"
- _log "Running export hook..."
- podman exec -i -u 0 "\$CONTAINER_NAME" /usr/local/bin/distrobox-export-hook.sh 2>/dev/null || true
- _log "Export hook done"
- else
- echo "Failed to uninstall \$pkg (exit code: \$rc)" >&2
- _log "Failed to uninstall \$pkg (exit code: \$rc)"
- exit \$rc
- fi
+if ! podman inspect "\$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+echo "Error: Container \$CONTAINER_NAME is not running and could not be started" >&2
+_log "Error: Container not running and could not be started"
+exit 1
+fi
+
+_log "Removing \$pkg via pacman -Rns (as root, no D-Bus needed)..."
+local remove_output
+remove_output=\$(podman exec -u 0 "\$CONTAINER_NAME" bash -c "
+rm -f /var/lib/pacman/db.lck 2>/dev/null
+pacman -Rns --noconfirm '"\$pkg"' 2>&1
+" </dev/null 2>&1)
+local rc=\$?
+_log "pacman -Rns exit code: \$rc"
+_log "pacman output: \${remove_output:0:500}"
+
+if [[ \$rc -eq 0 ]]; then
+echo "Successfully uninstalled \$pkg"
+_log "Successfully uninstalled \$pkg"
+else
+echo "Failed to uninstall \$pkg (exit code: \$rc)" >&2
+_log "Failed to uninstall \$pkg (exit code: \$rc)"
+exit \$rc
+fi
  }
 
 list_apps() {
@@ -2714,15 +2713,17 @@ UNINSTALL_EOF
     chmod +x "$uninstall_helper"
     log_info "Created uninstall helper: $uninstall_helper"
 
- local kickeraction_handler="$bin_dir/steamos-pamac-kickeraction-handler"
- cat > "$kickeraction_handler" << KICKERACTION_EOF
+local appstream_handler="$bin_dir/steamos-pamac-appstream-handler"
+cat > "$appstream_handler" << APPSTREAM_EOF
 #!/bin/bash
 set +e
+export HOME="/home/${current_user}"
+export PATH="/home/${current_user}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin"
 
 APP_DIR="\$HOME/.local/share/applications"
 STATE_DIR="\$HOME/.local/share/steamos-pamac/${CONTAINER_NAME}"
 UNINSTALL_HELPER="\$HOME/.local/bin/steamos-pamac-uninstall"
-LOG_FILE="\$STATE_DIR/kickeraction-handler.log"
+LOG_FILE="\$STATE_DIR/appstream-handler.log"
 
 mkdir -p "\$STATE_DIR"
 
@@ -2730,91 +2731,149 @@ log_msg() {
 echo "\$(date): \$*" >> "\$LOG_FILE"
 }
 
-log_msg "=== kickeraction-handler invoked: \$* ==="
-log_msg "HOME=\$HOME PATH=\$PATH USER=\$(whoami 2>/dev/null || id -un)"
+_setup_display_env() {
+[[ -n "\$DISPLAY" ]] || export DISPLAY=":0"
+[[ -n "\$XDG_RUNTIME_DIR" ]] || export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+[[ -n "\$DBUS_SESSION_BUS_ADDRESS" ]] || export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
 
-DESKTOP_FILE_URL="\$1"
-
-if [[ -z "\$DESKTOP_FILE_URL" ]]; then
-log_msg "Error: No desktop file URL argument provided"
-exit 1
+if [[ -z "\$WAYLAND_DISPLAY" ]]; then
+if [[ -e /run/user/$(id -u)/wayland-0 ]]; then
+export WAYLAND_DISPLAY="wayland-0"
+elif [[ -S /run/user/$(id -u)/wayland-0 ]]; then
+export WAYLAND_DISPLAY="wayland-0"
+fi
 fi
 
-DESKTOP_PATH="\${DESKTOP_FILE_URL#file://}"
-DESKTOP_PATH="\$(python3 -c "import urllib.parse, sys; print(urllib.parse.unquote(sys.argv[1]))" "\$DESKTOP_PATH" 2>/dev/null || echo "\$DESKTOP_PATH")"
+if [[ -n "\$XDG_RUNTIME_DIR" && ! -d "\$XDG_RUNTIME_DIR" ]]; then
+mkdir -p "\$XDG_RUNTIME_DIR" 2>/dev/null
+fi
+}
 
-if [[ ! -f "\$DESKTOP_PATH" ]]; then
-DESKTOP_PATH="\$APP_DIR/\$(basename "\$DESKTOP_PATH")"
+log_msg "=== appstream-handler invoked: \$* ==="
+log_msg "Initial env: DISPLAY=\$DISPLAY WAYLAND=\$WAYLAND_DISPLAY XDG=\$XDG_RUNTIME_DIR DBUS=\$DBUS_SESSION_BUS_ADDRESS"
+
+_setup_display_env
+
+log_msg "After setup: DISPLAY=\$DISPLAY WAYLAND=\$WAYLAND_DISPLAY XDG=\$XDG_RUNTIME_DIR DBUS=\$DBUS_SESSION_BUS_ADDRESS"
+
+APPSTREAM_URL="\$1"
+
+if [[ -z "\$APPSTREAM_URL" ]]; then
+log_msg "Error: No URL argument provided, falling through to Discover"
+exec plasma-discover "\$@"
 fi
 
-log_msg "Received desktop file: \$DESKTOP_FILE_URL -> \$DESKTOP_PATH"
+COMPONENT_ID="\${APPSTREAM_URL#appstream://}"
 
-if [[ ! -f "\$DESKTOP_PATH" ]]; then
-log_msg "Error: Desktop file not found: \$DESKTOP_PATH"
-echo "Error: Desktop file not found: \$DESKTOP_PATH" >&2
-exit 1
+if [[ -z "\$COMPONENT_ID" ]]; then
+log_msg "Error: Empty component ID, falling through to Discover"
+exec plasma-discover "\$@"
 fi
 
-if ! grep -q '^X-SteamOS-Pamac-Managed=true' "\$DESKTOP_PATH" 2>/dev/null; then
-log_msg "App is not pamac-managed, ignoring: \$DESKTOP_PATH"
+log_msg "Component ID: \$COMPONENT_ID"
+
+FOUND_DESKTOP=""
+
+for desktop_file in "\$APP_DIR"/${CONTAINER_NAME}-*.desktop; do
+[[ -f "\$desktop_file" ]] || continue
+
+SOURCE_DESKTOP=\$(grep '^X-SteamOS-Pamac-SourceDesktop=' "\$desktop_file" 2>/dev/null | cut -d= -f2)
+
+if [[ "\$SOURCE_DESKTOP" == "\$COMPONENT_ID" ]]; then
+FOUND_DESKTOP="\$desktop_file"
+log_msg "Found matching pamac-managed app: \$desktop_file (source: \$SOURCE_DESKTOP)"
+break
+fi
+
+BASENAME=\$(basename "\$desktop_file" .desktop)
+ENTRY_NAME="\${BASENAME#${CONTAINER_NAME}-}"
+if [[ "\$ENTRY_NAME" == "\${COMPONENT_ID%.desktop}" ]]; then
+FOUND_DESKTOP="\$desktop_file"
+log_msg "Found matching pamac-managed app by entry name: \$desktop_file"
+break
+fi
+done
+
+if [[ -n "\$FOUND_DESKTOP" ]]; then
+log_msg "Routing to pamac uninstall handler for: \$(basename "\$FOUND_DESKTOP")"
+
+SOURCE_PKG=\$(grep '^X-SteamOS-Pamac-SourcePackage=' "\$FOUND_DESKTOP" 2>/dev/null | cut -d= -f2)
+APP_NAME=\$(grep '^Name=' "\$FOUND_DESKTOP" 2>/dev/null | head -1 | cut -d= -f2)
+DESKTOP_BASENAME=\$(basename "\$FOUND_DESKTOP")
+
+CONFIRMED=false
+if command -v kdialog >/dev/null 2>&1; then
+log_msg "Attempting kdialog confirmation..."
+kdialog --yesno "Remove \$APP_NAME? This was installed via Pamac (AUR)." --title "Uninstall" 2>>"\$LOG_FILE"
+KDIALOG_RC=\$?
+log_msg "kdialog exit code: \$KDIALOG_RC"
+if [[ \$KDIALOG_RC -eq 0 ]]; then
+CONFIRMED=true
+else
+log_msg "User cancelled uninstall (kdialog rc=\$KDIALOG_RC)"
 exit 0
 fi
-
-SOURCE_PKG=\$(grep '^X-SteamOS-Pamac-SourcePackage=' "\$DESKTOP_PATH" 2>/dev/null | cut -d= -f2)
-if [[ -z "\$SOURCE_PKG" ]]; then
-log_msg "Error: No X-SteamOS-Pamac-SourcePackage found in \$DESKTOP_PATH"
-echo "Error: Cannot determine package for this application." >&2
-exit 1
-fi
-
-APP_NAME=\$(grep '^Name=' "\$DESKTOP_PATH" 2>/dev/null | head -1 | cut -d= -f2)
-DESKTOP_BASENAME=\$(basename "\$DESKTOP_PATH")
-
-log_msg "Uninstalling pamac-managed app: \$APP_NAME (package: \$SOURCE_PKG, desktop: \$DESKTOP_BASENAME)"
-
-if [[ -x "\$UNINSTALL_HELPER" ]]; then
-log_msg "Launching uninstall helper: \$UNINSTALL_HELPER --desktop-file \$DESKTOP_BASENAME"
-UNINSTALL_LOG="\$STATE_DIR/kickeraction-uninstall-\$(date +%s).log"
-"\$UNINSTALL_HELPER" --desktop-file "\$DESKTOP_BASENAME" > "\$UNINSTALL_LOG" 2>&1
-rc=\$?
-log_msg "Uninstall helper exited with code: \$rc"
-while IFS= read -r line; do
-log_msg "uninstall-helper: \$line"
-done < "\$UNINSTALL_LOG"
-rm -f "\$UNINSTALL_LOG"
-if [[ \$rc -ne 0 ]]; then
-log_msg "Uninstall FAILED for \$APP_NAME"
-kdialog --error "Failed to uninstall \$APP_NAME. Check log: \$LOG_FILE" 2>/dev/null || true
 else
-log_msg "Uninstall SUCCEEDED for \$APP_NAME"
+log_msg "kdialog not found, proceeding without confirmation"
+CONFIRMED=true
 fi
-exit \$rc
-else
-log_msg "Error: Uninstall helper not found at \$UNINSTALL_HELPER"
-echo "Error: Uninstall helper not found at \$UNINSTALL_HELPER" >&2
-exit 1
-fi
-KICKERACTION_EOF
-    chmod +x "$kickeraction_handler"
-    log_info "Created kickeraction handler: $kickeraction_handler"
 
-    local kickeraction_dir="$HOME/.local/share/plasma/kickeractions"
-    mkdir -p "$kickeraction_dir"
-    local kickeraction_desktop="$kickeraction_dir/steamos-pamac-uninstall.desktop"
-    cat > "$kickeraction_desktop" << KICKERACTION_DESKTOP_EOF
+if \$CONFIRMED; then
+log_msg "Starting uninstall for \$DESKTOP_BASENAME..."
+UNINSTALL_LOG="\$STATE_DIR/uninstall-\$(date +%s).log"
+
+systemd-run --user --scope -u "steamos-pamac-uninstall-\$(date +%s)" \\
+bash -c "
+export HOME=/home/${current_user}
+export PATH=/home/${current_user}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin
+export DISPLAY=\$DISPLAY
+export WAYLAND_DISPLAY=\$WAYLAND_DISPLAY
+export XDG_RUNTIME_DIR=\$XDG_RUNTIME_DIR
+export DBUS_SESSION_BUS_ADDRESS=\$DBUS_SESSION_BUS_ADDRESS
+
+'\$UNINSTALL_HELPER' --desktop-file '\$DESKTOP_BASENAME' > '\$UNINSTALL_LOG' 2>&1
+rc=\\\$?
+echo \\\"Exit code: \\\$rc\\\" >> '\$UNINSTALL_LOG'
+
+if [ \\\$rc -eq 0 ]; then
+update-desktop-database '\$APP_DIR' 2>/dev/null
+kbuildsycoca6 2>/dev/null
+qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.refreshCurrentShell 2>/dev/null || true
+notify-send -i edit-delete 'Uninstalled' '\$APP_NAME has been removed.' 2>/dev/null
+else
+notify-send -i dialog-error 'Uninstall Failed' 'Could not remove \$APP_NAME. See log for details.' 2>/dev/null
+fi
+" &>/dev/null &
+
+disown
+log_msg "Uninstall launched in background scope"
+fi
+exit 0
+else
+log_msg "No pamac-managed app found for component: \$COMPONENT_ID, passing to Discover"
+exec plasma-discover "\$@"
+fi
+APPSTREAM_EOF
+chmod +x "$appstream_handler"
+log_info "Created appstream handler: $appstream_handler"
+
+local appstream_handler_desktop="$APP_DIR/steamos-pamac-appstream-handler.desktop"
+cat > "$appstream_handler_desktop" << HANDLER_DESKTOP_EOF
 [Desktop Entry]
-Type=Service
-Name=SteamOS Pamac Uninstall Action
-X-KDE-OnlyForAppIds=
-Actions=uninstall;
+Type=Application
+Name=SteamOS Pamac AppStream Handler
+NoDisplay=true
+MimeType=x-scheme-handler/appstream;
+Exec=${appstream_handler} %U
+InitialPreference=10
+HANDLER_DESKTOP_EOF
+chmod 644 "$appstream_handler_desktop"
+log_info "Created appstream handler desktop: $appstream_handler_desktop"
 
-[Desktop Action uninstall]
-Name=Uninstall
-Icon=edit-delete
-Exec=${kickeraction_handler} %u
-KICKERACTION_DESKTOP_EOF
-    chmod 644 "$kickeraction_desktop"
-    log_info "Created kickeraction desktop: $kickeraction_desktop"
+xdg-mime default steamos-pamac-appstream-handler.desktop x-scheme-handler/appstream 2>/dev/null || true
+log_info "Registered appstream handler as default for x-scheme-handler/appstream"
+
+rm -f "$HOME/.local/share/plasma/kickeractions/steamos-pamac-uninstall.desktop" 2>/dev/null || true
 
     if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
         log_info "Add '$bin_dir' to your PATH to use the CLI wrapper directly."
@@ -3176,40 +3235,29 @@ update-desktop-database "\$APP_DIR" 2>/dev/null || true
 fi
 
 KICKERACTION_DIR="/home/${current_user}/.local/share/plasma/kickeractions"
-mkdir -p "\$KICKERACTION_DIR"
-KICKERACTION_FILE="\$KICKERACTION_DIR/steamos-pamac-uninstall.desktop"
-KICKERACTION_HANDLER="/home/${current_user}/.local/bin/steamos-pamac-kickeraction-handler"
+rm -f "\$KICKERACTION_DIR/steamos-pamac-uninstall.desktop" 2>/dev/null
+echo "\$(date): Removed kickeraction file (using appstream intercept instead)" >> "\$EXPORT_LOG"
 
-MANAGED_IDS=""
-while IFS= read -r desktop_path; do
-[[ -f "\$desktop_path" ]] || continue
-if grep -q '^X-SteamOS-Pamac-Managed=true' "\$desktop_path" 2>/dev/null; then
-storage_id=\$(basename "\$desktop_path" .desktop)
-if [[ -n "\$MANAGED_IDS" ]]; then
-MANAGED_IDS="\${MANAGED_IDS};\${storage_id}"
-else
-MANAGED_IDS="\$storage_id"
-fi
-fi
-done < "\$STATE_FILE" 2>/dev/null
+APPSTREAM_HANDLER_DIR="/home/${current_user}/.local/share/applications"
+APPSTREAM_HANDLER_DESKTOP="\$APPSTREAM_HANDLER_DIR/steamos-pamac-appstream-handler.desktop"
+APPSTREAM_HANDLER_BIN="/home/${current_user}/.local/bin/steamos-pamac-appstream-handler"
 
-if [[ -n "\$MANAGED_IDS" ]]; then
-cat > "\$KICKERACTION_FILE" << KICKERACTION_EOF
+if [[ ! -f "\$APPSTREAM_HANDLER_DESKTOP" ]]; then
+mkdir -p "\$APPSTREAM_HANDLER_DIR"
+cat > "\$APPSTREAM_HANDLER_DESKTOP" << HANDLER_EOF
 [Desktop Entry]
-Type=Service
-Name=SteamOS Pamac Uninstall Action
-X-KDE-OnlyForAppIds=\$MANAGED_IDS
-Actions=uninstall;
+Type=Application
+Name=SteamOS Pamac AppStream Handler
+NoDisplay=true
+MimeType=x-scheme-handler/appstream;
+Exec=\$APPSTREAM_HANDLER_BIN %U
+InitialPreference=10
+HANDLER_EOF
+echo "\$(date): Deployed appstream handler desktop file" >> "\$EXPORT_LOG"
+fi
 
-[Desktop Action uninstall]
-Name=Uninstall
-Icon=edit-delete
-Exec=\$KICKERACTION_HANDLER %u
-KICKERACTION_EOF
-echo "\$(date): Updated kickeraction with managed IDs: \$MANAGED_IDS" >> "\$EXPORT_LOG"
-else
-rm -f "\$KICKERACTION_FILE" 2>/dev/null
-echo "\$(date): No managed apps, removed kickeraction file" >> "\$EXPORT_LOG"
+if [[ -f "\$APPSTREAM_HANDLER_BIN" ]]; then
+chmod +x "\$APPSTREAM_HANDLER_BIN" 2>/dev/null
 fi
 HOOKSCRIPT
 

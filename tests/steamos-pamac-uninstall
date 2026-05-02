@@ -1,5 +1,7 @@
 #!/bin/bash
 set +e
+export HOME="/home/deck"
+export PATH="/home/deck/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin"
 CONTAINER_NAME="arch-pamac"
 APP_DIR="$HOME/.local/share/applications"
 STATE_DIR="$HOME/.local/share/steamos-pamac/$CONTAINER_NAME"
@@ -40,31 +42,30 @@ echo "Error: podman not found in PATH" >&2
 exit 1
 fi
 
-_log "Running podman exec for pamac remove..."
+_log "Starting container if stopped..."
+podman start "$CONTAINER_NAME" 2>/dev/null || true
+local start_rc=$?
+_log "podman start exit code: $start_rc"
+
+if ! podman inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+echo "Error: Container $CONTAINER_NAME is not running and could not be started" >&2
+_log "Error: Container not running and could not be started"
+exit 1
+fi
+
+_log "Removing $pkg via pacman -Rns (as root, no D-Bus needed)..."
 local remove_output
-remove_output=$(podman exec -u 0 "$CONTAINER_NAME" bash -c '
-rm -f /run/dbus/pid 2>/dev/null
-pkill pamac-daemon 2>/dev/null; pkill polkitd 2>/dev/null; pkill dbus-daemon 2>/dev/null
-sleep 1
-mkdir -p /run/dbus
-dbus-daemon --system --fork 2>/dev/null
-sleep 1
-/usr/lib/polkit-1/polkitd --no-debug &>/dev/null &
-sleep 1
-/usr/bin/pamac-daemon &>/dev/null &
-sleep 2
-pamac remove --no-confirm --no-save --no-orphans "'"$pkg"'" 2>&1
-' </dev/null 2>&1)
+remove_output=$(podman exec -u 0 "$CONTAINER_NAME" bash -c "
+rm -f /var/lib/pacman/db.lck 2>/dev/null
+pacman -Rns --noconfirm '$pkg' 2>&1
+" </dev/null 2>&1)
 local rc=$?
-_log "podman exec exit code: $rc"
-_log "podman exec output: ${remove_output:0:500}"
+_log "pacman -Rns exit code: $rc"
+_log "pacman output: ${remove_output:0:500}"
 
 if [[ $rc -eq 0 ]]; then
 echo "Successfully uninstalled $pkg"
 _log "Successfully uninstalled $pkg"
-_log "Running export hook..."
-podman exec -u 0 "$CONTAINER_NAME" /usr/local/bin/distrobox-export-hook.sh </dev/null 2>/dev/null || true
-_log "Export hook done"
 else
 echo "Failed to uninstall $pkg (exit code: $rc)" >&2
 _log "Failed to uninstall $pkg (exit code: $rc)"

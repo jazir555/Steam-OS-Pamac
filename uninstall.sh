@@ -46,7 +46,7 @@ remove_container() {
                 app_name=$(grep '^X-SteamOS-Pamac-SourceApp=' "$app_file" 2>/dev/null | cut -d= -f2- || true)
                 if [[ -n "$app_name" ]]; then
                     log_info "Un-exporting: $app_name"
-                    distrobox-enter "$CONTAINER_NAME" -- distrobox-export --app "$app_name" --delete 2>/dev/null || true
+		distrobox-enter "$CONTAINER_NAME" -- distrobox-export --container "$CONTAINER_NAME" --app "$app_name" --delete 2>/dev/null || true
                 fi
             done < <(find "$HOME/.local/share/applications" -maxdepth 1 -type f -name "*.desktop" -exec grep -l "^X-SteamOS-Pamac-Container=${CONTAINER_NAME}$" {} + 2>/dev/null || true)
         else

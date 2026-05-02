@@ -10,11 +10,7 @@ CONTAINER_HAS_INIT="unknown"
 
 CONTAINER_NAME="${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}"
 
-if [[ -n "${SUDO_USER:-}" ]]; then
-    CURRENT_USER="$SUDO_USER"
-else
-    CURRENT_USER=$(whoami)
-fi
+CURRENT_USER=$(whoami)
 
 ENABLE_MULTILIB="${ENABLE_MULTILIB:-true}"
 ENABLE_BUILD_CACHE="${ENABLE_BUILD_CACHE:-true}"
@@ -161,64 +157,90 @@ container_get_status_safe() {
 }
 
 ensure_container_healthy() {
-    local desc="${1:-container operation}"
-    local max_attempts=3
-    local attempt=1
+	local desc="${1:-container operation}"
+	local max_attempts=3
+	local attempt=1
 
-    while [[ $attempt -le $max_attempts ]]; do
-        if container_is_usable; then
-            return 0
-        fi
+	while [[ $attempt -le $max_attempts ]]; do
+		if container_is_usable; then
+			return 0
+		fi
 
-        local status
-        status=$(container_get_status_safe)
-        log_warn "Container status: '$status' (attempt $attempt/$max_attempts for: $desc)"
+		local status
+		status=$(container_get_status_safe)
+		log_warn "Container status: '$status' (attempt $attempt/$max_attempts for: $desc)"
 
-        case "$status" in
-            "running")
-                log_info "Container running but not responding. Attempting exec retry..."
-                sleep 2
-                ;;
-  "stopped"|"exited")
-    log_info "Container stopped. Starting..."
-    container_start 2>/dev/null || true
-    sleep 3
-    if [[ "$CONTAINER_HAS_INIT" == "false" ]]; then
-      if container_is_usable; then
-        return 0
-      fi
-      log_debug "Non-init container not yet usable after start, waiting..."
-      sleep 3
-      if container_is_usable; then
-        return 0
-      fi
-    fi
-    wait_for_container || {
-      log_error "Failed to start container."
-      return 1
-    }
-    ;;
-            "improper")
-                log_warn "Container in improper state. Attempting forced recovery..."
-                force_remove_container "$CONTAINER_NAME"
-                log_error "Container had to be removed. Please re-run the script."
-                return 1
-                ;;
-            "not_found")
-                log_error "Container '$CONTAINER_NAME' not found."
-                return 1
-                ;;
-            *)
-                log_debug "Container in state '$status', waiting..."
-                sleep 3
-                ;;
-        esac
+		case "$status" in
+			"running")
+				log_info "Container running but not responding. Attempting exec retry..."
+				sleep 2
+				;;
+			"stopped"|"exited")
+				log_info "Container stopped. Starting..."
+				container_start 2>/dev/null || true
+				sleep 3
+				if [[ "$CONTAINER_HAS_INIT" == "false" ]]; then
+					if container_is_usable; then
+						return 0
+					fi
+					log_debug "Non-init container not yet usable after start, waiting..."
+					sleep 3
+					if container_is_usable; then
+						return 0
+					fi
+				fi
+				local wait_rc=0
+				wait_for_container || wait_rc=$?
+				if [[ "$wait_rc" -eq 2 ]]; then
+					log_info "Container was stuck and removed (wait_for_container rc=2). Signaling recreate."
+					return 2
+				elif [[ "$wait_rc" -ne 0 ]]; then
+					log_error "Failed to start container."
+					return 1
+				fi
+				;;
+			"improper")
+				log_warn "Container in improper state. Attempting forced recovery..."
+				force_remove_container "$CONTAINER_NAME"
+				log_info "Container removed due to improper state. Signaling recreate."
+				return 2
+				;;
+			"not_found")
+				log_error "Container '$CONTAINER_NAME' not found."
+				return 2
+				;;
+			*)
+				log_debug "Container in state '$status', waiting..."
+				sleep 3
+				;;
+		esac
 
-        attempt=$((attempt + 1))
-    done
+		attempt=$((attempt + 1))
+	done
 
-    log_error "Container health check failed after $max_attempts attempts for: $desc"
-    return 1
+	log_error "Container health check failed after $max_attempts attempts for: $desc"
+	return 1
+}
+
+_ensure_healthy_or_recreate() {
+	local desc="${1:-container operation}"
+	local healthy_rc=0
+	ensure_container_healthy "$desc" || healthy_rc=$?
+	if [[ "$healthy_rc" -eq 0 ]]; then
+		return 0
+	elif [[ "$healthy_rc" -eq 2 ]]; then
+		log_info "Container signaled for recreation ($desc). Recreating..."
+		force_remove_container "$CONTAINER_NAME"
+		sleep 2
+		if ! create_container; then
+			log_error "Failed to recreate container after '$desc' recovery."
+			return 1
+		fi
+		log_success "Container recreated successfully after '$desc' issue."
+		return 0
+	else
+		return 1
+	fi
 }
 
 force_remove_container() {
@@ -270,18 +292,39 @@ force_remove_container() {
  fi
  fi
 
-  if $runtime_cmd inspect "$name" >/dev/null 2>&1; then
-    log_warn "Podman rm still failed for '$name'. Podman may be corrupted. Trying storage cleanup..."
-    local podman_storage="${XDG_DATA_HOME:-$HOME/.local/share}/containers/storage"
-    if [[ -d "$podman_storage" ]]; then
-      find "$podman_storage" -maxdepth 3 -path "*/$name*" -exec rm -rf {} \; 2>/dev/null || true
-    fi
-    local podman_run="/run/user/$(id -u)/containers"
-    if [[ -d "$podman_run" ]]; then
-      find "$podman_run" -maxdepth 2 -path "*/$name*" -exec rm -rf {} \; 2>/dev/null || true
-    fi
-    $runtime_cmd rm -f "$name" 2>/dev/null || true
-    sudo podman rm -f "$name" 2>/dev/null || true
+	if $runtime_cmd inspect "$name" >/dev/null 2>&1; then
+		log_warn "Podman rm still failed for '$name'. Podman may be corrupted."
+		log_warn "WARNING: Manual storage cleanup is a last resort. Deleting files from podman's"
+		log_warn "overlayfs storage while the container engine is running can leave the podman"
+		log_warn "database in an inconsistent state, causing 'ghost' containers or future failures"
+		log_warn "that even 'podman system reset' may not fix. Proceed only if other options failed."
+		if [[ -t 0 ]]; then
+			echo -ne "${RED}${BOLD}Type 'yes' to proceed with manual storage cleanup, or anything else to skip: ${NC}" >&2
+			local cleanup_confirm
+			read -r cleanup_confirm
+			if [[ "$cleanup_confirm" != "yes" ]]; then
+				log_warn "User declined manual storage cleanup. Skipping."
+				log_info "You can try 'podman system reset --force' or restart podman manually."
+				return
+			fi
+		else
+			log_warn "Non-interactive session — skipping manual storage cleanup to avoid podman corruption."
+			log_info "Run this script interactively to approve cleanup, or try 'podman system reset --force'."
+			return
+		fi
+		local podman_storage="${XDG_DATA_HOME:-$HOME/.local/share}/containers/storage"
+		if [[ -d "$podman_storage" ]]; then
+			log_warn "Removing container '$name' files from podman storage..."
+			find "$podman_storage" -maxdepth 3 -path "*/$name*" -exec rm -rf {} \; 2>/dev/null || true
+		fi
+		local podman_run="/run/user/$(id -u)/containers"
+		if [[ -d "$podman_run" ]]; then
+			find "$podman_run" -maxdepth 2 -path "*/$name*" -exec rm -rf {} \; 2>/dev/null || true
+		fi
+		$runtime_cmd rm -f "$name" 2>/dev/null || true
+		if sudo -n true 2>/dev/null; then
+			sudo podman rm -f "$name" 2>/dev/null || true
+		fi
   fi
 }
 
@@ -422,16 +465,34 @@ repair_podman() {
         return 0
     fi
 
-log_warn "Podman database may be corrupted. Attempting system reset..."
-log_warn "WARNING: 'podman system reset --force' will remove ALL containers, images, and volumes — not just the Pamac container. Any other distroboxes or podman workloads will be lost."
-local reset_output
-    reset_output=$(podman system reset --force 2>&1) && rc=0 || rc=$?
-    log_debug "podman system reset: $reset_output"
+	log_warn "Podman database may be corrupted. A full system reset is required but is DESTRUCTIVE."
+	log_warn "WARNING: 'podman system reset --force' will remove ALL containers, images, and volumes — not just the Pamac container. Any other distroboxes or podman workloads will be lost."
+	if [[ -t 0 ]]; then
+		echo -ne "${RED}${BOLD}Type 'yes' to proceed with podman system reset, or anything else to skip: ${NC}" >&2
+		local reset_confirm
+		read -r reset_confirm
+		if [[ "$reset_confirm" != "yes" ]]; then
+			log_warn "User declined podman system reset. Skipping to next recovery step."
+			log_info "You can run 'podman system reset --force' manually if needed."
+			goto_next_step=true
+		fi
+	else
+		log_warn "Non-interactive session — skipping automatic podman system reset to avoid data loss."
+		log_info "Run 'podman system reset --force' manually if you want to reset all podman data."
+		goto_next_step=true
+	fi
+	if [[ "${goto_next_step:-}" != "true" ]]; then
+		local reset_output
+		reset_output=$(podman system reset --force 2>&1) && rc=0 || rc=$?
+		log_debug "podman system reset: $reset_output"
+	fi
 
-    if podman info >/dev/null 2>&1; then
-        log_success "Podman recovered after system reset."
-        return 0
-    fi
+	if [[ "${goto_next_step:-}" != "true" ]] && podman info >/dev/null 2>&1; then
+		log_success "Podman recovered after system reset."
+		return 0
+	fi
+
+	goto_next_step=false
 
     log_info "Attempting to migrate podman storage..."
     podman system migrate 2>/dev/null || true
@@ -581,7 +642,7 @@ uninstall_setup() {
                 if [[ -n "$app_name" ]]; then
                     log_info "Un-exporting app: $app_name"
                     if [[ "$DRY_RUN" != "true" ]]; then
-                        distrobox-enter "$CONTAINER_NAME" -- env XDG_DATA_DIRS="/usr/local/share:/usr/share" XDG_DATA_HOME="/home/${CURRENT_USER}/.local/share" distrobox-export --app "$app_name" --delete 2>/dev/null || true
+			distrobox-enter "$CONTAINER_NAME" -- env XDG_DATA_DIRS="/usr/local/share:/usr/share" XDG_DATA_HOME="/home/${CURRENT_USER}/.local/share" distrobox-export --container "$CONTAINER_NAME" --app "$app_name" --delete 2>/dev/null || true
                     fi
                 fi
             done < <(find "$HOME/.local/share/applications" -maxdepth 1 -type f -name "*.desktop" -exec grep -l "^X-SteamOS-Pamac-Container=${CONTAINER_NAME}$" {} + 2>/dev/null || true)
@@ -1970,116 +2031,101 @@ install_aur_helper() {
         return 0
     fi
 
-    log_info "Stage 1/2: Installing build dependencies (batched to avoid OOM)..."
-    local deps_script
-    read -r -d '' deps_script <<'DEPS_EOF' || true
+	log_info "Verifying build dependencies (git, base-devel, go) are present..."
+	local verify_script
+	read -r -d '' verify_script <<'VERIFY_EOF' || true
 set -uo pipefail
 
 rm -f /var/lib/pacman/db.lck
 
-check_mem() {
-    local min_kb="${1:-262144}"
-    local desc="${2:-install}"
-    if [[ ! -f /proc/meminfo ]]; then
-        return 0
-    fi
-    local avail_kb
-    avail_kb=$(grep MemAvailable /proc/meminfo 2>/dev/null | awk '{print $2}' || echo "0")
-    if [[ "$avail_kb" != "0" && "$avail_kb" -lt "$min_kb" ]]; then
-        echo "Warning: Low memory (${avail_kb}KB available) for $desc."
-    fi
-}
+_missing=""
+command -v git >/dev/null 2>&1 || _missing="$_missing git"
+pacman -Q base-devel >/dev/null 2>&1 || _missing="$_missing base-devel"
+command -v go >/dev/null 2>&1 || _missing="$_missing go"
 
-safe_install() {
-    local attempt=0
-    local max_attempts=3
-    local rc=0
-    while [[ $attempt -lt $max_attempts ]]; do
-        rm -f /var/lib/pacman/db.lck
-        if pacman -S --noconfirm --needed "$@"; then
-            ldconfig 2>/dev/null || true
-            return 0
-        fi
-        rc=$?
-        attempt=$((attempt + 1))
-        if [[ $attempt -lt $max_attempts ]]; then
-            echo "Install failed (attempt $attempt/$max_attempts, exit=$rc), repairing DB..."
-if [[ $rc -eq 137 ]]; then
-echo "Exit code 137 indicates OOM kill. Syncing and retrying..."
-sync 2>/dev/null || true
-_safe_sleep 3
+if [[ -n "$_missing" ]]; then
+	echo "Missing build dependencies:$_missing — installing..."
+	safe_install() {
+		local attempt=0
+		local max_attempts=3
+		local rc=0
+		while [[ $attempt -lt $max_attempts ]]; do
+			rm -f /var/lib/pacman/db.lck
+			if pacman -S --noconfirm --needed "$@"; then
+				ldconfig 2>/dev/null || true
+				return 0
+			fi
+			rc=$?
+			attempt=$((attempt + 1))
+			if [[ $attempt -lt $max_attempts ]]; then
+				echo "Install failed (attempt $attempt/$max_attempts, exit=$rc), repairing DB..."
+				if [[ $rc -eq 137 ]]; then
+					echo "Exit code 137 indicates OOM kill. Syncing and retrying..."
+					sync 2>/dev/null || true
+					_safe_sleep 3
+				fi
+				pacman -Dk 2>/dev/null || true
+				pacman -Syy --noconfirm 2>/dev/null || true
+				_safe_sleep 3
+			fi
+		done
+		return $rc
+	}
+
+	for pkg in $_missing; do
+		if [[ "$pkg" == "base-devel" ]]; then
+			BASE_DEVEL_BATCHES=(
+				"m4 autoconf automake binutils"
+				"bison debugedit diffutils fakeroot"
+				"flex"
+				"gcc"
+				"gettext groff"
+				"gzip libtool make patch"
+				"pkgconf sed texinfo which"
+			)
+			for batch in "${BASE_DEVEL_BATCHES[@]}"; do
+				echo "Installing batch: $batch"
+				sync 2>/dev/null || true
+				_safe_sleep 1
+				if ! safe_install $batch; then
+					echo "Warning: batch install failed for: $batch"
+				fi
+			done
+			if ! pacman -Q base-devel >/dev/null 2>&1 && ! safe_install base-devel; then
+				echo "Warning: base-devel group meta-package could not be installed."
+			fi
+		else
+			echo "Installing $pkg..."
+			if ! safe_install "$pkg"; then
+				echo "Failed to install $pkg."
+				exit 1
+			fi
+		fi
+	done
+	echo "Missing dependencies installed."
+else
+	echo "All build dependencies already present."
 fi
-pacman -Dk 2>/dev/null || true
-pacman -Syy --noconfirm 2>/dev/null || true
-_safe_sleep 3
-fi
-    done
-    return $rc
-}
+VERIFY_EOF
 
-echo "Installing git..."
-check_mem 262144 "git install"
-if ! safe_install git; then
-    echo "Failed to install git."
-    exit 1
-fi
-
-echo "Installing base-devel in smaller batches to avoid OOM..."
-check_mem 524288 "base-devel install"
-sync 2>/dev/null || true
-_safe_sleep 1
-BASE_DEVEL_BATCHES=(
-    "m4 autoconf automake binutils"
-    "bison debugedit diffutils fakeroot"
-    "flex"
-    "gcc"
-    "gettext groff"
-    "gzip libtool make patch"
-    "pkgconf sed texinfo which"
-)
-for batch in "${BASE_DEVEL_BATCHES[@]}"; do
-echo "Installing batch: $batch"
-check_mem 262144 "base-devel batch"
-sync 2>/dev/null || true
-_safe_sleep 1
-if ! safe_install $batch; then
-        echo "Warning: batch install failed for: $batch"
-    fi
-done
-if ! pacman -Q base-devel >/dev/null 2>&1 && ! safe_install base-devel; then
-    echo "Warning: base-devel group meta-package could not be installed."
-fi
-
-echo "Installing go..."
-check_mem 262144 "go install"
-sync 2>/dev/null || true
-_safe_sleep 1
-if ! safe_install go; then
-    echo "Failed to install go."
-    exit 1
-fi
-
-echo "Build dependencies installed."
-DEPS_EOF
-
-    if ! exec_container_script "$deps_script" "yay-deps"; then
-        if ! container_is_usable; then
-            log_warn "Container not usable. Restarting..."
-            container_start 2>/dev/null || true
-            wait_for_container || {
-                log_error "Container unrecoverable."
-                return 1
-            }
-            log_info "Retrying build dependencies..."
-            if ! exec_container_script "$deps_script" "yay-deps-retry"; then
-                log_error "Failed to install build dependencies."
-                return 1
-            fi
-        else
-            log_error "Failed to install build dependencies."
-            return 1
-        fi
-    fi
+	if ! exec_container_script "$verify_script" "yay-deps-verify"; then
+		if ! container_is_usable; then
+			log_warn "Container not usable. Restarting..."
+			container_start 2>/dev/null || true
+			wait_for_container || {
+				log_error "Container unrecoverable."
+				return 1
+			}
+			log_info "Retrying build dependency verification..."
+			if ! exec_container_script "$verify_script" "yay-deps-verify-retry"; then
+				log_error "Failed to verify/install build dependencies."
+				return 1
+			fi
+		else
+			log_error "Failed to verify/install build dependencies."
+			return 1
+		fi
+	fi
 
     log_info "Stage 2/2: Building yay from AUR..."
     local build_script
@@ -2500,7 +2546,7 @@ export_pamac_to_host() {
 
     log_info "Exporting Pamac application using distrobox-export..."
     local distrobox_export_ok=false
-    if run_command distrobox-enter "$CONTAINER_NAME" -- env XDG_DATA_DIRS="/usr/local/share:/usr/share" XDG_DATA_HOME="/home/${CURRENT_USER}/.local/share" distrobox-export --app pamac-manager; then
+	if run_command distrobox-enter "$CONTAINER_NAME" -- env XDG_DATA_DIRS="/usr/local/share:/usr/share" XDG_DATA_HOME="/home/${CURRENT_USER}/.local/share" distrobox-export --container "$CONTAINER_NAME" --app pamac-manager; then
         log_success "Pamac exported via distrobox-export."
         distrobox_export_ok=true
     fi
@@ -3171,17 +3217,17 @@ run_distrobox_export() {
   _do_export() {
     local name="\$1"
     if [[ "\$(id -u)" -eq 0 ]]; then
-      sudo -Hu "${current_user}" \
-        env HOME="/home/${current_user}" \
-        XDG_DATA_DIRS="\$xdg_data_dirs" \
-        XDG_DATA_HOME="\$xdg_data_home" \
-        PATH="\$user_path" \
-        distrobox-export --app "\$name" 2>/dev/null
+		sudo -Hu "${current_user}" \
+			env HOME="/home/${current_user}" \
+			XDG_DATA_DIRS="\$xdg_data_dirs" \
+			XDG_DATA_HOME="\$xdg_data_home" \
+			PATH="\$user_path" \
+			distrobox-export --container "${container_name}" --app "\$name" 2>/dev/null
     else
-      export HOME="/home/${current_user}"
-      export XDG_DATA_DIRS="\$xdg_data_dirs"
-      export XDG_DATA_HOME="\$xdg_data_home"
-      distrobox-export --app "\$name" 2>/dev/null
+		export HOME="/home/${current_user}"
+		export XDG_DATA_DIRS="\$xdg_data_dirs"
+		export XDG_DATA_HOME="\$xdg_data_home"
+		distrobox-export --container "${container_name}" --app "\$name" 2>/dev/null
     fi
   }
 
@@ -3502,47 +3548,45 @@ main() {
 
     check_memory_ok 262144 "base setup" || log_warn "Low memory may cause OOM kills during base setup."
 
-if ! configure_container_base; then
-log_warn "Container base setup had errors. Checking container health..."
-if ! ensure_container_healthy "base setup recovery"; then
-exit 1
-fi
-fi
+	if ! configure_container_base; then
+		log_warn "Container base setup had errors. Checking container health..."
+		_ensure_healthy_or_recreate "base setup recovery" || exit 1
+	fi
 
-ensure_container_healthy "before critical helpers check" || exit 1
-ensure_critical_helpers
+	_ensure_healthy_or_recreate "before critical helpers check" || exit 1
+	ensure_critical_helpers
 
-ensure_container_healthy "before mirror optimization" || exit 1
-    optimize_pacman_mirrors
+	_ensure_healthy_or_recreate "before mirror optimization" || exit 1
+	optimize_pacman_mirrors
 
-    ensure_container_healthy "before multilib setup" || exit 1
-    configure_multilib
+	_ensure_healthy_or_recreate "before multilib setup" || exit 1
+	configure_multilib
 
-    ensure_container_healthy "after base setup" || exit 1
+	_ensure_healthy_or_recreate "after base setup" || exit 1
 
-    check_memory_ok 524288 "AUR helper build" || log_warn "Low memory may cause OOM kills during yay compilation."
+	check_memory_ok 524288 "AUR helper build" || log_warn "Low memory may cause OOM kills during yay compilation."
 
-    if ! install_aur_helper; then
-        if ensure_container_healthy "aur helper recovery"; then
-            log_info "Retrying AUR helper install..."
-            install_aur_helper || exit 1
-        else
-            exit 1
-        fi
-    fi
+	if ! install_aur_helper; then
+		if _ensure_healthy_or_recreate "aur helper recovery"; then
+			log_info "Retrying AUR helper install..."
+			install_aur_helper || exit 1
+		else
+			exit 1
+		fi
+	fi
 
-    ensure_container_healthy "after aur helper" || exit 1
+	_ensure_healthy_or_recreate "after aur helper" || exit 1
 
-    if ! install_pamac; then
-        if ensure_container_healthy "pamac install recovery"; then
-            log_info "Retrying Pamac install..."
-            install_pamac || exit 1
-        else
-            exit 1
-        fi
-    fi
+	if ! install_pamac; then
+		if _ensure_healthy_or_recreate "pamac install recovery"; then
+			log_info "Retrying Pamac install..."
+			install_pamac || exit 1
+		else
+			exit 1
+		fi
+	fi
 
-ensure_container_healthy "after pamac install" || exit 1
+	_ensure_healthy_or_recreate "after pamac install" || exit 1
 ensure_critical_helpers
 
 install_gaming_packages

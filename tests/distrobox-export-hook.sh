@@ -193,17 +193,17 @@ run_distrobox_export() {
   _do_export() {
     local name="$1"
     if [[ "$(id -u)" -eq 0 ]]; then
-      sudo -Hu "deck" \
-        env HOME="/home/deck" \
-        XDG_DATA_DIRS="$xdg_data_dirs" \
-        XDG_DATA_HOME="$xdg_data_home" \
-        PATH="$user_path" \
-        distrobox-export --app "$name" 2>/dev/null
+		sudo -Hu "deck" \
+			env HOME="/home/deck" \
+			XDG_DATA_DIRS="$xdg_data_dirs" \
+			XDG_DATA_HOME="$xdg_data_home" \
+			PATH="$user_path" \
+			distrobox-export --container arch-pamac --app "$name" 2>/dev/null
     else
-      export HOME="/home/deck"
-      export XDG_DATA_DIRS="$xdg_data_dirs"
-      export XDG_DATA_HOME="$xdg_data_home"
-      distrobox-export --app "$name" 2>/dev/null
+		export HOME="/home/deck"
+		export XDG_DATA_DIRS="$xdg_data_dirs"
+		export XDG_DATA_HOME="$xdg_data_home"
+		distrobox-export --container arch-pamac --app "$name" 2>/dev/null
     fi
   }
 

@@ -3,6 +3,7 @@ set +e
 export HOME="/home/deck"
 export PATH="/home/deck/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin"
 CONTAINER_NAME="arch-pamac"
+CONTAINER_MANAGER="${DISTROBOX_CONTAINER_MANAGER:-podman}"
 APP_DIR="$HOME/.local/share/applications"
 STATE_DIR="$HOME/.local/share/steamos-pamac/$CONTAINER_NAME"
 LOG_FILE="$STATE_DIR/uninstall-helper.log"
@@ -33,7 +34,7 @@ fi
 
 _log "=== steamos-pamac-uninstall invoked: $* ==="
 _log "HOME=$HOME PATH=$PATH USER=$(whoami 2>/dev/null || id -un)"
-_log "podman=$(command -v podman 2>/dev/null || echo NOT_FOUND)"
+_log "container manager=$(command -v "$CONTAINER_MANAGER" 2>/dev/null || echo NOT_FOUND)"
 
 show_help() {
 echo "Usage: steamos-pamac-uninstall [options]"
@@ -54,18 +55,18 @@ fi
 echo "Uninstalling $pkg from $CONTAINER_NAME..."
 _log "Uninstalling $pkg from $CONTAINER_NAME..."
 
-if ! command -v podman >/dev/null 2>&1; then
-_log "Error: podman not found in PATH"
-echo "Error: podman not found in PATH" >&2
-exit 1
-fi
+ if ! command -v "$CONTAINER_MANAGER" >/dev/null 2>&1; then
+ _log "Error: $CONTAINER_MANAGER not found in PATH"
+ echo "Error: $CONTAINER_MANAGER not found in PATH" >&2
+ exit 1
+ fi
 
-_log "Starting container if stopped..."
-podman start "$CONTAINER_NAME" 2>/dev/null || true
-local start_rc=$?
-_log "podman start exit code: $start_rc"
+ _log "Starting container if stopped..."
+ "$CONTAINER_MANAGER" start "$CONTAINER_NAME" 2>/dev/null || true
+ local start_rc=$?
+ _log "$CONTAINER_MANAGER start exit code: $start_rc"
 
-if ! podman inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+ if ! "$CONTAINER_MANAGER" inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
 echo "Error: Container $CONTAINER_NAME is not running and could not be started" >&2
 _log "Error: Container not running and could not be started"
 exit 1
@@ -73,7 +74,7 @@ fi
 
 _log "Removing $pkg via pacman -Rns (as root, no D-Bus needed)..."
 local remove_output
-remove_output=$(podman exec -u 0 "$CONTAINER_NAME" bash -c "
+ remove_output=$("$CONTAINER_MANAGER" exec -u 0 "$CONTAINER_NAME" bash -c "
 rm -f /var/lib/pacman/db.lck 2>/dev/null
 pacman -Rns --noconfirm \"$pkg\" 2>&1
 " </dev/null 2>&1)

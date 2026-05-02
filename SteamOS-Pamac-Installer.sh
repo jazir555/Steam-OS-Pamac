@@ -260,11 +260,15 @@ force_remove_container() {
     sleep 1
   fi
 
-  $runtime_cmd rm -f "$name" 2>/dev/null || true
-  if $runtime_cmd inspect "$name" >/dev/null 2>&1; then
-    log_debug "User podman rm failed, trying sudo..."
-    sudo podman rm -f "$name" 2>/dev/null || true
-  fi
+ $runtime_cmd rm -f "$name" 2>/dev/null || true
+ if $runtime_cmd inspect "$name" >/dev/null 2>&1; then
+ log_debug "User podman rm failed, trying sudo..."
+ if sudo -n true 2>/dev/null; then
+ sudo podman rm -f "$name" 2>/dev/null || true
+ else
+ log_warn "User podman rm failed and passwordless sudo not available. Skipping sudo fallback to avoid hang."
+ fi
+ fi
 
   if $runtime_cmd inspect "$name" >/dev/null 2>&1; then
     log_warn "Podman rm still failed for '$name'. Podman may be corrupted. Trying storage cleanup..."
@@ -902,19 +906,23 @@ exec_container_script() {
 
   rm -f "$_script_file"
 
-    if [[ "$CONTAINER_HAS_INIT" == "false" ]] && [[ $_rc -eq 137 ]]; then
-        if echo "$_output" | grep -q "$_marker"; then
-            log_debug "Script '$_desc' completed successfully (exit 137 is expected in non-init container - podman kills entry process after completion)."
-            container_start 2>/dev/null || true
-            repair_pacman_db
-            return 0
-        fi
-        log_warn "Script '$_desc' got exit 137 without completion marker. May be OOM or signal kill. Attempting DB repair..."
-        container_start 2>/dev/null || true
-        repair_pacman_db
-    fi
+ if [[ "$CONTAINER_HAS_INIT" == "false" ]] && [[ $_rc -ne 0 ]]; then
+ if echo "$_output" | grep -q "$_marker"; then
+ log_debug "Script '$_desc' completed successfully (exit $_rc is expected in non-init container - podman may kill entry process after completion)."
+ container_start 2>/dev/null || true
+ repair_pacman_db
+ return 0
+ fi
+ if [[ $_rc -eq 137 ]]; then
+ log_warn "Script '$_desc' got exit 137 without completion marker. May be OOM or signal kill. Attempting DB repair..."
+ else
+ log_warn "Script '$_desc' got exit $_rc without completion marker in non-init container. May be premature container stop. Attempting DB repair..."
+ fi
+ container_start 2>/dev/null || true
+ repair_pacman_db
+ fi
 
-    if [[ $_rc -ne 0 ]]; then
+ if [[ $_rc -ne 0 ]] && ! { [[ "$CONTAINER_HAS_INIT" == "false" ]] && echo "$_output" | grep -q "$_marker"; }; then
         log_warn "Script '$_desc' failed (exit=$_rc)."
         container_root_exec bash -c "rm -f /var/lib/pacman/db.lck; pkill -9 gpg-agent 2>/dev/null || true" 2>/dev/null || true
         ensure_container_healthy "$_desc" || return 1
@@ -952,19 +960,23 @@ exec_container_pipe() {
 
     rm -f "$_script_file"
 
-    if [[ "$CONTAINER_HAS_INIT" == "false" ]] && [[ $_rc -eq 137 ]]; then
-        if echo "$_output" | grep -q "$_marker"; then
-            log_debug "Piped script '$_desc' completed successfully (exit 137 is expected in non-init container - podman kills entry process after completion)."
-            container_start 2>/dev/null || true
-            repair_pacman_db
-            return 0
-        fi
-        log_warn "Piped script '$_desc' got exit 137 without completion marker. May be OOM or signal kill. Attempting DB repair..."
-        container_start 2>/dev/null || true
-        repair_pacman_db
-    fi
+ if [[ "$CONTAINER_HAS_INIT" == "false" ]] && [[ $_rc -ne 0 ]]; then
+ if echo "$_output" | grep -q "$_marker"; then
+ log_debug "Piped script '$_desc' completed successfully (exit $_rc is expected in non-init container - podman may kill entry process after completion)."
+ container_start 2>/dev/null || true
+ repair_pacman_db
+ return 0
+ fi
+ if [[ $_rc -eq 137 ]]; then
+ log_warn "Piped script '$_desc' got exit 137 without completion marker. May be OOM or signal kill. Attempting DB repair..."
+ else
+ log_warn "Piped script '$_desc' got exit $_rc without completion marker in non-init container. May be premature container stop. Attempting DB repair..."
+ fi
+ container_start 2>/dev/null || true
+ repair_pacman_db
+ fi
 
-    if [[ $_rc -ne 0 ]]; then
+ if [[ $_rc -ne 0 ]] && ! { [[ "$CONTAINER_HAS_INIT" == "false" ]] && echo "$_output" | grep -q "$_marker"; }; then
         log_warn "Piped script '$_desc' failed (exit=$_rc)."
         container_root_exec bash -c "rm -f /var/lib/pacman/db.lck; pkill -9 gpg-agent 2>/dev/null || true" 2>/dev/null || true
         ensure_container_healthy "$_desc" || return 1
@@ -998,9 +1010,9 @@ rm -f /etc/pacman.d/gnupg/S.dirmngr 2>/dev/null || true
 
 if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
 echo "Disabling systemd gpg-agent socket activation that interferes with keyring init..."
-systemctl stop 'gpg-agent@*.socket' 2>/dev/null || true
-systemctl stop 'gpg-agent@*.service' 2>/dev/null || true
-systemctl stop 'dirmngr@*.socket' 2>/dev/null || true
+ systemctl stop gpg-agent@*.socket 2>/dev/null || true
+ systemctl stop gpg-agent@*.service 2>/dev/null || true
+ systemctl stop dirmngr@*.socket 2>/dev/null || true
 fi
 
 export GNUPGHOME=/etc/pacman.d/gnupg
@@ -1178,11 +1190,17 @@ for pkg in $CRITICAL_PKGS; do
             if ! command -v pacman >/dev/null 2>&1; then
                 echo "FATAL: pacman broken after partial $pkg upgrade. This indicates shared library corruption."
                 echo "Attempting to recover by re-installing $pkg from cache..."
-                if ls /var/cache/pacman/pkg/${pkg}-*.pkg.tar.* >/dev/null 2>&1; then
-                    pacman -U --noconfirm /var/cache/pacman/pkg/${pkg}-*.pkg.tar.* 2>/dev/null || {
-                        echo "FATAL: Recovery failed. The container must be recreated."
-                        exit 2
-                    }
+ if ls /var/cache/pacman/pkg/${pkg}-*.pkg.tar.* >/dev/null 2>&1; then
+ latest_pkg=$(ls -t /var/cache/pacman/pkg/${pkg}-*.pkg.tar.* 2>/dev/null | head -1)
+ if [[ -n "$latest_pkg" ]]; then
+ pacman -U --noconfirm "$latest_pkg" 2>/dev/null || {
+ echo "FATAL: Recovery failed. The container must be recreated."
+ exit 2
+ }
+ else
+ echo "FATAL: No cached package for $pkg. The container must be recreated."
+ exit 2
+ fi
                 else
                     echo "FATAL: No cached package for $pkg. The container must be recreated."
                     exit 2
@@ -1653,12 +1671,18 @@ log_info "Verifying critical helper files in container..."
 
 local missing_items=()
 
-local systemd_run_check
-systemd_run_check=$(container_root_exec test -x /usr/local/sbin/systemd-run && echo "ok" || echo "missing" 2>/dev/null)
-if [[ "$systemd_run_check" != "ok" ]]; then
-log_warn "Fake systemd-run wrapper is MISSING from container."
-missing_items+=("systemd-run")
-fi
+ local systemd_run_check
+ systemd_run_check=$(container_root_exec test -x /usr/local/sbin/systemd-run && echo "ok" || echo "missing" 2>/dev/null)
+ local has_systemd
+ has_systemd=$(container_root_exec bash -c "command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1 && echo yes || echo no" 2>/dev/null)
+ if [[ "$systemd_run_check" != "ok" ]]; then
+ if [[ "$has_systemd" == "yes" ]]; then
+ log_debug "Fake systemd-run wrapper not present, but systemd is functional in container — not needed."
+ else
+ log_warn "Fake systemd-run wrapper is MISSING from container (and systemd is not functional)."
+ missing_items+=("systemd-run")
+ fi
+ fi
 
 local dbus_conf_check
 dbus_conf_check=$(container_root_exec test -f /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf && echo "ok" || echo "missing" 2>/dev/null)
@@ -2597,6 +2621,7 @@ set +e
 export HOME="/home/${current_user}"
 export PATH="/home/${current_user}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin"
 CONTAINER_NAME="${CONTAINER_NAME}"
+CONTAINER_MANAGER="${DISTROBOX_CONTAINER_MANAGER:-podman}"
 APP_DIR="\$HOME/.local/share/applications"
 STATE_DIR="\$HOME/.local/share/steamos-pamac/\$CONTAINER_NAME"
 LOG_FILE="\$STATE_DIR/uninstall-helper.log"
@@ -2627,7 +2652,7 @@ fi
 
 _log "=== steamos-pamac-uninstall invoked: \$* ==="
  _log "HOME=\$HOME PATH=\$PATH USER=\$(whoami 2>/dev/null || id -un)"
- _log "podman=\$(command -v podman 2>/dev/null || echo NOT_FOUND)"
+ _log "container manager=\$(command -v \"\$CONTAINER_MANAGER\" 2>/dev/null || echo NOT_FOUND)"
 
  show_help() {
     echo "Usage: steamos-pamac-uninstall [options]"
@@ -2648,16 +2673,16 @@ _log "=== steamos-pamac-uninstall invoked: \$* ==="
  echo "Uninstalling \$pkg from \$CONTAINER_NAME..."
  _log "Uninstalling \$pkg from \$CONTAINER_NAME..."
 
- if ! command -v podman >/dev/null 2>&1; then
- _log "Error: podman not found in PATH"
- echo "Error: podman not found in PATH" >&2
+ if ! command -v "\$CONTAINER_MANAGER" >/dev/null 2>&1; then
+ _log "Error: \$CONTAINER_MANAGER not found in PATH"
+ echo "Error: \$CONTAINER_MANAGER not found in PATH" >&2
  exit 1
  fi
 
-_log "Starting container if stopped..."
-podman start "\$CONTAINER_NAME" 2>/dev/null || true
+ _log "Starting container if stopped..."
+ "\$CONTAINER_MANAGER" start "\$CONTAINER_NAME" 2>/dev/null || true
 
-if ! podman inspect "\$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+ if ! "\$CONTAINER_MANAGER" inspect "\$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
 echo "Error: Container \$CONTAINER_NAME is not running and could not be started" >&2
 _log "Error: Container not running and could not be started"
 exit 1
@@ -2665,7 +2690,7 @@ fi
 
 _log "Removing \$pkg via pacman -Rns (as root, no D-Bus needed)..."
 local remove_output
-remove_output=\$(podman exec -u 0 "\$CONTAINER_NAME" bash -c "
+ remove_output=\$("\$CONTAINER_MANAGER" exec -u 0 "\$CONTAINER_NAME" bash -c "
 rm -f /var/lib/pacman/db.lck 2>/dev/null
 pacman -Rns --noconfirm \"\$pkg\" 2>&1
 " </dev/null 2>&1)

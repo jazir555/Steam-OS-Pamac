@@ -13,6 +13,24 @@ _log() {
 echo "$(date): $*" >> "$LOG_FILE"
 }
 
+_setup_display_env() {
+[[ -n "$DISPLAY" ]] || export DISPLAY=":0"
+[[ -n "$XDG_RUNTIME_DIR" ]] || export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+[[ -n "$DBUS_SESSION_BUS_ADDRESS" ]] || export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+
+if [[ -z "$WAYLAND_DISPLAY" ]]; then
+if [[ -e /run/user/$(id -u)/wayland-0 ]]; then
+export WAYLAND_DISPLAY="wayland-0"
+elif [[ -S /run/user/$(id -u)/wayland-0 ]]; then
+export WAYLAND_DISPLAY="wayland-0"
+fi
+fi
+
+if [[ -n "$XDG_RUNTIME_DIR" && ! -d "$XDG_RUNTIME_DIR" ]]; then
+mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null
+fi
+}
+
 _log "=== steamos-pamac-uninstall invoked: $* ==="
 _log "HOME=$HOME PATH=$PATH USER=$(whoami 2>/dev/null || id -un)"
 _log "podman=$(command -v podman 2>/dev/null || echo NOT_FOUND)"
@@ -57,7 +75,7 @@ _log "Removing $pkg via pacman -Rns (as root, no D-Bus needed)..."
 local remove_output
 remove_output=$(podman exec -u 0 "$CONTAINER_NAME" bash -c "
 rm -f /var/lib/pacman/db.lck 2>/dev/null
-pacman -Rns --noconfirm '$pkg' 2>&1
+pacman -Rns --noconfirm \"$pkg\" 2>&1
 " </dev/null 2>&1)
 local rc=$?
 _log "pacman -Rns exit code: $rc"
@@ -66,6 +84,11 @@ _log "pacman output: ${remove_output:0:500}"
 if [[ $rc -eq 0 ]]; then
 echo "Successfully uninstalled $pkg"
 _log "Successfully uninstalled $pkg"
+_setup_display_env
+update-desktop-database "$APP_DIR" 2>/dev/null || true
+kbuildsycoca6 2>/dev/null || true
+qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.refreshCurrentShell 2>/dev/null || true
+_log "Plasma menu refresh triggered"
 else
 echo "Failed to uninstall $pkg (exit code: $rc)" >&2
 _log "Failed to uninstall $pkg (exit code: $rc)"

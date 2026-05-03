@@ -2,6 +2,10 @@
 
 set -euo pipefail
 
+# Heredoc quoting convention:
+#   <<'EOF'  — no host variable expansion; content runs inside container
+#   <<EOF    — host variables expand at write-time; use \$ for literal $
+
 readonly SCRIPT_VERSION="5.2.0"
 readonly DEFAULT_CONTAINER_NAME="arch-pamac"
 readonly LOG_FILE="$HOME/distrobox-pamac-setup.log"
@@ -127,6 +131,7 @@ container_user_exec() {
 container_cp_from() {
     local src="$1" dst="$2"
     log_debug "Copying from container: $src -> $dst"
+    container_start 2>/dev/null || true
     if container_runtime cp "$CONTAINER_NAME:$src" "$dst" 2>/dev/null; then
         log_debug "Copied $src from container."
         return 0
@@ -222,25 +227,34 @@ ensure_container_healthy() {
 	return 1
 }
 
+_RECREATE_COUNT=0
+_MAX_RECREATES=2
+
 _ensure_healthy_or_recreate() {
-	local desc="${1:-container operation}"
-	local healthy_rc=0
-	ensure_container_healthy "$desc" || healthy_rc=$?
-	if [[ "$healthy_rc" -eq 0 ]]; then
-		return 0
-	elif [[ "$healthy_rc" -eq 2 ]]; then
-		log_info "Container signaled for recreation ($desc). Recreating..."
-		force_remove_container "$CONTAINER_NAME"
-		sleep 2
-		if ! create_container; then
-			log_error "Failed to recreate container after '$desc' recovery."
-			return 1
-		fi
-		log_success "Container recreated successfully after '$desc' issue."
-		return 0
-	else
-		return 1
-	fi
+    local desc="${1:-container operation}"
+    local healthy_rc=0
+    ensure_container_healthy "$desc" || healthy_rc=$?
+    if [[ "$healthy_rc" -eq 0 ]]; then
+        _RECREATE_COUNT=0
+        return 0
+    elif [[ "$healthy_rc" -eq 2 ]]; then
+        _RECREATE_COUNT=$((_RECREATE_COUNT + 1))
+        if [[ $_RECREATE_COUNT -gt $_MAX_RECREATES ]]; then
+            log_error "Container recreated $_MAX_RECREATES times without success. Aborting."
+            return 1
+        fi
+        log_info "Container signaled for recreation ($desc), attempt $_RECREATE_COUNT/$_MAX_RECREATES. Recreating..."
+        force_remove_container "$CONTAINER_NAME"
+        sleep 2
+        if ! create_container; then
+            log_error "Failed to recreate container after '$desc' recovery."
+            return 1
+        fi
+        log_success "Container recreated successfully after '$desc' issue."
+        return 0
+    else
+        return 1
+    fi
 }
 
 force_remove_container() {
@@ -465,34 +479,33 @@ repair_podman() {
         return 0
     fi
 
-	log_warn "Podman database may be corrupted. A full system reset is required but is DESTRUCTIVE."
-	log_warn "WARNING: 'podman system reset --force' will remove ALL containers, images, and volumes — not just the Pamac container. Any other distroboxes or podman workloads will be lost."
-	if [[ -t 0 ]]; then
-		echo -ne "${RED}${BOLD}Type 'yes' to proceed with podman system reset, or anything else to skip: ${NC}" >&2
-		local reset_confirm
-		read -r reset_confirm
-		if [[ "$reset_confirm" != "yes" ]]; then
-			log_warn "User declined podman system reset. Skipping to next recovery step."
-			log_info "You can run 'podman system reset --force' manually if needed."
-			goto_next_step=true
-		fi
-	else
-		log_warn "Non-interactive session — skipping automatic podman system reset to avoid data loss."
-		log_info "Run 'podman system reset --force' manually if you want to reset all podman data."
-		goto_next_step=true
-	fi
-	if [[ "${goto_next_step:-}" != "true" ]]; then
-		local reset_output
-		reset_output=$(podman system reset --force 2>&1) && rc=0 || rc=$?
-		log_debug "podman system reset: $reset_output"
-	fi
+    log_warn "Podman database may be corrupted. A full system reset is required but is DESTRUCTIVE."
+    log_warn "WARNING: 'podman system reset --force' will remove ALL containers, images, and volumes — not just the Pamac container. Any other distroboxes or podman workloads will be lost."
+    local skip_reset=false
+    if [[ -t 0 ]]; then
+        echo -ne "${RED}${BOLD}Type 'yes' to proceed with podman system reset, or anything else to skip: ${NC}" >&2
+        local reset_confirm
+        read -r reset_confirm
+        if [[ "$reset_confirm" != "yes" ]]; then
+            log_warn "User declined podman system reset. Skipping to next recovery step."
+            log_info "You can run 'podman system reset --force' manually if needed."
+            skip_reset=true
+        fi
+    else
+        log_warn "Non-interactive session — skipping automatic podman system reset to avoid data loss."
+        log_info "Run 'podman system reset --force' manually if you want to reset all podman data."
+        skip_reset=true
+    fi
+    if [[ "$skip_reset" != "true" ]]; then
+        local reset_output
+        reset_output=$(podman system reset --force 2>&1) && rc=0 || rc=$?
+        log_debug "podman system reset: $reset_output"
+    fi
 
-	if [[ "${goto_next_step:-}" != "true" ]] && podman info >/dev/null 2>&1; then
-		log_success "Podman recovered after system reset."
-		return 0
-	fi
-
-	goto_next_step=false
+    if [[ "$skip_reset" != "true" ]] && podman info >/dev/null 2>&1; then
+        log_success "Podman recovered after system reset."
+        return 0
+    fi
 
     log_info "Attempting to migrate podman storage..."
     podman system migrate 2>/dev/null || true
@@ -881,10 +894,8 @@ create_container() {
     fi
   fi
 
-  log_info "Starting container..."
-  set +e
-  container_start
-  set -e
+    log_info "Starting container..."
+    container_start 2>/dev/null || true
 
   local wait_result=0
   wait_for_container || wait_result=$?
@@ -950,7 +961,7 @@ exec_container_script() {
     _script_file=$(mktemp /tmp/pamac-script-XXXXXXXX)
     printf '%s\n' "${_preamble}${_script}" > "$_script_file"
 
-  local _marker="PAMAC_SCRIPT_OK_$$_$(date +%s)"
+    local _marker="PAMAC_SCRIPT_OK_$(head -c 16 /dev/urandom 2>/dev/null | xxd -p 2>/dev/null || echo "$$_$(date +%s%N)")"
   printf '\necho "%s"\n' "$_marker" >> "$_script_file"
 
   set +e
@@ -998,7 +1009,7 @@ exec_container_pipe() {
     shift
     local _rc=0
     local _script_file
-    local _marker="PAMAC_PIPE_OK_$$_$(date +%s)"
+    local _marker="PAMAC_PIPE_OK_$(head -c 16 /dev/urandom 2>/dev/null | xxd -p 2>/dev/null || echo "$$_$(date +%s%N)")"
     local _preamble='_safe_sleep() { if ! sleep "$1" 2>/dev/null; then read -t "$1" -r _ 2>/dev/null || true; fi; }
 '
 
@@ -1143,6 +1154,12 @@ if pacman -Syy --noconfirm 2>/dev/null; then
         echo "Warning: archlinux-keyring update failed, retrying..."
         pacman -S --noconfirm --needed archlinux-keyring 2>/dev/null || echo "Warning: keyring update failed"
     }
+    if pacman-key --verify /usr/share/keyrings/archlinux-packer.gpg 2>/dev/null || pacman-key --list-sigs 2>/dev/null | grep -q "archlinux"; then
+        if grep -q '^SigLevel.*Never' /etc/pacman.conf 2>/dev/null; then
+            echo "Restoring SigLevel to Required DatabaseOptional after successful keyring update."
+            sed -i 's/^SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf
+        fi
+    fi
 else
     echo "Warning: database sync failed, skipping keyring update."
 fi
@@ -2471,6 +2488,8 @@ fi
 export_pamac_to_host() {
     log_step "Exporting Pamac to host system"
 
+    local current_user="$CURRENT_USER"
+    local desktop_dir="$HOME/.local/share/applications"
     local icon_svg_dir="$HOME/.local/share/icons/hicolor/scalable/apps"
     local icon_png48_dir="$HOME/.local/share/icons/hicolor/48x48/apps"
     mkdir -p "$icon_svg_dir" "$icon_png48_dir"
@@ -2551,7 +2570,6 @@ export_pamac_to_host() {
         distrobox_export_ok=true
     fi
 
-    local desktop_dir="$HOME/.local/share/applications"
     mkdir -p "$desktop_dir"
     local exported_desktop=""
 
@@ -2601,13 +2619,12 @@ DESKTOP_EOF
         log_success "Created manual desktop entry: $exported_desktop"
     fi
 
-    if [[ -n "$exported_desktop" && -f "$exported_desktop" ]]; then
-        rm -f "$exported_desktop"
+    if [[ -z "$exported_desktop" ]]; then
+        exported_desktop="$desktop_dir/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
     fi
 
-log_info "Writing clean pamac-manager desktop entry with proper integration markers..."
-exported_desktop="$desktop_dir/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
-cat > "$exported_desktop" << DESKTOP_EOF
+    log_info "Writing clean pamac-manager desktop entry with proper integration markers..."
+    cat > "$exported_desktop" << DESKTOP_EOF
 [Desktop Entry]
 Type=Application
 Name=Add/Remove Software (on ${CONTAINER_NAME})
@@ -2970,7 +2987,7 @@ APPSTREAM_EOF
 chmod +x "$appstream_handler"
 log_info "Created appstream handler: $appstream_handler"
 
-local appstream_handler_desktop="$APP_DIR/steamos-pamac-appstream-handler.desktop"
+    local appstream_handler_desktop="$desktop_dir/steamos-pamac-appstream-handler.desktop"
 cat > "$appstream_handler_desktop" << HANDLER_DESKTOP_EOF
 [Desktop Entry]
 Type=Application
@@ -3077,14 +3094,15 @@ _fix_desktop_permissions() {
 }
 
 annotate_desktop() {
-  local desktop_file="\$1"
-  local app_name="\$2"
-  local export_name="\$3"
-  local owner_pkg="\$4"
+    local desktop_file="\$1"
+    local app_name="\$2"
+    local export_name="\$3"
+    local owner_pkg="\$4"
 
-  [[ -f "\$desktop_file" ]] || return 1
+    [[ -f "\$desktop_file" ]] || return 1
 
-  _fix_desktop_permissions "\$desktop_file"
+    _fix_desktop_permissions "\$desktop_file"
+    cp -f "\$desktop_file" "\$desktop_file.bak" 2>/dev/null || true
 
   if [[ "\$app_name" == "org.manjaro.pamac.manager" ]]; then
     cat > "\$desktop_file" << PAMAC_DESKTOP
@@ -3506,20 +3524,19 @@ main() {
           create_container || exit 1
         fi
         ;;
-      "stopping"|"paused"|"dead"|"exited"|"stopped"|"improper")
-        if [[ "$CONTAINER_HAS_INIT" == "false" ]] && [[ "$existing_status" == "exited" || "$existing_status" == "stopped" ]]; then
-          log_info "Container in '$existing_status' state (normal for non-init). Starting..."
-          container_start 2>/dev/null || true
-          sleep 3
-          if container_is_usable; then
-            log_success "Using existing container (restarted): $CONTAINER_NAME"
-            continue_to_setup=true
-          else
-            log_warn "Container not usable after restart, recreating..."
-            force_remove_container "$CONTAINER_NAME"
-            sleep 2
-            create_container || exit 1
-          fi
+        "stopping"|"paused"|"dead"|"exited"|"stopped"|"improper")
+            if [[ "$CONTAINER_HAS_INIT" == "false" ]] && [[ "$existing_status" == "exited" || "$existing_status" == "stopped" ]]; then
+                log_info "Container in '$existing_status' state (normal for non-init). Starting..."
+                container_start 2>/dev/null || true
+                sleep 3
+                if container_is_usable; then
+                    log_success "Using existing container (restarted): $CONTAINER_NAME"
+                else
+                    log_warn "Container not usable after restart, recreating..."
+                    force_remove_container "$CONTAINER_NAME"
+                    sleep 2
+                    create_container || exit 1
+                fi
         else
           log_warn "Container in '$existing_status' state - removing and recreating"
           force_remove_container "$CONTAINER_NAME"

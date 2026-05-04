@@ -2589,12 +2589,12 @@ export_pamac_to_host() {
     fi
 
     if [[ -z "$exported_desktop" ]]; then
-        log_warn "distrobox-export did not produce a desktop file. Creating manually..."
-        exported_desktop="$desktop_dir/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
-        cat > "$exported_desktop" << DESKTOP_EOF
+log_warn "distrobox-export did not produce a desktop file. Creating manually..."
+    exported_desktop="$desktop_dir/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
+    cat > "$exported_desktop" << DESKTOP_EOF
 [Desktop Entry]
-Name=Add/Remove Software (on ${CONTAINER_NAME})
-Comment=Manage packages inside the ${CONTAINER_NAME} distrobox
+Name=Pamac
+Comment=Add/Remove Software
 Exec=distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper %U
 Icon=system-software-install
 Terminal=false
@@ -2627,8 +2627,8 @@ DESKTOP_EOF
     cat > "$exported_desktop" << DESKTOP_EOF
 [Desktop Entry]
 Type=Application
-Name=Add/Remove Software (on ${CONTAINER_NAME})
-Comment=Manage packages inside the ${CONTAINER_NAME} distrobox
+Name=Pamac
+Comment=Add/Remove Software
 Exec=distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper %U
 Icon=system-software-install
 Terminal=false
@@ -3008,6 +3008,49 @@ rm -f "$HOME/.local/share/plasma/kickeractions/steamos-pamac-uninstall.desktop" 
     if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
         log_info "Add '$bin_dir' to your PATH to use the CLI wrapper directly."
     fi
+
+    _fix_xdg_data_dirs() {
+        local current_xdg
+        current_xdg=$(systemctl --user show-environment 2>/dev/null | grep '^XDG_DATA_DIRS=' | cut -d= -f2 || echo "")
+        if [[ -n "$current_xdg" && ":$current_xdg:" == *":$HOME/.local/share:"* ]]; then
+            log_info "XDG_DATA_DIRS already includes ~/.local/share - no fix needed"
+            return 0
+        fi
+
+        log_info "SteamOS does not include ~/.local/share in XDG_DATA_DIRS for plasmashell."
+        log_info "Installing systemd drop-in to fix KDE menu visibility..."
+
+        local new_xdg="$HOME/.local/share"
+        local IFS=':'
+        for p in $current_xdg; do
+            [[ -n "$p" ]] && new_xdg="$new_xdg:$p"
+        done
+
+        mkdir -p "$HOME/.config/systemd/user/plasma-plasmashell.service.d"
+        cat > "$HOME/.config/systemd/user/plasma-plasmashell.service.d/override-xdg-data-dirs.conf" << XDGOVERRIDE
+[Service]
+Environment=XDG_DATA_DIRS=${new_xdg}
+XDGOVERRIDE
+
+        mkdir -p "$HOME/.config/environment.d"
+        cat > "$HOME/.config/environment.d/30-xdg-data-dirs.conf" << XDGCONF
+XDG_DATA_DIRS=${new_xdg}
+XDGCONF
+
+        systemctl --user daemon-reload 2>/dev/null || true
+        export XDG_DATA_DIRS="$new_xdg"
+        systemctl --user import-environment XDG_DATA_DIRS 2>/dev/null || true
+
+        log_success "XDG_DATA_DIRS fix installed. Desktop apps in ~/.local/share will appear in KDE menu."
+        log_info "Note: If Pamac doesn't appear in the menu immediately, log out and back in."
+
+        if command -v kbuildsycoca6 >/dev/null 2>&1; then
+            XDG_DATA_DIRS="$new_xdg" kbuildsycoca6 --noincremental 2>/dev/null || true
+            log_info "KDE service cache rebuilt with corrected XDG_DATA_DIRS"
+        fi
+    }
+
+    _fix_xdg_data_dirs
 }
 
 setup_post_install_hooks() {
@@ -3104,12 +3147,12 @@ annotate_desktop() {
     _fix_desktop_permissions "\$desktop_file"
     cp -f "\$desktop_file" "\$desktop_file.bak" 2>/dev/null || true
 
-  if [[ "\$app_name" == "org.manjaro.pamac.manager" ]]; then
-    cat > "\$desktop_file" << PAMAC_DESKTOP
+if [[ "\$app_name" == "org.manjaro.pamac.manager" ]]; then
+            cat > "\$desktop_file" << PAMAC_DESKTOP
 [Desktop Entry]
 Type=Application
-Name=Add/Remove Software (on ${container_name})
-Comment=Manage packages inside the ${container_name} distrobox
+Name=Pamac
+Comment=Add/Remove Software
 Exec=distrobox enter ${container_name} -- pamac-manager-wrapper %U
 Icon=system-software-install
 Terminal=false

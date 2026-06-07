@@ -2752,7 +2752,7 @@ log_warn "distrobox-export did not produce a desktop file. Creating manually..."
 [Desktop Entry]
 Name=Pamac
 Comment=Add/Remove Software
-Exec=distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper %U
+Exec=${HOME}/.local/bin/pamac-manager-wrapper-host %U
 Icon=system-software-install
 Terminal=false
 Type=Application
@@ -2786,7 +2786,7 @@ DESKTOP_EOF
 Type=Application
 Name=Pamac
 Comment=Add/Remove Software
-Exec=distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper %U
+Exec=${HOME}/.local/bin/pamac-manager-wrapper-host %U
 Icon=system-software-install
 Terminal=false
 Categories=System;PackageManager;Settings;
@@ -2833,6 +2833,52 @@ exec distrobox enter "${CONTAINER_NAME}" -- pamac-cli-wrapper "\$@"
 WRAPPER_EOF
 chmod +x "$cli_wrapper"
 log_info "Created CLI wrapper: $cli_wrapper"
+
+local gui_wrapper="$bin_dir/pamac-manager-wrapper-host"
+cat > "$gui_wrapper" << GUI_WRAPPER_EOF
+#!/bin/bash
+export HOME=/home/deck
+export DISPLAY=\${DISPLAY:-:0}
+
+# Dynamically find the XAUTHORITY for the current desktop session
+if [[ -n "\${XAUTH:-}" && -f "\$XAUTH" ]]; then
+  export XAUTHORITY="\$XAUTH"
+elif [[ -f "\$HOME/.Xauthority" ]]; then
+  export XAUTHORITY="\$HOME/.Xauthority"
+else
+  newest_xauth=\$(ls -t /run/user/\$(id -u)/xauth_* 2>/dev/null | head -1)
+  if [[ -n "\$newest_xauth" && -f "\$newest_xauth" ]]; then
+    export XAUTHORITY="\$newest_xauth"
+  fi
+fi
+
+DESKTOP_FILE="\$HOME/.local/share/applications/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
+
+distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper "\$@" &
+LAUNCHER_PID=\$!
+
+sleep 1
+
+WINDOW_IDS=\$(XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xdotool search --class "pamac-manager" 2>/dev/null)
+
+for wid in \$WINDOW_IDS; do
+  width=\$(XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xwininfo -id "\$wid" 2>/dev/null | awk -F': ' '/Width:/{print \$2}')
+  if [ "\$width" = "1" ]; then
+    XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xprop -id "\$wid" \
+      -f _NET_WM_STATE 32a \
+      -set _NET_WM_STATE _NET_WM_STATE_SKIP_TASKBAR 2>/dev/null
+  fi
+  if [ "\$width" != "1" ]; then
+    XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xprop -id "\$wid" \
+      -f _KDE_NET_WM_DESKTOP_FILE 8u \
+      -set _KDE_NET_WM_DESKTOP_FILE "\$DESKTOP_FILE" 2>/dev/null
+  fi
+done
+
+wait "\$LAUNCHER_PID" 2>/dev/null
+GUI_WRAPPER_EOF
+chmod +x "$gui_wrapper"
+log_info "Created GUI wrapper: $gui_wrapper"
 
 local uninstall_helper="$bin_dir/steamos-pamac-uninstall"
 cat > "$uninstall_helper" << UNINSTALL_EOF
@@ -3310,7 +3356,7 @@ if [[ "\$app_name" == "org.manjaro.pamac.manager" ]]; then
 Type=Application
 Name=Pamac
 Comment=Add/Remove Software
-Exec=distrobox enter ${container_name} -- pamac-manager-wrapper %U
+Exec=\${HOME}/.local/bin/pamac-manager-wrapper-host %U
 Icon=system-software-install
 Terminal=false
 Categories=System;PackageManager;Settings;

@@ -19,6 +19,7 @@ CURRENT_USER=$(whoami)
 ENABLE_MULTILIB="${ENABLE_MULTILIB:-true}"
 ENABLE_BUILD_CACHE="${ENABLE_BUILD_CACHE:-true}"
 ENABLE_GAMING_PACKAGES="${ENABLE_GAMING_PACKAGES:-false}"
+ENABLE_EXTRA_REPOS="${ENABLE_EXTRA_REPOS:-true}"
 FORCE_REBUILD="${FORCE_REBUILD:-false}"
 OPTIMIZE_MIRRORS="${OPTIMIZE_MIRRORS:-true}"
 
@@ -54,7 +55,7 @@ initialize_logging() {
         echo "User: $CURRENT_USER"
         echo "OS: $os_version"
         echo "Container: $CONTAINER_NAME"
-        echo "Features: MULTILIB=$ENABLE_MULTILIB GAMING=$ENABLE_GAMING_PACKAGES BUILD_CACHE=$ENABLE_BUILD_CACHE OPTIMIZE_MIRRORS=$OPTIMIZE_MIRRORS"
+        echo "Features: MULTILIB=$ENABLE_MULTILIB GAMING=$ENABLE_GAMING_PACKAGES EXTRA_REPOS=$ENABLE_EXTRA_REPOS BUILD_CACHE=$ENABLE_BUILD_CACHE OPTIMIZE_MIRRORS=$OPTIMIZE_MIRRORS"
         echo "=========================================="
     } > "$LOG_FILE"
 
@@ -574,8 +575,10 @@ OPTIONS:
   --force-rebuild           Rebuild existing container if it exists
   --enable-multilib         Enable 32-bit package support (default)
   --disable-multilib        Explicitly disable 32-bit package support
-  --enable-gaming           Install extra gaming packages
-  --disable-gaming          Do not install gaming packages (default)
+--enable-gaming Install extra gaming packages
+    --disable-gaming Do not install gaming packages (default)
+    --enable-extra-repos Enable popular third-party repositories (default)
+    --disable-extra-repos Do not add third-party repositories
   --enable-build-cache      Enable persistent build cache for yay (default)
   --disable-build-cache     Disable persistent build cache for yay
   --optimize-mirrors        Select fastest Pacman mirrors (default)
@@ -608,8 +611,10 @@ parse_arguments() {
             --force-rebuild) FORCE_REBUILD="true"; shift ;;
             --enable-multilib) ENABLE_MULTILIB="true"; shift ;;
             --disable-multilib) ENABLE_MULTILIB="false"; shift ;;
-            --enable-gaming) ENABLE_GAMING_PACKAGES="true"; shift ;;
-            --disable-gaming) ENABLE_GAMING_PACKAGES="false"; shift ;;
+--enable-gaming) ENABLE_GAMING_PACKAGES="true"; shift ;;
+        --disable-gaming) ENABLE_GAMING_PACKAGES="false"; shift ;;
+        --enable-extra-repos) ENABLE_EXTRA_REPOS="true"; shift ;;
+        --disable-extra-repos) ENABLE_EXTRA_REPOS="false"; shift ;;
             --enable-build-cache) ENABLE_BUILD_CACHE="true"; shift ;;
             --disable-build-cache) ENABLE_BUILD_CACHE="false"; shift ;;
             --optimize-mirrors) OPTIMIZE_MIRRORS="true"; shift ;;
@@ -2040,6 +2045,158 @@ EOF
     fi
 }
 
+configure_extra_repos() {
+    if [[ "$ENABLE_EXTRA_REPOS" != "true" ]]; then
+        log_info "Skipping third-party repositories (use --enable-extra-repos to add them)."
+        return
+    fi
+
+    log_step "Configuring third-party repositories for broader package availability"
+
+    local repos_script
+    read -r -d '' repos_script <<'REPOS_EOF' || true
+set -uo pipefail
+
+rm -f /var/lib/pacman/db.lck
+
+_repo_already_enabled() {
+    grep -q "^\[$1\]" /etc/pacman.conf
+}
+
+echo "=== Configuring Chaotic-AUR repository ==="
+if ! _repo_already_enabled "chaotic-aur"; then
+    pacman -Sy --noconfirm 2>/dev/null || true
+    echo "Installing chaotic-keyring..."
+    if pacman -S --noconfirm --needed chaotic-keyring 2>/dev/null; then
+        echo "Chaotic keyring installed successfully."
+    else
+        echo "Chaotic keyring not in default repos. Installing from mirror..."
+        if command -v curl >/dev/null 2>&1; then
+            keyring_tmp="$(mktemp -d)"
+            if curl -sL "https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst" -o "$keyring_tmp/chaotic-keyring.pkg.tar.zst" 2>/dev/null && \
+               [[ -s "$keyring_tmp/chaotic-keyring.pkg.tar.zst" ]]; then
+                pacman -U --noconfirm "$keyring_tmp/chaotic-keyring.pkg.tar.zst" 2>/dev/null || echo "Warning: Chaotic keyring install from mirror failed."
+            else
+                echo "Warning: Could not download chaotic-keyring."
+            fi
+            rm -rf "$keyring_tmp"
+        else
+            echo "Warning: curl not available to download chaotic-keyring."
+        fi
+    fi
+    echo "Adding repository [chaotic-aur]..."
+    printf '\n[chaotic-aur]\nSigLevel = TrustedOnly\nInclude = /etc/pacman.d/chaotic-mirrorlist\n' >> /etc/pacman.conf
+    mkdir -p /etc/pacman.d
+    if ! [[ -f /etc/pacman.d/chaotic-mirrorlist ]] || ! grep -q '^Server' /etc/pacman.d/chaotic-mirrorlist 2>/dev/null; then
+        if command -v curl >/dev/null 2>&1 && \
+           curl -sL "https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist" -o /etc/pacman.d/chaotic-mirrorlist 2>/dev/null && \
+           [[ -s /etc/pacman.d/chaotic-mirrorlist ]] && \
+           ! grep -q '<html\|^<!DOCTYPE' /etc/pacman.d/chaotic-mirrorlist 2>/dev/null; then
+            : # mirrorlist downloaded successfully
+        else
+            printf '%s\n' \
+                '## Chaotic-AUR mirrorlist' \
+                'Server = https://cdn-mirror.chaotic.cx/chaotic-aur/$arch' \
+                'Server = https://geo-mirror.chaotic.cx/chaotic-aur/$arch' \
+                > /etc/pacman.d/chaotic-mirrorlist
+            echo "Warning: Using built-in chaotic-mirrorlist."
+        fi
+    fi
+    if command -v pacman-key >/dev/null 2>&1; then
+        pacman-key --recv-key 30565AC3868033CA 2>/dev/null || true
+        pacman-key --lsign-key 30565AC3868033CA 2>/dev/null || true
+    fi
+else
+    echo "Chaotic-AUR already enabled."
+fi
+
+echo "=== Configuring archlinuxcn repository ==="
+if ! _repo_already_enabled "archlinuxcn"; then
+    echo "Adding repository [archlinuxcn]..."
+    printf '\n[archlinuxcn]\nSigLevel = TrustedOnly\nServer = https://repo.archlinuxcn.org/$arch\n' >> /etc/pacman.conf
+    pacman -Sy --noconfirm 2>/dev/null || true
+    if pacman -S --noconfirm --needed archlinuxcn-keyring 2>/dev/null; then
+        echo "archlinuxcn-keyring installed."
+    else
+        echo "Warning: archlinuxcn-keyring install failed. Trying alternate method..."
+        if command -v pacman-key >/dev/null 2>&1; then
+            pacman-key --recv-key 11C2E2D1D43CF75C 2>/dev/null || true
+            pacman-key --lsign-key 11C2E2D1D43CF75C 2>/dev/null || true
+        fi
+    fi
+else
+    echo "archlinuxcn already enabled."
+fi
+
+echo "=== Configuring endeavouros repository ==="
+if ! _repo_already_enabled "endeavouros"; then
+    echo "Adding repository [endeavouros]..."
+    printf '\n[endeavouros]\nSigLevel = TrustedOnly\nServer = https://mirror.freedif.org/EndeavourOS/repo/$repo/$arch\n' >> /etc/pacman.conf
+    pacman -Sy --noconfirm 2>/dev/null || true
+    if pacman -S --noconfirm --needed endeavouros-keyring 2>/dev/null; then
+        echo "endeavouros keyring installed."
+    else
+        echo "Warning: endeavouros keyring install failed. Trying alternate method..."
+        if command -v pacman-key >/dev/null 2>&1; then
+            pacman-key --recv-key F52611D11AFD4556 2>/dev/null || true
+            pacman-key --lsign-key F52611D11AFD4556 2>/dev/null || true
+        fi
+    fi
+else
+    echo "endeavouros already enabled."
+fi
+
+echo "=== Configuring blackarch repository ==="
+if ! _repo_already_enabled "blackarch"; then
+    echo "Adding repository [blackarch]..."
+    printf '\n[blackarch]\nSigLevel = TrustedOnly\nServer = https://blackarch.org/blackarch/$repo/os/$arch\n' >> /etc/pacman.conf
+    pacman -Sy --noconfirm 2>/dev/null || true
+    echo "Installing blackarch-keyring..."
+    if pacman -S --noconfirm --needed blackarch-keyring 2>/dev/null; then
+        echo "blackarch keyring installed."
+        if command -v pacman-key >/dev/null 2>&1; then
+            pacman-key --lsign-key 4345771566D76038C2C3A6AB9E8275C9E4D56107 2>/dev/null || true
+        fi
+    else
+        echo "Warning: blackarch-keyring install failed. Trying alternate method..."
+        if command -v curl >/dev/null 2>&1; then
+            strap_tmp="$(mktemp -d)"
+            if curl -sL "https://blackarch.org/strap.sh" -o "$strap_tmp/strap.sh" 2>/dev/null && \
+               [[ -s "$strap_tmp/strap.sh" ]]; then
+                chmod +x "$strap_tmp/strap.sh"
+                "$strap_tmp/strap.sh" 2>/dev/null || echo "Warning: blackarch strap.sh failed."
+            fi
+            rm -rf "$strap_tmp"
+        fi
+    fi
+else
+    echo "blackarch already enabled."
+fi
+
+echo "=== Configuring mesa-git repository (disabled by default - can break GPU drivers) ==="
+if ! _repo_already_enabled "mesa-git"; then
+    echo "Skipping mesa-git repo (can break GPU drivers on Steam Deck)."
+    echo "To enable manually, add to /etc/pacman.conf inside the container:"
+    echo '  [mesa-git]'
+    echo '  SigLevel = TrustAll'
+    echo '  Server = https://cdn-mirror.chaotic.cx/chaotic-aur/mesa-git/$arch'
+else
+    echo "mesa-git already enabled."
+fi
+
+echo "=== Syncing package databases with new repositories ==="
+pacman -Sy --noconfirm 2>/dev/null || echo "Warning: database sync with new repos had issues."
+
+echo "Third-party repository configuration complete."
+echo "Available additional repos: chaotic-aur, archlinuxcn, endeavouros, blackarch"
+REPOS_EOF
+
+    if ! exec_container_script "$repos_script" "extra-repos"; then
+        log_warn "Third-party repository setup had issues. Some repos may not be available."
+        log_info "You can manually add repos later inside the container via /etc/pacman.conf"
+    fi
+}
+
 install_aur_helper() {
     log_step "Installing AUR helper (yay)"
 
@@ -3463,9 +3620,10 @@ show_completion_message() {
     echo "  Pamac GUI package manager installed and configured"
     echo "  AUR helper 'yay' available for command-line package management"
     [[ "$OPTIMIZE_MIRRORS" == "true" ]] && echo "  Pacman mirrors optimized for performance"
-    [[ "$ENABLE_MULTILIB" == "true" ]] && echo "  32-bit package support enabled"
-    [[ "$ENABLE_GAMING_PACKAGES" == "true" ]] && echo "  Gaming packages installed"
-    [[ "$ENABLE_BUILD_CACHE" == "true" ]] && echo "  Persistent build cache enabled"
+[[ "$ENABLE_MULTILIB" == "true" ]] && echo " 32-bit package support enabled"
+    [[ "$ENABLE_GAMING_PACKAGES" == "true" ]] && echo " Gaming packages installed"
+    [[ "$ENABLE_EXTRA_REPOS" == "true" ]] && echo " Third-party repos enabled: chaotic-aur, archlinuxcn, endeavouros, blackarch"
+    [[ "$ENABLE_BUILD_CACHE" == "true" ]] && echo " Persistent build cache enabled"
     echo
     echo -e "${BOLD}${GREEN}--- How to Use ---${NC}"
     echo "  Find 'Pamac Manager' in your application menu"
@@ -3620,9 +3778,12 @@ main() {
 	optimize_pacman_mirrors
 
 	_ensure_healthy_or_recreate "before multilib setup" || exit 1
-	configure_multilib
+configure_multilib
 
-	_ensure_healthy_or_recreate "after base setup" || exit 1
+    _ensure_healthy_or_recreate "before extra repos setup" || exit 1
+    configure_extra_repos
+
+    _ensure_healthy_or_recreate "after base setup" || exit 1
 
 	check_memory_ok 524288 "AUR helper build" || log_warn "Low memory may cause OOM kills during yay compilation."
 

@@ -73,7 +73,7 @@
 
 ```bash
 # Installation - Run once:
-./setup-pamac.sh
+./SteamOS-Pamac-Installer.sh
 
 # Daily usage - Just like any native app:
 # 1. Open Steam menu

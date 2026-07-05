@@ -2948,6 +2948,33 @@ set -uo pipefail
 
 rm -f /var/lib/pacman/db.lck
 
+# Crash recovery: detect leftover TrustAll from previous interrupted run
+_EXTRA_REPOS_SENTINEL="/etc/pacman.conf.extrarepos-pending"
+_EXTRA_REPOS_BACKUP="/etc/pacman.conf.extrarepos-backup"
+if [[ -f "$_EXTRA_REPOS_SENTINEL" ]]; then
+    if [[ -f "$_EXTRA_REPOS_BACKUP" ]]; then
+        echo "CRASH RECOVERY: Restoring pacman.conf from backup (TrustAll was in progress)."
+        cp -f "$_EXTRA_REPOS_BACKUP" /etc/pacman.conf
+    else
+        echo "CRASH RECOVERY: TrustAll sentinel found with no backup. Setting safe SigLevel."
+        sed -i 's/^SigLevel\s*=\s*TrustAll/SigLevel = Required DatabaseOptional/' /etc/pacman.conf 2>/dev/null || true
+    fi
+    rm -f "$_EXTRA_REPOS_SENTINEL" "$_EXTRA_REPOS_BACKUP" 2>/dev/null || true
+fi
+
+# Crash-safe rollback for TrustAll fallback
+_rollback_extra_repos() {
+    local exit_code=$?
+    if [[ -f "$_EXTRA_REPOS_BACKUP" ]]; then
+        if grep -q 'SigLevel\s*=\s*TrustAll' /etc/pacman.conf 2>/dev/null; then
+            echo "CRASH RECOVERY: Restoring pacman.conf from backup (exit code $exit_code)..."
+            cp -f "$_EXTRA_REPOS_BACKUP" /etc/pacman.conf
+        fi
+        rm -f "$_EXTRA_REPOS_BACKUP" "$_EXTRA_REPOS_SENTINEL" 2>/dev/null || true
+    fi
+}
+trap _rollback_extra_repos EXIT
+
 _repo_already_enabled() {
     grep -q "^\[$1\]" /etc/pacman.conf
 }
@@ -2966,7 +2993,14 @@ _import_key_with_retry() {
         local attempt=1
         while [[ $attempt -le $max_attempts ]]; do
             if timeout 30 pacman-key --recv-key --keyserver "$server" "$key_id" 2>/dev/null; then
-                timeout 30 pacman-key --lsign-key "$key_id" 2>/dev/null && return 0
+                local _verify_fp
+                _verify_fp=$(GNUPGHOME=/etc/pacman.d/gnupg gpg --with-colons --list-keys "$key_id" 2>/dev/null \
+                    | grep '^fpr' | head -1 | cut -d: -f10 || echo "")
+                if [[ -n "$_verify_fp" ]] && [[ "$_verify_fp" == *"$key_id" ]]; then
+                    timeout 30 pacman-key --lsign-key "$key_id" 2>/dev/null && return 0
+                else
+                    echo "Fingerprint verification failed for key $key_id (got $_verify_fp). Refusing to sign."
+                fi
             fi
             echo "Key import attempt $attempt/$max_attempts failed for $key_id from $server."
             attempt=$((attempt + 1))
@@ -3057,11 +3091,11 @@ _enable_repo_with_fallback() {
                     if file "$_tmp_key" 2>/dev/null | grep -qi "GPG\|PGP"; then
                         echo "  Found GPG key at $key_url"
                         if timeout 30 pacman-key --import "$_tmp_key" 2>/dev/null; then
-                            # Extract fingerprint and locally sign it
+                            # Extract fingerprint and verify it was actually imported into keyring
                             local _imported_fp
-                            _imported_fp=$(gpg --with-colons --show-keys "$_tmp_key" 2>/dev/null \
+                            _imported_fp=$(GNUPGHOME=/etc/pacman.d/gnupg gpg --with-colons --show-keys "$_tmp_key" 2>/dev/null \
                                 | grep '^fpr' | head -1 | cut -d: -f10 || echo "")
-                            if [[ -n "$_imported_fp" ]]; then
+                            if [[ -n "$_imported_fp" ]] && GNUPGHOME=/etc/pacman.d/gnupg gpg --list-keys "$_imported_fp" >/dev/null 2>&1; then
                                 timeout 30 pacman-key --lsign-key "$_imported_fp" 2>/dev/null || true
                                 echo "  Dynamically discovered key: ${_imported_fp: -8} (last 8 chars)"
                             fi
@@ -3098,6 +3132,14 @@ _enable_repo_with_fallback() {
         echo "This allows the repo to function but skips signature verification."
         echo "Consider manually importing the correct signing key later, or set"
         echo "  ${env_var_name}=<KEY_ID>  before running this script."
+        # Crash-safe: back up pacman.conf before weakening security.
+        # If the script is killed here, the trap restores from backup.
+        if [[ ! -f "$_EXTRA_REPOS_BACKUP" ]]; then
+            cp -f /etc/pacman.conf "$_EXTRA_REPOS_BACKUP"
+            sync 2>/dev/null || true
+            touch "$_EXTRA_REPOS_SENTINEL"
+            sync 2>/dev/null || true
+        fi
         printf '\n[%s]\nSigLevel = TrustAll\n%b' "$repo_name" "$server_lines" >> /etc/pacman.conf
     fi
 
@@ -3144,6 +3186,9 @@ pacman -Sy --noconfirm 2>/dev/null || echo "Warning: database sync with new repo
 
 echo "Third-party repository configuration complete."
 echo "Available additional repos: chaotic-aur, archlinuxcn, endeavouros"
+
+# Clean up crash recovery files on successful completion
+rm -f "$_EXTRA_REPOS_BACKUP" "$_EXTRA_REPOS_SENTINEL" 2>/dev/null || true
 REPOS_EOF
 
     if ! exec_container_script "$repos_script" "extra-repos"; then

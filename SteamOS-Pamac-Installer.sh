@@ -320,7 +320,14 @@ _ensure_healthy_or_recreate() {
         fi
         _RECREATE_COUNT=$((_RECREATE_COUNT + 1))
         log_info "Container signaled for recreation ($desc), attempt $_RECREATE_COUNT/$_MAX_RECREATES. Recreating..."
-        force_remove_container "$CONTAINER_NAME"
+        if ! force_remove_container "$CONTAINER_NAME"; then
+            log_warn "force_remove_container returned non-zero. Container may still exist."
+            if container_runtime_privileged inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+                log_error "Container '$CONTAINER_NAME' still exists after force removal. Cannot recreate."
+                _RECREATE_COUNT=0
+                return 1
+            fi
+        fi
         sleep 2
         local saved_guard="${_CREATE_RECREATION_GUARD:-}"
         unset _CREATE_RECREATION_GUARD
@@ -435,7 +442,12 @@ force_remove_container() {
 		if container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
 			log_error "Container '$name' still exists after system reset. Manual intervention required."
 			log_info "Try: sudo podman rm -f '$name' or reboot the system."
+			return 1
 		fi
+  fi
+
+  if container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
+    return 1
   fi
 }
 
@@ -1321,17 +1333,7 @@ fi
 ' 2>/dev/null || true
 }
 
-exec_container_script() {
-    local _script="$1"
-    local _desc="$2"
-    shift 2
-    if [[ -z "$_script" ]]; then
-        log_error "Internal error: container script '$_desc' is empty (heredoc delimiter may be missing/misfound). Aborting stage."
-        return 1
-    fi
-    local _rc=0
-    local _script_file
-    local _preamble='_safe_sleep() { if ! sleep "$1" 2>/dev/null; then read -t "$1" -r _ </dev/null 2>/dev/null || true; fi; }
+_CONTAINER_PREAMBLE='_safe_sleep() { if ! sleep "$1" 2>/dev/null; then read -t "$1" -r _ </dev/null 2>/dev/null || true; fi; }
 _atomic_sed_inplace() {
     local _target="$1"; shift
     local _tmp; _tmp=$(mktemp "${_target}.atomic.XXXXXX") || { echo "FATAL: mktemp failed for atomic sed on $_target"; return 1; }
@@ -1419,7 +1421,7 @@ install_base_devel_batched() {
                     echo "  Missing from failed batch: $pkg"
                     case "$pkg" in
                         gcc|binutils|make|fakeroot|pkgconf)
-                            echo "FATAL: Critical build tool '$pkg' missing. Cannot continue."
+                            echo "FATAL: Critical build tool '\''$pkg'\'' missing. Cannot continue."
                             _failed_critical=true
                             ;;
                     esac
@@ -1436,6 +1438,18 @@ install_base_devel_batched() {
     fi
 }
 '
+
+exec_container_script() {
+    local _script="$1"
+    local _desc="$2"
+    shift 2
+    if [[ -z "$_script" ]]; then
+        log_error "Internal error: container script '$_desc' is empty (heredoc delimiter may be missing/misfound). Aborting stage."
+        return 1
+    fi
+    local _rc=0
+    local _script_file
+    local _preamble="$_CONTAINER_PREAMBLE"
 
     _script_file=$(mktemp --tmpdir pamac-script-XXXXXXXX)
     _TEMP_FILES+=("$_script_file")
@@ -1510,111 +1524,7 @@ exec_container_pipe() {
     local _rc=0
     local _script_file
     local _marker="PAMAC_PIPE_OK_$(head -c 16 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$_$(date +%s)")"
-    local _preamble='_safe_sleep() { if ! sleep "$1" 2>/dev/null; then read -t "$1" -r _ </dev/null 2>/dev/null || true; fi; }
-_atomic_sed_inplace() {
-    local _target="$1"; shift
-    local _tmp; _tmp=$(mktemp "${_target}.atomic.XXXXXX") || { echo "FATAL: mktemp failed for atomic sed on $_target"; return 1; }
-    cp -f "$_target" "$_tmp" 2>/dev/null || { rm -f "$_tmp"; return 1; }
-    for _expr in "$@"; do sed -i "$_expr" "$_tmp"; done
-    sync "$_tmp" 2>/dev/null || sync 2>/dev/null || true
-    mv -f "$_tmp" "$_target"
-}
-_calc_makepkg_jobs() {
-    local ram_per_job_kb=768000
-    local mem_avail_kb=0
-    local ncpu
-    ncpu=$(nproc 2>/dev/null || echo "1")
-    if [[ -f /proc/meminfo ]]; then
-        mem_avail_kb=$(awk "/^MemAvailable:/{print \$2}" /proc/meminfo 2>/dev/null || echo "0")
-    fi
-    if [[ "$mem_avail_kb" -gt 0 ]]; then
-        local jobs=$(( mem_avail_kb / ram_per_job_kb ))
-        [[ "$jobs" -lt 1 ]] && jobs=1
-        [[ "$jobs" -gt "$ncpu" ]] && jobs="$ncpu"
-        echo "$jobs"
-    else
-        local safe_ncpu=$(( ncpu > 4 ? 4 : ncpu ))
-        echo "$safe_ncpu"
-    fi
-}
-_set_makepkg_jobs() {
-    local jobs
-    jobs=$(_calc_makepkg_jobs)
-    export MAKEFLAGS="-j${jobs}"
-    echo "MAKEFLAGS set to -j${jobs} (RAM-constrained build parallelism)"
-}
-safe_install() {
-    local attempt=0 max_attempts=3 rc=0
-    while [[ $attempt -lt $max_attempts ]]; do
-        rm -f /var/lib/pacman/db.lck
-        if pacman -S --noconfirm --needed "$@"; then
-            ldconfig 2>/dev/null || true
-            return 0
-        fi
-        rc=$?
-        attempt=$((attempt + 1))
-        if [[ $attempt -lt $max_attempts ]]; then
-            echo "Install failed (attempt $attempt/$max_attempts, exit=$rc), repairing DB..."
-            if [[ $rc -eq 137 ]]; then
-                echo "Exit code 137 indicates OOM kill. Syncing and retrying..."
-                sync 2>/dev/null || true
-                _safe_sleep 3
-            fi
-            pacman -Dk 2>/dev/null || true
-            pacman -Syy --noconfirm 2>/dev/null || true
-            _safe_sleep 2
-        fi
-    done
-    return $rc
-}
-_assert_installed() {
-    local _pkg="$1" _desc="${2:-$_pkg}"
-    if ! pacman -Q "$_pkg" >/dev/null 2>&1; then
-        echo "FATAL: $_desc ($_pkg) is not installed. Aborting."
-        return 1
-    fi
-    echo "Verified: $_desc ($_pkg) installed."
-}
-install_base_devel_batched() {
-    echo "Installing base-devel in smaller batches to avoid OOM..."
-    local _failed_critical=false
-    local BASE_DEVEL_BATCHES=(
-        "m4 autoconf automake binutils"
-        "bison debugedit diffutils fakeroot"
-        "flex"
-        "gcc"
-        "gettext groff"
-        "gzip libtool make patch"
-        "pkgconf sed texinfo which"
-    )
-    for batch in "${BASE_DEVEL_BATCHES[@]}"; do
-        echo "Installing batch: $batch"
-        sync 2>/dev/null || true
-        _safe_sleep 1
-        if ! safe_install $batch; then
-            echo "ERROR: batch install failed for: $batch"
-            for pkg in $batch; do
-                if ! pacman -Q "$pkg" >/dev/null 2>&1; then
-                    echo "  Missing from failed batch: $pkg"
-                    case "$pkg" in
-                        gcc|binutils|make|fakeroot|pkgconf)
-                            echo "FATAL: Critical build tool '$pkg' missing. Cannot continue."
-                            _failed_critical=true
-                            ;;
-                    esac
-                fi
-            done
-        fi
-    done
-    if [[ "$_failed_critical" == "true" ]]; then
-        echo "FATAL: Critical base-devel components failed to install. Aborting."
-        return 1
-    fi
-    if ! pacman -Q base-devel >/dev/null 2>&1 && ! safe_install base-devel; then
-        echo "Warning: base-devel group meta-package could not be installed (individual packages verified above)."
-    fi
-}
-'
+    local _preamble="$_CONTAINER_PREAMBLE"
 
     _script_file=$(mktemp --tmpdir pamac-pipe-XXXXXXXX)
     _TEMP_FILES+=("$_script_file")
@@ -3026,7 +2936,8 @@ _enable_repo_with_fallback() {
 
     # Allow environment variable override for key ID (e.g. CHAOTIC_AUR_KEY_ID=NEWID)
     local env_var_name
-    env_var_name=$(echo "${repo_name}" | tr '[:lower:]-' '[:upper:]_')_KEY_ID
+    local _normalized="${repo_name//-/_}"
+    env_var_name="${_normalized^^}_KEY_ID"
     local key_id="${!env_var_name:-$default_key_id}"
 
     echo "Adding repository [$repo_name] (key_id=$key_id)..."
@@ -3721,50 +3632,7 @@ echo "COMPATIBLE_COMMIT=latest_anyway"
 exit 3
 COMPAT_EOF
 
-    local _preamble='_safe_sleep() { if ! sleep "$1" 2>/dev/null; then read -t "$1" -r _ </dev/null 2>/dev/null || true; fi; }
-_calc_makepkg_jobs() {
-    local ram_per_job_kb=768000
-    local mem_avail_kb=0
-    local ncpu
-    ncpu=$(nproc 2>/dev/null || echo "1")
-    if [[ -f /proc/meminfo ]]; then
-        mem_avail_kb=$(awk "/^MemAvailable:/{print \$2}" /proc/meminfo 2>/dev/null || echo "0")
-    fi
-    if [[ "$mem_avail_kb" -gt 0 ]]; then
-        local jobs=$(( mem_avail_kb / ram_per_job_kb ))
-        [[ "$jobs" -lt 1 ]] && jobs=1
-        [[ "$jobs" -gt "$ncpu" ]] && jobs="$ncpu"
-        echo "$jobs"
-    else
-        local safe_ncpu=$(( ncpu > 4 ? 4 : ncpu ))
-        echo "$safe_ncpu"
-    fi
-}
-_set_makepkg_jobs() {
-    local jobs
-    jobs=$(_calc_makepkg_jobs)
-    export MAKEFLAGS="-j${jobs}"
-    echo "MAKEFLAGS set to -j${jobs} (RAM-constrained build parallelism)"
-}
-safe_install() {
-    local attempt=0 max_attempts=3 rc=0
-    while [[ $attempt -lt $max_attempts ]]; do
-        rm -f /var/lib/pacman/db.lck
-        if pacman -S --noconfirm --needed "$@"; then
-            ldconfig 2>/dev/null || true
-            return 0
-        fi
-        rc=$?
-        attempt=$((attempt + 1))
-        if [[ $attempt -lt $max_attempts ]]; then
-            echo "Install failed (attempt $attempt/$max_attempts, exit=$rc), repairing DB..."
-            pacman -Dk 2>/dev/null || true
-            pacman -Syy --noconfirm 2>/dev/null || true
-            _safe_sleep 2
-        fi
-    done
-    return $rc
-}'
+    local _preamble="$_CONTAINER_PREAMBLE"
 
     local _compat_script_file
     _compat_script_file=$(mktemp --tmpdir pamac-compat-XXXXXXXX)
@@ -4259,29 +4127,6 @@ fi
         fi
     fi
 
-    local bashrc_file="$HOME/.bashrc"
-    if [[ -f "$bashrc_file" ]]; then
-        if ! grep -q '^export HOME=' "$bashrc_file" 2>/dev/null || ! grep -q '^export PATH=.*\.local/bin' "$bashrc_file" 2>/dev/null; then
-            local bashrc_header
-            bashrc_header='#\n# ~/.bashrc\n#\nexport HOME="/home/'"$CURRENT_USER"'"\nexport PATH="/home/'"$CURRENT_USER"'/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin"\n'
-            local bashrc_tmp
-            bashrc_tmp=$(mktemp "${bashrc_file}.atomic.XXXXXX") 2>/dev/null
-            if [[ -n "$bashrc_tmp" ]]; then
-                { echo -e "$bashrc_header"; cat "$bashrc_file"; } > "$bashrc_tmp" 2>/dev/null && sync "$bashrc_tmp" 2>/dev/null || true
-                if [[ -s "$bashrc_tmp" ]]; then
-                    mv "$bashrc_tmp" "$bashrc_file" 2>/dev/null || rm -f "$bashrc_tmp" 2>/dev/null || true
-                else
-                    rm -f "$bashrc_tmp" 2>/dev/null || true
-                fi
-            fi
-            if grep -q '^export HOME=' "$bashrc_file" 2>/dev/null; then
-                log_info "Patched .bashrc with HOME/PATH exports before non-interactive check"
-            else
-                log_warn "Could not patch .bashrc automatically"
-            fi
-        fi
-    fi
-
     log_success "SSH environment configured for nested commands"
 }
 
@@ -4361,12 +4206,20 @@ export_pamac_to_host() {
 
         log_info "Installing xdotool inside container and creating host wrapper..."
 
-        if [[ -x "$_host_bindir/xdotool" ]] && file "$_host_bindir/xdotool" 2>/dev/null | grep -q "ELF"; then
-            log_warn "Removing previous host-compiled xdotool binary (shared library mismatch risk)."
-            rm -f "$_host_bindir/xdotool"
+        if [[ -x "$_host_bindir/xdotool" ]]; then
+            if grep -q "distrobox enter.*xdotool" "$_host_bindir/xdotool" 2>/dev/null; then
+                log_info "Updating existing distrobox xdotool wrapper..."
+                rm -f "$_host_bindir/xdotool"
+            elif file "$_host_bindir/xdotool" 2>/dev/null | grep -q "ELF"; then
+                log_info "Host has a native xdotool ELF binary (e.g. via pacman). Skipping wrapper to avoid shadowing."
+                _host_bindir_has_xdotool=true
+            else
+                log_info "Host has a non-wrapper xdotool script at $_host_bindir/xdotool. Skipping wrapper to avoid overwriting."
+                _host_bindir_has_xdotool=true
+            fi
         fi
 
-        if [[ ! -f "$_host_bindir/xdotool" ]]; then
+        if [[ "${_host_bindir_has_xdotool:-}" != "true" ]] && [[ ! -f "$_host_bindir/xdotool" ]]; then
             cat > "$_host_bindir/xdotool" << XDOTOOL_WRAPPER
 #!/bin/bash
 exec distrobox enter "$CONTAINER_NAME" -- xdotool "\$@"
@@ -5088,11 +4941,23 @@ STATE_FILE="\$STATE_DIR/exported-apps.list"
 EXPORT_LOG="\$STATE_DIR/export-hook.log"
 EXPLICIT_FILE="\$(mktemp)"
 NEW_STATE_FILE="\$(mktemp)"
+HASH_FILE="\$STATE_DIR/.last-explicit-hash"
 echo "\$(date): Hook triggered" > "\$EXPORT_LOG"
 mkdir -p "\$APP_DIR" "\$STATE_DIR"
 trap 'rm -f "\$EXPLICIT_FILE" "\$NEW_STATE_FILE"' EXIT
 
 pacman -Qeq > "\$EXPLICIT_FILE" 2>/dev/null || true
+
+CURRENT_HASH="\$(md5sum "\$EXPLICIT_FILE" 2>/dev/null | awk '{print \$1}')"
+if [[ -f "\$HASH_FILE" ]]; then
+    LAST_HASH="\$(cat "\$HASH_FILE" 2>/dev/null || echo "")"
+    if [[ "\$CURRENT_HASH" == "\$LAST_HASH" ]]; then
+        echo "\$(date): Explicit package list unchanged (hash=\${CURRENT_HASH:0:8}). Skipping export." >> "\$EXPORT_LOG"
+        exit 0
+    fi
+fi
+echo "\$CURRENT_HASH" > "\$HASH_FILE" 2>/dev/null || true
+echo "\$(date): Package list changed (hash=\${CURRENT_HASH:0:8}). Running export." >> "\$EXPORT_LOG"
 
 should_export_desktop() {
     local desktop_file="\$1"

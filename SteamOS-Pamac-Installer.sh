@@ -107,10 +107,19 @@ run_command() {
 }
 
 container_runtime() {
-    if [[ -n "${PODMAN_SUDO_FALLBACK:-}" ]]; then
-        sudo podman "$@"
+    local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
+    if [[ "$mgr" == "docker" ]]; then
+        if [[ -n "${PODMAN_SUDO_FALLBACK:-}" ]]; then
+            sudo docker "$@"
+        else
+            docker "$@"
+        fi
     else
-        podman "$@"
+        if [[ -n "${PODMAN_SUDO_FALLBACK:-}" ]]; then
+            sudo podman "$@"
+        else
+            podman "$@"
+        fi
     fi
 }
 
@@ -155,7 +164,8 @@ container_get_status() {
 }
 
 container_is_usable() {
-  container_root_exec bash -c "echo ok" 2>/dev/null | grep -q "ok"
+  container_start 2>/dev/null || true
+  timeout 15 container_runtime exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" bash -c "echo ok" </dev/null 2>/dev/null | grep -q "ok"
 }
 
 container_get_status_safe() {
@@ -262,6 +272,8 @@ force_remove_container() {
   local name="$1"
   local runtime_cmd="podman"
   [[ -n "${PODMAN_SUDO_FALLBACK:-}" ]] && runtime_cmd="sudo podman"
+  [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]] && runtime_cmd="docker"
+  [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" && -n "${PODMAN_SUDO_FALLBACK:-}" ]] && runtime_cmd="sudo docker"
 
   if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
     docker rm -f "$name" 2>/dev/null || true
@@ -299,42 +311,44 @@ force_remove_container() {
 
  $runtime_cmd rm -f "$name" 2>/dev/null || true
  if $runtime_cmd inspect "$name" >/dev/null 2>&1; then
- log_debug "User podman rm failed, trying sudo..."
+ log_debug "User $runtime_cmd rm failed, trying sudo..."
  if sudo -n true 2>/dev/null; then
  sudo podman rm -f "$name" 2>/dev/null || true
  else
- log_warn "User podman rm failed and passwordless sudo not available. Skipping sudo fallback to avoid hang."
+ log_warn "User $runtime_cmd rm failed and passwordless sudo not available. Skipping sudo fallback to avoid hang."
  fi
  fi
 
 	if $runtime_cmd inspect "$name" >/dev/null 2>&1; then
-		log_warn "Podman rm still failed for '$name'. Podman may be corrupted."
-		log_warn "WARNING: Manual storage cleanup is a last resort. Deleting files from podman's"
-		log_warn "overlayfs storage while the container engine is running can leave the podman"
+		log_warn "$runtime_cmd rm still failed for '$name'. $runtime_cmd may be corrupted."
+		log_warn "WARNING: Manual storage cleanup is a last resort. Deleting files from $runtime_cmd's"
+		log_warn "overlayfs storage while the container engine is running can leave the $runtime_cmd"
 		log_warn "database in an inconsistent state, causing 'ghost' containers or future failures"
-		log_warn "that even 'podman system reset' may not fix. Proceed only if other options failed."
+		log_warn "that even '$runtime_cmd system reset' may not fix. Proceed only if other options failed."
 		if [[ -t 0 ]]; then
 			echo -ne "${RED}${BOLD}Type 'yes' to proceed with manual storage cleanup, or anything else to skip: ${NC}" >&2
 			local cleanup_confirm
 			read -r cleanup_confirm
 			if [[ "$cleanup_confirm" != "yes" ]]; then
 				log_warn "User declined manual storage cleanup. Skipping."
-				log_info "You can try 'podman system reset --force' or restart podman manually."
+				log_info "You can try '$runtime_cmd system reset --force' or restart $runtime_cmd manually."
 				return
 			fi
 		else
-			log_warn "Non-interactive session — skipping manual storage cleanup to avoid podman corruption."
-			log_info "Run this script interactively to approve cleanup, or try 'podman system reset --force'."
+			log_warn "Non-interactive session — skipping manual storage cleanup to avoid $runtime_cmd corruption."
+			log_info "Run this script interactively to approve cleanup, or try '$runtime_cmd system reset --force'."
 			return
 		fi
 		local podman_storage="${XDG_DATA_HOME:-$HOME/.local/share}/containers/storage"
 		if [[ -d "$podman_storage" ]]; then
-			log_warn "Removing container '$name' files from podman storage..."
-			find "$podman_storage" -maxdepth 3 -path "*/$name*" -exec rm -rf {} \; 2>/dev/null || true
+			log_warn "Removing container '$name' files from $runtime_cmd storage..."
+			find "$podman_storage" -maxdepth 3 -type d -name "${name}" -exec rm -rf {} \; 2>/dev/null || true
+			find "$podman_storage" -maxdepth 3 -type d -name "${name}-*" -exec rm -rf {} \; 2>/dev/null || true
 		fi
 		local podman_run="/run/user/$(id -u)/containers"
 		if [[ -d "$podman_run" ]]; then
-			find "$podman_run" -maxdepth 2 -path "*/$name*" -exec rm -rf {} \; 2>/dev/null || true
+			find "$podman_run" -maxdepth 2 -type d -name "${name}" -exec rm -rf {} \; 2>/dev/null || true
+			find "$podman_run" -maxdepth 2 -type d -name "${name}-*" -exec rm -rf {} \; 2>/dev/null || true
 		fi
 		$runtime_cmd rm -f "$name" 2>/dev/null || true
 		if sudo -n true 2>/dev/null; then
@@ -681,12 +695,15 @@ uninstall_setup() {
         if [[ "$DRY_RUN" != "true" ]]; then
             local cleaned=0
             while IFS= read -r -d '' df; do
-                if grep -Eq "X-SteamOS-Pamac-Container=${CONTAINER_NAME}|distrobox( enter|[-]enter).*(^| )${CONTAINER_NAME}( |$)" "$df" >/dev/null 2>&1; then
+                if grep -Eq "X-SteamOS-Pamac-Container=${CONTAINER_NAME}|distrobox[- ]+enter.*${CONTAINER_NAME}|\b${CONTAINER_NAME}\b.*\.desktop" "$df" >/dev/null 2>&1; then
                     rm -f "$df" 2>/dev/null || true
                     cleaned=$((cleaned + 1))
                 fi
             done < <(find "$app_dir" -maxdepth 1 -type f -name "*.desktop" -print0 2>/dev/null)
             find "$app_dir" -maxdepth 1 -type f \( -name "${CONTAINER_NAME}-*.desktop" -o -name "*-${CONTAINER_NAME}.desktop" \) -delete 2>/dev/null || true
+            find "$app_dir" -maxdepth 1 -type f -name "*.desktop" -exec grep -l "X-SteamOS-Pamac-Container=${CONTAINER_NAME}" {} + 2>/dev/null | while IFS= read -r marked_df; do
+                rm -f "$marked_df" 2>/dev/null || true
+            done
             rm -f "$app_dir/${CONTAINER_NAME}.desktop" 2>/dev/null || true
             command -v update-desktop-database >/dev/null 2>&1 && \
                 update-desktop-database "$app_dir" 2>/dev/null || true
@@ -722,6 +739,8 @@ wait_for_container() {
   fi
   local max_attempts=30
   local attempt=0
+  local _saved_e
+  _saved_e=$(set -o | grep 'errtrace' | awk '{print $NF}')
   log_info "Waiting for container '$CONTAINER_NAME' to become ready..."
 
   set +e
@@ -735,8 +754,8 @@ wait_for_container() {
     case "$status" in
       "running")
         if container_root_exec bash -c "echo ready" 2>/dev/null | grep -q "ready"; then
-          set -e
-          log_success "Container is ready."
+          [[ "$_saved_e" == "on" ]] && set -e
+          log_success "Container is ready." || true
           return 0
         fi
         ;;
@@ -744,63 +763,63 @@ wait_for_container() {
         if [[ $attempt -le 5 ]]; then
           log_debug "Container in '$status' state, waiting..."
         else
-          log_warn "Container stuck in '$status' state - removing and recreating"
-          set -e
-          force_remove_container "$CONTAINER_NAME"
+          log_warn "Container stuck in '$status' state - removing and recreating" || true
+          force_remove_container "$CONTAINER_NAME" || true
+          [[ "$_saved_e" == "on" ]] && set -e
           return 2
         fi
         ;;
   "exited")
     if [[ "$CONTAINER_HAS_INIT" == "false" ]]; then
-      log_debug "Container exited (normal in non-init mode). Restarting..."
-      container_start
+      log_debug "Container exited (normal in non-init mode). Restarting..." || true
+      container_start || true
       sleep 3
       if container_is_usable; then
-        set -e
-        log_success "Container restarted and ready (non-init mode)."
+        [[ "$_saved_e" == "on" ]] && set -e
+        log_success "Container restarted and ready (non-init mode)." || true
         return 0
       fi
       if [[ $attempt -gt 5 ]]; then
-        log_warn "Non-init container not responding after restart. Removing and recreating."
-        set -e
-        force_remove_container "$CONTAINER_NAME"
+        log_warn "Non-init container not responding after restart. Removing and recreating." || true
+        force_remove_container "$CONTAINER_NAME" || true
+        [[ "$_saved_e" == "on" ]] && set -e
         return 2
       fi
     elif [[ $attempt -le 2 ]]; then
-      log_debug "Container exited. Attempting restart (attempt $attempt)..."
-      container_start
+      log_debug "Container exited. Attempting restart (attempt $attempt)..." || true
+      container_start || true
     elif [[ $attempt -le 5 ]]; then
       local exit_code
       exit_code=$(container_runtime inspect "$CONTAINER_NAME" --format '{{.State.ExitCode}}' 2>/dev/null || echo "unknown")
-      log_warn "Container keeps exiting (exit code: $exit_code). Inspecting..."
+      log_warn "Container keeps exiting (exit code: $exit_code). Inspecting..." || true
       case "$exit_code" in
-        137) log_error "Container was OOM-killed (exit 137). Not enough memory available." ;;
-        139) log_error "Container segfaulted (exit 139). Possible kernel or image incompatibility." ;;
-        1) log_warn "Container exited with code 1 (general error)." ;;
+        137) log_error "Container was OOM-killed (exit 137). Not enough memory available." || true ;;
+        139) log_error "Container segfaulted (exit 139). Possible kernel or image incompatibility." || true ;;
+        1) log_warn "Container exited with code 1 (general error)." || true ;;
       esac
-      log_debug "Waiting longer before next restart attempt..."
+      log_debug "Waiting longer before next restart attempt..." || true
     else
-      log_warn "Container stuck in 'exited' state - removing and recreating"
-      set -e
-      force_remove_container "$CONTAINER_NAME"
+      log_warn "Container stuck in 'exited' state - removing and recreating" || true
+      force_remove_container "$CONTAINER_NAME" || true
+      [[ "$_saved_e" == "on" ]] && set -e
       return 2
     fi
     ;;
       "not_found")
-        set -e
-        log_error "Container '$CONTAINER_NAME' not found."
+        log_error "Container '$CONTAINER_NAME' not found." || true
+        [[ "$_saved_e" == "on" ]] && set -e
         return 1
         ;;
       "created")
-        log_debug "Container in 'created' state, attempting start..."
-        container_start
+        log_debug "Container in 'created' state, attempting start..." || true
+        container_start || true
         ;;
     esac
 
     if [[ $attempt -gt $max_attempts ]]; then
-      set -e
-      log_error "Container failed to become ready after $((max_attempts * 2)) seconds."
-      log_info "Try removing with: podman rm -f $CONTAINER_NAME"
+      log_error "Container failed to become ready after $((max_attempts * 2)) seconds." || true
+      log_info "Try removing with: podman rm -f $CONTAINER_NAME" || true
+      [[ "$_saved_e" == "on" ]] && set -e
       return 1
     fi
 
@@ -1068,7 +1087,7 @@ configure_container_base() {
 
     local _ok=true
 
-    log_info "Stage 1/6: Initializing pacman keyring..."
+    log_info "Stage 1/7: Initializing pacman keyring..."
     local keyring_script
 read -r -d '' keyring_script <<'KEYRING_EOF' || true
 set -uo pipefail
@@ -1189,7 +1208,7 @@ KEYRING_EOF
         return 1
     fi
 
-    log_info "Stage 2/6: Performing system upgrade..."
+    log_info "Stage 2/7: Performing system upgrade..."
     local upgrade_script
     read -r -d '' upgrade_script <<'UPG_EOF' || true
 set -uo pipefail
@@ -1319,7 +1338,7 @@ UPG_EOF
         fi
     fi
 
-    log_info "Stage 3/6: Installing core system packages..."
+    log_info "Stage 3/7: Installing core system packages..."
     local core_script
     read -r -d '' core_script <<'CORE_EOF' || true
 set -uo pipefail
@@ -1374,7 +1393,7 @@ CORE_EOF
         fi
     fi
 
-    log_info "Stage 4/6: Installing development packages (batched to avoid OOM)..."
+    log_info "Stage 4/7: Installing development packages (batched to avoid OOM)..."
     local dev_script
     read -r -d '' dev_script <<'DEV_EOF' || true
 set -uo pipefail
@@ -1479,7 +1498,7 @@ DEV_EOF
         fi
     fi
 
-    log_info "Stage 5/6: Creating user and configuring sudo..."
+    log_info "Stage 5/7: Creating user and configuring sudo..."
     local user_script
     read -r -d '' user_script <<'USER_EOF' || true
 set -uo pipefail
@@ -2867,7 +2886,7 @@ log_info "Created CLI wrapper: $cli_wrapper"
 local gui_wrapper="$bin_dir/pamac-manager-wrapper-host"
 cat > "$gui_wrapper" << GUI_WRAPPER_EOF
 #!/bin/bash
-export HOME=/home/deck
+export HOME="/home/${current_user}"
 export DISPLAY=\${DISPLAY:-:0}
 
 # Dynamically find the XAUTHORITY for the current desktop session
@@ -3261,8 +3280,19 @@ else
 log_msg "User cancelled uninstall (kdialog rc=\$KDIALOG_RC)"
 exit 0
 fi
+elif command -v zenity >/dev/null 2>&1; then
+log_msg "Attempting zenity confirmation (kdialog not available)..."
+zenity --question --text="Remove \$APP_NAME?\nThis was installed via Pamac (AUR)." --title="Uninstall" 2>>"\$LOG_FILE"
+ZENITY_RC=\$?
+log_msg "zenity exit code: \$ZENITY_RC"
+if [[ \$ZENITY_RC -eq 0 ]]; then
+CONFIRMED=true
 else
-log_msg "kdialog not found, proceeding without confirmation"
+log_msg "User cancelled uninstall (zenity rc=\$ZENITY_RC)"
+exit 0
+fi
+else
+log_msg "No dialog tool found (kdialog/zenity). Proceeding without confirmation."
 CONFIRMED=true
 fi
 

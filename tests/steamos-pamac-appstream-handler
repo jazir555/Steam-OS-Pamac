@@ -96,8 +96,19 @@ else
 log_msg "User cancelled uninstall (kdialog rc=$KDIALOG_RC)"
 exit 0
 fi
+elif command -v zenity >/dev/null 2>&1; then
+log_msg "Attempting zenity confirmation (kdialog not available)..."
+zenity --question --text="Remove $APP_NAME?\nThis was installed via Pamac (AUR)." --title="Uninstall" 2>>"$LOG_FILE"
+ZENITY_RC=$?
+log_msg "zenity exit code: $ZENITY_RC"
+if [[ $ZENITY_RC -eq 0 ]]; then
+CONFIRMED=true
 else
-log_msg "kdialog not found, proceeding without confirmation"
+log_msg "User cancelled uninstall (zenity rc=$ZENITY_RC)"
+exit 0
+fi
+else
+log_msg "No dialog tool found (kdialog/zenity). Proceeding without confirmation."
 CONFIRMED=true
 fi
 

@@ -210,7 +210,9 @@ container_start() {
 }
 
 container_is_running() {
-  container_runtime_privileged inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q "true"
+  local _running
+  _running=$(container_runtime_privileged inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null || echo "false")
+  [[ "$_running" == "true" ]]
 }
 
 container_get_status() {
@@ -219,7 +221,9 @@ container_get_status() {
 
 container_is_usable() {
   container_start 2>/dev/null || true
-  timeout 15 container_runtime_privileged exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" bash -c "echo ok" </dev/null 2>/dev/null | grep -q "ok"
+  local _output
+  _output=$(timeout 15 container_runtime_privileged exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" bash -c "echo ok" </dev/null 2>/dev/null || echo "")
+  [[ "$_output" == *"ok"* ]]
 }
 
 container_get_status_safe() {
@@ -1073,7 +1077,7 @@ wait_for_container() {
   fi
   local max_attempts=30
   local attempt=0
-  _SAVED_ERREXIT=$(set -o | grep 'errexit' | awk '{print $NF}')
+  _SAVED_ERREXIT=$(set -o | grep 'errexit' | awk '{print $NF}' || echo "off")
   log_info "Waiting for container '$CONTAINER_NAME' to become ready..."
 
   set +e
@@ -2091,8 +2095,8 @@ set -uo pipefail
 
 rm -f /var/lib/pacman/db.lck
 
-echo "Installing core packages (sudo, shadow, gnupg)..."
-if ! safe_install sudo shadow gnupg; then
+echo "Installing core packages (sudo, shadow, gnupg, jq)..."
+if ! safe_install sudo shadow gnupg jq; then
     echo "ERROR: Failed to install core packages after retries."
     exit 1
 fi
@@ -3470,8 +3474,8 @@ if [[ -z "$aur_pacman_dep" ]]; then
 fi
 
 echo "pamac-aur requires: $aur_pacman_dep"
-req_version=$(echo "$aur_pacman_dep" | grep -oP "[0-9.]+" | head -1)
-req_op=$(echo "$aur_pacman_dep" | grep -oP "[><=]+" | head -1)
+req_version=$(echo "$aur_pacman_dep" | grep -oP "[0-9.]+" | head -1 || echo "")
+req_op=$(echo "$aur_pacman_dep" | grep -oP "[><=]+" | head -1 || echo "")
 echo "Required: pacman $req_op $req_version"
 
 req_major=$(echo "$req_version" | sanitize_version_component)
@@ -3644,12 +3648,12 @@ for try_commit in $_commits; do
         exit 2
     fi
 
-    old_req_ver=$(echo "$old_dep" | grep -oP "[0-9.]+" | head -1)
+    old_req_ver=$(echo "$old_dep" | grep -oP "[0-9.]+" | head -1 || echo "")
     old_req_major=$(echo "$old_req_ver" | grep -oP '^[0-9]+' || echo "0")
     old_req_minor=$(echo "$old_req_ver" | cut -d. -f2 | grep -oP '^[0-9]*' || echo "0")
     [[ -z "$old_req_major" ]] && old_req_major=0
     [[ -z "$old_req_minor" ]] && old_req_minor=0
-    old_req_op=$(echo "$old_dep" | grep -oP "[><=]+" | head -1)
+    old_req_op=$(echo "$old_dep" | grep -oP "[><=]+" | head -1 || echo "")
 
     if version_meets_requirement "$pacman_major" "$pacman_minor" "$old_req_op" "$old_req_major" "$old_req_minor"; then
         echo "  -> Compatible: requires pacman $old_dep (have $installed_pacman_ver)"
@@ -3751,9 +3755,9 @@ safe_install() {
             fi
             ;;
         2)
-            _PAMAC_COMPAT_COMMIT=$(echo "$_compat_output" | grep "^FOUND_COMPATIBLE_COMMIT=" | tail -1 | cut -d= -f2)
+            _PAMAC_COMPAT_COMMIT=$(echo "$_compat_output" | grep "^FOUND_COMPATIBLE_COMMIT=" | tail -1 | cut -d= -f2 || echo "")
             local _compat_reason
-            _compat_reason=$(echo "$_compat_output" | grep "^FOUND_COMPATIBLE_REASON=" | tail -1 | cut -d= -f2)
+            _compat_reason=$(echo "$_compat_output" | grep "^FOUND_COMPATIBLE_REASON=" | tail -1 | cut -d= -f2 || echo "")
             if [[ -n "$_PAMAC_COMPAT_COMMIT" ]]; then
                 if [[ "$_PAMAC_COMPAT_COMMIT" == "latest_anyway" ]]; then
                     log_warn "No compatible older pamac-aur found. Will attempt latest build anyway."
@@ -3786,7 +3790,7 @@ safe_install() {
 
     echo "$_compat_output" | grep -E "^(PASS|SUCCESS|WARNING|Strategy|  ->|Installed|Upgraded|INFO)" | while IFS= read -r line; do
         log_info "  compat: $line"
-    done
+    done || true
 
     export _PAMAC_COMPAT_COMMIT
     export _PAMAC_COMPAT_STRATEGY

@@ -1,4 +1,6 @@
 #!/bin/bash
+# shellcheck disable=SC2034  # Variables used in nested heredocs or later
+# shellcheck disable=SC2317  # Unreachable code in trap handler patterns
 
 set -euo pipefail
 
@@ -363,37 +365,53 @@ force_remove_container() {
   container_runtime_privileged rm -f "$name" 2>/dev/null || true
 
 	if container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
-		log_warn "rm still failed for '$name'. Container engine may be corrupted."
-		log_warn "WARNING: Manual storage cleanup is a last resort. Deleting files from container engine's"
-		log_warn "overlayfs storage while the container engine is running can leave the database"
-		log_warn "in an inconsistent state, causing 'ghost' containers or future failures"
-		log_warn "that even 'system reset' may not fix. Proceed only if other options failed."
+		log_warn "podman rm -f still failed for '$name'. The container engine may be corrupted."
+		log_warn ""
+		log_warn "IMPORTANT: A full 'podman system reset --force' would destroy ALL containers,"
+		log_warn "images, and volumes — not just this one. This script will NOT do that"
+		log_warn "automatically because it can destroy other distroboxes and podman workloads."
+		log_warn ""
+
+		local other_containers
+		other_containers=$(container_runtime_privileged ps -a --format '{{.Names}}' 2>/dev/null | grep -v "^${name}$" || true)
+		if [[ -n "$other_containers" ]]; then
+			log_warn "Other containers that would be destroyed by 'podman system reset':"
+			while IFS= read -r oc; do
+				log_warn "  - $oc"
+			done <<< "$other_containers"
+			log_warn ""
+		fi
+
+		log_warn "Manual recovery options (in order of safety):"
+		log_warn "  1. podman rm -f '$name'           (retry force removal)"
+		log_warn "  2. podman stop '$name' && podman rm '$name'  (stop then remove)"
+		log_warn "  3. systemctl --user restart podman  (restart the engine)"
+		log_warn "  4. podman system reset --force     (DESTRUCTIVE: removes ALL containers)"
+
 		if [[ -t 0 ]]; then
-			echo -ne "${RED}${BOLD}Type 'yes' to proceed with manual storage cleanup, or anything else to skip: ${NC}" >&2
+			echo -ne "${RED}${BOLD}Type 'reset' to run 'podman system reset --force' (destroys ALL containers), or anything else to skip: ${NC}" >&2
 			local cleanup_confirm
 			read -r cleanup_confirm
-			if [[ "$cleanup_confirm" != "yes" ]]; then
-				log_warn "User declined manual storage cleanup. Skipping."
-				log_info "Try 'podman system reset --force' or restart the engine manually."
+			if [[ "$cleanup_confirm" != "reset" ]]; then
+				log_warn "User declined podman system reset. Skipping."
+				log_info "Try manually: podman rm -f '$name' or podman system reset --force"
 				return
 			fi
 		else
-			log_warn "Non-interactive session — skipping manual storage cleanup to avoid engine corruption."
-			log_info "Run this script interactively to approve cleanup, or try 'podman system reset --force'."
+			log_warn "Non-interactive session — skipping podman system reset to avoid data loss."
+			log_info "Run this script interactively to approve, or try: podman system reset --force"
 			return
 		fi
-		local podman_storage="${XDG_DATA_HOME:-$HOME/.local/share}/containers/storage"
-		if [[ -d "$podman_storage" ]]; then
-			log_warn "Removing container '$name' files from storage..."
-			find "$podman_storage" -maxdepth 3 -type d -name "${name}" -exec rm -rf {} \; 2>/dev/null || true
-			find "$podman_storage" -maxdepth 3 -type d -name "${name}-*" -exec rm -rf {} \; 2>/dev/null || true
+
+		log_warn "Running 'podman system reset --force' — this will destroy ALL containers, images, and volumes."
+		podman system reset --force 2>&1 | while IFS= read -r line; do
+			log_warn "  $line"
+		done || true
+
+		if container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
+			log_error "Container '$name' still exists after system reset. Manual intervention required."
+			log_info "Try: sudo podman rm -f '$name' or reboot the system."
 		fi
-		local podman_run="/run/user/$(id -u)/containers"
-		if [[ -d "$podman_run" ]]; then
-			find "$podman_run" -maxdepth 2 -type d -name "${name}" -exec rm -rf {} \; 2>/dev/null || true
-			find "$podman_run" -maxdepth 2 -type d -name "${name}-*" -exec rm -rf {} \; 2>/dev/null || true
-		fi
-		container_runtime_privileged rm -f "$name" 2>/dev/null || true
   fi
 }
 
@@ -440,6 +458,78 @@ check_memory_ok() {
         fi
     else
         log_debug "Memory check OK: $(( mem_avail_kb / 1024 ))MB available for $desc."
+    fi
+
+    return 0
+}
+
+check_battery_power() {
+    local power_supply_dir="/sys/class/power_supply"
+    if [[ ! -d "$power_supply_dir" ]]; then
+        log_debug "No /sys/class/power_supply directory found, skipping battery check."
+        return 0
+    fi
+
+    local battery_found=false
+    local low_battery=false
+
+    for bat_dir in "$power_supply_dir"/*/; do
+        local type_file="$bat_dir/type"
+        [[ -f "$type_file" ]] || continue
+
+        local ps_type
+        ps_type=$(cat "$type_file" 2>/dev/null || true)
+        [[ "$ps_type" == "Battery" ]] || continue
+
+        battery_found=true
+        local bat_name
+        bat_name=$(basename "$bat_dir")
+
+        local capacity_file="$bat_dir/capacity"
+        local status_file="$bat_dir/status"
+        local capacity=-1
+        local status="Unknown"
+
+        if [[ -f "$capacity_file" ]]; then
+            capacity=$(cat "$capacity_file" 2>/dev/null || echo "-1")
+        fi
+        if [[ -f "$status_file" ]]; then
+            status=$(cat "$status_file" 2>/dev/null || echo "Unknown")
+        fi
+
+        if [[ "$capacity" -lt 0 || "$capacity" -gt 100 ]]; then
+            log_debug "Battery '$bat_name': capacity unreadable ($capacity%), skipping."
+            continue
+        fi
+
+        log_debug "Battery '$bat_name': ${capacity}% (${status})"
+
+        if [[ "$capacity" -lt 20 && "$status" != "Charging" && "$status" != "Full" ]]; then
+            low_battery=true
+            log_warn "Battery '${bat_name}' is at ${capacity}% (${status})."
+        fi
+    done
+
+    if [[ "$battery_found" == "false" ]]; then
+        log_debug "No batteries detected (desktop/AC system). Skipping battery check."
+        return 0
+    fi
+
+    if [[ "$low_battery" == "true" ]]; then
+        log_warn "Battery is below 20% and not charging. Compiling yay and parsing"
+        log_warn "heavy AUR packages can drain the battery quickly. Connect a"
+        log_warn "charger or ensure the system is plugged in before continuing."
+        if [[ -t 0 ]]; then
+            echo -ne "${YELLOW}${BOLD}Continue with low battery? (y/N): ${NC}" >&2
+            local bat_confirm
+            read -r bat_confirm
+            if [[ "$bat_confirm" != "y" && "$bat_confirm" != "Y" ]]; then
+                log_info "Aborted by user due to low battery."
+                return 1
+            fi
+        else
+            log_warn "Non-interactive session — continuing despite low battery."
+        fi
     fi
 
     return 0
@@ -539,17 +629,21 @@ repair_podman() {
     log_warn "Podman database may be corrupted. A full system reset is required but is DESTRUCTIVE."
     log_warn "WARNING: 'podman system reset --force' will remove ALL containers, images, and volumes — not just the Pamac container. Any other distroboxes or podman workloads will be lost."
     local existing_containers
-    existing_containers=$(podman ps -aq 2>/dev/null | wc -l)
-    [[ -n "$existing_containers" ]] || existing_containers=0
-    if [[ "$existing_containers" != "0" ]]; then
-        log_warn "Note: $existing_containers container(s) currently exist and will ALL be destroyed by reset."
+    existing_containers=$(podman ps -aq 2>/dev/null || true)
+    local container_count=0
+    if [[ -n "$existing_containers" ]]; then
+        container_count=$(echo "$existing_containers" | wc -l)
+        log_warn "The following $container_count container(s) currently exist and will ALL be destroyed:"
+        while IFS= read -r ec; do
+            [[ -n "$ec" ]] && log_warn "  - $ec"
+        done <<< "$existing_containers"
     fi
     local skip_reset=false
     if [[ -t 0 ]]; then
-        echo -ne "${RED}${BOLD}Type 'yes' to proceed with podman system reset, or anything else to skip: ${NC}" >&2
+        echo -ne "${RED}${BOLD}Type 'reset' to proceed with podman system reset (destroys ALL containers), or anything else to skip: ${NC}" >&2
         local reset_confirm
         read -r reset_confirm
-        if [[ "$reset_confirm" != "yes" ]]; then
+        if [[ "$reset_confirm" != "reset" ]]; then
             log_warn "User declined podman system reset. Skipping to next recovery step."
             log_info "You can run 'podman system reset --force' manually if needed."
             skip_reset=true
@@ -1359,12 +1453,12 @@ for attempt in 1 2 3; do
     rm -f /etc/pacman.d/gnupg/S.gpg-agent.browser /etc/pacman.d/gnupg/S.gpg-agent.ssh 2>/dev/null || true
     rm -f /etc/pacman.d/gnupg/S.dirmngr 2>/dev/null || true
 
-    if pacman-key --init 2>/dev/null; then
+    if timeout 120 pacman-key --init 2>/dev/null; then
         echo "Keyring init succeeded."
         keyring_ok=true
         break
     else
-        echo "Warning: pacman-key --init failed on attempt $attempt."
+        echo "Warning: pacman-key --init failed or timed out on attempt $attempt."
     fi
 done
 
@@ -1374,7 +1468,7 @@ if [[ "$keyring_ok" == "true" ]]; then
     find /etc/pacman.d/gnupg -type f -exec chmod 600 {} \; 2>/dev/null || true
     find /etc/pacman.d/gnupg -type d -exec chmod 700 {} \; 2>/dev/null || true
 
-    if pacman-key --populate archlinux 2>/dev/null; then
+    if timeout 60 pacman-key --populate archlinux 2>/dev/null; then
         echo "Keyring populated successfully."
     else
         echo "Warning: pacman-key --populate failed."
@@ -2323,101 +2417,80 @@ _repo_already_enabled() {
     grep -q "^\[$1\]" /etc/pacman.conf
 }
 
-echo "=== Configuring Chaotic-AUR repository ==="
-if ! _repo_already_enabled "chaotic-aur"; then
+_import_key_with_retry() {
+    local key_id="$1"
+    local max_attempts=3
+    local attempt=1
+    while [[ $attempt -le $max_attempts ]]; do
+        if timeout 30 pacman-key --recv-key "$key_id" 2>/dev/null; then
+            timeout 30 pacman-key --lsign-key "$key_id" 2>/dev/null && return 0
+        fi
+        echo "Key import attempt $attempt/$max_attempts failed for $key_id."
+        attempt=$((attempt + 1))
+        [[ $attempt -le $max_attempts ]] && sleep 2
+    done
+    echo "Warning: Could not import key $key_id after $max_attempts attempts."
+    return 1
+}
+
+_enable_repo_with_fallback() {
+    local repo_name="$1"
+    local keyring_pkg="$2"
+    local key_id="$3"
+    shift 3
+    local mirror_urls=("$@")
+
+    if _repo_already_enabled "$repo_name"; then
+        echo "$repo_name repository is already enabled."
+        return 0
+    fi
+
+    echo "Adding repository [$repo_name]..."
+    local server_lines=""
+    for url in "${mirror_urls[@]}"; do
+        server_lines="${server_lines}Server = $url\n"
+    done
+    printf '\n[%s]\nSigLevel = TrustedOnly\n%b' "$repo_name" "$server_lines" >> /etc/pacman.conf
+
     pacman -Sy --noconfirm 2>/dev/null || true
-    echo "Installing chaotic-keyring..."
-    if pacman -S --noconfirm --needed chaotic-keyring 2>/dev/null; then
-        echo "Chaotic keyring installed successfully."
+
+    if pacman -S --noconfirm --needed "$keyring_pkg" 2>/dev/null; then
+        echo "$repo_name keyring installed successfully."
     else
-        echo "Chaotic keyring not in default repos. Installing from mirror..."
-        echo "Pre-fetching Chaotic developer key for signature verification..."
+        echo "Warning: $keyring_pkg install from repos failed. Attempting key import..."
         if command -v pacman-key >/dev/null 2>&1; then
-            pacman-key --recv-key 30565AC3868033CA 2>/dev/null || true
-            pacman-key --lsign-key 30565AC3868033CA 2>/dev/null || true
-        fi
-        if command -v curl >/dev/null 2>&1; then
-            keyring_tmp="$(mktemp -d)"
-            _curl_rc=0
-            curl -sL "https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst" -o "$keyring_tmp/chaotic-keyring.pkg.tar.zst" 2>/dev/null || _curl_rc=$?
-            if [[ $_curl_rc -eq 0 ]] && [[ -s "$keyring_tmp/chaotic-keyring.pkg.tar.zst" ]]; then
-                if ! pacman -U --noconfirm "$keyring_tmp/chaotic-keyring.pkg.tar.zst" 2>/dev/null; then
-                    echo "Warning: Chaotic keyring install from mirror failed (signature may be invalid)."
-                    echo "Attempting key import fallback..."
-                    if command -v pacman-key >/dev/null 2>&1; then
-                        pacman-key --recv-key 30565AC3868033CA 2>/dev/null || true
-                        pacman-key --lsign-key 30565AC3868033CA 2>/dev/null || true
-                    fi
-                fi
-            else
-                echo "Warning: Could not download chaotic-keyring (curl exit code: $_curl_rc). Continuing with keyring utilities."
-            fi
-            rm -rf "$keyring_tmp"
-        else
-            echo "Warning: curl not available to download chaotic-keyring."
+            _import_key_with_retry "$key_id" || true
         fi
     fi
-    echo "Adding repository [chaotic-aur]..."
-    printf '\n[chaotic-aur]\nSigLevel = TrustedOnly\nInclude = /etc/pacman.d/chaotic-mirrorlist\n' >> /etc/pacman.conf
-    mkdir -p /etc/pacman.d
-    if ! [[ -f /etc/pacman.d/chaotic-mirrorlist ]] || ! grep -q '^Server' /etc/pacman.d/chaotic-mirrorlist 2>/dev/null; then
-        if command -v curl >/dev/null 2>&1 && \
-           curl -sL "https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist" -o /etc/pacman.d/chaotic-mirrorlist 2>/dev/null && \
-           [[ -s /etc/pacman.d/chaotic-mirrorlist ]] && \
-           ! grep -q '<html\|^<!DOCTYPE' /etc/pacman.d/chaotic-mirrorlist 2>/dev/null; then
-            : # mirrorlist downloaded successfully
-        else
-            printf '%s\n' \
-                '## Chaotic-AUR mirrorlist' \
-                'Server = https://cdn-mirror.chaotic.cx/chaotic-aur/$arch' \
-                'Server = https://geo-mirror.chaotic.cx/chaotic-aur/$arch' \
-                > /etc/pacman.d/chaotic-mirrorlist
-            echo "Warning: Using built-in chaotic-mirrorlist."
-        fi
-    fi
+
     if command -v pacman-key >/dev/null 2>&1; then
-        pacman-key --recv-key 30565AC3868033CA 2>/dev/null || true
-        pacman-key --lsign-key 30565AC3868033CA 2>/dev/null || true
+        _import_key_with_retry "$key_id" || true
     fi
-else
-    echo "Chaotic-AUR already enabled."
-fi
+
+    echo "$repo_name repository configured."
+    return 0
+}
+
+echo "=== Configuring Chaotic-AUR repository ==="
+_enable_repo_with_fallback \
+    "chaotic-aur" "chaotic-keyring" "30565AC3868033CA" \
+    "https://cdn-mirror.chaotic.cx/chaotic-aur/\$arch" \
+    "https://geo-mirror.chaotic.cx/chaotic-aur/\$arch" \
+    "https://mirror.chaotic.cx/chaotic-aur/\$arch" || echo "Warning: Chaotic-AUR setup failed. It will not be available."
 
 echo "=== Configuring archlinuxcn repository ==="
-if ! _repo_already_enabled "archlinuxcn"; then
-    echo "Adding repository [archlinuxcn]..."
-    printf '\n[archlinuxcn]\nSigLevel = TrustedOnly\nServer = https://repo.archlinuxcn.org/$arch\n' >> /etc/pacman.conf
-    pacman -Sy --noconfirm 2>/dev/null || true
-    if pacman -S --noconfirm --needed archlinuxcn-keyring 2>/dev/null; then
-        echo "archlinuxcn-keyring installed."
-    else
-        echo "Warning: archlinuxcn-keyring install failed. Trying alternate method..."
-        if command -v pacman-key >/dev/null 2>&1; then
-            pacman-key --recv-key 11C2E2D1D43CF75C 2>/dev/null || true
-            pacman-key --lsign-key 11C2E2D1D43CF75C 2>/dev/null || true
-        fi
-    fi
-else
-    echo "archlinuxcn already enabled."
-fi
+_enable_repo_with_fallback \
+    "archlinuxcn" "archlinuxcn-keyring" "11C2E2D1D43CF75C" \
+    "https://repo.archlinuxcn.org/\$arch" \
+    "https://mirrors.tuna.tsinghua.edu.cn/archlinuxcn/\$arch" \
+    "https://mirror.sjtu.edu.cn/archlinuxcn/\$arch" || echo "Warning: archlinuxcn setup failed. It will not be available."
 
 echo "=== Configuring endeavouros repository ==="
-if ! _repo_already_enabled "endeavouros"; then
-    echo "Adding repository [endeavouros]..."
-    printf '\n[endeavouros]\nSigLevel = TrustedOnly\nServer = https://mirror.freedif.org/EndeavourOS/repo/$repo/$arch\n' >> /etc/pacman.conf
-    pacman -Sy --noconfirm 2>/dev/null || true
-    if pacman -S --noconfirm --needed endeavouros-keyring 2>/dev/null; then
-        echo "endeavouros keyring installed."
-    else
-        echo "Warning: endeavouros keyring install failed. Trying alternate method..."
-        if command -v pacman-key >/dev/null 2>&1; then
-            pacman-key --recv-key F52611D11AFD4556 2>/dev/null || true
-            pacman-key --lsign-key F52611D11AFD4556 2>/dev/null || true
-        fi
-    fi
-else
-    echo "endeavouros already enabled."
-fi
+_enable_repo_with_fallback \
+    "endeavouros" "endeavouros-keyring" "F52611D11AFD4556" \
+    "https://mirror.freedif.org/EndeavourOS/repo/\$repo/\$arch" \
+    "https://mirror.endeavouros.com/EndeavourOS/repo/\$repo/\$arch" \
+    "https://mirror.enderunix.org/endeavouros/repo/\$repo/\$arch" || echo "Warning: EndeavourOS setup failed. It will not be available."
 
 echo "=== Configuring mesa-git repository (disabled by default - can break GPU drivers) ==="
 if ! _repo_already_enabled "mesa-git"; then
@@ -2438,8 +2511,9 @@ echo "Available additional repos: chaotic-aur, archlinuxcn, endeavouros"
 REPOS_EOF
 
     if ! exec_container_script "$repos_script" "extra-repos"; then
-        log_warn "Third-party repository setup had issues. Some repos may not be available."
-        log_info "You can manually add repos later inside the container via /etc/pacman.conf"
+        log_warn "Third-party repository setup encountered errors."
+        log_info "Individual repos may have failed due to key server or mirror issues."
+        log_info "The script will continue — failed repos can be configured later via /etc/pacman.conf inside the container."
     fi
 }
 
@@ -4236,6 +4310,8 @@ main() {
   ensure_podman
   detect_init_support
 
+    check_battery_power || exit 0
+
     if [[ "$DRY_RUN" == "true" ]]; then
         echo -e "${BOLD}${BLUE}Steam Deck Pamac Setup v${SCRIPT_VERSION}${NC} ${BOLD}${YELLOW}(DRY RUN)${NC}"
         echo
@@ -4345,6 +4421,7 @@ configure_multilib
     _ensure_healthy_or_recreate "after base setup" || exit 1
 
 	check_memory_ok 524288 "AUR helper build" || log_warn "Low memory may cause OOM kills during yay compilation."
+	check_battery_power || log_warn "Battery low, but continuing AUR helper build..."
 
 	if ! install_aur_helper; then
 		if _ensure_healthy_or_recreate "aur helper recovery"; then

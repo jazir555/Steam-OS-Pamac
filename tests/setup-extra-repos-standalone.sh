@@ -90,38 +90,11 @@ else
     echo "endeavouros already enabled."
 fi
 
-echo "=== Configuring blackarch repository ==="
-if ! _repo_already_enabled "blackarch"; then
-    echo "Adding repository [blackarch]..."
-    printf '\n[blackarch]\nSigLevel = TrustedOnly\nServer = https://blackarch.org/blackarch/$repo/os/$arch\n' >> /etc/pacman.conf
-    pacman -Sy --noconfirm 2>/dev/null || true
-    echo "Installing blackarch-keyring..."
-    if pacman -S --noconfirm --needed blackarch-keyring 2>/dev/null; then
-        echo "blackarch keyring installed."
-        if command -v pacman-key >/dev/null 2>&1; then
-            pacman-key --lsign-key 4345771566D76038C2C3A6AB9E8275C9E4D56107 2>/dev/null || true
-        fi
-    else
-        echo "Warning: blackarch-keyring install failed. Trying alternate method..."
-        if command -v curl >/dev/null 2>&1; then
-            strap_tmp="$(mktemp -d)"
-            if curl -sL "https://blackarch.org/strap.sh" -o "$strap_tmp/strap.sh" 2>/dev/null && \
-               [[ -s "$strap_tmp/strap.sh" ]]; then
-                chmod +x "$strap_tmp/strap.sh"
-                "$strap_tmp/strap.sh" 2>/dev/null || echo "Warning: blackarch strap.sh failed."
-            fi
-            rm -rf "$strap_tmp"
-        fi
-    fi
-else
-    echo "blackarch already enabled."
-fi
-
 echo "=== Syncing package databases with new repositories ==="
 pacman -Sy --noconfirm 2>/dev/null || echo "Warning: database sync with new repos had issues."
 
 echo "Third-party repository configuration complete."
-echo "Available additional repos: chaotic-aur, archlinuxcn, endeavouros, blackarch"
+echo "Available additional repos: chaotic-aur, archlinuxcn, endeavouros"
 
 echo "=== Verifying repos in pacman.conf ==="
 grep '^\[' /etc/pacman.conf

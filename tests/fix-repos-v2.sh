@@ -30,7 +30,6 @@ podman exec arch-pamac pacman -Sy --noconfirm extra 2>&1 | tail -3
 podman exec arch-pamac pacman -Sy --noconfirm chaotic-aur 2>&1 | tail -3
 podman exec arch-pamac pacman -Sy --noconfirm archlinuxcn 2>&1 | tail -3
 podman exec arch-pamac pacman -Sy --noconfirm endeavouros 2>&1 | tail -3
-podman exec arch-pamac pacman -Sy --noconfirm blackarch 2>&1 | tail -3
 
 echo ""
 echo "=== Full sync ==="

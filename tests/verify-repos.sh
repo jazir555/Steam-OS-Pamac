@@ -11,16 +11,12 @@ echo "=== Testing archlinuxcn ==="
 podman exec arch-pamac pacman -Ssq archlinuxcn/google-chrome 2>/dev/null || echo "not in archlinuxcn"
 
 echo ""
-echo "=== Testing blackarch ==="
-podman exec arch-pamac pacman -Ssq blackarch/nmap 2>/dev/null | head -3
-
-echo ""
 echo "=== Testing endeavouros ==="
 podman exec arch-pamac pacman -Ssq endeavouros/endeavouros-keyring 2>/dev/null || echo "endeavouros-keyring not found"
 
 echo ""
 echo "=== Package count per extra repo ==="
-for repo in chaotic-aur archlinuxcn blackarch endeavouros; do
+for repo in chaotic-aur archlinuxcn endeavouros; do
   count=$(podman exec arch-pamac pacman -Sl $repo 2>/dev/null | wc -l)
   echo "$repo: $count packages"
 done

@@ -2971,9 +2971,21 @@ if [[ -z "$installed_pacman_ver" ]]; then
     exit 0
 fi
 
-pacman_major=$(echo "$installed_pacman_ver" | cut -d. -f1)
-pacman_minor=$(echo "$installed_pacman_ver" | cut -d. -f2)
-echo "Parsed pacman version: major=$pacman_major minor=$pacman_minor"
+sanitize_version_component() {
+    # Strip epoch (e.g. "6:5.2.0" -> "5.2.0"), then extract only leading digits.
+    # Handles epochs, pre-release suffixes, and non-numeric characters.
+    local ver="$1"
+    ver="${ver#*:}"
+    echo "$ver" | grep -oP '^[0-9]+' || echo "0"
+}
+
+pacman_major=$(echo "$installed_pacman_ver" | sanitize_version_component)
+# For minor, strip epoch first, then get the second dot-separated component
+_pacman_minor_raw=$(echo "$installed_pacman_ver" | sed 's/^[^:]*://')
+_pacman_minor_raw=$(echo "$_pacman_minor_raw" | cut -d. -f2)
+pacman_minor=$(echo "$_pacman_minor_raw" | grep -oP '^[0-9]*' || echo "0")
+[[ -z "$pacman_minor" ]] && pacman_minor=0
+echo "Parsed pacman version: major=$pacman_major minor=$pacman_minor (raw: $installed_pacman_ver)"
 
 if [[ -n "$pamac_version_pin" && "$pamac_version_pin" != "latest" ]]; then
     echo "User specified --pamac-version=$pamac_version_pin. Attempting direct install..."
@@ -2997,7 +3009,7 @@ if [[ -n "$pamac_version_pin" && "$pamac_version_pin" != "latest" ]]; then
 fi
 
 echo "Fetching latest pamac-aur PKGBUILD from AUR..."
-aur_pkgbuild=$(curl -sf "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=pamac-aur" 2>/dev/null || echo "")
+aur_pkgbuild=$(curl -sf --connect-timeout 10 --max-time 30 "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=pamac-aur" 2>/dev/null || echo "")
 if [[ -z "$aur_pkgbuild" ]]; then
     echo "WARN: Could not fetch pamac-aur PKGBUILD from AUR (network issue?). Skipping check."
     exit 0
@@ -3015,8 +3027,10 @@ req_version=$(echo "$aur_pacman_dep" | grep -oP "[0-9.]+" | head -1)
 req_op=$(echo "$aur_pacman_dep" | grep -oP "[><=]+" | head -1)
 echo "Required: pacman $req_op $req_version"
 
-req_major=$(echo "$req_version" | cut -d. -f1)
-req_minor=$(echo "$req_version" | cut -d. -f2)
+req_major=$(echo "$req_version" | sanitize_version_component)
+_req_minor_raw=$(echo "$req_version" | cut -d. -f2)
+req_minor=$(echo "$_req_minor_raw" | grep -oP '^[0-9]*' || echo "0")
+[[ -z "$req_minor" ]] && req_minor=0
 
 version_meets_requirement() {
     local cur_major="$1" cur_minor="$2" op="$3" rq_major="$4" rq_minor="${5:-0}"
@@ -3071,8 +3085,10 @@ if [[ "$can_upgrade_pacman" == "true" ]]; then
         if pacman -S --noconfirm --needed pacman 2>&1 | tail -10; then
             new_ver=$(pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
             echo "Upgraded pacman to: $new_ver"
-            new_major=$(echo "$new_ver" | cut -d. -f1)
-            new_minor=$(echo "$new_ver" | cut -d. -f2)
+            new_major=$(echo "$new_ver" | sanitize_version_component)
+            _new_minor_raw=$(echo "$new_ver" | sed 's/^[^:]*://' | cut -d. -f2)
+            new_minor=$(echo "$_new_minor_raw" | grep -oP '^[0-9]*' || echo "0")
+            [[ -z "$new_minor" ]] && new_minor=0
             if version_meets_requirement "$new_major" "$new_minor" "$req_op" "$req_major" "$req_minor"; then
                 echo "SUCCESS: Upgraded pacman $new_ver now satisfies $aur_pacman_dep"
                 ldconfig 2>/dev/null || true
@@ -3084,8 +3100,10 @@ if [[ "$can_upgrade_pacman" == "true" ]]; then
             pacman -Syu --noconfirm 2>&1 | tail -20 || true
             new_ver=$(pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
             echo "After full upgrade, pacman version: $new_ver"
-            new_major=$(echo "$new_ver" | cut -d. -f1)
-            new_minor=$(echo "$new_ver" | cut -d. -f2)
+            new_major=$(echo "$new_ver" | sanitize_version_component)
+            _new_minor_raw2=$(echo "$new_ver" | sed 's/^[^:]*://' | cut -d. -f2)
+            new_minor=$(echo "$_new_minor_raw2" | grep -oP '^[0-9]*' || echo "0")
+            [[ -z "$new_minor" ]] && new_minor=0
             if version_meets_requirement "$new_major" "$new_minor" "$req_op" "$req_major" "$req_minor"; then
                 echo "SUCCESS: Full upgrade brought pacman $new_ver which satisfies $aur_pacman_dep"
                 ldconfig 2>/dev/null || true
@@ -3098,10 +3116,32 @@ fi
 
 echo ">>> Strategy B: Finding older pamac-aur revision compatible with pacman $installed_pacman_ver..."
 
-for try_commit in $(curl -sf "https://aur.archlinux.org/cgit/aur.git/log/?h=pamac-aur" 2>/dev/null | grep -oP 'commit/\K[a-f0-9]{40}' | head -10); do
+_CURL_TIMEOUT="--connect-timeout 10 --max-time 30"
+
+_aur_log_page=$(curl -sf $_CURL_TIMEOUT "https://aur.archlinux.org/cgit/aur.git/log/?h=pamac-aur" 2>/dev/null || echo "")
+if [[ -z "$_aur_log_page" ]]; then
+    echo "WARN: Could not fetch AUR commit log page (network issue or cgit endpoint changed)."
+    echo "WARN: Falling back to Strategy C (build latest regardless of compatibility)."
+    echo "COMPATIBLE_COMMIT=latest_anyway"
+    exit 3
+fi
+
+_commits=$(echo "$_aur_log_page" | grep -oP 'commit/\K[a-f0-9]{40}' | head -10 || true)
+if [[ -z "$_commits" ]]; then
+    echo "WARN: AUR cgit page fetched but no commit hashes found (HTML format may have changed)."
+    echo "WARN: The AUR web interface may have been restructured. Falling back to Strategy C."
+    echo "COMPATIBLE_COMMIT=latest_anyway"
+    exit 3
+fi
+
+_commit_count=$(echo "$_commits" | wc -l)
+echo "Found $_commit_count recent commits. Checking compatibility (with connection timeouts)..."
+
+for try_commit in $_commits; do
     echo "Checking commit: ${try_commit:0:12}..."
-    old_pkgbuild=$(curl -sf "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=pamac-aur&id=$try_commit" 2>/dev/null || echo "")
+    old_pkgbuild=$(curl -sf $_CURL_TIMEOUT "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=pamac-aur&id=$try_commit" 2>/dev/null || echo "")
     if [[ -z "$old_pkgbuild" ]]; then
+        echo "  -> Could not fetch PKGBUILD (network timeout or commit unreachable), skipping..."
         continue
     fi
 
@@ -3116,8 +3156,10 @@ for try_commit in $(curl -sf "https://aur.archlinux.org/cgit/aur.git/log/?h=pama
     fi
 
     old_req_ver=$(echo "$old_dep" | grep -oP "[0-9.]+" | head -1)
-    old_req_major=$(echo "$old_req_ver" | cut -d. -f1)
-    old_req_minor=$(echo "$old_req_ver" | cut -d. -f2)
+    old_req_major=$(echo "$old_req_ver" | grep -oP '^[0-9]+' || echo "0")
+    old_req_minor=$(echo "$old_req_ver" | cut -d. -f2 | grep -oP '^[0-9]*' || echo "0")
+    [[ -z "$old_req_major" ]] && old_req_major=0
+    [[ -z "$old_req_minor" ]] && old_req_minor=0
     old_req_op=$(echo "$old_dep" | grep -oP "[><=]+" | head -1)
 
     if version_meets_requirement "$pacman_major" "$pacman_minor" "$old_req_op" "$old_req_major" "$old_req_minor"; then

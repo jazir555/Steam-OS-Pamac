@@ -12,6 +12,15 @@ readonly LOG_FILE="$HOME/distrobox-pamac-setup.log"
 readonly REQUIRED_TOOLS=("distrobox")
 CONTAINER_HAS_INIT="unknown"
 
+# Track temp files for cleanup on interrupt
+_TEMP_FILES=()
+_cleanup_temp_files() {
+    for f in "${_TEMP_FILES[@]}"; do
+        rm -f "$f" 2>/dev/null || true
+    done
+}
+trap _cleanup_temp_files EXIT
+
 CONTAINER_NAME="${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}"
 
 CURRENT_USER=$(whoami)
@@ -22,7 +31,6 @@ ENABLE_GAMING_PACKAGES="${ENABLE_GAMING_PACKAGES:-false}"
 ENABLE_EXTRA_REPOS="${ENABLE_EXTRA_REPOS:-true}"
 FORCE_REBUILD="${FORCE_REBUILD:-false}"
 OPTIMIZE_MIRRORS="${OPTIMIZE_MIRRORS:-true}"
-ALLOW_SIGLEVEL_NEVER="${ALLOW_SIGLEVEL_NEVER:-}"
 ALLOW_SIGLEVEL_NEVER_CLI="${ALLOW_SIGLEVEL_NEVER_CLI:-}"
 
 : "${DISTROBOX_CONTAINER_MANAGER:=podman}"
@@ -113,28 +121,34 @@ run_command() {
 container_runtime() {
     local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
     if [[ "$mgr" == "docker" ]]; then
-        if [[ -n "${PODMAN_SUDO_FALLBACK:-}" ]]; then
+        docker "$@"
+    else
+        podman "$@"
+    fi
+}
+
+# Use sudo only for privileged operations (create, rm, system) when rootless is broken
+container_runtime_privileged() {
+    local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
+    if [[ -n "${PODMAN_SUDO_FALLBACK:-}" ]]; then
+        if [[ "$mgr" == "docker" ]]; then
             sudo docker "$@"
         else
-            docker "$@"
+            sudo podman "$@"
         fi
     else
-        if [[ -n "${PODMAN_SUDO_FALLBACK:-}" ]]; then
-            sudo podman "$@"
-        else
-            podman "$@"
-        fi
+        container_runtime "$@"
     fi
 }
 
 container_root_exec() {
   container_start 2>/dev/null || true
-  container_runtime exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" "$@"
+  container_runtime_privileged exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" "$@"
 }
 
 container_user_exec() {
   container_start 2>/dev/null || true
-  container_runtime exec -i -u "$CURRENT_USER" \
+  container_runtime_privileged exec -i -u "$CURRENT_USER" \
     -e HOME="/home/${CURRENT_USER}" \
     -e XDG_DATA_DIRS="/usr/local/share:/usr/share" \
     -e XDG_DATA_HOME="/home/${CURRENT_USER}/.local/share" \
@@ -146,7 +160,7 @@ container_cp_from() {
     local src="$1" dst="$2"
     log_debug "Copying from container: $src -> $dst"
     container_start 2>/dev/null || true
-    if container_runtime cp "$CONTAINER_NAME:$src" "$dst" 2>/dev/null; then
+    if container_runtime_privileged cp "$CONTAINER_NAME:$src" "$dst" 2>/dev/null; then
         log_debug "Copied $src from container."
         return 0
     else
@@ -156,20 +170,20 @@ container_cp_from() {
 }
 
 container_start() {
-  container_runtime start "$CONTAINER_NAME" >>"$LOG_FILE" 2>&1 || true
+  container_runtime_privileged start "$CONTAINER_NAME" >>"$LOG_FILE" 2>&1 || true
 }
 
 container_is_running() {
-  container_runtime inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q "true"
+  container_runtime_privileged inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q "true"
 }
 
 container_get_status() {
-  container_runtime inspect "$CONTAINER_NAME" --format '{{.State.Status}}' 2>/dev/null || echo "not_found"
+  container_runtime_privileged inspect "$CONTAINER_NAME" --format '{{.State.Status}}' 2>/dev/null || echo "not_found"
 }
 
 container_is_usable() {
   container_start 2>/dev/null || true
-  timeout 15 container_runtime exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" bash -c "echo ok" </dev/null 2>/dev/null | grep -q "ok"
+  timeout 15 container_runtime_privileged exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" bash -c "echo ok" </dev/null 2>/dev/null | grep -q "ok"
 }
 
 container_get_status_safe() {
@@ -225,7 +239,7 @@ ensure_container_healthy() {
 					log_warn "force_remove_container may not have fully removed '$CONTAINER_NAME'. Checking..."
 				fi
 				sleep 1
-				if container_runtime inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+				if container_runtime_privileged inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
 					log_error "Container '$CONTAINER_NAME' still exists after force_remove. Manual intervention required."
 					log_info "Try: podman rm -f $CONTAINER_NAME && distrobox rm -f $CONTAINER_NAME"
 					return 1
@@ -287,22 +301,13 @@ _ensure_healthy_or_recreate() {
 
 force_remove_container() {
   local name="$1"
-  local runtime_cmd="podman"
-  [[ -n "${PODMAN_SUDO_FALLBACK:-}" ]] && runtime_cmd="sudo podman"
-  [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]] && runtime_cmd="docker"
-  [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" && -n "${PODMAN_SUDO_FALLBACK:-}" ]] && runtime_cmd="sudo docker"
 
-  if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
-    docker rm -f "$name" 2>/dev/null || true
-    return
-  fi
-
-  if ! $runtime_cmd inspect "$name" >/dev/null 2>&1; then
+  if ! container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
     return
   fi
 
   local status
-  status=$($runtime_cmd inspect "$name" --format '{{.State.Status}}' 2>/dev/null || echo "not_found")
+  status=$(container_runtime_privileged inspect "$name" --format '{{.State.Status}}' 2>/dev/null || echo "not_found")
   if [[ "$status" == "not_found" ]]; then
     return
   fi
@@ -310,12 +315,12 @@ force_remove_container() {
   if [[ "$status" == "stopping" || "$status" == "stopped" || "$status" == "improper" ]]; then
     log_debug "Container '$name' in '$status' state - killing container processes"
     local pid
-    pid=$($runtime_cmd inspect "$name" --format '{{.State.Pid}}' 2>/dev/null || echo "0")
+    pid=$(container_runtime_privileged inspect "$name" --format '{{.State.Pid}}' 2>/dev/null || echo "0")
     if [[ "$pid" -gt 0 ]]; then
       kill -9 "$pid" 2>/dev/null || true
     fi
     local conmon_pid
-    conmon_pid=$($runtime_cmd inspect "$name" --format '{{.ConmonPidFile}}' 2>/dev/null || true)
+    conmon_pid=$(container_runtime_privileged inspect "$name" --format '{{.ConmonPidFile}}' 2>/dev/null || true)
     if [[ -n "$conmon_pid" && -f "$conmon_pid" ]]; then
       local cpid
       cpid=$(cat "$conmon_pid" 2>/dev/null || echo "0")
@@ -326,43 +331,31 @@ force_remove_container() {
     sleep 1
   fi
 
- $runtime_cmd rm -f "$name" 2>/dev/null || true
- if $runtime_cmd inspect "$name" >/dev/null 2>&1; then
- log_debug "User $runtime_cmd rm failed, trying sudo..."
- if sudo -n true 2>/dev/null; then
- if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
- sudo docker rm -f "$name" 2>/dev/null || true
- else
- sudo podman rm -f "$name" 2>/dev/null || true
- fi
- else
- log_warn "User $runtime_cmd rm failed and passwordless sudo not available. Skipping sudo fallback to avoid hang."
- fi
- fi
+  container_runtime_privileged rm -f "$name" 2>/dev/null || true
 
-	if $runtime_cmd inspect "$name" >/dev/null 2>&1; then
-		log_warn "$runtime_cmd rm still failed for '$name'. $runtime_cmd may be corrupted."
-		log_warn "WARNING: Manual storage cleanup is a last resort. Deleting files from $runtime_cmd's"
-		log_warn "overlayfs storage while the container engine is running can leave the $runtime_cmd"
-		log_warn "database in an inconsistent state, causing 'ghost' containers or future failures"
-		log_warn "that even '$runtime_cmd system reset' may not fix. Proceed only if other options failed."
+	if container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
+		log_warn "rm still failed for '$name'. Container engine may be corrupted."
+		log_warn "WARNING: Manual storage cleanup is a last resort. Deleting files from container engine's"
+		log_warn "overlayfs storage while the container engine is running can leave the database"
+		log_warn "in an inconsistent state, causing 'ghost' containers or future failures"
+		log_warn "that even 'system reset' may not fix. Proceed only if other options failed."
 		if [[ -t 0 ]]; then
 			echo -ne "${RED}${BOLD}Type 'yes' to proceed with manual storage cleanup, or anything else to skip: ${NC}" >&2
 			local cleanup_confirm
 			read -r cleanup_confirm
 			if [[ "$cleanup_confirm" != "yes" ]]; then
 				log_warn "User declined manual storage cleanup. Skipping."
-				log_info "You can try '$runtime_cmd system reset --force' or restart $runtime_cmd manually."
+				log_info "Try 'podman system reset --force' or restart the engine manually."
 				return
 			fi
 		else
-			log_warn "Non-interactive session — skipping manual storage cleanup to avoid $runtime_cmd corruption."
-			log_info "Run this script interactively to approve cleanup, or try '$runtime_cmd system reset --force'."
+			log_warn "Non-interactive session — skipping manual storage cleanup to avoid engine corruption."
+			log_info "Run this script interactively to approve cleanup, or try 'podman system reset --force'."
 			return
 		fi
 		local podman_storage="${XDG_DATA_HOME:-$HOME/.local/share}/containers/storage"
 		if [[ -d "$podman_storage" ]]; then
-			log_warn "Removing container '$name' files from $runtime_cmd storage..."
+			log_warn "Removing container '$name' files from storage..."
 			find "$podman_storage" -maxdepth 3 -type d -name "${name}" -exec rm -rf {} \; 2>/dev/null || true
 			find "$podman_storage" -maxdepth 3 -type d -name "${name}-*" -exec rm -rf {} \; 2>/dev/null || true
 		fi
@@ -371,14 +364,7 @@ force_remove_container() {
 			find "$podman_run" -maxdepth 2 -type d -name "${name}" -exec rm -rf {} \; 2>/dev/null || true
 			find "$podman_run" -maxdepth 2 -type d -name "${name}-*" -exec rm -rf {} \; 2>/dev/null || true
 		fi
-		$runtime_cmd rm -f "$name" 2>/dev/null || true
-		if sudo -n true 2>/dev/null; then
-			if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
-				sudo docker rm -f "$name" 2>/dev/null || true
-			else
-				sudo podman rm -f "$name" 2>/dev/null || true
-			fi
-		fi
+		container_runtime_privileged rm -f "$name" 2>/dev/null || true
   fi
 }
 
@@ -564,10 +550,10 @@ repair_podman() {
 
     log_info "Trying podman with sudo fallback..."
     if sudo podman info >/dev/null 2>&1; then
-        log_warn "Rootless podman broken, root podman works. Using sudo for container operations."
+        log_warn "Rootless podman broken, root podman works. Using sudo for container create/remove operations."
         export PODMAN_SUDO_FALLBACK=true
-        if container_runtime info >/dev/null 2>&1; then
-            log_success "Using root podman fallback."
+        if container_runtime_privileged info >/dev/null 2>&1; then
+            log_success "Using root podman fallback (privileged ops only)."
             return 0
         fi
     fi
@@ -641,9 +627,6 @@ OPTIONS:
 
 ENVIRONMENT VARIABLES:
   CONTAINER_NAME            Override default container name (default: arch-pamac)
-  ALLOW_SIGLEVEL_NEVER      Deprecated, no longer honored. Use
-                            --allow-siglevel-never instead (DISABLES PGP
-                            signature verification — insecure!)
   FORCE_REBUILD            Set to 'true' to force-rebuild existing container
   ENABLE_GAMING_PACKAGES   Set to 'true' to install gaming packages
 
@@ -835,7 +818,7 @@ wait_for_container() {
       container_start || true
     elif [[ $attempt -le 5 ]]; then
       local exit_code
-      exit_code=$(container_runtime inspect "$CONTAINER_NAME" --format '{{.State.ExitCode}}' 2>/dev/null || echo "unknown")
+      exit_code=$(container_runtime_privileged inspect "$CONTAINER_NAME" --format '{{.State.ExitCode}}' 2>/dev/null || echo "unknown")
       log_warn "Container keeps exiting (exit code: $exit_code). Inspecting..." || true
       case "$exit_code" in
         137) log_error "Container was OOM-killed (exit 137). Not enough memory available." || true ;;
@@ -902,7 +885,7 @@ detect_init_support() {
     if [[ "$mgr" == "docker" ]]; then
         init_binary=$(docker info --format '{{.Host.InitPath}}' 2>/dev/null || echo "")
     else
-        init_binary=$(container_runtime info --format '{{.Host.InitPath}}' 2>/dev/null || echo "")
+        init_binary=$(container_runtime_privileged info --format '{{.Host.InitPath}}' 2>/dev/null || echo "")
     fi
     if [[ -n "$init_binary" ]]; then
         local resolved
@@ -1038,6 +1021,7 @@ exec_container_script() {
 '
 
     _script_file=$(mktemp /tmp/pamac-script-XXXXXXXX)
+    _TEMP_FILES+=("$_script_file")
     printf '%s\n' "${_preamble}${_script}" > "$_script_file"
 
     local _marker="PAMAC_SCRIPT_OK_$(head -c 16 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$_$(date +%s)")"
@@ -1093,6 +1077,7 @@ exec_container_pipe() {
 '
 
     _script_file=$(mktemp /tmp/pamac-pipe-XXXXXXXX)
+    _TEMP_FILES+=("$_script_file")
     printf '%s' "$_preamble" > "$_script_file"
     cat >> "$_script_file"
     printf '\necho "%s"\n' "$_marker" >> "$_script_file"
@@ -1243,9 +1228,6 @@ KEYRING_EOF
 
     if grep -q 'SIGNAL:SIGLEVEL_NEEDED' "$LOG_FILE" 2>/dev/null; then
         local _apply_siglevel_never=false
-        if [[ "${ALLOW_SIGLEVEL_NEVER:-}" == "true" ]]; then
-            log_warn "ALLOW_SIGLEVEL_NEVER=true is no longer honored as a non-interactive override. Use --allow-siglevel-never instead."
-        fi
         if [[ "${ALLOW_SIGLEVEL_NEVER_CLI:-}" == "true" ]]; then
             echo -e "${RED}${BOLD}SECURITY WARNING: SigLevel=Never DISABLES all PGP signature verification.${NC}" >&2
             echo -e "${RED}${BOLD}This makes package installation vulnerable to tampering and MITM attacks.${NC}" >&2
@@ -1657,8 +1639,8 @@ dbus-daemon --system --fork 2>/dev/null || echo "Note: dbus-daemon start failed 
 fi
 fi
 
-echo "Leaving Pamac polkit policy at least-privilege defaults (auth_admin_keep)."
-echo "Passwordless package ops are handled via sudo (wheel) and the polkit wheel rule."
+echo "Leaving Pamac polkit policy at auth_admin_keep defaults."
+echo "Passwordless package ops for wheel group are handled by 10-pamac-nopasswd.rules (overrides this policy file)."
 pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
 if [[ -f "$pamac_policy" ]]; then
     if grep -q '<allow_any>yes</allow_any>' "$pamac_policy"; then
@@ -2629,14 +2611,14 @@ mkdir -p "/home/$current_user/.pamac-build"
 chown "$current_user:$current_user" "/home/$current_user/.pamac-build" 2>/dev/null || true
 echo "BuildDirectory set to /home/$current_user/.pamac-build"
 
-echo "Leaving Pamac polkit policy at least-privilege defaults (auth_admin_keep)."
+echo "Leaving Pamac polkit policy at auth_admin_keep defaults."
 pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
 if [[ -f "$pamac_policy" ]]; then
 if grep -q '<allow_any>yes</allow_any>' "$pamac_policy"; then
     sed -i 's|<allow_any>yes</allow_any>|<allow_any>auth_admin_keep</allow_any>|' "$pamac_policy"
     sed -i 's|<allow_inactive>yes</allow_inactive>|<allow_inactive>auth_admin_keep</allow_inactive>|' "$pamac_policy"
     sed -i 's|<allow_active>yes</allow_active>|<allow_active>auth_admin_keep</allow_active>|' "$pamac_policy"
-    echo "Restored least-privilege polkit policy (was previously relaxed to allow_any=yes)."
+    echo "Restored auth_admin_keep in polkit policy (was previously relaxed to allow_any=yes)."
 fi
 else
 echo "Warning: pamac polkit policy file not found at $pamac_policy"
@@ -2714,11 +2696,21 @@ EOF
     fi
 }
 
+_is_root_writable() {
+    [ -w /etc ]
+}
+
 configure_ssh_environment() {
     log_step "Configuring SSH environment for nested commands"
 
     if ! grep -qi steamos /etc/os-release 2>/dev/null; then
         log_info "Not SteamOS, skipping SSH environment setup."
+        return 0
+    fi
+
+    if ! _is_root_writable; then
+        log_info "Root filesystem is read-only – skipping SSH / profile host configuration."
+        log_info "These optional tweaks are only needed for advanced SSH remote access."
         return 0
     fi
 
@@ -2863,33 +2855,83 @@ export_pamac_to_host() {
     command -v gtk-update-icon-cache >/dev/null 2>&1 && \
         gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" -f 2>/dev/null || true
 
-    log_info "Installing X11 tools for window integration (xdotool, xprop, xwininfo)..."
+    log_info "Installing X11/Wayland tools for window integration..."
     container_root_exec bash -c 'pacman -S --noconfirm --needed xdotool xorg-xprop xorg-xwininfo 2>/dev/null || echo "Warning: x11 tools install failed (non-fatal)"'
 
-    log_info "Installing xdotool/xprop/xwininfo on host (required for wrapper taskbar integration)..."
-    local host_x11_ok=true
-    for host_tool in xdotool xprop xwininfo; do
-        if ! command -v "$host_tool" >/dev/null 2>&1; then
+    log_info "Installing window integration tools on host (xdotool/wlrctl for taskbar integration)..."
+    local has_wayland_tools=false
+
+    # Detect display server
+    local is_wayland=false
+    if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+        is_wayland=true
+    fi
+
+    if ! _is_root_writable; then
+        log_info "Root filesystem is read-only (SteamOS default). Skipping host package installation."
+        log_info "Window integration tools (xdotool/wlrctl) must be installed manually if needed."
+    else
+        # Helper: install a package on host via pkcon or pacman
+        _install_host_pkg() {
+            local pkg="$1"
             if command -v pkcon >/dev/null 2>&1; then
-                log_info "Installing $host_tool on host via pkcon..."
-                pkcon install -y "$host_tool" 2>/dev/null || {
-                    log_warn "Failed to install $host_tool on host via pkcon. Window integration may not work."
-                    host_x11_ok=false
-                }
-            elif [[ -f /usr/bin/steamos-readonly ]] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-                log_info "SteamOS detected — attempting $host_tool via pacman with sudo..."
-                sudo pacman -S --noconfirm "$host_tool" 2>/dev/null || {
-                    log_warn "Failed to install $host_tool on host. Window integration may not work."
-                    host_x11_ok=false
-                }
-            else
-                log_warn "$host_tool not found on host and cannot auto-install. Window integration (taskbar icon) may not work."
-                host_x11_ok=false
+                pkcon install -y "$pkg" 2>/dev/null && return 0
+            fi
+            if [[ -f /usr/bin/steamos-readonly ]] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+                sudo pacman -S --noconfirm "$pkg" 2>/dev/null && return 0
+            fi
+            return 1
+        }
+
+        if [[ "$is_wayland" == "true" ]]; then
+            # Wayland session - try wlrctl/kdotool
+            for host_tool in wlrctl kdotool; do
+                if command -v "$host_tool" >/dev/null 2>&1; then
+                    has_wayland_tools=true
+                    log_debug "Found Wayland tool: $host_tool"
+                    break
+                fi
+            done
+            if [[ "$has_wayland_tools" == "false" ]]; then
+                log_info "Wayland session detected, attempting to install Wayland window tools..."
+                if _install_host_pkg wlrctl; then
+                    has_wayland_tools=true
+                    log_info "Installed wlrctl for Wayland window management."
+                elif _install_host_pkg kdotool; then
+                    has_wayland_tools=true
+                    log_info "Installed kdotool for Wayland window management."
+                else
+                    log_warn "Could not install wlrctl or kdotool. Wayland taskbar integration may not work."
+                    log_info "You can install manually: 'pkcon install wlrctl' or 'pacman -S wlrctl'"
+                fi
             fi
         fi
-    done
-    if [[ "$host_x11_ok" == "true" ]]; then
-        log_success "xdotool, xprop, xwininfo are available on host."
+
+        # Always install X11 tools as well (needed for XWayland and fallback)
+        for host_tool in xdotool xprop xwininfo; do
+            if ! command -v "$host_tool" >/dev/null 2>&1; then
+                if _install_host_pkg "$host_tool"; then
+                    log_info "Installed $host_tool on host."
+                else
+                    log_warn "$host_tool not found on host and cannot auto-install. Window integration may use fallback."
+                fi
+            fi
+        done
+    fi
+
+    # Determine overall tool availability — either Wayland or X11 tools suffice
+    local host_tools_available=false
+    if [[ "$has_wayland_tools" == "true" ]]; then
+        host_tools_available=true
+        log_success "Wayland window tools available ($([ "$is_wayland" == "true" ] && echo "session is Wayland" || echo "XWayland fallback"))."
+    fi
+    if command -v xdotool >/dev/null 2>&1; then
+        host_tools_available=true
+        log_success "X11 window tools available."
+    fi
+    if [[ "$host_tools_available" == "false" ]]; then
+        log_warn "No window management tools available (neither Wayland nor X11). Taskbar integration will be skipped."
+        log_info "Install manually: 'pkcon install wlrctl' (Wayland) or 'pkcon install xdotool' (X11)"
     fi
 
     log_info "Creating pamac-manager launch wrapper inside container..."
@@ -3055,66 +3097,148 @@ cat > "$gui_wrapper" << GUI_WRAPPER_EOF
 export HOME="/home/${current_user}"
 export DISPLAY=\${DISPLAY:-:0}
 
+# Detect display server
+IS_WAYLAND=false
+if [[ -n "\${WAYLAND_DISPLAY:-}" ]]; then
+    IS_WAYLAND=true
+fi
+
 # Dynamically find the XAUTHORITY for the current desktop session
-if [[ -n "\${XAUTH:-}" && -f "\$XAUTH" ]]; then
-  export XAUTHORITY="\$XAUTH"
-elif [[ -f "\$HOME/.Xauthority" ]]; then
-  export XAUTHORITY="\$HOME/.Xauthority"
-else
-  newest_xauth=\$(ls -t /run/user/\$(id -u)/xauth_* 2>/dev/null | head -1)
-  if [[ -n "\$newest_xauth" && -f "\$newest_xauth" ]]; then
-    export XAUTHORITY="\$newest_xauth"
-  fi
+if [[ "\$IS_WAYLAND" == "false" ]]; then
+    if [[ -n "\${XAUTH:-}" && -f "\$XAUTH" ]]; then
+        export XAUTHORITY="\$XAUTH"
+    elif [[ -f "\$HOME/.Xauthority" ]]; then
+        export XAUTHORITY="\$HOME/.Xauthority"
+    else
+        newest_xauth=\$(ls -t /run/user/\$(id -u)/xauth_* 2>/dev/null | head -1)
+        if [[ -n "\$newest_xauth" && -f "\$newest_xauth" ]]; then
+            export XAUTHORITY="\$newest_xauth"
+        fi
+    fi
 fi
 
 DESKTOP_FILE="\$HOME/.local/share/applications/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
 
+# Check which window management tools are available
+HAS_WINDOW_MGMT=false
+if [[ "\$IS_WAYLAND" == "true" ]]; then
+    if command -v wlrctl >/dev/null 2>&1 || command -v kdotool >/dev/null 2>&1 || command -v hyprctl >/dev/null 2>&1; then
+        HAS_WINDOW_MGMT=true
+    elif command -v xdotool >/dev/null 2>&1; then
+        # XWayland fallback: X11 tools work through XWayland on Wayland sessions
+        HAS_WINDOW_MGMT=true
+    fi
+else
+    if command -v xdotool >/dev/null 2>&1; then
+        HAS_WINDOW_MGMT=true
+    fi
+fi
+
+# Helper: find pamac-manager windows (works on X11 and Wayland)
+_find_pamac_windows() {
+    if [[ "\$IS_WAYLAND" == "true" ]]; then
+        # Try native Wayland tools first
+        if command -v wlrctl >/dev/null 2>&1; then
+            wlrctl toplevel list 2>/dev/null | grep -i "pamac-manager" | awk '{print \$1}'
+        elif command -v kdotool >/dev/null 2>&1; then
+            kdotool search --name "pamac-manager" 2>/dev/null
+        elif command -v hyprctl >/dev/null 2>&1; then
+            hyprctl clients -j 2>/dev/null | grep -o '"address":"[^"]*"' | grep -v "0x0" | while read -r line; do
+                addr=\$(echo "\$line" | cut -d'"' -f4)
+                title=\$(hyprctl clients -j 2>/dev/null | grep -A5 "\"address\":\"\$addr\"" | grep '"title"' | cut -d'"' -f4)
+                if echo "\$title" | grep -qi "pamac-manager"; then
+                    echo "\$addr"
+                fi
+            done
+        elif command -v xdotool >/dev/null 2>&1; then
+            # XWayland fallback
+            xdotool search --class "pamac-manager" 2>/dev/null
+        fi
+    else
+        # X11 session
+        xdotool search --class "pamac-manager" 2>/dev/null
+    fi
+}
+
+# Helper: get window width (works on X11 and Wayland)
+_get_window_width() {
+    local wid="\$1"
+    if [[ "\$IS_WAYLAND" == "true" ]]; then
+        # Wayland doesn't expose window geometry via standard tools
+        # Assume window is valid if found
+        if [[ -n "\$wid" ]]; then
+            echo "100"
+        fi
+    else
+        xwininfo -id "\$wid" 2>/dev/null | awk -F': ' '/Width:/{print \$2}'
+    fi
+}
+
+# Helper: set desktop file hint (X11 only; Wayland compositors handle this differently)
+_set_desktop_file_hint() {
+    local wid="\$1"
+    if [[ "\$IS_WAYLAND" == "false" ]] && command -v xprop >/dev/null 2>&1; then
+        XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xprop -id "\$wid" \
+            -f _KDE_NET_WM_DESKTOP_FILE 8u \
+            -set _KDE_NET_WM_DESKTOP_FILE "\$DESKTOP_FILE" 2>/dev/null
+    fi
+}
+
 # Record EXISTING pamac-manager windows BEFORE launching new instance
-OLD_WINDOWS=\$(XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xdotool search --class "pamac-manager" 2>/dev/null | sort)
+OLD_WINDOWS=""
+if [[ "\$HAS_WINDOW_MGMT" == "true" ]]; then
+    OLD_WINDOWS="\$( _find_pamac_windows | sort)"
+fi
 
 # Launch Pamac in the background via distrobox
 distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper "\$@" &
 LAUNCHER_PID=\$!
 
-# Poll for NEW pamac-manager windows (up to 30 seconds)
+# Poll for NEW pamac-manager windows (up to 30 seconds) — only if tools are available
 WAIT_MAX=30
 WAITED=0
 FOUND=0
-while [[ \$WAITED -lt \$WAIT_MAX && \$FOUND -eq 0 ]]; do
-  sleep 2
-  WAITED=\$((WAITED + 2))
-  CURRENT_WINDOWS=\$(XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xdotool search --class "pamac-manager" 2>/dev/null | sort)
-  NEW_WINDOWS=\$(comm -13 <(echo "\$OLD_WINDOWS") <(echo "\$CURRENT_WINDOWS") 2>/dev/null)
-  if [[ -n "\$NEW_WINDOWS" ]]; then
-    FOUND=1
-    for wid in \$NEW_WINDOWS; do
-      width=\$(XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xwininfo -id "\$wid" 2>/dev/null | awk -F': ' '/Width:/{print \$2}')
-      if [[ -n "\$width" ]] && [[ "\$width" != "1" ]]; then
-        FOUND=2
-        CURRENT_WINDOWS="\$NEW_WINDOWS"
-        break
-      fi
+if [[ "\$HAS_WINDOW_MGMT" == "true" ]]; then
+    while [[ \$WAITED -lt \$WAIT_MAX && \$FOUND -eq 0 ]]; do
+        sleep 2
+        WAITED=\$((WAITED + 2))
+        CURRENT_WINDOWS="\$( _find_pamac_windows | sort)"
+        NEW_WINDOWS="\$(comm -13 <(echo "\$OLD_WINDOWS") <(echo "\$CURRENT_WINDOWS") 2>/dev/null)"
+        if [[ -n "\$NEW_WINDOWS" ]]; then
+            FOUND=1
+            for wid in \$NEW_WINDOWS; do
+                width=\$( _get_window_width "\$wid")
+                if [[ -n "\$width" ]] && [[ "\$width" != "1" ]]; then
+                    FOUND=2
+                    CURRENT_WINDOWS="\$NEW_WINDOWS"
+                    break
+                fi
+            done
+            if [[ \$FOUND -ne 2 ]]; then
+                FOUND=0
+            fi
+        fi
     done
-    if [[ \$FOUND -ne 2 ]]; then
-      FOUND=0
-    fi
-  fi
-done
 
-# Process ALL current pamac-manager windows (fix taskbar)
-ALL_WINDOWS=\$(XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xdotool search --class "pamac-manager" 2>/dev/null)
-for wid in \$ALL_WINDOWS; do
-  width=\$(XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xwininfo -id "\$wid" 2>/dev/null | awk -F': ' '/Width:/{print \$2}')
-  if [ "\$width" = "1" ]; then
-    XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xprop -id "\$wid" \
-      -f _NET_WM_STATE 32a \
-      -set _NET_WM_STATE _NET_WM_STATE_SKIP_TASKBAR 2>/dev/null
-  elif [ -n "\$width" ]; then
-    XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xprop -id "\$wid" \
-      -f _KDE_NET_WM_DESKTOP_FILE 8u \
-      -set _KDE_NET_WM_DESKTOP_FILE "\$DESKTOP_FILE" 2>/dev/null
-  fi
-done
+    # Process ALL current pamac-manager windows (fix taskbar)
+    ALL_WINDOWS=\$( _find_pamac_windows)
+    for wid in \$ALL_WINDOWS; do
+        width=\$( _get_window_width "\$wid")
+        if [ "\$width" = "1" ]; then
+            # X11 only: mark tiny windows as skip-taskbar
+            if [[ "\$IS_WAYLAND" == "false" ]] && command -v xprop >/dev/null 2>&1; then
+                XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xprop -id "\$wid" \
+                    -f _NET_WM_STATE 32a \
+                    -set _NET_WM_STATE _NET_WM_STATE_SKIP_TASKBAR 2>/dev/null
+            fi
+        elif [ -n "\$width" ]; then
+            _set_desktop_file_hint "\$wid"
+        fi
+    done
+else
+    # No window management tools available — just wait for Pamac to finish
+    echo "Note: No window management tools found (xdotool/wlrctl/kdotool). Taskbar integration skipped." >&2
+fi
 
 wait "\$LAUNCHER_PID" 2>/dev/null
 GUI_WRAPPER_EOF

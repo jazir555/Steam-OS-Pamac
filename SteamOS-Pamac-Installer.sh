@@ -1553,28 +1553,48 @@ set -uo pipefail
 
 rm -f /var/lib/pacman/db.lck
 
+# Atomic pacman.conf writer: avoids sed -i which is non-atomic and can corrupt
+# the file if the process is killed mid-write (power loss, SIGKILL).
+# Writes to a temp file, fsyncs, then atomically renames over the target.
+_atomic_write_pacman_conf() {
+    local target="/etc/pacman.conf"
+    local new_siglevel="$1"
+    local tmp
+    tmp=$(mktemp "${target}.atomic.XXXXXX") || { echo "FATAL: mktemp failed"; return 1; }
+    cp -f "$target" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = ${new_siglevel}/" "$tmp"
+    grep -q '^SigLevel' "$tmp" || printf 'SigLevel = %s\n' "$new_siglevel" >> "$tmp"
+    sync "$tmp" 2>/dev/null || sync 2>/dev/null || true
+    mv -f "$tmp" "$target"
+}
+
 echo "Step 0/5: Checking for leftover insecure SigLevel from previous crash..."
-if grep -q '^SigLevel\s*=\s*TrustAll' /etc/pacman.conf 2>/dev/null; then
-    if [[ -f /etc/pacman.conf.siglevel-backup ]]; then
+# The sentinel file marks that a TrustAll operation was in progress when the
+# previous run was interrupted. It survives reboots and container restarts,
+# unlike traps which only fire during the current process lifetime.
+_SIGLEVEL_SENTINEL="/etc/pacman.conf.siglevel-pending"
+_SIGLEVEL_BACKUP="/etc/pacman.conf.siglevel-backup"
+if [[ -f "$_SIGLEVEL_SENTINEL" ]] || grep -q '^SigLevel\s*=\s*TrustAll' /etc/pacman.conf 2>/dev/null; then
+    if [[ -f "$_SIGLEVEL_BACKUP" ]]; then
         echo "WARNING: Found SigLevel=TrustAll from a previous interrupted run. Restoring from backup."
-        cp -f /etc/pacman.conf.siglevel-backup /etc/pacman.conf
+        cp -f "$_SIGLEVEL_BACKUP" /etc/pacman.conf
     else
         echo "WARNING: Found SigLevel=TrustAll with no backup. Forcing restore to safe default."
-        sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf
-        grep -q '^SigLevel' /etc/pacman.conf || echo 'SigLevel = Required DatabaseOptional' >> /etc/pacman.conf
+        _atomic_write_pacman_conf "Required DatabaseOptional"
     fi
+    rm -f "$_SIGLEVEL_SENTINEL" "$_SIGLEVEL_BACKUP" 2>/dev/null || true
 fi
 
-# Crash-safe SigLevel restoration: if this script is killed, restore the backup
+# Crash-safe SigLevel restoration: if this script is killed, restore the backup.
+# The sentinel file is also checked on next boot for defense-in-depth.
 _rollback_siglevel() {
     local exit_code=$?
-    if [[ -f /etc/pacman.conf.siglevel-backup ]] && grep -q '^SigLevel\s*=\s*TrustAll' /etc/pacman.conf 2>/dev/null; then
+    if [[ -f "$_SIGLEVEL_BACKUP" ]] && grep -q '^SigLevel\s*=\s*TrustAll' /etc/pacman.conf 2>/dev/null; then
         echo "Trap: Restoring SigLevel from backup (exit code $exit_code)..."
-        cp -f /etc/pacman.conf.siglevel-backup /etc/pacman.conf
+        cp -f "$_SIGLEVEL_BACKUP" /etc/pacman.conf
     fi
-    # Clean up backup on normal completion (restored by script logic below)
-    if [[ $exit_code -eq 0 ]] && [[ -f /etc/pacman.conf.siglevel-backup ]]; then
-        rm -f /etc/pacman.conf.siglevel-backup
+    if [[ $exit_code -eq 0 ]] && [[ -f "$_SIGLEVEL_BACKUP" ]]; then
+        rm -f "$_SIGLEVEL_BACKUP" "$_SIGLEVEL_SENTINEL" 2>/dev/null || true
     fi
 }
 trap _rollback_siglevel EXIT
@@ -1601,16 +1621,17 @@ export GPG_AGENT_INFO=
 chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
 
 echo "Step 2/5: Temporarily relaxing signature verification for self-healing..."
-# Create a backup BEFORE weakening security, so a crash can be recovered
-# Atomic backup: write to temp file first, then rename to avoid partial writes
+# Create atomic backup (mktemp + mv is already atomic on POSIX)
 _tmp_siglevel_bak=$(mktemp /etc/pacman.conf.siglevel-backup.XXXXXX)
 cp -f /etc/pacman.conf "$_tmp_siglevel_bak"
+sync 2>/dev/null || true
 mv -f "$_tmp_siglevel_bak" /etc/pacman.conf.siglevel-backup
-sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = TrustAll/' /etc/pacman.conf
-if ! grep -q '^SigLevel' /etc/pacman.conf; then
-    echo 'SigLevel = TrustAll' >> /etc/pacman.conf
-fi
-echo "Backup saved to /etc/pacman.conf.siglevel-backup for crash recovery."
+# Create sentinel BEFORE weakening security — survives power loss / SIGKILL
+touch "$_SIGLEVEL_SENTINEL"
+sync 2>/dev/null || true
+# Atomically write TrustAll to pacman.conf
+_atomic_write_pacman_conf "TrustAll"
+echo "Backup saved to $_SIGLEVEL_BACKUP; crash sentinel at $_SIGLEVEL_SENTINEL."
 
 echo "Step 3/5: Updating keyring, GPG, and certificate packages..."
 rm -f /var/lib/pacman/db.lck
@@ -1677,11 +1698,10 @@ fi
 
 if [[ "$keyring_ok" == "true" ]]; then
     echo "Restoring SigLevel to Required DatabaseOptional..."
-    sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf
-    grep -q '^SigLevel' /etc/pacman.conf || echo 'SigLevel = Required DatabaseOptional' >> /etc/pacman.conf
+    _atomic_write_pacman_conf "Required DatabaseOptional"
 
-    # Remove the backup since we've successfully restored
-    rm -f /etc/pacman.conf.siglevel-backup
+    # Remove the backup and sentinel since we've successfully restored
+    rm -f "$_SIGLEVEL_BACKUP" "$_SIGLEVEL_SENTINEL" 2>/dev/null || true
 
     echo "Testing database sync with restored signature verification..."
     if pacman -Syy --noconfirm 2>/dev/null; then
@@ -1696,8 +1716,9 @@ if [[ "$keyring_ok" != "true" ]]; then
     echo "FATAL: Pacman keyring could not be repaired. The container is in an unsecure state."
     echo "FATAL: Aborting installation to prevent running without signature verification."
     # Ensure we don't leave the container in a wide-open state
-    sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf 2>/dev/null || true
-    rm -f /etc/pacman.conf.siglevel-backup 2>/dev/null || true
+    _atomic_write_pacman_conf "Required DatabaseOptional" 2>/dev/null || \
+        sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf 2>/dev/null || true
+    rm -f "$_SIGLEVEL_BACKUP" "$_SIGLEVEL_SENTINEL" 2>/dev/null || true
     exit 100
 fi
 
@@ -2069,6 +2090,21 @@ set +e
 BOOTSTRAP_LOG="/tmp/pamac-bootstrap.log"
 touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 666 "$BOOTSTRAP_LOG" 2>/dev/null
 
+# Crash recovery: if the previous keyring-init run was killed (power loss, SIGKILL),
+# the TrustAll SigLevel may be permanently set. The sentinel file persists across
+# container restarts and reboots — check and restore on every shell entry.
+if [[ -f /etc/pacman.conf.siglevel-pending ]] || grep -q '^SigLevel\s*=\s*TrustAll' /etc/pacman.conf 2>/dev/null; then
+    if [[ -f /etc/pacman.conf.siglevel-backup ]]; then
+        echo "[$(date '+%H:%M:%S')] CRASH RECOVERY: Restoring SigLevel from backup (sentinel found)" >> "$BOOTSTRAP_LOG" 2>/dev/null || true
+        cp -f /etc/pacman.conf.siglevel-backup /etc/pacman.conf 2>/dev/null || true
+    else
+        echo "[$(date '+%H:%M:%S')] CRASH RECOVERY: SigLevel=TrustAll with no backup, forcing safe default" >> "$BOOTSTRAP_LOG" 2>/dev/null || true
+        sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf 2>/dev/null || true
+        grep -q '^SigLevel' /etc/pacman.conf 2>/dev/null || echo 'SigLevel = Required DatabaseOptional' >> /etc/pacman.conf
+    fi
+    rm -f /etc/pacman.conf.siglevel-pending /etc/pacman.conf.siglevel-backup 2>/dev/null || true
+fi
+
 _safe_sleep() {
 if ! sleep "$1" 2>/dev/null; then
 read -t "$1" -r _ 2>/dev/null || true
@@ -2342,6 +2378,18 @@ cat > /usr/local/bin/pamac-session-bootstrap.sh << 'BOOTSTRAP'
 set +e
 BOOTSTRAP_LOG="/tmp/pamac-bootstrap.log"
 touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 666 "$BOOTSTRAP_LOG" 2>/dev/null
+
+if [[ -f /etc/pacman.conf.siglevel-pending ]] || grep -q '^SigLevel\s*=\s*TrustAll' /etc/pacman.conf 2>/dev/null; then
+    if [[ -f /etc/pacman.conf.siglevel-backup ]]; then
+        echo "[$(date '+%H:%M:%S')] CRASH RECOVERY: Restoring SigLevel from backup (sentinel found)" >> "$BOOTSTRAP_LOG" 2>/dev/null || true
+        cp -f /etc/pacman.conf.siglevel-backup /etc/pacman.conf 2>/dev/null || true
+    else
+        echo "[$(date '+%H:%M:%S')] CRASH RECOVERY: SigLevel=TrustAll with no backup, forcing safe default" >> "$BOOTSTRAP_LOG" 2>/dev/null || true
+        sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf 2>/dev/null || true
+        grep -q '^SigLevel' /etc/pacman.conf 2>/dev/null || echo 'SigLevel = Required DatabaseOptional' >> /etc/pacman.conf
+    fi
+    rm -f /etc/pacman.conf.siglevel-pending /etc/pacman.conf.siglevel-backup 2>/dev/null || true
+fi
 
 _safe_sleep() {
 if ! sleep "$1" 2>/dev/null; then
@@ -3254,7 +3302,7 @@ export_pamac_to_host() {
     log_info "Installing X11/Wayland tools for window integration..."
     container_root_exec bash -c 'pacman -S --noconfirm --needed xdotool xorg-xprop xorg-xwininfo 2>/dev/null || echo "Warning: x11 tools install failed (non-fatal)"'
 
-    log_info "Compiling window integration tools inside container and exporting to host..."
+    log_info "Compiling xdotool inside container and exporting to host (X11 fallback)..."
     local has_wayland_tools=false
     local _host_bindir="$HOME/.local/bin"
     mkdir -p "$_host_bindir"
@@ -3265,34 +3313,7 @@ export_pamac_to_host() {
 set +e
 mkdir -p $_container_tool_dir
 
-# Install build dependencies
-pacman -S --noconfirm --needed base-devel git cmake meson \
-    wayland wayland-protocols libx11 libxtst 2>/dev/null || true
-
-_build_wlrctl() {
-    echo '--- Building wlrctl ---'
-    local _src=\$(mktemp -d)
-    if ! git clone --depth 1 https://github.com/ArtixUniverse/wlrctl \$_src/wlrctl 2>/dev/null; then
-        echo 'wlrctl: git clone failed'
-        return 1
-    fi
-    cd \$_src/wlrctl
-    if meson setup build --default-library=static 2>/dev/null; then
-        if ninja -C build 2>/dev/null; then
-            cp build/wlrctl $_container_tool_dir/wlrctl 2>/dev/null
-            echo 'wlrctl: build OK'
-            cd /; rm -rf \$_src; return 0
-        fi
-    fi
-    if make 2>/dev/null; then
-        cp wlrctl $_container_tool_dir/wlrctl 2>/dev/null
-        echo 'wlrctl: build OK (make fallback)'
-        cd /; rm -rf \$_src; return 0
-    fi
-    cd /; rm -rf \$_src
-    echo 'wlrctl: build FAILED'
-    return 1
-}
+pacman -S --noconfirm --needed base-devel git 2>/dev/null || true
 
 _build_xdotool() {
     echo '--- Building xdotool ---'
@@ -3312,11 +3333,10 @@ _build_xdotool() {
     return 1
 }
 
-_build_wlrctl
 _build_xdotool
 " 2>/dev/null || true
 
-    for _tool in wlrctl xdotool; do
+    for _tool in xdotool; do
         if container_cp_from "$_container_tool_dir/$_tool" "$_host_bindir/$_tool" 2>/dev/null; then
             if [[ -s "$_host_bindir/$_tool" ]]; then
                 chmod +x "$_host_bindir/$_tool"
@@ -3329,25 +3349,15 @@ _build_xdotool
 
     container_root_exec bash -c "rm -rf $_container_tool_dir" 2>/dev/null || true
 
-    # Determine tool availability — check host PATH and exported binaries
+    # The wrapper now uses StartupWMClass + XDG_ACTIVATION_TOKEN for Wayland
+    # and a single xdotool attempt for X11 fallback. No wlrctl/kdotool needed.
     local host_tools_available=false
-    if command -v wlrctl >/dev/null 2>&1 || [[ -x "$_host_bindir/wlrctl" ]]; then
-        host_tools_available=true
-        has_wayland_tools=true
-        log_success "Wayland window tools available (wlrctl)."
-    fi
-    if command -v kdotool >/dev/null 2>&1; then
-        host_tools_available=true
-        has_wayland_tools=true
-        log_success "Wayland window tools available (kdotool)."
-    fi
     if command -v xdotool >/dev/null 2>&1 || [[ -x "$_host_bindir/xdotool" ]]; then
         host_tools_available=true
-        log_success "X11 window tools available (xdotool)."
+        log_success "X11 window tools available (xdotool — X11 fallback)."
     fi
     if [[ "$host_tools_available" == "false" ]]; then
-        log_warn "No window management tools available. Taskbar integration will use fallback."
-        log_info "Compiled tools could not be exported. Taskbar icon may use a generic Wayland/X11 icon."
+        log_info "No xdotool available on host. Wayland taskbar integration uses XDG_ACTIVATION_TOKEN (no tools needed)."
     fi
 
     log_info "Creating pamac-manager launch wrapper inside container..."
@@ -3365,23 +3375,21 @@ DESKTOP_FILE="__DESKTOP_PATH__"
 pamac-manager "$@" &
 PAMAC_PID=$!
 
-WAIT_MAX=30
-WAITED=0
-FOUND=0
-
-while [[ $WAITED -lt $WAIT_MAX && $FOUND -eq 0 ]]; do
-  sleep 2
-  WAITED=$((WAITED + 2))
-  for wid in $(xdotool search --class "pamac-manager" 2>/dev/null); do
-    width=$(xwininfo -id "$wid" 2>/dev/null | awk '/Width:/{print $NF}')
-    if [[ -n "$width" ]] && [[ "$width" -gt 1 ]]; then
-      xprop -id "$wid" -f _KDE_NET_WM_DESKTOP_FILE 8u \
-        -set _KDE_NET_WM_DESKTOP_FILE "$DESKTOP_FILE" 2>/dev/null
-      FOUND=1
-      break
-    fi
-  done
-done
+# On X11 only, make a single best-effort attempt to set the desktop file hint
+# after a brief delay. This avoids the brittle 30-second polling loop that
+# depends on xdotool/wlrctl/hyprctl — tools that are increasingly restricted
+# by Wayland compositors for security reasons.
+if [[ -z "${WAYLAND_DISPLAY:-}" ]] && command -v xprop >/dev/null 2>&1; then
+    sleep 3
+    for wid in $(xdotool search --class "pamac-manager" 2>/dev/null | head -5); do
+        width=$(xwininfo -id "$wid" 2>/dev/null | awk '/Width:/{print $NF}')
+        if [[ -n "$width" ]] && [[ "$width" -gt 1 ]]; then
+            xprop -id "$wid" -f _KDE_NET_WM_DESKTOP_FILE 8u \
+                -set _KDE_NET_WM_DESKTOP_FILE "$DESKTOP_FILE" 2>/dev/null
+            break
+        fi
+    done
+fi
 
 wait "$PAMAC_PID" 2>/dev/null
 CONTAINER_WRAPPER_EOF
@@ -3544,125 +3552,31 @@ if [[ -d "\$HOME/.local/bin" ]]; then
     export PATH="\$HOME/.local/bin:\$PATH"
 fi
 
-# Check which window management tools are available
-HAS_WINDOW_MGMT=false
-if [[ "\$IS_WAYLAND" == "true" ]]; then
-    if command -v wlrctl >/dev/null 2>&1 || command -v kdotool >/dev/null 2>&1 || command -v hyprctl >/dev/null 2>&1; then
-        HAS_WINDOW_MGMT=true
-    elif command -v xdotool >/dev/null 2>&1; then
-        # XWayland fallback: X11 tools work through XWayland on Wayland sessions
-        HAS_WINDOW_MGMT=true
-    fi
-else
-    if command -v xdotool >/dev/null 2>&1; then
-        HAS_WINDOW_MGMT=true
-    fi
-fi
-
-# Helper: find pamac-manager windows (works on X11 and Wayland)
-_find_pamac_windows() {
-    if [[ "\$IS_WAYLAND" == "true" ]]; then
-        # Try native Wayland tools first
-        if command -v wlrctl >/dev/null 2>&1; then
-            wlrctl toplevel list 2>/dev/null | grep -i "pamac-manager" | awk '{print \$1}'
-        elif command -v kdotool >/dev/null 2>&1; then
-            kdotool search --name "pamac-manager" 2>/dev/null
-        elif command -v hyprctl >/dev/null 2>&1; then
-            hyprctl clients -j 2>/dev/null | grep -o '"address":"[^"]*"' | grep -v "0x0" | while read -r line; do
-                addr=\$(echo "\$line" | cut -d'"' -f4)
-                title=\$(hyprctl clients -j 2>/dev/null | grep -A5 "\"address\":\"\$addr\"" | grep '"title"' | cut -d'"' -f4)
-                if echo "\$title" | grep -qi "pamac-manager"; then
-                    echo "\$addr"
-                fi
-            done
-        elif command -v xdotool >/dev/null 2>&1; then
-            # XWayland fallback
-            xdotool search --class "pamac-manager" 2>/dev/null
-        fi
-    else
-        # X11 session
-        xdotool search --class "pamac-manager" 2>/dev/null
-    fi
-}
-
-# Helper: get window width (works on X11 and Wayland)
-_get_window_width() {
-    local wid="\$1"
-    if [[ "\$IS_WAYLAND" == "true" ]]; then
-        # Wayland doesn't expose window geometry via standard tools
-        # Assume window is valid if found
-        if [[ -n "\$wid" ]]; then
-            echo "100"
-        fi
-    else
-        xwininfo -id "\$wid" 2>/dev/null | awk -F': ' '/Width:/{print \$2}'
-    fi
-}
-
-# Helper: set desktop file hint (X11 only; Wayland compositors handle this differently)
-_set_desktop_file_hint() {
-    local wid="\$1"
-    if [[ "\$IS_WAYLAND" == "false" ]] && command -v xprop >/dev/null 2>&1; then
-        XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xprop -id "\$wid" \
-            -f _KDE_NET_WM_DESKTOP_FILE 8u \
-            -set _KDE_NET_WM_DESKTOP_FILE "\$DESKTOP_FILE" 2>/dev/null
-    fi
-}
-
-# Record EXISTING pamac-manager windows BEFORE launching new instance
-OLD_WINDOWS=""
-if [[ "\$HAS_WINDOW_MGMT" == "true" ]]; then
-    OLD_WINDOWS="\$( _find_pamac_windows | sort)"
-fi
+# Modern desktop environments use XDG_ACTIVATION_TOKEN to match windows to
+# .desktop files. Set it before launch so the compositor can associate the
+# window correctly — no polling or window-property injection needed.
+export XDG_ACTIVATION_TOKEN="${CONTAINER_NAME}-pamac-manager"
 
 # Launch Pamac in the background via distrobox
 distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper "\$@" &
 LAUNCHER_PID=\$!
 
-# Poll for NEW pamac-manager windows (up to 30 seconds) — only if tools are available
-WAIT_MAX=30
-WAITED=0
-FOUND=0
-if [[ "\$HAS_WINDOW_MGMT" == "true" ]]; then
-    while [[ \$WAITED -lt \$WAIT_MAX && \$FOUND -eq 0 ]]; do
-        sleep 2
-        WAITED=\$((WAITED + 2))
-        CURRENT_WINDOWS="\$( _find_pamac_windows | sort)"
-        NEW_WINDOWS="\$(comm -13 <(echo "\$OLD_WINDOWS") <(echo "\$CURRENT_WINDOWS") 2>/dev/null)"
-        if [[ -n "\$NEW_WINDOWS" ]]; then
-            FOUND=1
-            for wid in \$NEW_WINDOWS; do
-                width=\$( _get_window_width "\$wid")
-                if [[ -n "\$width" ]] && [[ "\$width" != "1" ]]; then
-                    FOUND=2
-                    CURRENT_WINDOWS="\$NEW_WINDOWS"
-                    break
-                fi
-            done
-            if [[ \$FOUND -ne 2 ]]; then
-                FOUND=0
-            fi
+# On X11 only: make a single best-effort attempt to set the _KDE_NET_WM_DESKTOP_FILE
+# property after a brief delay. This is a legacy fallback — modern KDE Plasma (5.27+)
+# and GNOME (42+) use StartupWMClass and XDG_ACTIVATION_TOKEN instead.
+# We avoid the old 30-second polling loop with xdotool/wlrctl/hyprctl because those
+# tools are increasingly restricted by Wayland compositors and are unreliable.
+if [[ "\$IS_WAYLAND" == "false" ]] && command -v xprop >/dev/null 2>&1 && command -v xdotool >/dev/null 2>&1; then
+    sleep 3
+    for wid in \$(xdotool search --class "pamac-manager" 2>/dev/null | head -5); do
+        width=\$(xwininfo -id "\$wid" 2>/dev/null | awk -F': ' '/Width:/{print \$2}')
+        if [[ -n "\$width" ]] && [[ "\$width" -gt 1 ]]; then
+            XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xprop -id "\$wid" \
+                -f _KDE_NET_WM_DESKTOP_FILE 8u \
+                -set _KDE_NET_WM_DESKTOP_FILE "\$DESKTOP_FILE" 2>/dev/null
+            break
         fi
     done
-
-    # Process ALL current pamac-manager windows (fix taskbar)
-    ALL_WINDOWS=\$( _find_pamac_windows)
-    for wid in \$ALL_WINDOWS; do
-        width=\$( _get_window_width "\$wid")
-        if [ "\$width" = "1" ]; then
-            # X11 only: mark tiny windows as skip-taskbar
-            if [[ "\$IS_WAYLAND" == "false" ]] && command -v xprop >/dev/null 2>&1; then
-                XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xprop -id "\$wid" \
-                    -f _NET_WM_STATE 32a \
-                    -set _NET_WM_STATE _NET_WM_STATE_SKIP_TASKBAR 2>/dev/null
-            fi
-        elif [ -n "\$width" ]; then
-            _set_desktop_file_hint "\$wid"
-        fi
-    done
-else
-    # No window management tools available — just wait for Pamac to finish
-    echo "Note: No window management tools found (xdotool/wlrctl/kdotool). Taskbar integration skipped." >&2
 fi
 
 wait "\$LAUNCHER_PID" 2>/dev/null

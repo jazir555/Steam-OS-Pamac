@@ -2331,12 +2331,24 @@ if ! _repo_already_enabled "chaotic-aur"; then
         echo "Chaotic keyring installed successfully."
     else
         echo "Chaotic keyring not in default repos. Installing from mirror..."
+        echo "Pre-fetching Chaotic developer key for signature verification..."
+        if command -v pacman-key >/dev/null 2>&1; then
+            pacman-key --recv-key 30565AC3868033CA 2>/dev/null || true
+            pacman-key --lsign-key 30565AC3868033CA 2>/dev/null || true
+        fi
         if command -v curl >/dev/null 2>&1; then
             keyring_tmp="$(mktemp -d)"
             _curl_rc=0
             curl -sL "https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst" -o "$keyring_tmp/chaotic-keyring.pkg.tar.zst" 2>/dev/null || _curl_rc=$?
             if [[ $_curl_rc -eq 0 ]] && [[ -s "$keyring_tmp/chaotic-keyring.pkg.tar.zst" ]]; then
-                pacman -U --noconfirm "$keyring_tmp/chaotic-keyring.pkg.tar.zst" 2>/dev/null || echo "Warning: Chaotic keyring install from mirror failed."
+                if ! pacman -U --noconfirm "$keyring_tmp/chaotic-keyring.pkg.tar.zst" 2>/dev/null; then
+                    echo "Warning: Chaotic keyring install from mirror failed (signature may be invalid)."
+                    echo "Attempting key import fallback..."
+                    if command -v pacman-key >/dev/null 2>&1; then
+                        pacman-key --recv-key 30565AC3868033CA 2>/dev/null || true
+                        pacman-key --lsign-key 30565AC3868033CA 2>/dev/null || true
+                    fi
+                fi
             else
                 echo "Warning: Could not download chaotic-keyring (curl exit code: $_curl_rc). Continuing with keyring utilities."
             fi

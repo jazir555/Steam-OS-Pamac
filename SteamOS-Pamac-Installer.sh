@@ -2734,7 +2734,7 @@ set +e
 /usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true
 
 export DISPLAY=\${DISPLAY:-:0}
-DESKTOP_FILE="/home/deck/.local/share/applications/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
+DESKTOP_FILE="/home/${CURRENT_USER}/.local/share/applications/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
 
 pamac-manager "\$@" &
 PAMAC_PID=\$!
@@ -3057,7 +3057,7 @@ _log "Successfully uninstalled \$pkg"
 
 _log "Cleaning up desktop files for \$pkg..."
 local removed_desktops=0
-for df in "\$APP_DIR"/arch-pamac-*.desktop; do
+for df in "\$APP_DIR"/"\${CONTAINER_NAME}"-*.desktop; do
 [[ -f "\$df" ]] || continue
 local df_pkg
 df_pkg=\$(grep '^X-SteamOS-Pamac-SourcePackage=' "\$df" 2>/dev/null | cut -d= -f2)

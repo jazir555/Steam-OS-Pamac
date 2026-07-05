@@ -1306,6 +1306,38 @@ exec_container_script() {
     local _rc=0
     local _script_file
     local _preamble='_safe_sleep() { if ! sleep "$1" 2>/dev/null; then read -t "$1" -r _ </dev/null 2>/dev/null || true; fi; }
+_atomic_sed_inplace() {
+    local _target="$1"; shift
+    local _tmp; _tmp=$(mktemp "${_target}.atomic.XXXXXX") || { echo "FATAL: mktemp failed for atomic sed on $_target"; return 1; }
+    cp -f "$_target" "$_tmp" 2>/dev/null || { rm -f "$_tmp"; return 1; }
+    for _expr in "$@"; do sed -i "$_expr" "$_tmp"; done
+    sync "$_tmp" 2>/dev/null || sync 2>/dev/null || true
+    mv -f "$_tmp" "$_target"
+}
+_calc_makepkg_jobs() {
+    local ram_per_job_kb=768000
+    local mem_avail_kb=0
+    local ncpu
+    ncpu=$(nproc 2>/dev/null || echo "1")
+    if [[ -f /proc/meminfo ]]; then
+        mem_avail_kb=$(awk "/^MemAvailable:/{print \$2}" /proc/meminfo 2>/dev/null || echo "0")
+    fi
+    if [[ "$mem_avail_kb" -gt 0 ]]; then
+        local jobs=$(( mem_avail_kb / ram_per_job_kb ))
+        [[ "$jobs" -lt 1 ]] && jobs=1
+        [[ "$jobs" -gt "$ncpu" ]] && jobs="$ncpu"
+        echo "$jobs"
+    else
+        local safe_ncpu=$(( ncpu > 4 ? 4 : ncpu ))
+        echo "$safe_ncpu"
+    fi
+}
+_set_makepkg_jobs() {
+    local jobs
+    jobs=$(_calc_makepkg_jobs)
+    export MAKEFLAGS="-j${jobs}"
+    echo "MAKEFLAGS set to -j${jobs} (RAM-constrained build parallelism)"
+}
 safe_install() {
     local attempt=0 max_attempts=3 rc=0
     while [[ $attempt -lt $max_attempts ]]; do
@@ -1429,6 +1461,38 @@ exec_container_pipe() {
     local _script_file
     local _marker="PAMAC_PIPE_OK_$(head -c 16 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$_$(date +%s)")"
     local _preamble='_safe_sleep() { if ! sleep "$1" 2>/dev/null; then read -t "$1" -r _ </dev/null 2>/dev/null || true; fi; }
+_atomic_sed_inplace() {
+    local _target="$1"; shift
+    local _tmp; _tmp=$(mktemp "${_target}.atomic.XXXXXX") || { echo "FATAL: mktemp failed for atomic sed on $_target"; return 1; }
+    cp -f "$_target" "$_tmp" 2>/dev/null || { rm -f "$_tmp"; return 1; }
+    for _expr in "$@"; do sed -i "$_expr" "$_tmp"; done
+    sync "$_tmp" 2>/dev/null || sync 2>/dev/null || true
+    mv -f "$_tmp" "$_target"
+}
+_calc_makepkg_jobs() {
+    local ram_per_job_kb=768000
+    local mem_avail_kb=0
+    local ncpu
+    ncpu=$(nproc 2>/dev/null || echo "1")
+    if [[ -f /proc/meminfo ]]; then
+        mem_avail_kb=$(awk "/^MemAvailable:/{print \$2}" /proc/meminfo 2>/dev/null || echo "0")
+    fi
+    if [[ "$mem_avail_kb" -gt 0 ]]; then
+        local jobs=$(( mem_avail_kb / ram_per_job_kb ))
+        [[ "$jobs" -lt 1 ]] && jobs=1
+        [[ "$jobs" -gt "$ncpu" ]] && jobs="$ncpu"
+        echo "$jobs"
+    else
+        local safe_ncpu=$(( ncpu > 4 ? 4 : ncpu ))
+        echo "$safe_ncpu"
+    fi
+}
+_set_makepkg_jobs() {
+    local jobs
+    jobs=$(_calc_makepkg_jobs)
+    export MAKEFLAGS="-j${jobs}"
+    echo "MAKEFLAGS set to -j${jobs} (RAM-constrained build parallelism)"
+}
 safe_install() {
     local attempt=0 max_attempts=3 rc=0
     while [[ $attempt -lt $max_attempts ]]; do
@@ -1727,14 +1791,14 @@ if [[ "$keyring_ok" != "true" ]]; then
     echo "FATAL: Aborting installation to prevent running without signature verification."
     # Ensure we don't leave the container in a wide-open state
     _atomic_write_pacman_conf "Required DatabaseOptional" 2>/dev/null || \
-        sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf 2>/dev/null || true
+        _atomic_sed_inplace /etc/pacman.conf 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' 2>/dev/null || true
     rm -f "$_SIGLEVEL_BACKUP" "$_SIGLEVEL_SENTINEL" 2>/dev/null || true
     exit 100
 fi
 
 echo "Configuring pacman for low-memory environment..."
 if grep -q '^ParallelDownloads' /etc/pacman.conf 2>/dev/null; then
-    sed -i 's/^ParallelDownloads.*/ParallelDownloads = 1/' /etc/pacman.conf
+    _atomic_sed_inplace '/etc/pacman.conf' 's/^ParallelDownloads.*/ParallelDownloads = 1/'
 else
     echo 'ParallelDownloads = 1' >> /etc/pacman.conf
 fi
@@ -2059,9 +2123,10 @@ echo "Passwordless package ops for wheel group are handled by 10-pamac-nopasswd.
 pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
 if [[ -f "$pamac_policy" ]]; then
     if grep -q '<allow_any>yes</allow_any>' "$pamac_policy"; then
-        sed -i 's|<allow_any>yes</allow_any>|<allow_any>auth_admin_keep</allow_any>|' "$pamac_policy"
-        sed -i 's|<allow_inactive>yes</allow_inactive>|<allow_inactive>auth_admin_keep</allow_inactive>|' "$pamac_policy"
-        sed -i 's|<allow_active>yes</allow_active>|<allow_active>auth_admin_keep</allow_active>|' "$pamac_policy"
+        _atomic_sed_inplace "$pamac_policy" \
+            's|<allow_any>yes</allow_any>|<allow_any>auth_admin_keep</allow_any>|' \
+            's|<allow_inactive>yes</allow_inactive>|<allow_inactive>auth_admin_keep</allow_inactive>|' \
+            's|<allow_active>yes</allow_active>|<allow_active>auth_admin_keep</allow_active>|'
         echo "Restored least-privilege polkit policy (was previously relaxed to allow_any=yes)."
     fi
 else
@@ -2109,8 +2174,14 @@ if [[ -f /etc/pacman.conf.siglevel-pending ]] || grep -q '^SigLevel\s*=\s*TrustA
         cp -f /etc/pacman.conf.siglevel-backup /etc/pacman.conf 2>/dev/null || true
     else
         echo "[$(date '+%H:%M:%S')] CRASH RECOVERY: SigLevel=TrustAll with no backup, forcing safe default" >> "$BOOTSTRAP_LOG" 2>/dev/null || true
-        sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf 2>/dev/null || true
-        grep -q '^SigLevel' /etc/pacman.conf 2>/dev/null || echo 'SigLevel = Required DatabaseOptional' >> /etc/pacman.conf
+        _tmp_pac=$(mktemp /etc/pacman.conf.atomic.XXXXXX) 2>/dev/null && {
+            cp -f /etc/pacman.conf "$_tmp_pac" 2>/dev/null && {
+                sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' "$_tmp_pac" 2>/dev/null
+                grep -q '^SigLevel' "$_tmp_pac" 2>/dev/null || echo 'SigLevel = Required DatabaseOptional' >> "$_tmp_pac"
+                sync "$_tmp_pac" 2>/dev/null || sync 2>/dev/null || true
+                mv -f "$_tmp_pac" /etc/pacman.conf 2>/dev/null
+            } || rm -f "$_tmp_pac" 2>/dev/null
+        } || sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf 2>/dev/null || true
     fi
     rm -f /etc/pacman.conf.siglevel-pending /etc/pacman.conf.siglevel-backup 2>/dev/null || true
 fi
@@ -2272,7 +2343,7 @@ exec "${CMD_ARGS[@]}"
 fi
 SYSTEMD_RUN_FAKE
 chmod +x /usr/local/sbin/systemd-run
-sed -i "s/HOST_USER_PLACEHOLDER/$HOST_USER/g" /usr/local/sbin/systemd-run
+_atomic_sed_inplace /usr/local/sbin/systemd-run "s/HOST_USER_PLACEHOLDER/$HOST_USER/g"
 echo "Fake systemd-run installed at /usr/local/sbin/systemd-run."
 echo "Unrecognized arguments will be logged to /tmp/systemd-run-fake.log for debugging."
 
@@ -2395,8 +2466,14 @@ if [[ -f /etc/pacman.conf.siglevel-pending ]] || grep -q '^SigLevel\s*=\s*TrustA
         cp -f /etc/pacman.conf.siglevel-backup /etc/pacman.conf 2>/dev/null || true
     else
         echo "[$(date '+%H:%M:%S')] CRASH RECOVERY: SigLevel=TrustAll with no backup, forcing safe default" >> "$BOOTSTRAP_LOG" 2>/dev/null || true
-        sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf 2>/dev/null || true
-        grep -q '^SigLevel' /etc/pacman.conf 2>/dev/null || echo 'SigLevel = Required DatabaseOptional' >> /etc/pacman.conf
+        _tmp_pac=$(mktemp /etc/pacman.conf.atomic.XXXXXX) 2>/dev/null && {
+            cp -f /etc/pacman.conf "$_tmp_pac" 2>/dev/null && {
+                sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' "$_tmp_pac" 2>/dev/null
+                grep -q '^SigLevel' "$_tmp_pac" 2>/dev/null || echo 'SigLevel = Required DatabaseOptional' >> "$_tmp_pac"
+                sync "$_tmp_pac" 2>/dev/null || sync 2>/dev/null || true
+                mv -f "$_tmp_pac" /etc/pacman.conf 2>/dev/null
+            } || rm -f "$_tmp_pac" 2>/dev/null
+        } || sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf 2>/dev/null || true
     fi
     rm -f /etc/pacman.conf.siglevel-pending /etc/pacman.conf.siglevel-backup 2>/dev/null || true
 fi
@@ -2562,7 +2639,7 @@ exec "${CMD_ARGS[@]}"
 fi
 SYSTEMD_RUN_FAKE
 chmod +x /usr/local/sbin/systemd-run
-sed -i "s/HOST_USER_PLACEHOLDER/$HOST_USER/g" /usr/local/sbin/systemd-run
+_atomic_sed_inplace /usr/local/sbin/systemd-run "s/HOST_USER_PLACEHOLDER/$HOST_USER/g"
 repaired=$((repaired + 1))
 echo "Fake systemd-run repaired."
 echo "Unrecognized arguments will be logged to /tmp/systemd-run-fake.log for debugging."
@@ -2937,6 +3014,7 @@ _safe_sleep "$wait_time"
 done
 
 chown -R "$current_user:$current_user" /tmp/yay
+_set_makepkg_jobs
 sudo -Hu "$current_user" bash -lc "cd /tmp/yay && makepkg -si --noconfirm --clean"
 BUILD_EOF
 
@@ -2998,6 +3076,7 @@ if [[ -n "$pamac_version_pin" && "$pamac_version_pin" != "latest" ]]; then
     rm -rf /tmp/pamac-aur-compat
     if sudo -Hu "$current_user" bash -lc "git clone --depth 1 --branch '$pamac_version_pin' https://aur.archlinux.org/pamac-aur.git /tmp/pamac-aur-compat" 2>&1 || \
        sudo -Hu "$current_user" bash -lc "git clone --depth 1 https://aur.archlinux.org/pamac-aur.git /tmp/pamac-aur-compat && cd /tmp/pamac-aur-compat && git checkout '$pamac_version_pin'" 2>&1; then
+        _set_makepkg_jobs
         if sudo -Hu "$current_user" bash -lc "cd /tmp/pamac-aur-compat && makepkg -si --noconfirm --clean" 2>&1; then
             echo "SUCCESS: pamac-aur $pamac_version_pin installed from git."
             rm -rf /tmp/pamac-aur-compat
@@ -3116,40 +3195,48 @@ fi
 
 echo ">>> Strategy B: Finding older pamac-aur revision compatible with pacman $installed_pacman_ver..."
 
-_CURL_TIMEOUT="--connect-timeout 10 --max-time 30"
+# Use git directly to iterate commits — this is frontend-agnostic and does not
+# depend on the AUR web interface (CGIT, GitLab, Gitea, etc.).
+_AUR_GIT_URL="https://aur.archlinux.org/pamac-aur.git"
+_AUR_WORK="/tmp/pamac-aur-compat-history"
+rm -rf "$_AUR_WORK"
 
-_aur_log_page=$(curl -sf $_CURL_TIMEOUT "https://aur.archlinux.org/cgit/aur.git/log/?h=pamac-aur" 2>/dev/null || echo "")
-if [[ -z "$_aur_log_page" ]]; then
-    echo "WARN: Could not fetch AUR commit log page (network issue or cgit endpoint changed)."
+echo "Cloning pamac-aur repository (shallow) for commit history..."
+if ! git clone --depth=50 --single-branch "$_AUR_GIT_URL" "$_AUR_WORK" 2>/tmp/pamac_aur_clone_err; then
+    echo "WARN: git clone of pamac-aur failed:"
+    cat /tmp/pamac_aur_clone_err 2>/dev/null | tail -3
+    rm -rf "$_AUR_WORK"
     echo "WARN: Falling back to Strategy C (build latest regardless of compatibility)."
     echo "COMPATIBLE_COMMIT=latest_anyway"
     exit 3
 fi
 
-_commits=$(echo "$_aur_log_page" | grep -oP 'commit/\K[a-f0-9]{40}' | head -10 || true)
+_commits=$(git -C "$_AUR_WORK" log --format=%H -10 2>/dev/null || true)
 if [[ -z "$_commits" ]]; then
-    echo "WARN: AUR cgit page fetched but no commit hashes found (HTML format may have changed)."
-    echo "WARN: The AUR web interface may have been restructured. Falling back to Strategy C."
+    echo "WARN: git log returned no commits."
+    rm -rf "$_AUR_WORK"
+    echo "WARN: Falling back to Strategy C."
     echo "COMPATIBLE_COMMIT=latest_anyway"
     exit 3
 fi
 
 _commit_count=$(echo "$_commits" | wc -l)
-echo "Found $_commit_count recent commits. Checking compatibility (with connection timeouts)..."
+echo "Found $_commit_count recent commits. Checking compatibility..."
 
 for try_commit in $_commits; do
     echo "Checking commit: ${try_commit:0:12}..."
-    old_pkgbuild=$(curl -sf $_CURL_TIMEOUT "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=pamac-aur&id=$try_commit" 2>/dev/null || echo "")
+    old_pkgbuild=$(git -C "$_AUR_WORK" show "${try_commit}:PKGBUILD" 2>/dev/null || echo "")
     if [[ -z "$old_pkgbuild" ]]; then
-        echo "  -> Could not fetch PKGBUILD (network timeout or commit unreachable), skipping..."
+        echo "  -> Could not read PKGBUILD at this commit, skipping..."
         continue
     fi
 
     old_dep=$(echo "$old_pkgbuild" | grep -E "^(depends|makedepends)\\+?=" | grep -oP "pacman[><= ]+[0-9.]+" | head -1 || echo "")
     if [[ -z "$old_dep" ]]; then
         echo "  -> No pacman constraint in this revision (likely compatible)"
-        commit_date=$(echo "$old_pkgbuild" | grep -oP "^# Last updated: .*" || echo "unknown date")
+        commit_date=$(git -C "$_AUR_WORK" log -1 --format=%ai "$try_commit" 2>/dev/null || echo "unknown date")
         echo "  -> $commit_date"
+        rm -rf "$_AUR_WORK"
         echo "FOUND_COMPATIBLE_COMMIT=$try_commit"
         echo "FOUND_COMPATIBLE_REASON=no explicit pacman constraint"
         exit 2
@@ -3164,12 +3251,15 @@ for try_commit in $_commits; do
 
     if version_meets_requirement "$pacman_major" "$pacman_minor" "$old_req_op" "$old_req_major" "$old_req_minor"; then
         echo "  -> Compatible: requires pacman $old_dep (have $installed_pacman_ver)"
+        rm -rf "$_AUR_WORK"
         echo "FOUND_COMPATIBLE_COMMIT=$try_commit"
         echo "FOUND_COMPATIBLE_REASON=requires pacman $old_dep"
         exit 2
     fi
     echo "  -> Incompatible: requires pacman $old_dep"
 done
+
+rm -rf "$_AUR_WORK"
 
 echo ""
 echo "Strategy B exhausted: no compatible older pamac-aur revision found in recent history."
@@ -3179,6 +3269,30 @@ exit 3
 COMPAT_EOF
 
     local _preamble='_safe_sleep() { if ! sleep "$1" 2>/dev/null; then read -t "$1" -r _ </dev/null 2>/dev/null || true; fi; }
+_calc_makepkg_jobs() {
+    local ram_per_job_kb=768000
+    local mem_avail_kb=0
+    local ncpu
+    ncpu=$(nproc 2>/dev/null || echo "1")
+    if [[ -f /proc/meminfo ]]; then
+        mem_avail_kb=$(awk "/^MemAvailable:/{print \$2}" /proc/meminfo 2>/dev/null || echo "0")
+    fi
+    if [[ "$mem_avail_kb" -gt 0 ]]; then
+        local jobs=$(( mem_avail_kb / ram_per_job_kb ))
+        [[ "$jobs" -lt 1 ]] && jobs=1
+        [[ "$jobs" -gt "$ncpu" ]] && jobs="$ncpu"
+        echo "$jobs"
+    else
+        local safe_ncpu=$(( ncpu > 4 ? 4 : ncpu ))
+        echo "$safe_ncpu"
+    fi
+}
+_set_makepkg_jobs() {
+    local jobs
+    jobs=$(_calc_makepkg_jobs)
+    export MAKEFLAGS="-j${jobs}"
+    echo "MAKEFLAGS set to -j${jobs} (RAM-constrained build parallelism)"
+}
 safe_install() {
     local attempt=0 max_attempts=3 rc=0
     while [[ $attempt -lt $max_attempts ]]; do
@@ -3338,6 +3452,7 @@ install_from_aur_commit() {
         return 1
     fi
     echo "Building pamac-aur from commit ${commit:0:12}..."
+    _set_makepkg_jobs
     sudo -Hu "$current_user" bash -lc "cd '$work_dir' && makepkg -si --noconfirm --clean" 2>/tmp/pamac_build_err
     local build_rc=$?
     rm -rf "$work_dir"
@@ -3350,8 +3465,11 @@ install_from_aur_commit() {
 }
 
 install_from_yay() {
+    _set_makepkg_jobs
+    local _jobs
+    _jobs=$(_calc_makepkg_jobs)
     for attempt in 1 2 3; do
-        if sudo -Hu "$current_user" bash -lc "yay -S --noconfirm --needed --noprogressbar pamac-aur"; then
+        if sudo -Hu "$current_user" bash -lc "MAKEFLAGS=-j${_jobs} yay -S --noconfirm --needed --noprogressbar pamac-aur"; then
             return 0
         fi
         echo "yay install attempt $attempt/3 failed. Retrying in 5 seconds..."
@@ -3389,6 +3507,7 @@ case "$compat_strategy" in
             echo "Standard yay install failed. Attempting direct clone..."
             rm -rf /tmp/pamac-aur-fallback
             if sudo -Hu "$current_user" bash -lc "git clone --depth=1 https://aur.archlinux.org/pamac-aur.git /tmp/pamac-aur-fallback" 2>/tmp/pamac_fb_err; then
+                _set_makepkg_jobs
                 if sudo -Hu "$current_user" bash -lc "cd /tmp/pamac-aur-fallback && makepkg -si --noconfirm --clean" 2>&1 | tail -15; then
                     pamac_installed=true
                 fi
@@ -3415,7 +3534,10 @@ fi
 if ! command -v pamac >/dev/null 2>&1; then
     echo "pamac CLI not found after install. Retrying without --needed..."
     rm -f /var/lib/pacman/db.lck
-    sudo -Hu "$current_user" bash -lc "yay -S --noconfirm --noprogressbar pamac-aur" || true
+    _set_makepkg_jobs
+    local _jobs
+    _jobs=$(_calc_makepkg_jobs)
+    sudo -Hu "$current_user" bash -lc "MAKEFLAGS=-j${_jobs} yay -S --noconfirm --noprogressbar pamac-aur" || true
 fi
 
 if ! command -v pamac-manager >/dev/null 2>&1; then
@@ -3479,25 +3601,33 @@ set -uo pipefail
 
 current_user="$1"
 
+# Atomic pamac.conf editor: avoids sed -i which is non-atomic and can corrupt
+# the file if the process is killed mid-write (power loss, SIGKILL).
+# Writes to a temp file, applies all edits, fsyncs, then atomically renames.
+_atomic_edit_pamac_conf() {
+    local target="/etc/pamac.conf"
+    local tmp
+    tmp=$(mktemp "${target}.atomic.XXXXXX") || { echo "FATAL: mktemp failed for pamac.conf edit"; return 1; }
+    cp -f "$target" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    sed -i 's/^#EnableAUR/EnableAUR/' "$tmp"
+    sed -i 's/^#CheckAURUpdates/CheckAURUpdates/' "$tmp"
+    sed -i 's/^#CheckAURVCSUpdates/CheckAURVCSUpdates/' "$tmp"
+    grep -q '^EnableAUR' "$tmp" || printf 'EnableAUR\n' >> "$tmp"
+    grep -q '^CheckAURUpdates' "$tmp" || printf 'CheckAURUpdates\n' >> "$tmp"
+    if grep -q '^BuildDirectory' "$tmp"; then
+        sed -i 's|^BuildDirectory.*|BuildDirectory = /home/'"$current_user"'/\.pamac-build|' "$tmp"
+    else
+        printf 'BuildDirectory = /home/%s/.pamac-build\n' "$current_user" >> "$tmp"
+    fi
+    sync "$tmp" 2>/dev/null || sync 2>/dev/null || true
+    mv -f "$tmp" "$target"
+}
+
 echo "Configuring Pamac for AUR support..."
 if [[ -f /etc/pamac.conf ]]; then
-    sed -i 's/^#EnableAUR/EnableAUR/' /etc/pamac.conf
-    sed -i 's/^#CheckAURUpdates/CheckAURUpdates/' /etc/pamac.conf
-    sed -i 's/^#CheckAURVCSUpdates/CheckAURVCSUpdates/' /etc/pamac.conf
-    if ! grep -q '^EnableAUR' /etc/pamac.conf; then
-        echo "EnableAUR" >> /etc/pamac.conf
-    fi
-    if ! grep -q '^CheckAURUpdates' /etc/pamac.conf; then
-        echo "CheckAURUpdates" >> /etc/pamac.conf
-    fi
-    echo "Pamac configuration updated for AUR support."
+    _atomic_edit_pamac_conf
+    echo "Pamac configuration updated for AUR support (atomically)."
 
-echo "Setting BuildDirectory for AUR builds (writable by non-root)..."
-if grep -q '^BuildDirectory' /etc/pamac.conf; then
-sed -i 's|^BuildDirectory.*|BuildDirectory = /home/'"$current_user"'/\.pamac-build|' /etc/pamac.conf
-else
-echo "BuildDirectory = /home/$current_user/.pamac-build" >> /etc/pamac.conf
-fi
 mkdir -p "/home/$current_user/.pamac-build"
 chown "$current_user:$current_user" "/home/$current_user/.pamac-build" 2>/dev/null || true
 echo "BuildDirectory set to /home/$current_user/.pamac-build"
@@ -3506,9 +3636,10 @@ echo "Leaving Pamac polkit policy at auth_admin_keep defaults."
 pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
 if [[ -f "$pamac_policy" ]]; then
 if grep -q '<allow_any>yes</allow_any>' "$pamac_policy"; then
-    sed -i 's|<allow_any>yes</allow_any>|<allow_any>auth_admin_keep</allow_any>|' "$pamac_policy"
-    sed -i 's|<allow_inactive>yes</allow_inactive>|<allow_inactive>auth_admin_keep</allow_inactive>|' "$pamac_policy"
-    sed -i 's|<allow_active>yes</allow_active>|<allow_active>auth_admin_keep</allow_active>|' "$pamac_policy"
+    _atomic_sed_inplace "$pamac_policy" \
+        's|<allow_any>yes</allow_any>|<allow_any>auth_admin_keep</allow_any>|' \
+        's|<allow_inactive>yes</allow_inactive>|<allow_inactive>auth_admin_keep</allow_inactive>|' \
+        's|<allow_active>yes</allow_active>|<allow_active>auth_admin_keep</allow_active>|'
     echo "Restored auth_admin_keep in polkit policy (was previously relaxed to allow_any=yes)."
 fi
 else
@@ -3668,10 +3799,15 @@ fi
         if ! grep -q '^export HOME=' "$bashrc_file" 2>/dev/null || ! grep -q '^export PATH=.*\.local/bin' "$bashrc_file" 2>/dev/null; then
             local bashrc_header
             bashrc_header='#\n# ~/.bashrc\n#\nexport HOME="/home/'"$CURRENT_USER"'"\nexport PATH="/home/'"$CURRENT_USER"'/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin"\n'
-            if grep -q '^\[\[ \$- != \*i\* \]\]' "$bashrc_file" 2>/dev/null || grep -q '^\[\[ \$- !=' "$bashrc_file" 2>/dev/null; then
-                run_command sed -i "1i\\${bashrc_header}" "$bashrc_file" 2>/dev/null || true
-            else
-                { echo -e "$bashrc_header"; cat "$bashrc_file"; } > "$bashrc_file.tmp" 2>/dev/null && mv "$bashrc_file.tmp" "$bashrc_file" 2>/dev/null || true
+            local bashrc_tmp
+            bashrc_tmp=$(mktemp "${bashrc_file}.atomic.XXXXXX") 2>/dev/null
+            if [[ -n "$bashrc_tmp" ]]; then
+                { echo -e "$bashrc_header"; cat "$bashrc_file"; } > "$bashrc_tmp" 2>/dev/null && sync "$bashrc_tmp" 2>/dev/null || true
+                if [[ -s "$bashrc_tmp" ]]; then
+                    mv "$bashrc_tmp" "$bashrc_file" 2>/dev/null || rm -f "$bashrc_tmp" 2>/dev/null || true
+                else
+                    rm -f "$bashrc_tmp" 2>/dev/null || true
+                fi
             fi
             if grep -q '^export HOME=' "$bashrc_file" 2>/dev/null; then
                 log_info "Patched .bashrc with HOME/PATH exports before non-interactive check"
@@ -3755,7 +3891,9 @@ export_pamac_to_host() {
     mkdir -p "$_host_bindir"
 
     local _container_tool_dir="/tmp/pamac-host-tools"
+    local _xdotool_build_rc=0
 
+    set +e
     container_root_exec bash -c "
 set +e
 mkdir -p $_container_tool_dir
@@ -3763,25 +3901,42 @@ mkdir -p $_container_tool_dir
 pacman -S --noconfirm --needed base-devel git 2>/dev/null || true
 
 _build_xdotool() {
-    echo '--- Building xdotool ---'
+    echo '--- Building xdotool from source ---'
     local _src=\$(mktemp -d)
-    if ! git clone --depth 1 https://github.com/jordansissel/xdotool \$_src/xdotool 2>/dev/null; then
-        echo 'xdotool: git clone failed'
-        return 1
+    if ! git clone --depth 1 https://github.com/jordansissel/xdotool \$_src/xdotool 2>/tmp/xdotool_clone_err; then
+        echo 'xdotool: git clone FAILED'
+        cat /tmp/xdotool_clone_err 2>/dev/null | tail -3
+        echo 'xdotool: skipping build (clone failed — network or git issue)'
+        cd /; rm -rf \$_src; return 1
     fi
     cd \$_src/xdotool
-    if make xdotool 2>/dev/null; then
+    if make xdotool 2>/tmp/xdotool_build_err; then
         cp xdotool $_container_tool_dir/xdotool 2>/dev/null
         echo 'xdotool: build OK'
         cd /; rm -rf \$_src; return 0
     fi
+    echo 'xdotool: make FAILED'
+    cat /tmp/xdotool_build_err 2>/dev/null | tail -5
     cd /; rm -rf \$_src
-    echo 'xdotool: build FAILED'
     return 1
 }
 
 _build_xdotool
-" 2>/dev/null || true
+_rc=\$?
+if [[ \$_rc -ne 0 ]]; then
+    echo 'WARNING: xdotool source build failed (exit \$_rc). X11 window hint injection will be unavailable.'
+    echo 'This is non-fatal — Pamac will still launch, but X11 taskbar integration may not work.'
+fi
+exit \$_rc
+" 2>/dev/null
+    _xdotool_build_rc=$?
+    set -e
+
+    if [[ $_xdotool_build_rc -ne 0 ]]; then
+        log_warn "xdotool source build failed inside container (exit code: $_xdotool_build_rc)."
+        log_info "X11 window hint injection (StartupWMClass fallback) will be unavailable."
+        log_info "This is non-fatal — Pamac still works; Wayland uses XDG_ACTIVATION_TOKEN (no xdotool needed)."
+    fi
 
     for _tool in xdotool; do
         if container_cp_from "$_container_tool_dir/$_tool" "$_host_bindir/$_tool" 2>/dev/null; then
@@ -5068,7 +5223,7 @@ main() {
             log_error "CRITICAL: Container has SigLevel=TrustAll with no backup file."
             log_error "Previous run may have been interrupted before backup was created."
             log_error "Forcing SigLevel to safe default..."
-            if container_root_exec bash -c "sed -i 's/^SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf && grep -q '^SigLevel' /etc/pacman.conf || echo 'SigLevel = Required DatabaseOptional' >> /etc/pacman.conf" 2>/dev/null; then
+            if container_root_exec bash -c 'tmp=$(mktemp /etc/pacman.conf.atomic.XXXXXX) && cp -f /etc/pacman.conf "$tmp" && sed -i "s/^SigLevel.*/SigLevel = Required DatabaseOptional/" "$tmp" && (grep -q "^SigLevel" "$tmp" || echo "SigLevel = Required DatabaseOptional" >> "$tmp") && sync "$tmp" 2>/dev/null || sync 2>/dev/null || true && mv -f "$tmp" /etc/pacman.conf' 2>/dev/null; then
                 log_success "Restored SigLevel to Required DatabaseOptional."
             else
                 log_error "Failed to restore SigLevel. Manual intervention required."

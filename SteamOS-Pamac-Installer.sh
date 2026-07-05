@@ -3030,15 +3030,59 @@ _enable_repo_with_fallback() {
         done
     fi
 
-    # Step 3: Import the signing key from keyservers as a last resort
+    # Step 3: Dynamically discover and import GPG key from repo mirrors
+    # Tries to download the signing key directly from the repo's distribution
+    # rather than relying on hardcoded fingerprints that may become stale after key rotations.
+    if [[ "$key_ok" != "true" ]] && command -v pacman-key >/dev/null 2>&1; then
+        echo "Attempting dynamic key discovery from repo mirrors..."
+        local host_arch
+        host_arch=$(uname -m 2>/dev/null || echo "x86_64")
+        for url in "${mirror_urls[@]}"; do
+            local direct_url="${url}"
+            direct_url="${direct_url//\\\$arch/$host_arch}"
+            direct_url="${direct_url//\$arch/$host_arch}"
+            direct_url="${direct_url//\\\$repo/$repo_name}"
+            direct_url="${direct_url//\$repo/$repo_name}"
+            # Try common GPG key distribution filenames used by Arch repos
+            for keyfile in "pub.gpg" "archlinuxcn.gpg" "key.gpg"; do
+                local key_url="${direct_url%/}/$keyfile"
+                local _tmp_key="/tmp/repo-key-discover-${repo_name}.gpg"
+                if timeout 15 curl -fsSL --connect-timeout 5 -o "$_tmp_key" "$key_url" 2>/dev/null; then
+                    if file "$_tmp_key" 2>/dev/null | grep -qi "GPG\|PGP"; then
+                        echo "  Found GPG key at $key_url"
+                        if timeout 30 pacman-key --import "$_tmp_key" 2>/dev/null; then
+                            # Extract fingerprint and locally sign it
+                            local _imported_fp
+                            _imported_fp=$(gpg --with-colons --show-keys "$_tmp_key" 2>/dev/null \
+                                | grep '^fpr' | head -1 | cut -d: -f10 || echo "")
+                            if [[ -n "$_imported_fp" ]]; then
+                                timeout 30 pacman-key --lsign-key "$_imported_fp" 2>/dev/null || true
+                                echo "  Dynamically discovered key: ${_imported_fp: -8} (last 8 chars)"
+                            fi
+                            key_ok=true
+                            rm -f "$_tmp_key"
+                            break 2
+                        fi
+                    fi
+                    rm -f "$_tmp_key"
+                fi
+            done
+        done
+        if [[ "$key_ok" != "true" ]]; then
+            echo "  No GPG key found at common mirror paths. Trying keyserver fallback..."
+        fi
+    fi
+
+    # Step 4: Import the signing key from keyservers as last resort (uses hardcoded fingerprint)
     if [[ "$key_ok" != "true" ]] && command -v pacman-key >/dev/null 2>&1; then
         echo "Attempting key import from keyservers (key_id=$key_id)..."
+        echo "Note: If this fails, the key may have been rotated. Set ${env_var_name}=<NEW_KEY_ID> to override."
         if _import_key_with_retry "$key_id"; then
             key_ok=true
         fi
     fi
 
-    # Step 4: Write the repo entry with appropriate SigLevel
+    # Step 5: Write the repo entry with appropriate SigLevel
     if [[ "$key_ok" == "true" ]]; then
         printf '\n[%s]\nSigLevel = TrustedOnly\n%b' "$repo_name" "$server_lines" >> /etc/pacman.conf
         echo "$repo_name repository configured (TrustedOnly)."
@@ -3328,14 +3372,42 @@ mkdir -p "$_AUR_CACHE_DIR" 2>/dev/null || true
 
 _fetch_aur_pkgbuild() {
     local fetched=""
-    # Try the CGIT web endpoint first
+
+    # Method 1: AUR RPC v5 JSON API (most stable, no CGIT dependency)
+    # Returns package metadata as JSON including Depends/MakeDepends arrays.
+    # We format the output as PKGBUILD-like text so downstream grep parsing works.
+    local _rpc_url="https://aur.archlinux.org/rpc/v5/info/pamac-aur"
+    local _rpc_resp
+    _rpc_resp=$(curl -sf --connect-timeout 10 --max-time 30 "$_rpc_url" 2>/dev/null || echo "")
+    if [[ -n "$_rpc_resp" ]] && echo "$_rpc_resp" | grep -q '"resultcount":1'; then
+        # Extract Depends array elements (handle empty arrays too)
+        local _deps_raw _makedeps_raw
+        _deps_raw=$(echo "$_rpc_resp" | sed -n 's/.*"Depends":\[\([^]]*\)\].*/\1/p' 2>/dev/null || echo "")
+        _makedeps_raw=$(echo "$_rpc_resp" | sed -n 's/.*"MakeDepends":\[\([^]]*\)\].*/\1/p' 2>/dev/null || echo "")
+        # Format as PKGBUILD-like lines for downstream grep compatibility
+        if [[ -n "$_deps_raw" ]]; then
+            _deps_formatted=$(echo "$_deps_raw" | sed 's/","/\n/g; s/"//g')
+            echo "depends=($_deps_formatted)"
+        fi
+        if [[ -n "$_makedeps_raw" ]]; then
+            _makedeps_formatted=$(echo "$_makedeps_raw" | sed 's/","/\n/g; s/"//g')
+            echo "makedepends=($_makedeps_formatted)"
+        fi
+        # If we got at least one dependency line, RPC was successful
+        if [[ -n "$_deps_raw" || -n "$_makedeps_raw" ]]; then
+            echo "# Generated from AUR RPC v5 API"
+            return 0
+        fi
+    fi
+
+    # Method 2: CGIT web endpoint (may be rate-limited by Cloudflare)
     fetched=$(curl -sf --connect-timeout 10 --max-time 30 \
         "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=pamac-aur" 2>/dev/null || echo "")
     if [[ -n "$fetched" ]]; then
         echo "$fetched"
         return 0
     fi
-    # Fallback: use git to read PKGBUILD directly (bypasses web frontend)
+    # Method 3: git clone to read PKGBUILD directly (bypasses web frontend)
     local _git_tmp
     _git_tmp=$(mktemp -d 2>/dev/null || echo "")
     if [[ -n "$_git_tmp" ]]; then
@@ -3409,6 +3481,31 @@ req_minor=$(echo "$_req_minor_raw" | grep -oP '^[0-9]*' || echo "0")
 
 version_meets_requirement() {
     local cur_major="$1" cur_minor="$2" op="$3" rq_major="$4" rq_minor="${5:-0}"
+
+    # Use vercmp when available (standard Arch Linux utility that correctly handles
+    # epochs like "6:5.2.0", pre-release suffixes like "rc", and package revisions)
+    if command -v vercmp >/dev/null 2>&1; then
+        local cur_full="${cur_major}.${cur_minor}"
+        local rq_full="${rq_major}.${rq_minor}"
+        local cmp_result
+        cmp_result=$(vercmp "$cur_full" "$rq_full" 2>/dev/null || echo "")
+        if [[ -n "$cmp_result" && "$cmp_result" =~ ^-?[0-9]+$ ]]; then
+            case "$op" in
+                ">="|"="|"==")
+                    [[ "$cmp_result" -ge 0 ]] && return 0 || return 1 ;;
+                ">")
+                    [[ "$cmp_result" -gt 0 ]] && return 0 || return 1 ;;
+                "<=")
+                    [[ "$cmp_result" -le 0 ]] && return 0 || return 1 ;;
+                "<")
+                    [[ "$cmp_result" -lt 0 ]] && return 0 || return 1 ;;
+                *)
+                    return 0 ;;
+            esac
+        fi
+    fi
+
+    # Fallback: manual major.minor comparison (when vercmp is unavailable)
     case "$op" in
         ">="|"="|"==")
             if [[ "$cur_major" -gt "$rq_major" ]]; then return 0; fi
@@ -3445,9 +3542,18 @@ echo "INCOMPATIBLE: pacman $installed_pacman_ver does NOT satisfy $aur_pacman_de
 echo ""
 
 can_upgrade_pacman=false
-if [[ "$req_major" -gt "$pacman_major" ]] || \
-   { [[ "$req_major" -eq "$pacman_major" ]] && [[ "$req_minor" -gt "$pacman_minor" ]]; }; then
-    can_upgrade_pacman=true
+if command -v vercmp >/dev/null 2>&1; then
+    # Use vercmp for accurate comparison (handles epochs, pre-release suffixes)
+    _cmp_result=$(vercmp "$installed_pacman_ver" "$req_version" 2>/dev/null || echo "")
+    if [[ -n "$_cmp_result" && "$_cmp_result" =~ ^-?[0-9]+$ ]] && [[ "$_cmp_result" -lt 0 ]]; then
+        can_upgrade_pacman=true
+    fi
+else
+    # Fallback: manual major.minor comparison
+    if [[ "$req_major" -gt "$pacman_major" ]] || \
+       { [[ "$req_major" -eq "$pacman_major" ]] && [[ "$req_minor" -gt "$pacman_minor" ]]; }; then
+        can_upgrade_pacman=true
+    fi
 fi
 
 if [[ "$can_upgrade_pacman" == "true" ]]; then

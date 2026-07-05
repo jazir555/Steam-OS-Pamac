@@ -1694,18 +1694,86 @@ export GNUPGHOME=/etc/pacman.d/gnupg
 export GPG_AGENT_INFO=
 chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
 
-echo "Step 2/5: Temporarily relaxing signature verification for self-healing..."
-# Create atomic backup (mktemp + mv is already atomic on POSIX)
-_tmp_siglevel_bak=$(mktemp /etc/pacman.conf.siglevel-backup.XXXXXX)
-cp -f /etc/pacman.conf "$_tmp_siglevel_bak"
-sync 2>/dev/null || true
-mv -f "$_tmp_siglevel_bak" /etc/pacman.conf.siglevel-backup
-# Create sentinel BEFORE weakening security — survives power loss / SIGKILL
-touch "$_SIGLEVEL_SENTINEL"
-sync 2>/dev/null || true
-# Atomically write TrustAll to pacman.conf
-_atomic_write_pacman_conf "TrustAll"
-echo "Backup saved to $_SIGLEVEL_BACKUP; crash sentinel at $_SIGLEVEL_SENTINEL."
+echo "Step 2/5: Attempting safe keyring recovery (no signature relaxation)..."
+
+_safe_recovered=false
+
+# Method A: Refresh keys from keyservers (uses GnuPG's built-in HTTP client, no curl needed)
+echo "Method A: Refreshing keys from keyservers..."
+pkill -9 gpg-agent 2>/dev/null || true
+pkill -9 dirmngr 2>/dev/null || true
+_safe_sleep 1
+for _ks in "hkps://keyserver.ubuntu.com" "hkps://keys.openpgp.org" "hkps://pgp.mit.edu"; do
+    echo "  Trying keyserver: $_ks"
+    if timeout 45 pacman-key --refresh-keys --keyserver "$_ks" 2>/dev/null; then
+        echo "  Key refresh succeeded from $_ks."
+        _safe_recovered=true
+        break
+    fi
+    echo "  Keyserver $_ks failed or timed out."
+done
+
+# Method B: Download keyring package directly via HTTPS and import keys manually
+if [[ "$_safe_recovered" != "true" ]] && command -v curl >/dev/null 2>&1; then
+    echo "Method B: Attempting direct keyring package download via HTTPS..."
+    _mirror_url="https://geo.mirror.pkgbuild.com/core/os/x86_64"
+    _kr_pkg=$(curl -sLf --connect-timeout 10 --max-time 30 "${_mirror_url}/" 2>/dev/null | \
+        grep -oP 'archlinux-keyring-[0-9]+-[0-9]+-any\.pkg\.tar\.zst' | sort -V | tail -1 || true)
+    if [[ -n "$_kr_pkg" ]]; then
+        echo "  Found keyring package: $_kr_pkg"
+        _tmp_kr=$(mktemp /tmp/kr-XXXXXX.pkg.tar.zst)
+        if curl -sLf --connect-timeout 10 --max-time 120 -o "$_tmp_kr" "${_mirror_url}/${_kr_pkg}" 2>/dev/null; then
+            _tmp_kr_dir=$(mktemp -d /tmp/kr-extract-XXXXXX)
+            if tar -xf "$_tmp_kr" -C "$_tmp_kr_dir" 2>/dev/null; then
+                for _kr_file in "$_tmp_kr_dir"/usr/share/pacman/keyrings/archlinux*; do
+                    [[ -f "$_kr_file" ]] && cp -f "$_kr_file" /etc/pacman.d/gnupg/ 2>/dev/null || true
+                done
+                echo "  Keyring files extracted. Populating..."
+                if pacman-key --populate archlinux 2>/dev/null; then
+                    echo "  Direct keyring import succeeded."
+                    _safe_recovered=true
+                else
+                    echo "  Keyring populate failed after direct import."
+                fi
+            fi
+            rm -rf "$_tmp_kr_dir"
+        fi
+        rm -f "$_tmp_kr"
+    else
+        echo "  Could not find keyring package on mirror."
+    fi
+fi
+
+# Method C: Try standard database sync (works if keys are only slightly stale)
+if [[ "$_safe_recovered" != "true" ]]; then
+    echo "Method C: Attempting standard database sync and keyring update..."
+    rm -f /var/lib/pacman/db.lck
+    if pacman -Syy --noconfirm 2>/dev/null; then
+        if pacman -S --noconfirm --needed archlinux-keyring gnupg 2>/dev/null; then
+            echo "Standard sync and keyring update succeeded."
+            _safe_recovered=true
+        fi
+    fi
+fi
+
+# Fallback: TrustAll (only if all safe methods failed)
+if [[ "$_safe_recovered" == "true" ]]; then
+    echo "Safe keyring recovery succeeded. No TrustAll fallback needed."
+else
+    echo "WARNING: All safe recovery methods failed. Falling back to temporary TrustAll (last resort)."
+    echo "TrustAll is insecure and will be restored immediately after keyring update."
+    # Create atomic backup (mktemp + mv is already atomic on POSIX)
+    _tmp_siglevel_bak=$(mktemp /etc/pacman.conf.siglevel-backup.XXXXXX)
+    cp -f /etc/pacman.conf "$_tmp_siglevel_bak"
+    sync 2>/dev/null || true
+    mv -f "$_tmp_siglevel_bak" /etc/pacman.conf.siglevel-backup
+    # Create sentinel BEFORE weakening security — survives power loss / SIGKILL
+    touch "$_SIGLEVEL_SENTINEL"
+    sync 2>/dev/null || true
+    # Atomically write TrustAll to pacman.conf
+    _atomic_write_pacman_conf "TrustAll"
+    echo "Backup saved to $_SIGLEVEL_BACKUP; crash sentinel at $_SIGLEVEL_SENTINEL."
+fi
 
 echo "Step 3/5: Updating keyring, GPG, and certificate packages..."
 rm -f /var/lib/pacman/db.lck
@@ -2915,6 +2983,13 @@ install_aur_helper() {
         return 0
     fi
 
+    log_info "Attempting to install yay from prebuilt repositories..."
+    if container_root_exec bash -c 'rm -f /var/lib/pacman/db.lck; pacman -Sy --noconfirm 2>/dev/null; pacman -S --noconfirm --needed yay 2>/dev/null; command -v yay >/dev/null 2>&1 && echo __PREBUILT_OK__' 2>/dev/null | grep -q "__PREBUILT_OK__"; then
+        log_success "AUR helper yay installed from prebuilt repository."
+        return 0
+    fi
+    log_info "Prebuilt yay not available. Building from source..."
+
 	log_info "Verifying build dependencies (git, base-devel, go) are present..."
 	local verify_script
 	read -r -d '' verify_script <<'VERIFY_EOF' || true
@@ -3398,6 +3473,13 @@ install_pamac() {
         log_info "Pamac is already installed (manager + CLI)."
         return 0
     fi
+
+    log_info "Attempting to install pamac-aur from prebuilt repositories..."
+    if container_root_exec bash -c 'rm -f /var/lib/pacman/db.lck; pacman -Sy --noconfirm 2>/dev/null; pacman -S --noconfirm --needed pamac-aur 2>/dev/null; command -v pamac-manager >/dev/null 2>&1 && command -v pamac >/dev/null 2>&1 && echo __PREBUILT_OK__' 2>/dev/null | grep -q "__PREBUILT_OK__"; then
+        log_success "Pamac installed from prebuilt repository."
+        return 0
+    fi
+    log_info "Prebuilt pamac-aur not available. Building from source..."
 
     _PAMAC_COMPAT_COMMIT=""
     _PAMAC_COMPAT_STRATEGY=""

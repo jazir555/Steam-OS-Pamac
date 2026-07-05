@@ -589,10 +589,10 @@ OPTIONS:
   --force-rebuild           Rebuild existing container if it exists
   --enable-multilib         Enable 32-bit package support (default)
   --disable-multilib        Explicitly disable 32-bit package support
---enable-gaming Install extra gaming packages
-    --disable-gaming Do not install gaming packages (default)
-    --enable-extra-repos Enable popular third-party repositories (default)
-    --disable-extra-repos Do not add third-party repositories
+  --enable-gaming            Install extra gaming packages
+  --disable-gaming           Do not install gaming packages (default)
+  --enable-extra-repos       Enable popular third-party repositories (default)
+  --disable-extra-repos      Do not add third-party repositories
   --enable-build-cache      Enable persistent build cache for yay (default)
   --disable-build-cache     Disable persistent build cache for yay
   --optimize-mirrors        Select fastest Pacman mirrors (default)
@@ -740,7 +740,7 @@ wait_for_container() {
   local max_attempts=30
   local attempt=0
   local _saved_e
-  _saved_e=$(set -o | grep 'errtrace' | awk '{print $NF}')
+  _saved_e=$(set -o | grep 'errexit' | awk '{print $NF}')
   log_info "Waiting for container '$CONTAINER_NAME' to become ready..."
 
   set +e
@@ -985,7 +985,7 @@ exec_container_script() {
     _script_file=$(mktemp /tmp/pamac-script-XXXXXXXX)
     printf '%s\n' "${_preamble}${_script}" > "$_script_file"
 
-    local _marker="PAMAC_SCRIPT_OK_$(head -c 16 /dev/urandom 2>/dev/null | xxd -p 2>/dev/null || echo "$$_$(date +%s%N)")"
+    local _marker="PAMAC_SCRIPT_OK_$(head -c 16 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$_$(date +%s%N)")"
   printf '\necho "%s"\n' "$_marker" >> "$_script_file"
 
   set +e
@@ -1033,7 +1033,7 @@ exec_container_pipe() {
     shift
     local _rc=0
     local _script_file
-    local _marker="PAMAC_PIPE_OK_$(head -c 16 /dev/urandom 2>/dev/null | xxd -p 2>/dev/null || echo "$$_$(date +%s%N)")"
+    local _marker="PAMAC_PIPE_OK_$(head -c 16 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$_$(date +%s%N)")"
     local _preamble='_safe_sleep() { if ! sleep "$1" 2>/dev/null; then read -t "$1" -r _ 2>/dev/null || true; fi; }
 '
 

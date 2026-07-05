@@ -21,8 +21,6 @@ _cleanup_temp_files() {
         rm -f "$f" 2>/dev/null || true
     done
 }
-trap _cleanup_temp_files EXIT
-
 CONTAINER_NAME="${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}"
 
 CURRENT_USER=$(whoami)
@@ -76,7 +74,7 @@ initialize_logging() {
         echo "=========================================="
     } > "$LOG_FILE"
 
-    trap 'exit_code=$?; echo "=== Run finished: $(date) - Exit: $exit_code ===" >> "$LOG_FILE"' EXIT
+    trap 'exit_code=$?; _cleanup_temp_files; echo "=== Run finished: $(date) - Exit: $exit_code ===" >> "$LOG_FILE"' EXIT
 }
 
 _log() {
@@ -85,14 +83,14 @@ _log() {
     timestamp=$(date +'%Y-%m-%d %H:%M:%S')
 
     local plain_message
-    plain_message=$(printf '%s' "$message" | sed 's/\x1B\[[0-9;]*[A-Za-z]//g' || printf '%s' "$message")
+    plain_message=$(printf '%s' "$message" | sed 's/\x1B\[[0-9;]*[A-Za-z]//g') || plain_message="$message"
 
     echo "[$timestamp] $level: $plain_message" >> "$LOG_FILE"
 
     case "$LOG_LEVEL" in
-        "quiet") if [[ "$level" == "ERROR" ]]; then echo -e "${color}${message}${NC}"; fi ;;
-        "normal") if [[ "$level" != "DEBUG" ]]; then echo -e "${color}${message}${NC}"; fi ;;
-        "verbose") echo -e "${color}${message}${NC}" ;;
+        "quiet") if [[ "$level" == "ERROR" ]]; then printf '%b\n' "${color}${message}${NC}"; fi ;;
+        "normal") if [[ "$level" != "DEBUG" ]]; then printf '%b\n' "${color}${message}${NC}"; fi ;;
+        "verbose") printf '%b\n' "${color}${message}${NC}" ;;
     esac
 }
 
@@ -962,6 +960,10 @@ parse_arguments() {
             --no-optimize-mirrors) OPTIMIZE_MIRRORS="false"; shift ;;
             --pamac-version)
                 [[ -z "${2:-}" ]] && { log_error "pamac-version cannot be empty"; exit 1; }
+                if [[ ! "$2" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+                    log_error "Invalid pamac-version: '$2' (only alphanumerics, dots, hyphens, underscores allowed)"
+                    exit 1
+                fi
                 PAMAC_VERSION="$2"
                 shift 2
                 ;;
@@ -1077,7 +1079,7 @@ wait_for_container() {
   fi
   local max_attempts=30
   local attempt=0
-  _SAVED_ERREXIT=$(set -o | grep 'errexit' | awk '{print $NF}' || echo "off")
+  _SAVED_ERREXIT=$(shopt -o -q errexit && echo "on" || echo "off")
   log_info "Waiting for container '$CONTAINER_NAME' to become ready..."
 
   set +e
@@ -2565,7 +2567,7 @@ log_info "Verifying critical helper files in container..."
 local missing_items=()
 
  local systemd_run_check
- systemd_run_check=$(container_root_exec test -x /usr/local/sbin/systemd-run && echo "ok" || echo "missing" 2>/dev/null)
+ systemd_run_check=$( { container_root_exec test -x /usr/local/sbin/systemd-run && echo "ok" || echo "missing"; } 2>/dev/null)
  local has_systemd
  has_systemd=$(container_root_exec bash -c "command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1 && echo yes || echo no" 2>/dev/null)
  if [[ "$systemd_run_check" != "ok" ]]; then
@@ -2578,14 +2580,14 @@ local missing_items=()
  fi
 
 local dbus_conf_check
-dbus_conf_check=$(container_root_exec test -f /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf && echo "ok" || echo "missing" 2>/dev/null)
+dbus_conf_check=$( { container_root_exec test -f /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf && echo "ok" || echo "missing"; } 2>/dev/null)
 if [[ "$dbus_conf_check" != "ok" ]]; then
 log_warn "D-Bus daemon policy config is MISSING from container."
 missing_items+=("dbus-daemon-conf")
 fi
 
 local bootstrap_check
-bootstrap_check=$(container_root_exec test -x /usr/local/bin/pamac-session-bootstrap.sh && echo "ok" || echo "missing" 2>/dev/null)
+bootstrap_check=$( { container_root_exec test -x /usr/local/bin/pamac-session-bootstrap.sh && echo "ok" || echo "missing"; } 2>/dev/null)
 if [[ "$bootstrap_check" != "ok" ]]; then
 log_warn "Pamac bootstrap helper is MISSING from container."
 missing_items+=("bootstrap")
@@ -3965,15 +3967,30 @@ echo "pamac-manager and pamac CLI installed successfully."
 PAMAC_INSTALL_EOF
 
     if ! exec_container_script "$pamac_install" "pamac-install" "$CURRENT_USER" "$_compat_strategy" "$_compat_commit"; then
-        if ! container_is_usable; then
-            log_warn "Container not usable after pamac install. Restarting..."
-            container_start 2>/dev/null || true
-            wait_for_container || {
-                log_error "Container unrecoverable."
-                return 1
-            }
-            log_info "Retrying pamac install..."
-            if ! exec_container_script "$pamac_install" "pamac-install-retry" "$CURRENT_USER" "$_compat_strategy" "$_compat_commit"; then
+        log_warn "First pamac install attempt failed. Retrying once..."
+        container_start 2>/dev/null || true
+        sleep 3
+        if ! exec_container_script "$pamac_install" "pamac-install-retry" "$CURRENT_USER" "$_compat_strategy" "$_compat_commit"; then
+            if ! container_is_usable; then
+                log_warn "Container not usable after pamac install retry. Attempting recovery..."
+                container_start 2>/dev/null || true
+                wait_for_container || {
+                    log_error "Container unrecoverable."
+                    return 1
+                }
+                log_info "Retrying pamac install after recovery..."
+                if ! exec_container_script "$pamac_install" "pamac-install-recovery" "$CURRENT_USER" "$_compat_strategy" "$_compat_commit"; then
+                    log_error "Failed to install Pamac after recovery retry."
+                    log_error ""
+                    log_error "The pamac-aur AUR package may be broken upstream."
+                    log_error "Options:"
+                    log_error "  1. Check https://aur.archlinux.org/packages/pamac-aur for current status"
+                    log_error "  2. Try: --pamac-version <tag>  to pin a specific working version"
+                    log_error "  3. Wait for the AUR maintainer to update pamac-aur for the latest pacman"
+                    log_error ""
+                    return 1
+                fi
+            else
                 log_error "Failed to install Pamac after retry."
                 log_error ""
                 log_error "The pamac-aur AUR package may be broken upstream."
@@ -3984,16 +4001,6 @@ PAMAC_INSTALL_EOF
                 log_error ""
                 return 1
             fi
-        else
-            log_error "Failed to install Pamac."
-            log_error ""
-            log_error "The pamac-aur AUR package may be broken upstream."
-            log_error "Options:"
-            log_error "  1. Check https://aur.archlinux.org/packages/pamac-aur for current status"
-            log_error "  2. Try: --pamac-version <tag>  to pin a specific working version"
-            log_error "  3. Wait for the AUR maintainer to update pamac-aur for the latest pacman"
-            log_error ""
-            return 1
         fi
     fi
 

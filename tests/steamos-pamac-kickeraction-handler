@@ -52,10 +52,9 @@ DESKTOP_BASENAME=$(basename "$DESKTOP_PATH")
 log_msg "Uninstalling pamac-managed app: $APP_NAME (package: $SOURCE_PKG, desktop: $DESKTOP_BASENAME)"
 
 UNINSTALL_LOG="$STATE_DIR/kickeraction-uninstall-$(date +%s).log"
-log_msg "Spawning uninstall via systemd-run in separate scope"
+log_msg "Spawning uninstall via nohup in background"
 
-systemd-run --user --scope -u "steamos-pamac-uninstall-$(date +%s)" \
-    bash -c "
+nohup bash -c "
     export HOME=/home/deck
     export PATH=/home/deck/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin
     export DISPLAY=:0
@@ -65,19 +64,6 @@ systemd-run --user --scope -u "steamos-pamac-uninstall-$(date +%s)" \
     '$UNINSTALL_HELPER' --desktop-file '$DESKTOP_BASENAME' > '$UNINSTALL_LOG' 2>&1
     rc=\$?
     echo \"Exit code: \$rc\" >> '$UNINSTALL_LOG'
-
-    if [ \$rc -eq 0 ]; then
-        # Refresh KDE's service cache so the icon disappears from the menu
-        update-desktop-database '$APP_DIR' 2>/dev/null
-        kbuildsycoca6 2>/dev/null
-        # Signal plasmashell to refresh
-        qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.refreshCurrentShell 2>/dev/null || true
-        # Also try via KDE's kconf update mechanism
-        qdbus org.kde.kded6 /modules/proxyscout refresh 2>/dev/null || true
-        notify-send -i edit-delete 'Uninstalled' '$APP_NAME has been removed.' 2>/dev/null
-    else
-        notify-send -i dialog-error 'Uninstall Failed' 'Could not remove $APP_NAME. See log for details.' 2>/dev/null
-    fi
     " &>/dev/null &
 
 disown

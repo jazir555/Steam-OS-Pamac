@@ -105,8 +105,11 @@ if $CONFIRMED; then
 log_msg "Starting uninstall for $DESKTOP_BASENAME..."
 UNINSTALL_LOG="$STATE_DIR/uninstall-$(date +%s).log"
 
-systemd-run --user --scope -u "steamos-pamac-uninstall-$(date +%s)" \
-bash -c "
+if command -v notify-send >/dev/null 2>&1; then
+notify-send -i package-generic "Uninstalling..." "Removing $APP_NAME..." 2>/dev/null || true
+fi
+
+nohup bash -c "
 export HOME=/home/deck
 export PATH=/home/deck/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin
 export DISPLAY=$DISPLAY
@@ -117,19 +120,10 @@ export DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS
 '$UNINSTALL_HELPER' --desktop-file '$DESKTOP_BASENAME' > '$UNINSTALL_LOG' 2>&1
 rc=\$?
 echo \"Exit code: \$rc\" >> '$UNINSTALL_LOG'
-
-if [ \$rc -eq 0 ]; then
-update-desktop-database '$APP_DIR' 2>/dev/null
-kbuildsycoca6 2>/dev/null
-qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.refreshCurrentShell 2>/dev/null || true
-notify-send -i edit-delete 'Uninstalled' '$APP_NAME has been removed.' 2>/dev/null
-else
-notify-send -i dialog-error 'Uninstall Failed' 'Could not remove $APP_NAME. See log for details.' 2>/dev/null
-fi
 " &>/dev/null &
 
 disown
-log_msg "Uninstall launched in background scope"
+log_msg "Uninstall launched in background (nohup pid=$!)"
 fi
 exit 0
 else

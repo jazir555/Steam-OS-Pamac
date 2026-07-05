@@ -356,6 +356,45 @@ test_desktop_file() {
 	local exec_line
 	exec_line=$(ssh_check "grep '^Exec=' '$pamac_desktop' 2>/dev/null | head -1" || echo "")
 	log_test " Exec: $exec_line"
+
+	local validate_out
+	validate_out=$(ssh_check "desktop-file-validate '$pamac_desktop' 2>&1" || true)
+	if [[ -z "$validate_out" ]]; then
+		pass "Pamac desktop file passes desktop-file-validate"
+	else
+		fail "Pamac desktop file has validation errors: $(echo "$validate_out" | head -3)"
+	fi
+
+	local actions_line
+	actions_line=$(ssh_check "grep '^Actions=' '$pamac_desktop' 2>/dev/null | head -1" || echo "")
+	if [[ -n "$actions_line" ]]; then
+		pass "Actions= key found: $actions_line"
+		local action_ids
+		action_ids=$(echo "$actions_line" | sed 's/^Actions=//' | tr ';' '\n' | grep -v '^$' || true)
+		while IFS= read -r action_id; do
+			[[ -n "$action_id" ]] || continue
+			local has_section
+			has_section=$(ssh_check "grep -q '^\[Desktop Action ${action_id}\]' '$pamac_desktop' 2>/dev/null && echo true || echo false" || echo "false")
+			if [[ "$has_section" == "true" ]]; then
+				pass "Action '$action_id' has matching [Desktop Action $action_id] section"
+			else
+				fail "Action '$action_id' listed in Actions= but has no [Desktop Action $action_id] section"
+			fi
+		done <<< "$action_ids"
+	else
+		skip "No Actions= key found"
+	fi
+
+	local validate_all
+	validate_all=$(ssh_check "for f in '$desktop_files'; do desktop-file-validate \"\$f\" 2>&1; done" || true)
+	if [[ -z "$validate_all" ]]; then
+		pass "All exported desktop files pass desktop-file-validate"
+	else
+		local error_count
+		error_count=$(echo "$validate_all" | wc -l)
+		fail "$error_count desktop file validation errors found"
+		log_test " Validation errors: $(echo "$validate_all" | head -5)"
+	fi
 }
 
 ###############################################################################
@@ -676,6 +715,22 @@ test_uninstall_helper() {
 		else
 			pass "Uninstall helper --package successfully removed $TEST_PACKAGE_AUR"
 		fi
+
+		local desktop_after_uninstall
+		desktop_after_uninstall=$(ssh_check "grep -rl 'X-SteamOS-Pamac-SourcePackage=$TEST_PACKAGE_AUR' /home/deck/.local/share/applications/ 2>/dev/null" || true)
+		if [[ -z "$desktop_after_uninstall" ]]; then
+			pass "Desktop file for $TEST_PACKAGE_AUR cleaned up after uninstall"
+		else
+			fail "Desktop file still exists after uninstall: $desktop_after_uninstall"
+		fi
+
+		local state_after
+		state_after=$(ssh_check "grep '$TEST_PACKAGE_AUR' /home/deck/.local/share/steamos-pamac/$CONTAINER_NAME/exported-apps.list 2>/dev/null" || true)
+		if [[ -z "$state_after" ]]; then
+			pass "State file entry for $TEST_PACKAGE_AUR cleaned up"
+		else
+			fail "State file still has entry for $TEST_PACKAGE_AUR: $state_after"
+		fi
 	else
 		fail "Could not install $TEST_PACKAGE_AUR for uninstall helper test"
 	fi
@@ -718,19 +773,26 @@ test_desktop_action_uninstall() {
 		local other_count
 		other_count=$(echo "$other_desktops" | wc -l)
 		log_test " Checking $other_count other exported desktop file(s) for uninstall action..."
-		local all_have_actions=true
+		local all_valid=true
 		while IFS= read -r other_file; do
 			local other_has_action
 			other_has_action=$(ssh_check "grep -q '^\[Desktop Action uninstall\]' '$other_file' 2>/dev/null && echo true || echo false" || echo "false")
 			if [[ "$other_has_action" != "true" ]]; then
 				log_test " WARNING: $(basename "$other_file") missing uninstall action"
-				all_have_actions=false
+				all_valid=false
+			fi
+
+			local other_validate
+			other_validate=$(ssh_check "desktop-file-validate '$other_file' 2>&1" || true)
+			if [[ -n "$other_validate" ]]; then
+				log_test " VALIDATION ERROR: $(basename "$other_file"): $(echo "$other_validate" | head -2)"
+				all_valid=false
 			fi
 		done <<< "$other_desktops"
-		if [[ "$all_have_actions" == "true" ]]; then
-			pass "All exported desktop files have uninstall action"
+		if [[ "$all_valid" == "true" ]]; then
+			pass "All exported desktop files have uninstall action and pass validation"
 		else
-			skip "Some exported desktop files missing uninstall action (may need export hook re-run)"
+			skip "Some exported desktop files have issues (may need export hook re-run)"
 		fi
 	else
 		skip "No other exported desktop files to check"

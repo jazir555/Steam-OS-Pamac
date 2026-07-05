@@ -2704,12 +2704,42 @@ export_pamac_to_host() {
     command -v gtk-update-icon-cache >/dev/null 2>&1 && \
         gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" -f 2>/dev/null || true
 
+    log_info "Installing X11 tools for window integration (xdotool, xprop)..."
+    container_root_exec bash -c 'pacman -S --noconfirm --needed xdotool xorg-xprop xorg-xwininfo 2>/dev/null || echo "Warning: x11 tools install failed (non-fatal)"'
+
     log_info "Creating pamac-manager launch wrapper inside container..."
-    printf '%s\n' '#!/bin/bash' \
-        'set +e' \
-        '/usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true' \
-        'exec pamac-manager "$@"' \
-        | container_root_exec tee /usr/local/bin/pamac-manager-wrapper > /dev/null
+    container_root_exec bash -c 'cat > /usr/local/bin/pamac-manager-wrapper' << CONTAINER_WRAPPER_EOF
+#!/bin/bash
+set +e
+
+/usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true
+
+export DISPLAY=\${DISPLAY:-:0}
+DESKTOP_FILE="/home/deck/.local/share/applications/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
+
+pamac-manager "\$@" &
+PAMAC_PID=\$!
+
+WAIT_MAX=30
+WAITED=0
+FOUND=0
+
+while [[ \$WAITED -lt \$WAIT_MAX && \$FOUND -eq 0 ]]; do
+  sleep 2
+  WAITED=\$((WAITED + 2))
+  for wid in \$(xdotool search --class "pamac-manager" 2>/dev/null); do
+    width=\$(xwininfo -id "\$wid" 2>/dev/null | awk '/Width:/{print \$NF}')
+    if [[ -n "\$width" ]] && [[ "\$width" -gt 1 ]]; then
+      xprop -id "\$wid" -f _KDE_NET_WM_DESKTOP_FILE 8u \
+        -set _KDE_NET_WM_DESKTOP_FILE "\$DESKTOP_FILE" 2>/dev/null
+      FOUND=1
+      break
+    fi
+  done
+done
+
+wait "\$PAMAC_PID" 2>/dev/null
+CONTAINER_WRAPPER_EOF
     container_root_exec chmod +x /usr/local/bin/pamac-manager-wrapper
     log_info "pamac-manager-wrapper created inside container."
 
@@ -2854,21 +2884,47 @@ fi
 
 DESKTOP_FILE="\$HOME/.local/share/applications/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
 
+# Record EXISTING pamac-manager windows BEFORE launching new instance
+OLD_WINDOWS=\$(XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xdotool search --class "pamac-manager" 2>/dev/null | sort)
+
+# Launch Pamac in the background via distrobox
 distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper "\$@" &
 LAUNCHER_PID=\$!
 
-sleep 1
+# Poll for NEW pamac-manager windows (up to 30 seconds)
+WAIT_MAX=30
+WAITED=0
+FOUND=0
+while [[ \$WAITED -lt \$WAIT_MAX && \$FOUND -eq 0 ]]; do
+  sleep 2
+  WAITED=\$((WAITED + 2))
+  CURRENT_WINDOWS=\$(XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xdotool search --class "pamac-manager" 2>/dev/null | sort)
+  NEW_WINDOWS=\$(comm -13 <(echo "\$OLD_WINDOWS") <(echo "\$CURRENT_WINDOWS") 2>/dev/null)
+  if [[ -n "\$NEW_WINDOWS" ]]; then
+    FOUND=1
+    for wid in \$NEW_WINDOWS; do
+      width=\$(XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xwininfo -id "\$wid" 2>/dev/null | awk -F': ' '/Width:/{print \$2}')
+      if [[ -n "\$width" ]] && [[ "\$width" != "1" ]]; then
+        FOUND=2
+        CURRENT_WINDOWS="\$NEW_WINDOWS"
+        break
+      fi
+    done
+    if [[ \$FOUND -ne 2 ]]; then
+      FOUND=0
+    fi
+  fi
+done
 
-WINDOW_IDS=\$(XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xdotool search --class "pamac-manager" 2>/dev/null)
-
-for wid in \$WINDOW_IDS; do
+# Process ALL current pamac-manager windows (fix taskbar)
+ALL_WINDOWS=\$(XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xdotool search --class "pamac-manager" 2>/dev/null)
+for wid in \$ALL_WINDOWS; do
   width=\$(XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xwininfo -id "\$wid" 2>/dev/null | awk -F': ' '/Width:/{print \$2}')
   if [ "\$width" = "1" ]; then
     XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xprop -id "\$wid" \
       -f _NET_WM_STATE 32a \
       -set _NET_WM_STATE _NET_WM_STATE_SKIP_TASKBAR 2>/dev/null
-  fi
-  if [ "\$width" != "1" ]; then
+  elif [ -n "\$width" ]; then
     XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xprop -id "\$wid" \
       -f _KDE_NET_WM_DESKTOP_FILE 8u \
       -set _KDE_NET_WM_DESKTOP_FILE "\$DESKTOP_FILE" 2>/dev/null
@@ -2939,9 +2995,18 @@ _log "=== steamos-pamac-uninstall invoked: \$* ==="
  echo "Uninstalling \$pkg from \$CONTAINER_NAME..."
  _log "Uninstalling \$pkg from \$CONTAINER_NAME..."
 
+_setup_display_env
+
+if command -v notify-send >/dev/null 2>&1; then
+notify-send -i package-generic "Uninstalling..." "Removing \$pkg from \$CONTAINER_NAME" 2>/dev/null || true
+fi
+
  if ! command -v "\$CONTAINER_MANAGER" >/dev/null 2>&1; then
  _log "Error: \$CONTAINER_MANAGER not found in PATH"
  echo "Error: \$CONTAINER_MANAGER not found in PATH" >&2
+ if command -v notify-send >/dev/null 2>&1; then
+ notify-send -i dialog-error "Uninstall Failed" "\$CONTAINER_MANAGER not found" 2>/dev/null || true
+ fi
  exit 1
  fi
 
@@ -2951,6 +3016,9 @@ _log "=== steamos-pamac-uninstall invoked: \$* ==="
  if ! "\$CONTAINER_MANAGER" inspect "\$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
 echo "Error: Container \$CONTAINER_NAME is not running and could not be started" >&2
 _log "Error: Container not running and could not be started"
+if command -v notify-send >/dev/null 2>&1; then
+notify-send -i dialog-error "Uninstall Failed" "Container \$CONTAINER_NAME is not running" 2>/dev/null || true
+fi
 exit 1
 fi
 
@@ -2967,14 +3035,61 @@ _log "pacman output: \${remove_output:0:500}"
 if [[ \$rc -eq 0 ]]; then
 echo "Successfully uninstalled \$pkg"
 _log "Successfully uninstalled \$pkg"
-_setup_display_env
+
+_log "Cleaning up desktop files for \$pkg..."
+local removed_desktops=0
+for df in "\$APP_DIR"/arch-pamac-*.desktop; do
+[[ -f "\$df" ]] || continue
+local df_pkg
+df_pkg=\$(grep '^X-SteamOS-Pamac-SourcePackage=' "\$df" 2>/dev/null | cut -d= -f2)
+if [[ "\$df_pkg" == "\$pkg" ]]; then
+_log "Removing desktop file: \$df"
+rm -f "\$df"
+removed_desktops=\$((removed_desktops + 1))
+fi
+done
+if [[ \$removed_desktops -gt 0 ]]; then
+_log "Removed \$removed_desktops desktop file(s) for \$pkg"
+fi
+
+if [[ -f "\$STATE_DIR/exported-apps.list" ]]; then
+local tmp_list
+tmp_list=\$(mktemp)
+while IFS= read -r line; do
+[[ -f "\$line" ]] || continue
+local line_pkg
+line_pkg=\$(grep '^X-SteamOS-Pamac-SourcePackage=' "\$line" 2>/dev/null | cut -d= -f2)
+if [[ "\$line_pkg" != "\$pkg" ]]; then
+echo "\$line" >> "\$tmp_list"
+fi
+done < "\$STATE_DIR/exported-apps.list"
+mv "\$tmp_list" "\$STATE_DIR/exported-apps.list" 2>/dev/null || true
+_log "Updated exported-apps.list (removed entries for \$pkg)"
+fi
+
+if command -v update-desktop-database >/dev/null 2>&1; then
 update-desktop-database "\$APP_DIR" 2>/dev/null || true
-kbuildsycoca6 2>/dev/null || true
+fi
+if command -v kbuildsycoca6 >/dev/null 2>&1; then
+DISPLAY="\${DISPLAY:-:0}" kbuildsycoca6 --noincremental 2>/dev/null || true
+fi
+if command -v qdbus6 >/dev/null 2>&1; then
+qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.refreshCurrentShell 2>/dev/null || true
+elif command -v qdbus >/dev/null 2>&1; then
 qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.refreshCurrentShell 2>/dev/null || true
+fi
 _log "Plasma menu refresh triggered"
+
+if command -v notify-send >/dev/null 2>&1; then
+notify-send -i edit-delete "Uninstalled" "\$pkg has been removed successfully." 2>/dev/null || true
+fi
+_log "Notification sent"
 else
 echo "Failed to uninstall \$pkg (exit code: \$rc)" >&2
 _log "Failed to uninstall \$pkg (exit code: \$rc)"
+if command -v notify-send >/dev/null 2>&1; then
+notify-send -i dialog-error "Uninstall Failed" "Could not remove \$pkg (exit code: \$rc)" 2>/dev/null || true
+fi
 exit \$rc
 fi
  }
@@ -3155,8 +3270,11 @@ if \$CONFIRMED; then
 log_msg "Starting uninstall for \$DESKTOP_BASENAME..."
 UNINSTALL_LOG="\$STATE_DIR/uninstall-\$(date +%s).log"
 
-systemd-run --user --scope -u "steamos-pamac-uninstall-\$(date +%s)" \\
-bash -c "
+if command -v notify-send >/dev/null 2>&1; then
+notify-send -i package-generic "Uninstalling..." "Removing \$APP_NAME..." 2>/dev/null || true
+fi
+
+nohup bash -c "
 export HOME=/home/${current_user}
 export PATH=/home/${current_user}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin
 export DISPLAY=\$DISPLAY
@@ -3167,19 +3285,10 @@ export DBUS_SESSION_BUS_ADDRESS=\$DBUS_SESSION_BUS_ADDRESS
 '\$UNINSTALL_HELPER' --desktop-file '\$DESKTOP_BASENAME' > '\$UNINSTALL_LOG' 2>&1
 rc=\\\$?
 echo \\\"Exit code: \\\$rc\\\" >> '\$UNINSTALL_LOG'
-
-if [ \\\$rc -eq 0 ]; then
-update-desktop-database '\$APP_DIR' 2>/dev/null
-kbuildsycoca6 2>/dev/null
-qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.refreshCurrentShell 2>/dev/null || true
-notify-send -i edit-delete 'Uninstalled' '\$APP_NAME has been removed.' 2>/dev/null
-else
-notify-send -i dialog-error 'Uninstall Failed' 'Could not remove \$APP_NAME. See log for details.' 2>/dev/null
-fi
 " &>/dev/null &
 
 disown
-log_msg "Uninstall launched in background scope"
+log_msg "Uninstall launched in background (nohup)"
 fi
 exit 0
 else

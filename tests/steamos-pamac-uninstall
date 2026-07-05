@@ -55,9 +55,18 @@ fi
 echo "Uninstalling $pkg from $CONTAINER_NAME..."
 _log "Uninstalling $pkg from $CONTAINER_NAME..."
 
+_setup_display_env
+
+if command -v notify-send >/dev/null 2>&1; then
+notify-send -i package-generic "Uninstalling..." "Removing $pkg from $CONTAINER_NAME" 2>/dev/null || true
+fi
+
  if ! command -v "$CONTAINER_MANAGER" >/dev/null 2>&1; then
  _log "Error: $CONTAINER_MANAGER not found in PATH"
  echo "Error: $CONTAINER_MANAGER not found in PATH" >&2
+ if command -v notify-send >/dev/null 2>&1; then
+ notify-send -i dialog-error "Uninstall Failed" "$CONTAINER_MANAGER not found" 2>/dev/null || true
+ fi
  exit 1
  fi
 
@@ -69,6 +78,9 @@ _log "Uninstalling $pkg from $CONTAINER_NAME..."
  if ! "$CONTAINER_MANAGER" inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
 echo "Error: Container $CONTAINER_NAME is not running and could not be started" >&2
 _log "Error: Container not running and could not be started"
+if command -v notify-send >/dev/null 2>&1; then
+notify-send -i dialog-error "Uninstall Failed" "Container $CONTAINER_NAME is not running" 2>/dev/null || true
+fi
 exit 1
 fi
 
@@ -76,7 +88,7 @@ _log "Removing $pkg via pacman -Rns (as root, no D-Bus needed)..."
 local remove_output
  remove_output=$("$CONTAINER_MANAGER" exec -u 0 "$CONTAINER_NAME" bash -c "
 rm -f /var/lib/pacman/db.lck 2>/dev/null
-pacman -Rns --noconfirm \"$pkg\" 2>&1
+pacman -Rns --noconfirm "$pkg" 2>&1
 " </dev/null 2>&1)
 local rc=$?
 _log "pacman -Rns exit code: $rc"
@@ -85,14 +97,61 @@ _log "pacman output: ${remove_output:0:500}"
 if [[ $rc -eq 0 ]]; then
 echo "Successfully uninstalled $pkg"
 _log "Successfully uninstalled $pkg"
-_setup_display_env
+
+_log "Cleaning up desktop files for $pkg..."
+local removed_desktops=0
+for df in "$APP_DIR"/arch-pamac-*.desktop; do
+[[ -f "$df" ]] || continue
+local df_pkg
+df_pkg=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$df" 2>/dev/null | cut -d= -f2)
+if [[ "$df_pkg" == "$pkg" ]]; then
+_log "Removing desktop file: $df"
+rm -f "$df"
+removed_desktops=$((removed_desktops + 1))
+fi
+done
+if [[ $removed_desktops -gt 0 ]]; then
+_log "Removed $removed_desktops desktop file(s) for $pkg"
+fi
+
+if [[ -f "$STATE_DIR/exported-apps.list" ]]; then
+local tmp_list
+tmp_list=$(mktemp)
+while IFS= read -r line; do
+[[ -f "$line" ]] || continue
+local line_pkg
+line_pkg=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$line" 2>/dev/null | cut -d= -f2)
+if [[ "$line_pkg" != "$pkg" ]]; then
+echo "$line" >> "$tmp_list"
+fi
+done < "$STATE_DIR/exported-apps.list"
+mv "$tmp_list" "$STATE_DIR/exported-apps.list" 2>/dev/null || true
+_log "Updated exported-apps.list (removed entries for $pkg)"
+fi
+
+if command -v update-desktop-database >/dev/null 2>&1; then
 update-desktop-database "$APP_DIR" 2>/dev/null || true
-kbuildsycoca6 2>/dev/null || true
+fi
+if command -v kbuildsycoca6 >/dev/null 2>&1; then
+DISPLAY="${DISPLAY:-:0}" kbuildsycoca6 --noincremental 2>/dev/null || true
+fi
+if command -v qdbus6 >/dev/null 2>&1; then
+qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.refreshCurrentShell 2>/dev/null || true
+elif command -v qdbus >/dev/null 2>&1; then
 qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.refreshCurrentShell 2>/dev/null || true
+fi
 _log "Plasma menu refresh triggered"
+
+if command -v notify-send >/dev/null 2>&1; then
+notify-send -i edit-delete "Uninstalled" "$pkg has been removed successfully." 2>/dev/null || true
+fi
+_log "Notification sent"
 else
 echo "Failed to uninstall $pkg (exit code: $rc)" >&2
 _log "Failed to uninstall $pkg (exit code: $rc)"
+if command -v notify-send >/dev/null 2>&1; then
+notify-send -i dialog-error "Uninstall Failed" "Could not remove $pkg (exit code: $rc)" 2>/dev/null || true
+fi
 exit $rc
 fi
 }

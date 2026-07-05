@@ -23,6 +23,7 @@ ENABLE_EXTRA_REPOS="${ENABLE_EXTRA_REPOS:-true}"
 FORCE_REBUILD="${FORCE_REBUILD:-false}"
 OPTIMIZE_MIRRORS="${OPTIMIZE_MIRRORS:-true}"
 ALLOW_SIGLEVEL_NEVER="${ALLOW_SIGLEVEL_NEVER:-}"
+ALLOW_SIGLEVEL_NEVER_CLI="${ALLOW_SIGLEVEL_NEVER_CLI:-}"
 
 : "${DISTROBOX_CONTAINER_MANAGER:=podman}"
 
@@ -633,14 +634,16 @@ OPTIONS:
   --dry-run                 Show what would be done without making changes
   --verbose                 Show detailed output, including command logs
   --quiet                   Only show errors
+  --allow-siglevel-never    Allow the SigLevel=Never fallback (DISABLES
+                            PGP signature verification — insecure!)
   --version                 Show version information
   -h, --help                Show this help message
 
 ENVIRONMENT VARIABLES:
   CONTAINER_NAME            Override default container name (default: arch-pamac)
-  ALLOW_SIGLEVEL_NEVER     Set to 'true' to allow the SigLevel=Never fallback
-                            without prompting when keyring init fails
-                            (DISABLES PGP signature verification — insecure!)
+  ALLOW_SIGLEVEL_NEVER      Deprecated, no longer honored. Use
+                            --allow-siglevel-never instead (DISABLES PGP
+                            signature verification — insecure!)
   FORCE_REBUILD            Set to 'true' to force-rebuild existing container
   ENABLE_GAMING_PACKAGES   Set to 'true' to install gaming packages
 
@@ -650,7 +653,7 @@ EXAMPLES:
   $0 --container-name my-arch              # Custom container name
   $0 --check                               # Verify system is ready
   $0 --uninstall                           # Remove everything
-  ALLOW_SIGLEVEL_NEVER=true $0            # Allow insecure keyring fallback non-interactively
+  $0 --allow-siglevel-never        # Insecure: disable PGP verification fallback (no prompt)
 EOF
 }
 
@@ -678,6 +681,7 @@ parse_arguments() {
             --check) CHECK_ONLY="true"; shift ;;
             --verbose) LOG_LEVEL="verbose"; shift ;;
             --quiet) LOG_LEVEL="quiet"; shift ;;
+            --allow-siglevel-never) ALLOW_SIGLEVEL_NEVER_CLI="true"; shift ;;
             --version) echo "Steam Deck Pamac Setup v${SCRIPT_VERSION}"; exit 0 ;;
             -h|--help) show_usage; exit 0 ;;
             *) log_error "Unknown option: $1"; show_usage; exit 1 ;;
@@ -1240,21 +1244,35 @@ KEYRING_EOF
     if grep -q 'SIGNAL:SIGLEVEL_NEEDED' "$LOG_FILE" 2>/dev/null; then
         local _apply_siglevel_never=false
         if [[ "${ALLOW_SIGLEVEL_NEVER:-}" == "true" ]]; then
+            log_warn "ALLOW_SIGLEVEL_NEVER=true is no longer honored as a non-interactive override. Use --allow-siglevel-never instead."
+        fi
+        if [[ "${ALLOW_SIGLEVEL_NEVER_CLI:-}" == "true" ]]; then
+            echo -e "${RED}${BOLD}SECURITY WARNING: SigLevel=Never DISABLES all PGP signature verification.${NC}" >&2
+            echo -e "${RED}${BOLD}This makes package installation vulnerable to tampering and MITM attacks.${NC}" >&2
+            echo -e "${RED}${BOLD}This installation is now considered INSECURE and will be logged.${NC}" >&2
+            log_warn "SigLevel=Never fallback applied via --allow-siglevel-never. Installation is now insecure (signature verification disabled)."
             _apply_siglevel_never=true
-            log_warn "ALLOW_SIGLEVEL_NEVER=true — applying SigLevel=Never without prompt."
         elif [[ -t 0 ]]; then
             echo -e "${RED}${BOLD}Keyring init/populate failed — PGP signature verification cannot be configured.${NC}" >&2
             echo -e "${YELLOW}The only fallback is SigLevel=Never, which ${RED}${BOLD}DISABLES all package signature verification${NC}${YELLOW}.${NC}" >&2
             echo -e "${RED}${BOLD}This makes package installation vulnerable to tampering and man-in-the-middle attacks.${NC}" >&2
-            echo -ne "${BOLD}Apply SigLevel=Never fallback? [y/N] ${NC}" >&2
+            echo -e "${RED}${BOLD}WARNING: This installation will be permanently marked as INSECURE.${NC}" >&2
+            echo -ne "${BOLD}To confirm, type the exact phrase: disable-verification\n> ${NC}" >&2
             read -r _siglevel_confirm
-            if [[ "$_siglevel_confirm" =~ ^[Yy]$ ]]; then
-                _apply_siglevel_never=true
+            if [[ "$_siglevel_confirm" == "disable-verification" ]]; then
+                echo -ne "${BOLD}Please re-type to confirm: ${NC}" >&2
+                read -r _siglevel_confirm2
+                if [[ "$_siglevel_confirm2" == "disable-verification" ]]; then
+                    log_warn "User confirmed SigLevel=Never fallback via two-factor prompt. Installation is now insecure (signature verification disabled)."
+                    _apply_siglevel_never=true
+                else
+                    log_warn "Confirmation mismatch — SigLevel=Never fallback declined. Package installation may be impossible."
+                fi
             else
                 log_warn "User declined SigLevel=Never fallback. Package installation may be impossible."
             fi
         else
-            log_warn "Non-interactive session — SigLevel=Never fallback skipped. Set ALLOW_SIGLEVEL_NEVER=true to allow it."
+            log_warn "Non-interactive session — SigLevel=Never fallback skipped. Run with a TTY to confirm interactively, or pass --allow-siglevel-never (insecure)."
         fi
 
         if [[ "$_apply_siglevel_never" == "true" ]]; then
@@ -1272,6 +1290,7 @@ else
     echo 'SigLevel = Never' >> /etc/pacman.conf
 fi
 echo "SigLevel=Never applied."
+echo "[WARN] $(date '+%Y-%m-%dT%H:%M:%S') Signature verification DISABLED via SigLevel=Never fallback. Installation is INSECURE." >> /var/log/siglevel-never.log 2>/dev/null || true
 SIGLEVEL_EOF
             if ! exec_container_script "$siglevel_script" "siglevel-never-apply"; then
                 log_error "Failed to apply SigLevel=Never fallback."
@@ -1638,15 +1657,18 @@ dbus-daemon --system --fork 2>/dev/null || echo "Note: dbus-daemon start failed 
 fi
 fi
 
-echo "Patching polkit policy for non-interactive authorization..."
+echo "Leaving Pamac polkit policy at least-privilege defaults (auth_admin_keep)."
+echo "Passwordless package ops are handled via sudo (wheel) and the polkit wheel rule."
 pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
 if [[ -f "$pamac_policy" ]]; then
-sed -i 's|<allow_any>auth_admin_keep</allow_any>|<allow_any>yes</allow_any>|' "$pamac_policy"
-sed -i 's|<allow_inactive>auth_admin_keep</allow_inactive>|<allow_inactive>yes</allow_inactive>|' "$pamac_policy"
-sed -i 's|<allow_active>auth_admin_keep</allow_active>|<allow_active>yes</allow_active>|' "$pamac_policy"
-echo "Polkit policy patched: allow_any=yes, allow_inactive=yes, allow_active=yes"
+    if grep -q '<allow_any>yes</allow_any>' "$pamac_policy"; then
+        sed -i 's|<allow_any>yes</allow_any>|<allow_any>auth_admin_keep</allow_any>|' "$pamac_policy"
+        sed -i 's|<allow_inactive>yes</allow_inactive>|<allow_inactive>auth_admin_keep</allow_inactive>|' "$pamac_policy"
+        sed -i 's|<allow_active>yes</allow_active>|<allow_active>auth_admin_keep</allow_active>|' "$pamac_policy"
+        echo "Restored least-privilege polkit policy (was previously relaxed to allow_any=yes)."
+    fi
 else
-echo "Note: pamac polkit policy not yet installed (will be patched after pamac-aur install)."
+    echo "Note: pamac polkit policy not yet installed (defaults are least-privilege)."
 fi
 
 echo "Polkit and D-Bus setup finished."
@@ -1694,7 +1716,7 @@ echo "[$(date '+%H:%M:%S')] $*" >> "$BOOTSTRAP_LOG" 2>/dev/null || true
 ensure_service() {
 local name="$1"
 local pid_ok="$2"
-local start_cmd="$3"
+local start_fn="$3"
 local retries=5
 local count=0
 
@@ -1705,7 +1727,7 @@ fi
 
 log_bootstrap "Starting $name..."
 while [[ $count -lt $retries ]]; do
-eval "$start_cmd" >> "$BOOTSTRAP_LOG" 2>&1
+"$start_fn" >> "$BOOTSTRAP_LOG" 2>&1
 _safe_sleep 1
 if command -v pgrep >/dev/null 2>&1 && pgrep -x "$pid_ok" >/dev/null 2>&1; then
 log_bootstrap "$name started successfully"
@@ -1717,15 +1739,30 @@ log_bootstrap "WARNING: $name may not have started after $retries attempts"
 return 1
 }
 
+start_dbus() {
+mkdir -p /run/dbus
+dbus-daemon --system --fork 2>/dev/null
+}
+
+start_polkitd() {
+if [[ -x /usr/lib/polkit-1/polkitd ]]; then
+/usr/lib/polkit-1/polkitd --no-debug &
+fi
+}
+
+start_pamac_daemon() {
+/usr/bin/pamac-daemon &
+}
+
 if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
 log_bootstrap "systemd detected, starting services via systemctl"
 systemctl start polkit 2>/dev/null || true
 systemctl start pamac-daemon >/dev/null 2>&1 || true
 else
 log_bootstrap "Non-systemd environment, starting services manually"
-ensure_service "dbus-daemon" "dbus-daemon" 'mkdir -p /run/dbus; dbus-daemon --system --fork 2>/dev/null'
-ensure_service "polkitd" "polkitd" 'if [[ -x /usr/lib/polkit-1/polkitd ]]; then /usr/lib/polkit-1/polkitd --no-debug & fi'
-ensure_service "pamac-daemon" "pamac-daemon" '/usr/bin/pamac-daemon &'
+ensure_service "dbus-daemon" "dbus-daemon" start_dbus
+ensure_service "polkitd" "polkitd" start_polkitd
+ensure_service "pamac-daemon" "pamac-daemon" start_pamac_daemon
 fi
 BOOTSTRAP
 chmod +x /usr/local/bin/pamac-session-bootstrap.sh
@@ -1912,7 +1949,7 @@ echo "[$(date '+%H:%M:%S')] $*" >> "$BOOTSTRAP_LOG" 2>/dev/null || true
 ensure_service() {
 local name="$1"
 local pid_ok="$2"
-local start_cmd="$3"
+local start_fn="$3"
 local retries=5
 local count=0
 
@@ -1923,7 +1960,7 @@ fi
 
 log_bootstrap "Starting $name..."
 while [[ $count -lt $retries ]]; do
-eval "$start_cmd" >> "$BOOTSTRAP_LOG" 2>&1
+"$start_fn" >> "$BOOTSTRAP_LOG" 2>&1
 _safe_sleep 1
 if command -v pgrep >/dev/null 2>&1 && pgrep -x "$pid_ok" >/dev/null 2>&1; then
 log_bootstrap "$name started successfully"
@@ -1935,15 +1972,30 @@ log_bootstrap "WARNING: $name may not have started after $retries attempts"
 return 1
 }
 
+start_dbus() {
+mkdir -p /run/dbus
+dbus-daemon --system --fork 2>/dev/null
+}
+
+start_polkitd() {
+if [[ -x /usr/lib/polkit-1/polkitd ]]; then
+/usr/lib/polkit-1/polkitd --no-debug &
+fi
+}
+
+start_pamac_daemon() {
+/usr/bin/pamac-daemon &
+}
+
 if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
 log_bootstrap "systemd detected, starting services via systemctl"
 systemctl start polkit 2>/dev/null || true
 systemctl start pamac-daemon >/dev/null 2>&1 || true
 else
 log_bootstrap "Non-systemd environment, starting services manually"
-ensure_service "dbus-daemon" "dbus-daemon" 'mkdir -p /run/dbus; dbus-daemon --system --fork 2>/dev/null'
-ensure_service "polkitd" "polkitd" 'if [[ -x /usr/lib/polkit-1/polkitd ]]; then /usr/lib/polkit-1/polkitd --no-debug & fi'
-ensure_service "pamac-daemon" "pamac-daemon" '/usr/bin/pamac-daemon &'
+ensure_service "dbus-daemon" "dbus-daemon" start_dbus
+ensure_service "polkitd" "polkitd" start_polkitd
+ensure_service "pamac-daemon" "pamac-daemon" start_pamac_daemon
 fi
 BOOTSTRAP
 chmod +x /usr/local/bin/pamac-session-bootstrap.sh
@@ -2577,13 +2629,15 @@ mkdir -p "/home/$current_user/.pamac-build"
 chown "$current_user:$current_user" "/home/$current_user/.pamac-build" 2>/dev/null || true
 echo "BuildDirectory set to /home/$current_user/.pamac-build"
 
-echo "Patching polkit policy for non-interactive authorization..."
+echo "Leaving Pamac polkit policy at least-privilege defaults (auth_admin_keep)."
 pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
 if [[ -f "$pamac_policy" ]]; then
-sed -i 's|<allow_any>auth_admin_keep</allow_any>|<allow_any>yes</allow_any>|' "$pamac_policy"
-sed -i 's|<allow_inactive>auth_admin_keep</allow_inactive>|<allow_inactive>yes</allow_inactive>|' "$pamac_policy"
-sed -i 's|<allow_active>auth_admin_keep</allow_active>|<allow_active>yes</allow_active>|' "$pamac_policy"
-echo "Polkit policy patched: allow_any=yes, allow_inactive=yes, allow_active=yes"
+if grep -q '<allow_any>yes</allow_any>' "$pamac_policy"; then
+    sed -i 's|<allow_any>yes</allow_any>|<allow_any>auth_admin_keep</allow_any>|' "$pamac_policy"
+    sed -i 's|<allow_inactive>yes</allow_inactive>|<allow_inactive>auth_admin_keep</allow_inactive>|' "$pamac_policy"
+    sed -i 's|<allow_active>yes</allow_active>|<allow_active>auth_admin_keep</allow_active>|' "$pamac_policy"
+    echo "Restored least-privilege polkit policy (was previously relaxed to allow_any=yes)."
+fi
 else
 echo "Warning: pamac polkit policy file not found at $pamac_policy"
 fi

@@ -3254,80 +3254,100 @@ export_pamac_to_host() {
     log_info "Installing X11/Wayland tools for window integration..."
     container_root_exec bash -c 'pacman -S --noconfirm --needed xdotool xorg-xprop xorg-xwininfo 2>/dev/null || echo "Warning: x11 tools install failed (non-fatal)"'
 
-    log_info "Installing window integration tools on host (xdotool/wlrctl for taskbar integration)..."
+    log_info "Compiling window integration tools inside container and exporting to host..."
     local has_wayland_tools=false
+    local _host_bindir="$HOME/.local/bin"
+    mkdir -p "$_host_bindir"
 
-    # Detect display server
-    local is_wayland=false
-    if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
-        is_wayland=true
+    local _container_tool_dir="/tmp/pamac-host-tools"
+
+    container_root_exec bash -c "
+set +e
+mkdir -p $_container_tool_dir
+
+# Install build dependencies
+pacman -S --noconfirm --needed base-devel git cmake meson \
+    wayland wayland-protocols libx11 libxtst 2>/dev/null || true
+
+_build_wlrctl() {
+    echo '--- Building wlrctl ---'
+    local _src=\$(mktemp -d)
+    if ! git clone --depth 1 https://github.com/ArtixUniverse/wlrctl \$_src/wlrctl 2>/dev/null; then
+        echo 'wlrctl: git clone failed'
+        return 1
     fi
+    cd \$_src/wlrctl
+    if meson setup build --default-library=static 2>/dev/null; then
+        if ninja -C build 2>/dev/null; then
+            cp build/wlrctl $_container_tool_dir/wlrctl 2>/dev/null
+            echo 'wlrctl: build OK'
+            cd /; rm -rf \$_src; return 0
+        fi
+    fi
+    if make 2>/dev/null; then
+        cp wlrctl $_container_tool_dir/wlrctl 2>/dev/null
+        echo 'wlrctl: build OK (make fallback)'
+        cd /; rm -rf \$_src; return 0
+    fi
+    cd /; rm -rf \$_src
+    echo 'wlrctl: build FAILED'
+    return 1
+}
 
-    if ! _is_root_writable; then
-        log_info "Root filesystem is read-only (SteamOS default). Skipping host package installation."
-        log_info "Window integration tools (xdotool/wlrctl) must be installed manually if needed."
-    else
-        # Helper: install a package on host via pkcon or pacman
-        _install_host_pkg() {
-            local pkg="$1"
-            if command -v pkcon >/dev/null 2>&1; then
-                pkcon install -y "$pkg" 2>/dev/null && return 0
-            fi
-            if [[ -f /usr/bin/steamos-readonly ]] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-                sudo pacman -S --noconfirm "$pkg" 2>/dev/null && return 0
-            fi
-            return 1
-        }
+_build_xdotool() {
+    echo '--- Building xdotool ---'
+    local _src=\$(mktemp -d)
+    if ! git clone --depth 1 https://github.com/jordansissel/xdotool \$_src/xdotool 2>/dev/null; then
+        echo 'xdotool: git clone failed'
+        return 1
+    fi
+    cd \$_src/xdotool
+    if make xdotool 2>/dev/null; then
+        cp xdotool $_container_tool_dir/xdotool 2>/dev/null
+        echo 'xdotool: build OK'
+        cd /; rm -rf \$_src; return 0
+    fi
+    cd /; rm -rf \$_src
+    echo 'xdotool: build FAILED'
+    return 1
+}
 
-        if [[ "$is_wayland" == "true" ]]; then
-            # Wayland session - try wlrctl/kdotool
-            for host_tool in wlrctl kdotool; do
-                if command -v "$host_tool" >/dev/null 2>&1; then
-                    has_wayland_tools=true
-                    log_debug "Found Wayland tool: $host_tool"
-                    break
-                fi
-            done
-            if [[ "$has_wayland_tools" == "false" ]]; then
-                log_info "Wayland session detected, attempting to install Wayland window tools..."
-                if _install_host_pkg wlrctl; then
-                    has_wayland_tools=true
-                    log_info "Installed wlrctl for Wayland window management."
-                elif _install_host_pkg kdotool; then
-                    has_wayland_tools=true
-                    log_info "Installed kdotool for Wayland window management."
-                else
-                    log_warn "Could not install wlrctl or kdotool. Wayland taskbar integration may not work."
-                    log_info "You can install manually: 'pkcon install wlrctl' or 'pacman -S wlrctl'"
-                fi
+_build_wlrctl
+_build_xdotool
+" 2>/dev/null || true
+
+    for _tool in wlrctl xdotool; do
+        if container_cp_from "$_container_tool_dir/$_tool" "$_host_bindir/$_tool" 2>/dev/null; then
+            if [[ -s "$_host_bindir/$_tool" ]]; then
+                chmod +x "$_host_bindir/$_tool"
+                log_success "Exported $_tool to $_host_bindir/$_tool"
+            else
+                rm -f "$_host_bindir/$_tool"
             fi
         fi
+    done
 
-        # Always install X11 tools as well (needed for XWayland and fallback)
-        for host_tool in xdotool xprop xwininfo; do
-            if ! command -v "$host_tool" >/dev/null 2>&1; then
-                if _install_host_pkg "$host_tool"; then
-                    log_info "Installed $host_tool on host."
-                else
-                    log_warn "$host_tool not found on host and cannot auto-install. Window integration may use fallback."
-                fi
-            fi
-        done
-    fi
+    container_root_exec bash -c "rm -rf $_container_tool_dir" 2>/dev/null || true
 
-    # Determine overall tool availability — either Wayland or X11 tools suffice
+    # Determine tool availability — check host PATH and exported binaries
     local host_tools_available=false
-    if [[ "$has_wayland_tools" == "true" ]]; then
+    if command -v wlrctl >/dev/null 2>&1 || [[ -x "$_host_bindir/wlrctl" ]]; then
         host_tools_available=true
-        log_success "Wayland window tools available ($([ "$is_wayland" == "true" ] && echo "session is Wayland" || echo "XWayland fallback"))."
+        has_wayland_tools=true
+        log_success "Wayland window tools available (wlrctl)."
     fi
-    if command -v xdotool >/dev/null 2>&1; then
+    if command -v kdotool >/dev/null 2>&1; then
         host_tools_available=true
-        log_success "X11 window tools available."
+        has_wayland_tools=true
+        log_success "Wayland window tools available (kdotool)."
+    fi
+    if command -v xdotool >/dev/null 2>&1 || [[ -x "$_host_bindir/xdotool" ]]; then
+        host_tools_available=true
+        log_success "X11 window tools available (xdotool)."
     fi
     if [[ "$host_tools_available" == "false" ]]; then
-        log_warn "No window management tools available (neither Wayland nor X11). Taskbar integration will be skipped."
-        log_info "Install manually: 'pkcon install wlrctl' (Wayland) or 'pkcon install xdotool' (X11)"
+        log_warn "No window management tools available. Taskbar integration will use fallback."
+        log_info "Compiled tools could not be exported. Taskbar icon may use a generic Wayland/X11 icon."
     fi
 
     log_info "Creating pamac-manager launch wrapper inside container..."
@@ -3518,6 +3538,11 @@ if [[ "\$IS_WAYLAND" == "false" ]]; then
 fi
 
 DESKTOP_FILE="\$HOME/.local/share/applications/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
+
+# Ensure ~/.local/bin is in PATH for tools compiled inside the container
+if [[ -d "\$HOME/.local/bin" ]]; then
+    export PATH="\$HOME/.local/bin:\$PATH"
+fi
 
 # Check which window management tools are available
 HAS_WINDOW_MGMT=false
@@ -4650,6 +4675,46 @@ main() {
         ;;
     esac
   fi
+
+    # Safety check: detect stale SigLevel=TrustAll from a previous crashed run.
+    # The keyring script sets SigLevel=TrustAll temporarily, with a backup for crash recovery.
+    # If the script was killed mid-run, the container is left in an insecure state.
+    # We MUST detect this BEFORE re-running configure_container_base to prevent re-entering
+    # a TrustAll state on top of an already-compromised state.
+    if container_is_usable 2>/dev/null; then
+        local _stale_siglevel
+        _stale_siglevel=$(container_runtime_privileged exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" \
+            bash -c 'grep -q "^SigLevel\s*=\s*TrustAll" /etc/pacman.conf 2>/dev/null && [[ -f /etc/pacman.conf.siglevel-backup ]] && echo "stale"' 2>/dev/null || true)
+        if [[ "$_stale_siglevel" == "stale" ]]; then
+            log_error "CRITICAL: Container has leftover SigLevel=TrustAll from a previous interrupted run."
+            log_error "This means signature verification is disabled, which is a security risk."
+            log_error "Attempting automatic recovery from backup..."
+            if container_root_exec bash -c 'cp -f /etc/pacman.conf.siglevel-backup /etc/pacman.conf' 2>/dev/null; then
+                log_success "Auto-reverted SigLevel from backup. Container is secure."
+            else
+                log_error "Auto-revert failed. Refusing to proceed until manually fixed."
+                log_info "Manual fix: distrobox enter $CONTAINER_NAME -- bash -c '"
+                log_info "  cp -f /etc/pacman.conf.siglevel-backup /etc/pacman.conf || true"
+                log_info "  sed -i \"s/^SigLevel.*/SigLevel = Required DatabaseOptional/\" /etc/pacman.conf'"
+                exit 1
+            fi
+        fi
+        # Also catch TrustAll without backup (worst case: script died before backup was created
+        # or backup was cleaned up while SigLevel was still TrustAll)
+        _stale_siglevel=$(container_runtime_privileged exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" \
+            bash -c 'grep -q "^SigLevel\s*=\s*TrustAll" /etc/pacman.conf 2>/dev/null && [[ ! -f /etc/pacman.conf.siglevel-backup ]] && echo "trustall_nobak"' 2>/dev/null || true)
+        if [[ "$_stale_siglevel" == "trustall_nobak" ]]; then
+            log_error "CRITICAL: Container has SigLevel=TrustAll with no backup file."
+            log_error "Previous run may have been interrupted before backup was created."
+            log_error "Forcing SigLevel to safe default..."
+            if container_root_exec bash -c "sed -i 's/^SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf && grep -q '^SigLevel' /etc/pacman.conf || echo 'SigLevel = Required DatabaseOptional' >> /etc/pacman.conf" 2>/dev/null; then
+                log_success "Restored SigLevel to Required DatabaseOptional."
+            else
+                log_error "Failed to restore SigLevel. Manual intervention required."
+                exit 1
+            fi
+        fi
+    fi
 
     check_memory_ok 262144 "base setup" 262144 || {
         log_error "Insufficient memory for base setup (need at least 256MB). Aborting."

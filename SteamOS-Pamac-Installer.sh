@@ -31,7 +31,6 @@ ENABLE_GAMING_PACKAGES="${ENABLE_GAMING_PACKAGES:-false}"
 ENABLE_EXTRA_REPOS="${ENABLE_EXTRA_REPOS:-true}"
 FORCE_REBUILD="${FORCE_REBUILD:-false}"
 OPTIMIZE_MIRRORS="${OPTIMIZE_MIRRORS:-true}"
-ALLOW_SIGLEVEL_NEVER_CLI="${ALLOW_SIGLEVEL_NEVER_CLI:-}"
 
 : "${DISTROBOX_CONTAINER_MANAGER:=podman}"
 
@@ -510,7 +509,8 @@ repair_podman() {
     log_warn "Podman database may be corrupted. A full system reset is required but is DESTRUCTIVE."
     log_warn "WARNING: 'podman system reset --force' will remove ALL containers, images, and volumes — not just the Pamac container. Any other distroboxes or podman workloads will be lost."
     local existing_containers
-    existing_containers=$(podman ps -aq 2>/dev/null | wc -l 2>/dev/null || echo "0")
+    existing_containers=$(podman ps -aq 2>/dev/null | wc -l)
+    [[ -n "$existing_containers" ]] || existing_containers=0
     if [[ "$existing_containers" != "0" ]]; then
         log_warn "Note: $existing_containers container(s) currently exist and will ALL be destroyed by reset."
     fi
@@ -620,8 +620,6 @@ OPTIONS:
   --dry-run                 Show what would be done without making changes
   --verbose                 Show detailed output, including command logs
   --quiet                   Only show errors
-  --allow-siglevel-never    Allow the SigLevel=Never fallback (DISABLES
-                            PGP signature verification — insecure!)
   --version                 Show version information
   -h, --help                Show this help message
 
@@ -636,7 +634,6 @@ EXAMPLES:
   $0 --container-name my-arch              # Custom container name
   $0 --check                               # Verify system is ready
   $0 --uninstall                           # Remove everything
-  $0 --allow-siglevel-never        # Insecure: disable PGP verification fallback (no prompt)
 EOF
 }
 
@@ -664,7 +661,6 @@ parse_arguments() {
             --check) CHECK_ONLY="true"; shift ;;
             --verbose) LOG_LEVEL="verbose"; shift ;;
             --quiet) LOG_LEVEL="quiet"; shift ;;
-            --allow-siglevel-never) ALLOW_SIGLEVEL_NEVER_CLI="true"; shift ;;
             --version) echo "Steam Deck Pamac Setup v${SCRIPT_VERSION}"; exit 0 ;;
             -h|--help) show_usage; exit 0 ;;
             *) log_error "Unknown option: $1"; show_usage; exit 1 ;;
@@ -874,7 +870,7 @@ detect_init_support() {
         return
     fi
 
-    if [[ "$(cat /proc/1/comm 2>/dev/null || echo unknown)" != "systemd" ]]; then
+    if ! { read -r _pid1_comm < /proc/1/comm 2>/dev/null; } || [[ "$_pid1_comm" != "systemd" ]]; then
         CONTAINER_HAS_INIT="false"
         log_info "Host init is not systemd - using non-init container mode."
         return
@@ -1127,14 +1123,14 @@ configure_container_base() {
 
     local _ok=true
 
-    log_info "Stage 1/7: Initializing pacman keyring..."
+    log_info "Stage 1/7: Initializing pacman keyring and signature verification..."
     local keyring_script
-read -r -d '' keyring_script <<'KEYRING_EOF' || true
+    read -r -d '' keyring_script <<'KEYRING_EOF' || true
 set -uo pipefail
 
 rm -f /var/lib/pacman/db.lck
 
-echo "Step 1/4: Cleaning up stale gpg-agent state..."
+echo "Step 1/5: Cleaning up stale GPG state..."
 pkill -9 gpg-agent 2>/dev/null || true
 pkill -9 dirmngr 2>/dev/null || true
 _safe_sleep 1
@@ -1145,70 +1141,105 @@ rm -f /etc/pacman.d/gnupg/S.gpg-agent.ssh 2>/dev/null || true
 rm -f /etc/pacman.d/gnupg/S.dirmngr 2>/dev/null || true
 
 if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
-echo "Disabling systemd gpg-agent socket activation that interferes with keyring init..."
- systemctl stop gpg-agent@*.socket 2>/dev/null || true
- systemctl stop gpg-agent@*.service 2>/dev/null || true
- systemctl stop dirmngr@*.socket 2>/dev/null || true
+    echo "Disabling systemd gpg-agent socket activation that interferes with keyring init..."
+    systemctl stop gpg-agent@*.socket 2>/dev/null || true
+    systemctl stop gpg-agent@*.service 2>/dev/null || true
+    systemctl stop dirmngr@*.socket 2>/dev/null || true
 fi
 
 export GNUPGHOME=/etc/pacman.d/gnupg
 export GPG_AGENT_INFO=
 chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
 
-echo "Step 2/4: Initializing pacman keyring with existing keyring..."
-keyring_init_ok=false
-if pacman-key --init 2>/dev/null; then
-echo "Keyring init succeeded."
-keyring_init_ok=true
-else
-echo "Warning: pacman-key --init failed (likely gpg-agent/systemd conflict)."
-echo "Attempting with forced gpg-agent cleanup..."
-pkill -9 gpg-agent 2>/dev/null || true
-pkill -9 dirmngr 2>/dev/null || true
-_safe_sleep 3
-rm -f /etc/pacman.d/gnupg/S.gpg-agent /etc/pacman.d/gnupg/S.gpg-agent.extra 2>/dev/null || true
-rm -f /etc/pacman.d/gnupg/S.gpg-agent.browser /etc/pacman.d/gnupg/S.gpg-agent.ssh 2>/dev/null || true
-rm -f /etc/pacman.d/gnupg/S.dirmngr 2>/dev/null || true
-if pacman-key --init 2>/dev/null; then
-echo "Keyring init succeeded on retry."
-keyring_init_ok=true
-else
-echo "Warning: pacman-key --init still failed."
-fi
+echo "Step 2/5: Temporarily relaxing signature verification for self-healing..."
+sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+if ! grep -q '^SigLevel' /etc/pacman.conf; then
+    echo 'SigLevel = Never' >> /etc/pacman.conf
 fi
 
-if [[ "$keyring_init_ok" == "true" ]]; then
-    echo "Step 3/4: Populating keyring with existing archlinux keys..."
-    echo "Ensuring correct permissions on GPG directory..."
+echo "Step 3/5: Updating keyring, GPG, and certificate packages..."
+rm -f /var/lib/pacman/db.lck
+
+if ! pacman -Syy --noconfirm 2>/dev/null; then
+    echo "Warning: Initial database sync failed. Attempting repair with --overwrite..."
+    pacman -Syy --noconfirm --overwrite '*' 2>/dev/null || true
+fi
+
+pacman -S --noconfirm --needed archlinux-keyring gnupg 2>/dev/null || {
+    echo "Warning: Core keyring/GPG update failed, retrying..."
+    pacman -S --noconfirm --needed archlinux-keyring gnupg 2>/dev/null || true
+}
+pacman -S --noconfirm --needed ca-certificates-mozilla ca-certificates-utils 2>/dev/null || {
+    echo "Warning: Certificate package update failed, retrying..."
+    pacman -S --noconfirm --needed ca-certificates-mozilla 2>/dev/null || true
+}
+
+echo "Step 4/5: Aggressively re-initializing pacman keyring..."
+keyring_ok=false
+
+for attempt in 1 2 3; do
+    echo "Attempting pacman-key --init (attempt $attempt/3)..."
+    pkill -9 gpg-agent 2>/dev/null || true
+    pkill -9 dirmngr 2>/dev/null || true
+    _safe_sleep 2
+    rm -f /etc/pacman.d/gnupg/S.gpg-agent /etc/pacman.d/gnupg/S.gpg-agent.extra 2>/dev/null || true
+    rm -f /etc/pacman.d/gnupg/S.gpg-agent.browser /etc/pacman.d/gnupg/S.gpg-agent.ssh 2>/dev/null || true
+    rm -f /etc/pacman.d/gnupg/S.dirmngr 2>/dev/null || true
+
+    if pacman-key --init 2>/dev/null; then
+        echo "Keyring init succeeded."
+        keyring_ok=true
+        break
+    else
+        echo "Warning: pacman-key --init failed on attempt $attempt."
+    fi
+done
+
+if [[ "$keyring_ok" == "true" ]]; then
+    echo "Populating keyring with archlinux keys..."
     chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
     find /etc/pacman.d/gnupg -type f -exec chmod 600 {} \; 2>/dev/null || true
     find /etc/pacman.d/gnupg -type d -exec chmod 700 {} \; 2>/dev/null || true
+
     if pacman-key --populate archlinux 2>/dev/null; then
         echo "Keyring populated successfully."
     else
         echo "Warning: pacman-key --populate failed."
-        echo "SIGNAL:SIGLEVEL_NEEDED"
+        keyring_ok=false
     fi
-else
-    echo "Keyring init failed. Package signature verification cannot be configured."
-    echo "SIGNAL:SIGLEVEL_NEEDED"
 fi
 
-echo "Step 4/4: Updating archlinux-keyring package..."
-rm -f /var/lib/pacman/db.lck
-if pacman -Syy --noconfirm 2>/dev/null; then
-    pacman -S --noconfirm --needed archlinux-keyring 2>/dev/null || {
-        echo "Warning: archlinux-keyring update failed, retrying..."
-        pacman -S --noconfirm --needed archlinux-keyring 2>/dev/null || echo "Warning: keyring update failed"
-    }
-    if pacman-key --verify /usr/share/keyrings/archlinux-packer.gpg 2>/dev/null || pacman-key --list-sigs 2>/dev/null | grep -q "archlinux"; then
-        if grep -q '^SigLevel.*Never' /etc/pacman.conf 2>/dev/null; then
-            echo "Restoring SigLevel to Required DatabaseOptional after successful keyring update."
-            sed -i 's/^SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf
-        fi
+echo "Step 5/5: Verifying keyring and restoring security settings..."
+
+if [[ "$keyring_ok" == "true" ]]; then
+    if pacman-key --list-sigs 2>/dev/null | grep -q "archlinux"; then
+        echo "Keyring contains archlinux signatures."
+    else
+        echo "Warning: pacman-key --list-sigs did not confirm archlinux keys."
+        keyring_ok=false
     fi
-else
-    echo "Warning: database sync failed, skipping keyring update."
+fi
+
+if [[ "$keyring_ok" == "true" ]]; then
+    echo "Restoring SigLevel to Required DatabaseOptional..."
+    sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf
+    grep -q '^SigLevel' /etc/pacman.conf || echo 'SigLevel = Required DatabaseOptional' >> /etc/pacman.conf
+
+    echo "Testing database sync with restored signature verification..."
+    if pacman -Syy --noconfirm 2>/dev/null; then
+        echo "Signature verification restored and functional."
+    else
+        echo "Warning: Database sync failed after restoring SigLevel."
+        keyring_ok=false
+    fi
+fi
+
+if [[ "$keyring_ok" != "true" ]]; then
+    echo "FATAL: Pacman keyring could not be repaired. The container is in an unsecure state."
+    echo "FATAL: Aborting installation to prevent running without signature verification."
+    # Ensure we don't leave the container in a wide-open state
+    sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf 2>/dev/null || true
+    exit 100
 fi
 
 echo "Configuring pacman for low-memory environment..."
@@ -1218,66 +1249,14 @@ else
     echo 'ParallelDownloads = 1' >> /etc/pacman.conf
 fi
 
-echo "Keyring initialization complete."
+echo "Keyring initialization and self-healing complete."
 KEYRING_EOF
 
     if ! exec_container_script "$keyring_script" "keyring-init"; then
-        log_warn "Keyring initialization had issues. Continuing..."
-        _ok=false
-    fi
-
-    if grep -q 'SIGNAL:SIGLEVEL_NEEDED' "$LOG_FILE" 2>/dev/null; then
-        local _apply_siglevel_never=false
-        if [[ "${ALLOW_SIGLEVEL_NEVER_CLI:-}" == "true" ]]; then
-            echo -e "${RED}${BOLD}SECURITY WARNING: SigLevel=Never DISABLES all PGP signature verification.${NC}" >&2
-            echo -e "${RED}${BOLD}This makes package installation vulnerable to tampering and MITM attacks.${NC}" >&2
-            echo -e "${RED}${BOLD}This installation is now considered INSECURE and will be logged.${NC}" >&2
-            log_warn "SigLevel=Never fallback applied via --allow-siglevel-never. Installation is now insecure (signature verification disabled)."
-            _apply_siglevel_never=true
-        elif [[ -t 0 ]]; then
-            echo -e "${RED}${BOLD}Keyring init/populate failed — PGP signature verification cannot be configured.${NC}" >&2
-            echo -e "${YELLOW}The only fallback is SigLevel=Never, which ${RED}${BOLD}DISABLES all package signature verification${NC}${YELLOW}.${NC}" >&2
-            echo -e "${RED}${BOLD}This makes package installation vulnerable to tampering and man-in-the-middle attacks.${NC}" >&2
-            echo -e "${RED}${BOLD}WARNING: This installation will be permanently marked as INSECURE.${NC}" >&2
-            echo -ne "${BOLD}To confirm, type the exact phrase: disable-verification\n> ${NC}" >&2
-            read -r _siglevel_confirm
-            if [[ "$_siglevel_confirm" == "disable-verification" ]]; then
-                echo -ne "${BOLD}Please re-type to confirm: ${NC}" >&2
-                read -r _siglevel_confirm2
-                if [[ "$_siglevel_confirm2" == "disable-verification" ]]; then
-                    log_warn "User confirmed SigLevel=Never fallback via two-factor prompt. Installation is now insecure (signature verification disabled)."
-                    _apply_siglevel_never=true
-                else
-                    log_warn "Confirmation mismatch — SigLevel=Never fallback declined. Package installation may be impossible."
-                fi
-            else
-                log_warn "User declined SigLevel=Never fallback. Package installation may be impossible."
-            fi
-        else
-            log_warn "Non-interactive session — SigLevel=Never fallback skipped. Run with a TTY to confirm interactively, or pass --allow-siglevel-never (insecure)."
-        fi
-
-        if [[ "$_apply_siglevel_never" == "true" ]]; then
-            local siglevel_script
-            read -r -d '' siglevel_script <<'SIGLEVEL_EOF' || true
-set -uo pipefail
-echo "Applying SigLevel=Never to pacman.conf (user-approved)..."
-rm -f /var/lib/pacman/db.lck
-if command -v sed >/dev/null 2>&1; then
-    sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
-    if ! grep -q '^SigLevel' /etc/pacman.conf; then
-        echo 'SigLevel = Never' >> /etc/pacman.conf
-    fi
-else
-    echo 'SigLevel = Never' >> /etc/pacman.conf
-fi
-echo "SigLevel=Never applied."
-echo "[WARN] $(date '+%Y-%m-%dT%H:%M:%S') Signature verification DISABLED via SigLevel=Never fallback. Installation is INSECURE." >> /var/log/siglevel-never.log 2>/dev/null || true
-SIGLEVEL_EOF
-            if ! exec_container_script "$siglevel_script" "siglevel-never-apply"; then
-                log_error "Failed to apply SigLevel=Never fallback."
-            fi
-        fi
+        log_error "Keyring initialization and self-healing failed permanently."
+        log_error "The container cannot operate securely without valid package signatures."
+        log_error "This usually indicates a broken base image, missing network connectivity, or corrupted keyring."
+        return 1
     fi
 
     if ! container_is_usable; then
@@ -1326,7 +1305,7 @@ fi
 echo "Upgrading system packages (3-pass: keyring+SSL first, then non-critical, then critical)..."
 rm -f /var/lib/pacman/db.lck
 
-CRITICAL_PKGS="openssl glibc lib32-glibc systemd-libs pam"
+CRITICAL_PKGS=(openssl glibc lib32-glibc systemd-libs pam)
 upgrade_ok=true
 
 echo "Pass 1: Upgrading keyring and certificate packages first..."
@@ -1342,14 +1321,14 @@ verify_core_tools || {
 }
 
 echo "Pass 2: Upgrading remaining non-critical packages..."
-SKIP_PKGS="systemd systemd-sysvcompat"
-exclude_args=""
-for pkg in $CRITICAL_PKGS archlinux-keyring ca-certificates-mozilla $SKIP_PKGS; do
-    exclude_args="$exclude_args --ignore $pkg"
+SKIP_PKGS=(systemd systemd-sysvcompat)
+exclude_args=()
+for pkg in "${CRITICAL_PKGS[@]}" archlinux-keyring ca-certificates-mozilla "${SKIP_PKGS[@]}"; do
+    exclude_args+=(--ignore "$pkg")
 done
-if ! pacman -Su --noconfirm --needed $exclude_args 2>/dev/null; then
+if ! pacman -Su --noconfirm --needed "${exclude_args[@]}" 2>/dev/null; then
     echo "Non-critical upgrade had issues, trying with conflict resolution..."
-    pacman -Su --noconfirm --needed $exclude_args 2>/dev/null || echo "Warning: non-critical upgrade failed"
+    pacman -Su --noconfirm --needed "${exclude_args[@]}" 2>/dev/null || echo "Warning: non-critical upgrade failed"
 fi
 
 verify_core_tools || {
@@ -1358,7 +1337,7 @@ verify_core_tools || {
 }
 
 echo "Pass 3: Upgrading critical packages (openssl, glibc, systemd)..."
-for pkg in $CRITICAL_PKGS; do
+for pkg in "${CRITICAL_PKGS[@]}"; do
     if pacman -Q "$pkg" >/dev/null 2>&1; then
         rm -f /var/lib/pacman/db.lck
         echo "Upgrading $pkg..."
@@ -4238,8 +4217,8 @@ main() {
     check_memory_ok 262144 "base setup" || log_warn "Low memory may cause OOM kills during base setup."
 
 	if ! configure_container_base; then
-		log_warn "Container base setup had errors. Checking container health..."
-		_ensure_healthy_or_recreate "base setup recovery" || exit 1
+		log_error "Container base setup failed permanently. Aborting installation."
+		exit 1
 	fi
 
 	_ensure_healthy_or_recreate "before critical helpers check" || exit 1

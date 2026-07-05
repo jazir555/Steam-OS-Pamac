@@ -42,6 +42,7 @@ CHECK_ONLY="${CHECK_ONLY:-false}"
 UNINSTALL="${UNINSTALL:-false}"
 EXPORT_ONLY="${EXPORT_ONLY:-false}"
 LOG_LEVEL="${LOG_LEVEL:-normal}"
+PAMAC_VERSION="${PAMAC_VERSION:-}"
 
 setup_colors() {
     if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
@@ -878,6 +879,8 @@ OPTIONS:
   --force-rebuild           Rebuild existing container if it exists
   --enable-multilib         Enable 32-bit package support (default)
   --disable-multilib        Explicitly disable 32-bit package support
+  --pamac-version VERSION    Pin pamac-aur to a specific AUR version/commit
+                             (default: latest; use "latest" for automatic)
   --enable-gaming            Install extra gaming packages
   --disable-gaming           Do not install gaming packages (default)
   --enable-extra-repos       Enable popular third-party repositories (default)
@@ -899,6 +902,7 @@ ENVIRONMENT VARIABLES:
   CONTAINER_NAME            Override default container name (default: arch-pamac)
   FORCE_REBUILD            Set to 'true' to force-rebuild existing container
   ENABLE_GAMING_PACKAGES   Set to 'true' to install gaming packages
+  PAMAC_VERSION            Specific pamac-aur version/commit to install (AUR fallback)
   ALLOW_SUDO_FALLBACK      Set to 'true' to allow sudo podman fallback (INSECURE:
                            runs container as host root instead of subuid/subgid,
                            reducing isolation if a malicious AUR package is installed)
@@ -906,6 +910,7 @@ ENVIRONMENT VARIABLES:
 EXAMPLES:
   $0                                       # Basic setup
   $0 --enable-gaming --no-optimize-mirrors # Gaming setup, skip mirror optimization
+  $0 --pamac-version v11.0.2              # Pin pamac-aur to a specific release tag
   $0 --container-name my-arch              # Custom container name
   $0 --check                               # Verify system is ready
   $0 --uninstall                           # Remove everything
@@ -932,6 +937,11 @@ parse_arguments() {
             --disable-build-cache) ENABLE_BUILD_CACHE="false"; shift ;;
             --optimize-mirrors) OPTIMIZE_MIRRORS="true"; shift ;;
             --no-optimize-mirrors) OPTIMIZE_MIRRORS="false"; shift ;;
+            --pamac-version)
+                [[ -z "${2:-}" ]] && { log_error "pamac-version cannot be empty"; exit 1; }
+                PAMAC_VERSION="$2"
+                shift 2
+                ;;
             --uninstall) UNINSTALL="true"; shift ;;
             --export-only) EXPORT_ONLY="true"; shift ;;
             --dry-run) DRY_RUN="true"; shift ;;
@@ -2938,6 +2948,293 @@ BUILD_EOF
     log_success "AUR helper yay installed."
 }
 
+ensure_pamac_aur_compat() {
+    log_step "Ensuring pamac-aur AUR compatibility with container pacman"
+
+    local compat_script
+    read -r -d '' compat_script <<'COMPAT_EOF' || true
+set -uo pipefail
+
+current_user="$1"
+pamac_version_pin="${2:-}"
+
+echo "=== pamac-aur AUR Compatibility Auto-Remediation ==="
+
+installed_pacman_ver=""
+if command -v pacman >/dev/null 2>&1; then
+    installed_pacman_ver=$(pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
+fi
+echo "Installed pacman version: ${installed_pacman_ver:-unknown}"
+
+if [[ -z "$installed_pacman_ver" ]]; then
+    echo "WARN: Cannot determine pacman version. Skipping compatibility check."
+    exit 0
+fi
+
+pacman_major=$(echo "$installed_pacman_ver" | cut -d. -f1)
+pacman_minor=$(echo "$installed_pacman_ver" | cut -d. -f2)
+echo "Parsed pacman version: major=$pacman_major minor=$pacman_minor"
+
+if [[ -n "$pamac_version_pin" && "$pamac_version_pin" != "latest" ]]; then
+    echo "User specified --pamac-version=$pamac_version_pin. Attempting direct install..."
+    rm -f /var/lib/pacman/db.lck
+    if sudo -Hu "$current_user" bash -lc "yay -S --noconfirm --noprogressbar --clone --noedit 'pamac-aur=$pamac_version_pin'" 2>&1; then
+        echo "SUCCESS: pamac-aur $pamac_version_pin installed via --pamac-version."
+        exit 0
+    fi
+    echo "Direct version install failed. Trying git clone approach..."
+    rm -rf /tmp/pamac-aur-compat
+    if sudo -Hu "$current_user" bash -lc "git clone --depth 1 --branch '$pamac_version_pin' https://aur.archlinux.org/pamac-aur.git /tmp/pamac-aur-compat" 2>&1 || \
+       sudo -Hu "$current_user" bash -lc "git clone --depth 1 https://aur.archlinux.org/pamac-aur.git /tmp/pamac-aur-compat && cd /tmp/pamac-aur-compat && git checkout '$pamac_version_pin'" 2>&1; then
+        if sudo -Hu "$current_user" bash -lc "cd /tmp/pamac-aur-compat && makepkg -si --noconfirm --clean" 2>&1; then
+            echo "SUCCESS: pamac-aur $pamac_version_pin installed from git."
+            rm -rf /tmp/pamac-aur-compat
+            exit 0
+        fi
+    fi
+    rm -rf /tmp/pamac-aur-compat
+    echo "WARN: --pamac-version=$pamac_version_pin failed. Falling back to automatic detection..."
+fi
+
+echo "Fetching latest pamac-aur PKGBUILD from AUR..."
+aur_pkgbuild=$(curl -sf "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=pamac-aur" 2>/dev/null || echo "")
+if [[ -z "$aur_pkgbuild" ]]; then
+    echo "WARN: Could not fetch pamac-aur PKGBUILD from AUR (network issue?). Skipping check."
+    exit 0
+fi
+
+aur_pacman_dep=$(echo "$aur_pkgbuild" | grep -E "^(depends|makedepends)\\+?=" | grep -oP "pacman[><= ]+[0-9.]+" | head -1 || echo "")
+if [[ -z "$aur_pacman_dep" ]]; then
+    echo "No explicit pacman version constraint found in pamac-aur PKGBUILD."
+    echo "Compatibility assumed. Proceeding."
+    exit 0
+fi
+
+echo "pamac-aur requires: $aur_pacman_dep"
+req_version=$(echo "$aur_pacman_dep" | grep -oP "[0-9.]+" | head -1)
+req_op=$(echo "$aur_pacman_dep" | grep -oP "[><=]+" | head -1)
+echo "Required: pacman $req_op $req_version"
+
+req_major=$(echo "$req_version" | cut -d. -f1)
+req_minor=$(echo "$req_version" | cut -d. -f2)
+
+version_meets_requirement() {
+    local cur_major="$1" cur_minor="$2" op="$3" rq_major="$4" rq_minor="${5:-0}"
+    case "$op" in
+        ">="|"="|"==")
+            if [[ "$cur_major" -gt "$rq_major" ]]; then return 0; fi
+            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -ge "$rq_minor" ]]; then return 0; fi
+            return 1
+            ;;
+        ">")
+            if [[ "$cur_major" -gt "$rq_major" ]]; then return 0; fi
+            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -gt "$rq_minor" ]]; then return 0; fi
+            return 1
+            ;;
+        "<=")
+            if [[ "$cur_major" -lt "$rq_major" ]]; then return 0; fi
+            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -le "$rq_minor" ]]; then return 0; fi
+            return 1
+            ;;
+        "<")
+            if [[ "$cur_major" -lt "$rq_major" ]]; then return 0; fi
+            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -lt "$rq_minor" ]]; then return 0; fi
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+if version_meets_requirement "$pacman_major" "$pacman_minor" "$req_op" "$req_major" "$req_minor"; then
+    echo "PASS: pacman $installed_pacman_ver satisfies requirement $aur_pacman_dep"
+    exit 0
+fi
+
+echo "INCOMPATIBLE: pacman $installed_pacman_ver does NOT satisfy $aur_pacman_dep"
+echo ""
+
+can_upgrade_pacman=false
+if [[ "$req_major" -gt "$pacman_major" ]] || \
+   { [[ "$req_major" -eq "$pacman_major" ]] && [[ "$req_minor" -gt "$pacman_minor" ]]; }; then
+    can_upgrade_pacman=true
+fi
+
+if [[ "$can_upgrade_pacman" == "true" ]]; then
+    echo ">>> Strategy A: Container pacman is TOO OLD (have $installed_pacman_ver, need $req_op $req_version)"
+    echo ">>> Attempting to upgrade pacman inside the container to satisfy pamac-aur..."
+    rm -f /var/lib/pacman/db.lck
+    if pacman -Sy --noconfirm 2>&1 | tail -5; then
+        echo "Database synced. Upgrading pacman and dependencies..."
+        rm -f /var/lib/pacman/db.lck
+        if pacman -S --noconfirm --needed pacman 2>&1 | tail -10; then
+            new_ver=$(pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
+            echo "Upgraded pacman to: $new_ver"
+            new_major=$(echo "$new_ver" | cut -d. -f1)
+            new_minor=$(echo "$new_ver" | cut -d. -f2)
+            if version_meets_requirement "$new_major" "$new_minor" "$req_op" "$req_major" "$req_minor"; then
+                echo "SUCCESS: Upgraded pacman $new_ver now satisfies $aur_pacman_dep"
+                ldconfig 2>/dev/null || true
+                exit 0
+            fi
+            echo "WARNING: Upgraded pacman $new_ver still does not satisfy $aur_pacman_dep"
+            echo "Attempting full system upgrade to pull in all dependencies..."
+            rm -f /var/lib/pacman/db.lck
+            pacman -Syu --noconfirm 2>&1 | tail -20 || true
+            new_ver=$(pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
+            echo "After full upgrade, pacman version: $new_ver"
+            new_major=$(echo "$new_ver" | cut -d. -f1)
+            new_minor=$(echo "$new_ver" | cut -d. -f2)
+            if version_meets_requirement "$new_major" "$new_minor" "$req_op" "$req_major" "$req_minor"; then
+                echo "SUCCESS: Full upgrade brought pacman $new_ver which satisfies $aur_pacman_dep"
+                ldconfig 2>/dev/null || true
+                exit 0
+            fi
+        fi
+    fi
+    echo "WARNING: Could not upgrade pacman to satisfy pamac-aur. Falling back to Strategy B..."
+fi
+
+echo ">>> Strategy B: Finding older pamac-aur revision compatible with pacman $installed_pacman_ver..."
+
+for try_commit in $(curl -sf "https://aur.archlinux.org/cgit/aur.git/log/?h=pamac-aur" 2>/dev/null | grep -oP 'commit/\K[a-f0-9]{40}' | head -10); do
+    echo "Checking commit: ${try_commit:0:12}..."
+    old_pkgbuild=$(curl -sf "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=pamac-aur&id=$try_commit" 2>/dev/null || echo "")
+    if [[ -z "$old_pkgbuild" ]]; then
+        continue
+    fi
+
+    old_dep=$(echo "$old_pkgbuild" | grep -E "^(depends|makedepends)\\+?=" | grep -oP "pacman[><= ]+[0-9.]+" | head -1 || echo "")
+    if [[ -z "$old_dep" ]]; then
+        echo "  -> No pacman constraint in this revision (likely compatible)"
+        commit_date=$(echo "$old_pkgbuild" | grep -oP "^# Last updated: .*" || echo "unknown date")
+        echo "  -> $commit_date"
+        echo "FOUND_COMPATIBLE_COMMIT=$try_commit"
+        echo "FOUND_COMPATIBLE_REASON=no explicit pacman constraint"
+        exit 2
+    fi
+
+    old_req_ver=$(echo "$old_dep" | grep -oP "[0-9.]+" | head -1)
+    old_req_major=$(echo "$old_req_ver" | cut -d. -f1)
+    old_req_minor=$(echo "$old_req_ver" | cut -d. -f2)
+    old_req_op=$(echo "$old_dep" | grep -oP "[><=]+" | head -1)
+
+    if version_meets_requirement "$pacman_major" "$pacman_minor" "$old_req_op" "$old_req_major" "$old_req_minor"; then
+        echo "  -> Compatible: requires pacman $old_dep (have $installed_pacman_ver)"
+        echo "FOUND_COMPATIBLE_COMMIT=$try_commit"
+        echo "FOUND_COMPATIBLE_REASON=requires pacman $old_dep"
+        exit 2
+    fi
+    echo "  -> Incompatible: requires pacman $old_dep"
+done
+
+echo ""
+echo "Strategy B exhausted: no compatible older pamac-aur revision found in recent history."
+echo "Strategy C: Attempting installation anyway with --noconfirm (build may succeed despite version mismatch)..."
+echo "COMPATIBLE_COMMIT=latest_anyway"
+exit 3
+COMPAT_EOF
+
+    local _preamble='_safe_sleep() { if ! sleep "$1" 2>/dev/null; then read -t "$1" -r _ </dev/null 2>/dev/null || true; fi; }
+safe_install() {
+    local attempt=0 max_attempts=3 rc=0
+    while [[ $attempt -lt $max_attempts ]]; do
+        rm -f /var/lib/pacman/db.lck
+        if pacman -S --noconfirm --needed "$@"; then
+            ldconfig 2>/dev/null || true
+            return 0
+        fi
+        rc=$?
+        attempt=$((attempt + 1))
+        if [[ $attempt -lt $max_attempts ]]; then
+            echo "Install failed (attempt $attempt/$max_attempts, exit=$rc), repairing DB..."
+            pacman -Dk 2>/dev/null || true
+            pacman -Syy --noconfirm 2>/dev/null || true
+            _safe_sleep 2
+        fi
+    done
+    return $rc
+}'
+
+    local _compat_script_file
+    _compat_script_file=$(mktemp --tmpdir pamac-compat-XXXXXXXX)
+    _TEMP_FILES+=("$_compat_script_file")
+    printf '%s\n' "${_preamble}${compat_script}" > "$_compat_script_file"
+
+    local _compat_marker="COMPAT_CHECK_$(head -c 8 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$")"
+    printf '\necho "%s"\n' "$_compat_marker" >> "$_compat_script_file"
+
+    set +e
+    local _compat_output=""
+    if [[ "$LOG_LEVEL" == "verbose" ]]; then
+        _compat_output=$(container_root_exec bash -s "$@" < "$_compat_script_file" 2>&1 | tee -a "$LOG_FILE")
+        _compat_rc=${PIPESTATUS[0]}
+    else
+        _compat_output=$(container_root_exec bash -s "$@" < "$_compat_script_file" 2>&1)
+        _compat_rc=$?
+        echo "$_compat_output" >> "$LOG_FILE"
+    fi
+    set -e
+
+    rm -f "$_compat_script_file"
+
+    _PAMAC_COMPAT_COMMIT=""
+    _PAMAC_COMPAT_STRATEGY=""
+
+    case $_compat_rc in
+        0)
+            if echo "$_compat_output" | grep -q "SUCCESS"; then
+                log_success "pamac-aur compatibility resolved: $(echo "$_compat_output" | grep "SUCCESS" | head -1 | sed 's/^[^:]*: //')"
+                _PAMAC_COMPAT_STRATEGY="ok"
+            else
+                log_info "pamac-aur compatibility check passed (no action needed)."
+                _PAMAC_COMPAT_STRATEGY="ok"
+            fi
+            ;;
+        2)
+            _PAMAC_COMPAT_COMMIT=$(echo "$_compat_output" | grep "^FOUND_COMPATIBLE_COMMIT=" | tail -1 | cut -d= -f2)
+            local _compat_reason
+            _compat_reason=$(echo "$_compat_output" | grep "^FOUND_COMPATIBLE_REASON=" | tail -1 | cut -d= -f2)
+            if [[ -n "$_PAMAC_COMPAT_COMMIT" ]]; then
+                if [[ "$_PAMAC_COMPAT_COMMIT" == "latest_anyway" ]]; then
+                    log_warn "No compatible older pamac-aur found. Will attempt latest build anyway."
+                    _PAMAC_COMPAT_STRATEGY="try_latest"
+                else
+                    log_info "Found compatible older pamac-aur revision: ${_PAMAC_COMPAT_COMMIT:0:12}"
+                    log_info "Reason: $_compat_reason"
+                    _PAMAC_COMPAT_STRATEGY="use_commit"
+                fi
+            else
+                log_warn "Compatibility check found a potential revision but could not parse commit."
+                _PAMAC_COMPAT_STRATEGY="try_latest"
+            fi
+            ;;
+        3)
+            log_warn "No compatible pamac-aur revision found in AUR history."
+            log_info "Will attempt installation of latest pamac-aur (may fail if pacman API changed)."
+            _PAMAC_COMPAT_STRATEGY="try_latest"
+            ;;
+        *)
+            if echo "$_compat_output" | grep -q "INCOMPATIBLE"; then
+                log_warn "pamac-aur compatibility issue detected but auto-remediation failed."
+                log_info "Will attempt installation anyway..."
+            else
+                log_info "pamac-aur compatibility check completed (minor issues, proceeding)."
+            fi
+            _PAMAC_COMPAT_STRATEGY="try_latest"
+            ;;
+    esac
+
+    echo "$_compat_output" | grep -E "^(PASS|SUCCESS|WARNING|Strategy|  ->|Installed|Upgraded|INFO)" | while IFS= read -r line; do
+        log_info "  compat: $line"
+    done
+
+    export _PAMAC_COMPAT_COMMIT
+    export _PAMAC_COMPAT_STRATEGY
+    return 0
+}
+
 install_pamac() {
     log_step "Installing Pamac package manager"
 
@@ -2946,16 +3243,33 @@ install_pamac() {
         return 0
     fi
 
+    _PAMAC_COMPAT_COMMIT=""
+    _PAMAC_COMPAT_STRATEGY=""
+    ensure_pamac_aur_compat "$CURRENT_USER" "$PAMAC_VERSION" || true
+
+    local _compat_strategy="${_PAMAC_COMPAT_STRATEGY:-try_latest}"
+    local _compat_commit="${_PAMAC_COMPAT_COMMIT:-}"
+
+    if [[ "$_compat_strategy" == "ok" ]]; then
+        log_info "pamac-aur is compatible. Proceeding with standard installation."
+    elif [[ "$_compat_strategy" == "use_commit" ]]; then
+        log_info "Using compatible older pamac-aur revision: ${_compat_commit:0:12}"
+    elif [[ "$_compat_strategy" == "try_latest" ]]; then
+        log_warn "Will attempt latest pamac-aur (compatibility uncertain)."
+    fi
+
     log_info "Stage 1/2: Installing pamac-aur from AUR..."
     local pamac_install
-read -r -d '' pamac_install <<'PAMAC_INSTALL_EOF' || true
+    read -r -d '' pamac_install <<'PAMAC_INSTALL_EOF' || true
 set -uo pipefail
 
 current_user="$1"
+compat_strategy="${2:-try_latest}"
+compat_commit="${3:-}"
 
 rm -f /var/lib/pacman/db.lck
 
-echo "Installing pamac-aur from AUR..."
+echo "Installing pamac-aur (strategy: $compat_strategy)..."
 pamac_installed=false
 
 if ! sudo -n true 2>/dev/null; then
@@ -2963,24 +3277,101 @@ if ! sudo -n true 2>/dev/null; then
     echo "If build hangs, ensure NOPASSWD sudo is configured for the current user in the container."
 fi
 
-for attempt in 1 2 3; do
-    if sudo -Hu "$current_user" bash -lc "yay -S --noconfirm --needed --noprogressbar pamac-aur"; then
-        pamac_installed=true
-        break
+install_from_aur_commit() {
+    local commit="$1"
+    local work_dir="/tmp/pamac-aur-pkg-$$"
+    echo "Cloning pamac-aur at commit ${commit:0:12}..."
+    rm -rf "$work_dir"
+    sudo -Hu "$current_user" bash -lc "git clone --depth=50 https://aur.archlinux.org/pamac-aur.git '$work_dir'" 2>/tmp/pamac_clone_err || {
+        echo "Git clone failed:"
+        cat /tmp/pamac_clone_err 2>/dev/null | tail -5
+        return 1
+    }
+    if ! sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git checkout '$commit'" 2>/tmp/pamac_checkout_err; then
+        echo "Checkout failed (commit ${commit:0:12}):"
+        cat /tmp/pamac_checkout_err 2>/dev/null | tail -5
+        echo "Attempting to find closest ancestor..."
+        sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git log --oneline -5" 2>/dev/null || true
+        rm -rf "$work_dir"
+        return 1
     fi
-    echo "yay install attempt $attempt failed. Retrying in 5 seconds..."
-    _safe_sleep 5
-    sudo -Hu "$current_user" bash -lc "yay -Y --gendb" 2>/dev/null || true
-    rm -f /var/lib/pacman/db.lck
-done
+    echo "Building pamac-aur from commit ${commit:0:12}..."
+    sudo -Hu "$current_user" bash -lc "cd '$work_dir' && makepkg -si --noconfirm --clean" 2>/tmp/pamac_build_err
+    local build_rc=$?
+    rm -rf "$work_dir"
+    if [[ $build_rc -eq 0 ]]; then
+        return 0
+    fi
+    echo "Build from commit failed (exit $build_rc):"
+    cat /tmp/pamac_build_err 2>/dev/null | tail -15
+    return 1
+}
+
+install_from_yay() {
+    for attempt in 1 2 3; do
+        if sudo -Hu "$current_user" bash -lc "yay -S --noconfirm --needed --noprogressbar pamac-aur"; then
+            return 0
+        fi
+        echo "yay install attempt $attempt/3 failed. Retrying in 5 seconds..."
+        _safe_sleep 5
+        sudo -Hu "$current_user" bash -lc "yay -Y --gendb" 2>/dev/null || true
+        rm -f /var/lib/pacman/db.lck
+    done
+    return 1
+}
+
+case "$compat_strategy" in
+    use_commit)
+        if [[ -n "$compat_commit" ]]; then
+            echo "Strategy: install from compatible AUR commit ${compat_commit:0:12}"
+            if install_from_aur_commit "$compat_commit"; then
+                pamac_installed=true
+            else
+                echo "Commit install failed. Falling back to yay install..."
+                if install_from_yay; then
+                    pamac_installed=true
+                fi
+            fi
+        else
+            echo "No commit specified. Falling back to yay install..."
+            if install_from_yay; then
+                pamac_installed=true
+            fi
+        fi
+        ;;
+    try_latest|ok|"")
+        echo "Strategy: install latest pamac-aur via yay"
+        if install_from_yay; then
+            pamac_installed=true
+        else
+            echo "Standard yay install failed. Attempting direct clone..."
+            rm -rf /tmp/pamac-aur-fallback
+            if sudo -Hu "$current_user" bash -lc "git clone --depth=1 https://aur.archlinux.org/pamac-aur.git /tmp/pamac-aur-fallback" 2>/tmp/pamac_fb_err; then
+                if sudo -Hu "$current_user" bash -lc "cd /tmp/pamac-aur-fallback && makepkg -si --noconfirm --clean" 2>&1 | tail -15; then
+                    pamac_installed=true
+                fi
+                rm -rf /tmp/pamac-aur-fallback
+            else
+                echo "Direct clone also failed:"
+                cat /tmp/pamac_fb_err 2>/dev/null | tail -5
+            fi
+        fi
+        ;;
+esac
 
 if [[ "$pamac_installed" != "true" ]]; then
-    echo "Error: pamac-aur install failed after 3 attempts."
+    echo "Error: pamac-aur install failed with all strategies."
+    echo ""
+    echo "DIAGNOSIS: The pamac-aur AUR package may be incompatible with the current container."
+    echo "  - Container pacman version: $(pacman -Q pacman 2>/dev/null | awk '{print $2}')"
+    echo "  - If pacman was recently upgraded, pamac-aur may not have been updated yet."
+    echo "  - Try: --pamac-version <tag>  (see https://aur.archlinux.org/packages/pamac-aur)"
+    echo ""
     exit 1
 fi
 
 if ! command -v pamac >/dev/null 2>&1; then
-    echo "pamac CLI not found after yay reported success. Retrying without --needed..."
+    echo "pamac CLI not found after install. Retrying without --needed..."
     rm -f /var/lib/pacman/db.lck
     sudo -Hu "$current_user" bash -lc "yay -S --noconfirm --noprogressbar pamac-aur" || true
 fi
@@ -2996,7 +3387,7 @@ fi
 echo "pamac-manager and pamac CLI installed successfully."
 PAMAC_INSTALL_EOF
 
-    if ! exec_container_script "$pamac_install" "pamac-install" "$CURRENT_USER"; then
+    if ! exec_container_script "$pamac_install" "pamac-install" "$CURRENT_USER" "$_compat_strategy" "$_compat_commit"; then
         if ! container_is_usable; then
             log_warn "Container not usable after pamac install. Restarting..."
             container_start 2>/dev/null || true
@@ -3005,12 +3396,26 @@ PAMAC_INSTALL_EOF
                 return 1
             }
             log_info "Retrying pamac install..."
-            if ! exec_container_script "$pamac_install" "pamac-install-retry" "$CURRENT_USER"; then
+            if ! exec_container_script "$pamac_install" "pamac-install-retry" "$CURRENT_USER" "$_compat_strategy" "$_compat_commit"; then
                 log_error "Failed to install Pamac after retry."
+                log_error ""
+                log_error "The pamac-aur AUR package may be broken upstream."
+                log_error "Options:"
+                log_error "  1. Check https://aur.archlinux.org/packages/pamac-aur for current status"
+                log_error "  2. Try: --pamac-version <tag>  to pin a specific working version"
+                log_error "  3. Wait for the AUR maintainer to update pamac-aur for the latest pacman"
+                log_error ""
                 return 1
             fi
         else
             log_error "Failed to install Pamac."
+            log_error ""
+            log_error "The pamac-aur AUR package may be broken upstream."
+            log_error "Options:"
+            log_error "  1. Check https://aur.archlinux.org/packages/pamac-aur for current status"
+            log_error "  2. Try: --pamac-version <tag>  to pin a specific working version"
+            log_error "  3. Wait for the AUR maintainer to update pamac-aur for the latest pacman"
+            log_error ""
             return 1
         fi
     fi

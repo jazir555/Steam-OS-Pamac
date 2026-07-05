@@ -22,6 +22,7 @@ ENABLE_GAMING_PACKAGES="${ENABLE_GAMING_PACKAGES:-false}"
 ENABLE_EXTRA_REPOS="${ENABLE_EXTRA_REPOS:-true}"
 FORCE_REBUILD="${FORCE_REBUILD:-false}"
 OPTIMIZE_MIRRORS="${OPTIMIZE_MIRRORS:-true}"
+ALLOW_SIGLEVEL_NEVER="${ALLOW_SIGLEVEL_NEVER:-}"
 
 : "${DISTROBOX_CONTAINER_MANAGER:=podman}"
 
@@ -635,12 +636,21 @@ OPTIONS:
   --version                 Show version information
   -h, --help                Show this help message
 
+ENVIRONMENT VARIABLES:
+  CONTAINER_NAME            Override default container name (default: arch-pamac)
+  ALLOW_SIGLEVEL_NEVER     Set to 'true' to allow the SigLevel=Never fallback
+                            without prompting when keyring init fails
+                            (DISABLES PGP signature verification — insecure!)
+  FORCE_REBUILD            Set to 'true' to force-rebuild existing container
+  ENABLE_GAMING_PACKAGES   Set to 'true' to install gaming packages
+
 EXAMPLES:
   $0                                       # Basic setup
   $0 --enable-gaming --no-optimize-mirrors # Gaming setup, skip mirror optimization
   $0 --container-name my-arch              # Custom container name
   $0 --check                               # Verify system is ready
   $0 --uninstall                           # Remove everything
+  ALLOW_SIGLEVEL_NEVER=true $0            # Allow insecure keyring fallback non-interactively
 EOF
 }
 
@@ -1187,29 +1197,12 @@ if [[ "$keyring_init_ok" == "true" ]]; then
     if pacman-key --populate archlinux 2>/dev/null; then
         echo "Keyring populated successfully."
     else
-echo "Warning: pacman-key --populate failed."
-echo "Falling back to SigLevel=Never."
-echo "SECURITY WARNING: PGP signature verification is now DISABLED. Packages will be installed without cryptographic verification, which makes them vulnerable to tampering or man-in-the-middle attacks. This is a last resort for environments with broken GPG/entropy."
-        if command -v sed >/dev/null 2>&1; then
-            sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
-            if ! grep -q '^SigLevel' /etc/pacman.conf; then
-                echo 'SigLevel = Never' >> /etc/pacman.conf
-            fi
-        else
-            echo 'SigLevel = Never' >> /etc/pacman.conf
-        fi
+        echo "Warning: pacman-key --populate failed."
+        echo "SIGNAL:SIGLEVEL_NEEDED"
     fi
 else
-    echo "Falling back to SigLevel=Never to allow package installation without PGP verification."
-echo "SECURITY WARNING: PGP signature verification is now DISABLED. Packages will be installed without cryptographic verification, which makes them vulnerable to tampering or man-in-the-middle attacks. This is a last resort for environments with broken GPG/entropy."
-    if command -v sed >/dev/null 2>&1; then
-        sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
-        if ! grep -q '^SigLevel' /etc/pacman.conf; then
-            echo 'SigLevel = Never' >> /etc/pacman.conf
-        fi
-    else
-        echo 'SigLevel = Never' >> /etc/pacman.conf
-    fi
+    echo "Keyring init failed. Package signature verification cannot be configured."
+    echo "SIGNAL:SIGLEVEL_NEEDED"
 fi
 
 echo "Step 4/4: Updating archlinux-keyring package..."
@@ -1242,6 +1235,48 @@ KEYRING_EOF
     if ! exec_container_script "$keyring_script" "keyring-init"; then
         log_warn "Keyring initialization had issues. Continuing..."
         _ok=false
+    fi
+
+    if grep -q 'SIGNAL:SIGLEVEL_NEEDED' "$LOG_FILE" 2>/dev/null; then
+        local _apply_siglevel_never=false
+        if [[ "${ALLOW_SIGLEVEL_NEVER:-}" == "true" ]]; then
+            _apply_siglevel_never=true
+            log_warn "ALLOW_SIGLEVEL_NEVER=true — applying SigLevel=Never without prompt."
+        elif [[ -t 0 ]]; then
+            echo -e "${RED}${BOLD}Keyring init/populate failed — PGP signature verification cannot be configured.${NC}" >&2
+            echo -e "${YELLOW}The only fallback is SigLevel=Never, which ${RED}${BOLD}DISABLES all package signature verification${NC}${YELLOW}.${NC}" >&2
+            echo -e "${RED}${BOLD}This makes package installation vulnerable to tampering and man-in-the-middle attacks.${NC}" >&2
+            echo -ne "${BOLD}Apply SigLevel=Never fallback? [y/N] ${NC}" >&2
+            read -r _siglevel_confirm
+            if [[ "$_siglevel_confirm" =~ ^[Yy]$ ]]; then
+                _apply_siglevel_never=true
+            else
+                log_warn "User declined SigLevel=Never fallback. Package installation may be impossible."
+            fi
+        else
+            log_warn "Non-interactive session — SigLevel=Never fallback skipped. Set ALLOW_SIGLEVEL_NEVER=true to allow it."
+        fi
+
+        if [[ "$_apply_siglevel_never" == "true" ]]; then
+            local siglevel_script
+            read -r -d '' siglevel_script <<'SIGLEVEL_EOF' || true
+set -uo pipefail
+echo "Applying SigLevel=Never to pacman.conf (user-approved)..."
+rm -f /var/lib/pacman/db.lck
+if command -v sed >/dev/null 2>&1; then
+    sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+    if ! grep -q '^SigLevel' /etc/pacman.conf; then
+        echo 'SigLevel = Never' >> /etc/pacman.conf
+    fi
+else
+    echo 'SigLevel = Never' >> /etc/pacman.conf
+fi
+echo "SigLevel=Never applied."
+SIGLEVEL_EOF
+            if ! exec_container_script "$siglevel_script" "siglevel-never-apply"; then
+                log_error "Failed to apply SigLevel=Never fallback."
+            fi
+        fi
     fi
 
     if ! container_is_usable; then

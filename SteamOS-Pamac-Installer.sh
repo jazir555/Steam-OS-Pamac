@@ -1601,9 +1601,24 @@ if ! getent group wheel >/dev/null 2>&1; then
     groupadd wheel || echo "Warning: groupadd wheel failed"
 fi
 
-echo '%wheel ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/99-wheel-nopasswd
+cat > /etc/sudoers.d/99-wheel-nopasswd <<'SUDOERS'
+Cmnd_Alias PAMAC_CMDS = /usr/bin/pacman, \
+    /usr/bin/pamac, \
+    /usr/bin/pamac-manager, \
+    /usr/bin/pamac-daemon, \
+    /usr/bin/yay, \
+    /usr/bin/makepkg, \
+    /usr/bin/pacman-key, \
+    /usr/bin/paccache, \
+    /usr/bin/pacscripts, \
+    /usr/bin/lsblk, \
+    /usr/bin/blkid, \
+    /usr/bin/findmnt
+
+%wheel ALL=(ALL:ALL) NOPASSWD: PAMAC_CMDS
+SUDOERS
 chmod 0440 /etc/sudoers.d/99-wheel-nopasswd
-echo "Configured passwordless sudo for wheel."
+echo "Configured strict sudo allowlist for package management only."
 USER_EOF
 
     exec_container_script "$user_script" "user-setup" "$CURRENT_USER" || return 1
@@ -1618,12 +1633,20 @@ if pacman -S --noconfirm --needed polkit; then
 polkit_dir="/etc/polkit-1/rules.d"
 mkdir -p "$polkit_dir"
 printf '%s\n' 'polkit.addRule(function(action, subject) {' \
-' if (action.id.indexOf("org.manjaro.pamac.") == 0 &&' \
-' subject.isInGroup("wheel")) {' \
-' return polkit.Result.YES;' \
+' var PAMAC_ACTIONS = [' \
+'   "org.manjaro.pamac.install", ' \
+'   "org.manjaro.pamac.remove", ' \
+'   "org.manjaro.pamac.update", ' \
+'   "org.manjaro.pamac.get-updates", ' \
+'   "org.manjaro.pamac.refresh-cache"' \
+' ];' \
+' if (PAMAC_ACTIONS.indexOf(action.id) >= 0 &&' \
+'   subject.isInGroup("wheel") &&' \
+'   subject.local && subject.active) {' \
+'   return polkit.Result.YES;' \
 ' }' \
 '});' > "$polkit_dir/10-pamac-nopasswd.rules"
-echo "polkit passwordless rule created for pamac operations."
+echo "polkit passwordless rule created for pamac operations (explicit allowlist, local+active only)."
 if ! id polkitd >/dev/null 2>&1; then
 useradd -r -d / -s /usr/bin/nologin polkitd 2>/dev/null || echo "Note: polkitd user creation failed"
 fi
@@ -2574,15 +2597,15 @@ if [[ -f /etc/pamac.conf ]]; then
     fi
     echo "Pamac configuration updated for AUR support."
 
-echo "Setting BuildDirectory for AUR builds (writable by non-root)..."
+echo "Setting BuildDirectory for AUR builds (container-native, not host-mounted)..."
 if grep -q '^BuildDirectory' /etc/pamac.conf; then
-sed -i 's|^BuildDirectory.*|BuildDirectory = /home/'"$current_user"'/\.pamac-build|' /etc/pamac.conf
+sed -i 's|^BuildDirectory.*|BuildDirectory = /var/cache/pamac-build|' /etc/pamac.conf
 else
-echo "BuildDirectory = /home/$current_user/.pamac-build" >> /etc/pamac.conf
+echo "BuildDirectory = /var/cache/pamac-build" >> /etc/pamac.conf
 fi
-mkdir -p "/home/$current_user/.pamac-build"
-chown "$current_user:$current_user" "/home/$current_user/.pamac-build" 2>/dev/null || true
-echo "BuildDirectory set to /home/$current_user/.pamac-build"
+mkdir -p /var/cache/pamac-build
+chown "$current_user:$current_user" /var/cache/pamac-build 2>/dev/null || true
+echo "BuildDirectory set to /var/cache/pamac-build"
 
 echo "Leaving Pamac polkit policy at auth_admin_keep defaults."
 pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
@@ -2599,9 +2622,9 @@ fi
 else
 echo "Warning: /etc/pamac.conf not found. Creating minimal config."
 mkdir -p /etc
-printf 'EnableAUR\nCheckAURUpdates\nCheckAURVCSUpdates\nBuildDirectory = /home/'"$current_user"'/.pamac-build\n' > /etc/pamac.conf
-mkdir -p "/home/$current_user/.pamac-build"
-chown "$current_user:$current_user" "/home/$current_user/.pamac-build" 2>/dev/null || true
+printf 'EnableAUR\nCheckAURUpdates\nCheckAURVCSUpdates\nBuildDirectory = /var/cache/pamac-build\n' > /etc/pamac.conf
+mkdir -p /var/cache/pamac-build
+chown "$current_user:$current_user" /var/cache/pamac-build 2>/dev/null || true
 fi
 
     echo "Syncing package database..."

@@ -3301,7 +3301,73 @@ if [[ -n "$pamac_version_pin" && "$pamac_version_pin" != "latest" ]]; then
 fi
 
 echo "Fetching latest pamac-aur PKGBUILD from AUR..."
-aur_pkgbuild=$(curl -sf --connect-timeout 10 --max-time 30 "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=pamac-aur" 2>/dev/null || echo "")
+
+_AUR_CACHE_DIR="/var/cache/pamac-aur-compat"
+_AUR_CACHE_FILE="$_AUR_CACHE_DIR/PKGBUILD"
+_AUR_CACHE_META="$_AUR_CACHE_DIR/timestamp"
+_AUR_CACHE_TTL=86400  # 24 hours
+
+mkdir -p "$_AUR_CACHE_DIR" 2>/dev/null || true
+
+_fetch_aur_pkgbuild() {
+    local fetched=""
+    # Try the CGIT web endpoint first
+    fetched=$(curl -sf --connect-timeout 10 --max-time 30 \
+        "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=pamac-aur" 2>/dev/null || echo "")
+    if [[ -n "$fetched" ]]; then
+        echo "$fetched"
+        return 0
+    fi
+    # Fallback: use git to read PKGBUILD directly (bypasses web frontend)
+    local _git_tmp
+    _git_tmp=$(mktemp -d 2>/dev/null || echo "")
+    if [[ -n "$_git_tmp" ]]; then
+        if git clone --depth 1 --single-branch https://aur.archlinux.org/pamac-aur.git "$_git_tmp/pamac-aur" 2>/dev/null; then
+            if [[ -f "$_git_tmp/pamac-aur/PKGBUILD" ]]; then
+                cat "$_git_tmp/pamac-aur/PKGBUILD"
+                rm -rf "$_git_tmp"
+                return 0
+            fi
+        fi
+        rm -rf "$_git_tmp"
+    fi
+    return 1
+}
+
+aur_pkgbuild=""
+_cache_age=999999
+
+# Check if a fresh cache exists
+if [[ -f "$_AUR_CACHE_FILE" && -f "$_AUR_CACHE_META" ]]; then
+    if [[ -r "$_AUR_CACHE_META" ]]; then
+        _cached_ts=$(cat "$_AUR_CACHE_META" 2>/dev/null || echo "0")
+        _now_ts=$(date +%s 2>/dev/null || echo "0")
+        _cache_age=$(( _now_ts - _cached_ts ))
+        if [[ $_cache_age -lt 0 ]]; then _cache_age=0; fi
+    fi
+    if [[ $_cache_age -lt $_AUR_CACHE_TTL ]]; then
+        echo "Using cached PKGBUILD (${_cache_age}s old, TTL ${_AUR_CACHE_TTL}s)."
+        aur_pkgbuild=$(cat "$_AUR_CACHE_FILE" 2>/dev/null || echo "")
+    fi
+fi
+
+# Fetch fresh if cache was stale or missing
+if [[ -z "$aur_pkgbuild" ]]; then
+    echo "Fetching fresh PKGBUILD from AUR..."
+    aur_pkgbuild=$(_fetch_aur_pkgbuild 2>/dev/null || echo "")
+    if [[ -n "$aur_pkgbuild" ]]; then
+        echo "$aur_pkgbuild" > "$_AUR_CACHE_FILE" 2>/dev/null || true
+        date +%s > "$_AUR_CACHE_META" 2>/dev/null || true
+        echo "PKGBUILD cached for future runs."
+    fi
+fi
+
+# Stale cache fallback: use outdated cached copy rather than aborting
+if [[ -z "$aur_pkgbuild" && -f "$_AUR_CACHE_FILE" ]]; then
+    echo "WARN: AUR unreachable and fresh fetch failed. Using stale cached PKGBUILD (${_cache_age}s old)."
+    aur_pkgbuild=$(cat "$_AUR_CACHE_FILE" 2>/dev/null || echo "")
+fi
+
 if [[ -z "$aur_pkgbuild" ]]; then
     echo "WARN: Could not fetch pamac-aur PKGBUILD from AUR (network issue?). Skipping check."
     exit 0
@@ -4102,19 +4168,26 @@ export_pamac_to_host() {
     command -v gtk-update-icon-cache >/dev/null 2>&1 && \
         gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" -f 2>/dev/null || true
 
-    log_info "Installing X11/Wayland tools for window integration..."
-    container_root_exec bash -c 'pacman -S --noconfirm --needed xdotool xorg-xprop xorg-xwininfo 2>/dev/null || echo "Warning: x11 tools install failed (non-fatal)"'
+    local _host_is_x11=false
+    if [[ -n "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+        _host_is_x11=true
+    fi
 
-    log_info "Compiling xdotool inside container and exporting to host (X11 fallback)..."
-    local has_wayland_tools=false
     local _host_bindir="$HOME/.local/bin"
     mkdir -p "$_host_bindir"
 
-    local _container_tool_dir="/tmp/pamac-host-tools"
-    local _xdotool_build_rc=0
+    if [[ "$_host_is_x11" == "true" ]]; then
+        log_info "X11 session detected. Installing X11 tools for window integration..."
+        container_root_exec bash -c 'pacman -S --noconfirm --needed xdotool xorg-xprop xorg-xwininfo 2>/dev/null || echo "Warning: x11 tools install failed (non-fatal)"'
 
-    set +e
-    container_root_exec bash -c "
+        log_info "Compiling xdotool inside container and exporting to host (X11 fallback)..."
+        local has_wayland_tools=false
+
+        local _container_tool_dir="/tmp/pamac-host-tools"
+        local _xdotool_build_rc=0
+
+        set +e
+        container_root_exec bash -c "
 set +e
 mkdir -p $_container_tool_dir
 
@@ -4149,30 +4222,32 @@ if [[ \$_rc -ne 0 ]]; then
 fi
 exit \$_rc
 " 2>/dev/null
-    _xdotool_build_rc=$?
-    set -e
+        _xdotool_build_rc=$?
+        set -e
 
-    if [[ $_xdotool_build_rc -ne 0 ]]; then
-        log_warn "xdotool source build failed inside container (exit code: $_xdotool_build_rc)."
-        log_info "X11 window hint injection (StartupWMClass fallback) will be unavailable."
-        log_info "This is non-fatal — Pamac still works; Wayland uses XDG_ACTIVATION_TOKEN (no xdotool needed)."
+        if [[ $_xdotool_build_rc -ne 0 ]]; then
+            log_warn "xdotool source build failed inside container (exit code: $_xdotool_build_rc)."
+            log_info "X11 window hint injection (StartupWMClass fallback) will be unavailable."
+            log_info "This is non-fatal — Pamac still works; Wayland uses XDG_ACTIVATION_TOKEN (no xdotool needed)."
+        fi
+
+        for _tool in xdotool; do
+            if container_cp_from "$_container_tool_dir/$_tool" "$_host_bindir/$_tool" 2>/dev/null; then
+                if [[ -s "$_host_bindir/$_tool" ]]; then
+                    chmod +x "$_host_bindir/$_tool"
+                    log_success "Exported $_tool to $_host_bindir/$_tool"
+                else
+                    rm -f "$_host_bindir/$_tool"
+                fi
+            fi
+        done
+
+        container_root_exec bash -c "rm -rf $_container_tool_dir" 2>/dev/null || true
+    else
+        log_info "Wayland session detected (or no DISPLAY). Skipping xdotool compilation."
+        log_info "Wayland taskbar integration uses XDG_ACTIVATION_TOKEN — no xdotool needed."
     fi
 
-    for _tool in xdotool; do
-        if container_cp_from "$_container_tool_dir/$_tool" "$_host_bindir/$_tool" 2>/dev/null; then
-            if [[ -s "$_host_bindir/$_tool" ]]; then
-                chmod +x "$_host_bindir/$_tool"
-                log_success "Exported $_tool to $_host_bindir/$_tool"
-            else
-                rm -f "$_host_bindir/$_tool"
-            fi
-        fi
-    done
-
-    container_root_exec bash -c "rm -rf $_container_tool_dir" 2>/dev/null || true
-
-    # The wrapper now uses StartupWMClass + XDG_ACTIVATION_TOKEN for Wayland
-    # and a single xdotool attempt for X11 fallback. No wlrctl/kdotool needed.
     local host_tools_available=false
     if command -v xdotool >/dev/null 2>&1 || [[ -x "$_host_bindir/xdotool" ]]; then
         host_tools_available=true

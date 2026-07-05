@@ -37,6 +37,7 @@ OPTIMIZE_MIRRORS="${OPTIMIZE_MIRRORS:-true}"
 DRY_RUN="${DRY_RUN:-false}"
 CHECK_ONLY="${CHECK_ONLY:-false}"
 UNINSTALL="${UNINSTALL:-false}"
+EXPORT_ONLY="${EXPORT_ONLY:-false}"
 LOG_LEVEL="${LOG_LEVEL:-normal}"
 
 setup_colors() {
@@ -127,9 +128,20 @@ container_runtime() {
 }
 
 # Use sudo only for privileged operations (create, rm, system) when rootless is broken
+_SUDO_VERIFIED=""
 container_runtime_privileged() {
     local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
     if [[ -n "${PODMAN_SUDO_FALLBACK:-}" ]]; then
+        if [[ "$_SUDO_VERIFIED" != "ok" ]]; then
+            if sudo -n true 2>/dev/null; then
+                _SUDO_VERIFIED="ok"
+            else
+                log_warn "sudo -n true failed (password may be required). Falling back to rootless podman."
+                unset PODMAN_SUDO_FALLBACK
+                container_runtime "$@"
+                return $?
+            fi
+        fi
         if [[ "$mgr" == "docker" ]]; then
             sudo docker "$@"
         else
@@ -141,12 +153,22 @@ container_runtime_privileged() {
 }
 
 container_root_exec() {
-  container_start 2>/dev/null || true
+  if ! container_is_usable; then
+    container_start 2>/dev/null || true
+    if ! container_is_usable; then
+      log_warn "Container not usable before root exec. Attempting anyway..."
+    fi
+  fi
   container_runtime_privileged exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" "$@"
 }
 
 container_user_exec() {
-  container_start 2>/dev/null || true
+  if ! container_is_usable; then
+    container_start 2>/dev/null || true
+    if ! container_is_usable; then
+      log_warn "Container not usable before user exec. Attempting anyway..."
+    fi
+  fi
   container_runtime_privileged exec -i -u "$CURRENT_USER" \
     -e HOME="/home/${CURRENT_USER}" \
     -e XDG_DATA_DIRS="/usr/local/share:/usr/share" \
@@ -158,7 +180,9 @@ container_user_exec() {
 container_cp_from() {
     local src="$1" dst="$2"
     log_debug "Copying from container: $src -> $dst"
-    container_start 2>/dev/null || true
+    if ! container_is_usable; then
+        container_start 2>/dev/null || true
+    fi
     if container_runtime_privileged cp "$CONTAINER_NAME:$src" "$dst" 2>/dev/null; then
         log_debug "Copied $src from container."
         return 0
@@ -276,6 +300,7 @@ _ensure_healthy_or_recreate() {
     elif [[ "$healthy_rc" -eq 2 ]]; then
         if [[ ${_RECREATE_COUNT:-0} -ge ${_MAX_RECREATES:-2} ]]; then
             log_error "Container recreated $_MAX_RECREATES times without success. Aborting."
+            _RECREATE_COUNT=0
             return 1
         fi
         _RECREATE_COUNT=$((_RECREATE_COUNT + 1))
@@ -290,10 +315,15 @@ _ensure_healthy_or_recreate() {
             return 1
         fi
         _CREATE_RECREATION_GUARD="$saved_guard"
+        if ! container_is_usable; then
+            log_error "Container recreated but not usable after '$desc' recovery."
+            return 1
+        fi
         log_success "Container recreated successfully after '$desc' issue."
         _RECREATE_COUNT=0
         return 0
     else
+        _RECREATE_COUNT=0
         return 1
     fi
 }
@@ -616,6 +646,7 @@ OPTIONS:
   --optimize-mirrors        Select fastest Pacman mirrors (default)
   --no-optimize-mirrors     Do not change default Pacman mirrors
   --uninstall               Remove container and all related files
+  --export-only              Re-export apps to host menu without running full setup
   --check                   Perform system checks and exit without installing
   --dry-run                 Show what would be done without making changes
   --verbose                 Show detailed output, including command logs
@@ -657,6 +688,7 @@ parse_arguments() {
             --optimize-mirrors) OPTIMIZE_MIRRORS="true"; shift ;;
             --no-optimize-mirrors) OPTIMIZE_MIRRORS="false"; shift ;;
             --uninstall) UNINSTALL="true"; shift ;;
+            --export-only) EXPORT_ONLY="true"; shift ;;
             --dry-run) DRY_RUN="true"; shift ;;
             --check) CHECK_ONLY="true"; shift ;;
             --verbose) LOG_LEVEL="verbose"; shift ;;
@@ -1014,6 +1046,53 @@ exec_container_script() {
     local _rc=0
     local _script_file
     local _preamble='_safe_sleep() { if ! sleep "$1" 2>/dev/null; then read -t "$1" -r _ </dev/null 2>/dev/null || true; fi; }
+safe_install() {
+    local attempt=0 max_attempts=3 rc=0
+    while [[ $attempt -lt $max_attempts ]]; do
+        rm -f /var/lib/pacman/db.lck
+        if pacman -S --noconfirm --needed "$@"; then
+            ldconfig 2>/dev/null || true
+            return 0
+        fi
+        rc=$?
+        attempt=$((attempt + 1))
+        if [[ $attempt -lt $max_attempts ]]; then
+            echo "Install failed (attempt $attempt/$max_attempts, exit=$rc), repairing DB..."
+            if [[ $rc -eq 137 ]]; then
+                echo "Exit code 137 indicates OOM kill. Syncing and retrying..."
+                sync 2>/dev/null || true
+                _safe_sleep 3
+            fi
+            pacman -Dk 2>/dev/null || true
+            pacman -Syy --noconfirm 2>/dev/null || true
+            _safe_sleep 2
+        fi
+    done
+    return $rc
+}
+install_base_devel_batched() {
+    echo "Installing base-devel in smaller batches to avoid OOM..."
+    local BASE_DEVEL_BATCHES=(
+        "m4 autoconf automake binutils"
+        "bison debugedit diffutils fakeroot"
+        "flex"
+        "gcc"
+        "gettext groff"
+        "gzip libtool make patch"
+        "pkgconf sed texinfo which"
+    )
+    for batch in "${BASE_DEVEL_BATCHES[@]}"; do
+        echo "Installing batch: $batch"
+        sync 2>/dev/null || true
+        _safe_sleep 1
+        if ! safe_install $batch; then
+            echo "Warning: batch install failed for: $batch"
+        fi
+    done
+    if ! pacman -Q base-devel >/dev/null 2>&1 && ! safe_install base-devel; then
+        echo "Warning: base-devel group meta-package could not be installed."
+    fi
+}
 '
 
     _script_file=$(mktemp /tmp/pamac-script-XXXXXXXX)
@@ -1055,6 +1134,26 @@ exec_container_script() {
 
  if [[ $_rc -ne 0 ]] && ! { [[ "$CONTAINER_HAS_INIT" == "false" ]] && echo "$_output" | grep -q "$_marker"; }; then
         log_warn "Script '$_desc' failed (exit=$_rc)."
+        if [[ $_rc -eq 100 ]]; then
+            log_error "Fatal keyring/security error in script '$_desc'. Last 20 lines of output:"
+            echo "$_output" | tail -20 | while IFS= read -r line; do
+                log_error "  $line"
+            done
+        elif [[ $_rc -eq 137 ]]; then
+            log_error "Script '$_desc' killed (OOM/signal). Last 20 lines of output:"
+            echo "$_output" | tail -20 | while IFS= read -r line; do
+                log_error "  $line"
+            done
+        else
+            local _tail
+            _tail=$(echo "$_output" | tail -20)
+            if [[ -n "$_tail" ]]; then
+                log_warn "Last 20 lines of script output:"
+                echo "$_tail" | while IFS= read -r line; do
+                    log_warn "  $line"
+                done
+            fi
+        fi
         container_root_exec bash -c "rm -f /var/lib/pacman/db.lck; pkill -9 gpg-agent 2>/dev/null || true" 2>/dev/null || true
         container_start 2>/dev/null || true
         repair_pacman_db
@@ -1070,12 +1169,66 @@ exec_container_pipe() {
     local _script_file
     local _marker="PAMAC_PIPE_OK_$(head -c 16 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$_$(date +%s)")"
     local _preamble='_safe_sleep() { if ! sleep "$1" 2>/dev/null; then read -t "$1" -r _ </dev/null 2>/dev/null || true; fi; }
+safe_install() {
+    local attempt=0 max_attempts=3 rc=0
+    while [[ $attempt -lt $max_attempts ]]; do
+        rm -f /var/lib/pacman/db.lck
+        if pacman -S --noconfirm --needed "$@"; then
+            ldconfig 2>/dev/null || true
+            return 0
+        fi
+        rc=$?
+        attempt=$((attempt + 1))
+        if [[ $attempt -lt $max_attempts ]]; then
+            echo "Install failed (attempt $attempt/$max_attempts, exit=$rc), repairing DB..."
+            if [[ $rc -eq 137 ]]; then
+                echo "Exit code 137 indicates OOM kill. Syncing and retrying..."
+                sync 2>/dev/null || true
+                _safe_sleep 3
+            fi
+            pacman -Dk 2>/dev/null || true
+            pacman -Syy --noconfirm 2>/dev/null || true
+            _safe_sleep 2
+        fi
+    done
+    return $rc
+}
+install_base_devel_batched() {
+    echo "Installing base-devel in smaller batches to avoid OOM..."
+    local BASE_DEVEL_BATCHES=(
+        "m4 autoconf automake binutils"
+        "bison debugedit diffutils fakeroot"
+        "flex"
+        "gcc"
+        "gettext groff"
+        "gzip libtool make patch"
+        "pkgconf sed texinfo which"
+    )
+    for batch in "${BASE_DEVEL_BATCHES[@]}"; do
+        echo "Installing batch: $batch"
+        sync 2>/dev/null || true
+        _safe_sleep 1
+        if ! safe_install $batch; then
+            echo "Warning: batch install failed for: $batch"
+        fi
+    done
+    if ! pacman -Q base-devel >/dev/null 2>&1 && ! safe_install base-devel; then
+        echo "Warning: base-devel group meta-package could not be installed."
+    fi
+}
 '
 
     _script_file=$(mktemp /tmp/pamac-pipe-XXXXXXXX)
     _TEMP_FILES+=("$_script_file")
     printf '%s' "$_preamble" > "$_script_file"
     cat >> "$_script_file"
+    local _piped_size
+    _piped_size=$(wc -c < "$_script_file" 2>/dev/null || echo "0")
+    if [[ "$_piped_size" -le ${#_preamble} ]]; then
+        log_error "Internal error: piped script '$_desc' is empty (heredoc delimiter may be missing/misfound). Aborting stage."
+        rm -f "$_script_file"
+        return 1
+    fi
     printf '\necho "%s"\n' "$_marker" >> "$_script_file"
 
     set +e
@@ -1110,6 +1263,26 @@ exec_container_pipe() {
 
  if [[ $_rc -ne 0 ]] && ! { [[ "$CONTAINER_HAS_INIT" == "false" ]] && echo "$_output" | grep -q "$_marker"; }; then
         log_warn "Piped script '$_desc' failed (exit=$_rc)."
+        if [[ $_rc -eq 100 ]]; then
+            log_error "Fatal keyring/security error in piped script '$_desc'. Last 20 lines of output:"
+            echo "$_output" | tail -20 | while IFS= read -r line; do
+                log_error "  $line"
+            done
+        elif [[ $_rc -eq 137 ]]; then
+            log_error "Piped script '$_desc' killed (OOM/signal). Last 20 lines of output:"
+            echo "$_output" | tail -20 | while IFS= read -r line; do
+                log_error "  $line"
+            done
+        else
+            local _tail
+            _tail=$(echo "$_output" | tail -20)
+            if [[ -n "$_tail" ]]; then
+                log_warn "Last 20 lines of piped script output:"
+                echo "$_tail" | while IFS= read -r line; do
+                    log_warn "  $line"
+                done
+            fi
+        fi
         container_root_exec bash -c "rm -f /var/lib/pacman/db.lck; pkill -9 gpg-agent 2>/dev/null || true" 2>/dev/null || true
         container_start 2>/dev/null || true
         repair_pacman_db
@@ -1401,33 +1574,6 @@ set -uo pipefail
 
 rm -f /var/lib/pacman/db.lck
 
-safe_install() {
-    local attempt=0
-    local max_attempts=3
-    local rc=0
-    while [[ $attempt -lt $max_attempts ]]; do
-        rm -f /var/lib/pacman/db.lck
-        if pacman -S --noconfirm --needed "$@"; then
-            ldconfig 2>/dev/null || true
-            return 0
-        fi
-        rc=$?
-        attempt=$((attempt + 1))
-        if [[ $attempt -lt $max_attempts ]]; then
-            echo "Core package install failed (attempt $attempt/$max_attempts, exit=$rc), repairing DB..."
-if [[ $rc -eq 137 ]]; then
-echo "Exit code 137 indicates OOM kill. Syncing and retrying..."
-sync 2>/dev/null || true
-_safe_sleep 3
-fi
-pacman -Dk 2>/dev/null || true
-pacman -Syy --noconfirm 2>/dev/null || true
-_safe_sleep 2
-fi
-    done
-    return $rc
-}
-
 echo "Installing core packages (sudo, shadow, gnupg)..."
 if ! safe_install sudo shadow gnupg; then
     echo "ERROR: Failed to install core packages after retries."
@@ -1469,33 +1615,6 @@ check_mem() {
     fi
 }
 
-safe_install() {
-    local attempt=0
-    local max_attempts=3
-    local rc=0
-    while [[ $attempt -lt $max_attempts ]]; do
-        rm -f /var/lib/pacman/db.lck
-        if pacman -S --noconfirm --needed "$@"; then
-            ldconfig 2>/dev/null || true
-            return 0
-        fi
-        rc=$?
-        attempt=$((attempt + 1))
-        if [[ $attempt -lt $max_attempts ]]; then
-            echo "Install failed (attempt $attempt/$max_attempts, exit=$rc), repairing DB..."
-if [[ $rc -eq 137 ]]; then
-echo "Exit code 137 indicates OOM kill. Trying with swap flush..."
-sync 2>/dev/null || true
-_safe_sleep 3
-fi
-pacman -Dk 2>/dev/null || true
-pacman -Syy --noconfirm 2>/dev/null || true
-_safe_sleep 3
-fi
-    done
-    return $rc
-}
-
 echo "Installing git..."
 check_mem 262144 "git install"
 if ! safe_install git; then
@@ -1503,31 +1622,8 @@ if ! safe_install git; then
     exit 1
 fi
 
-echo "Installing base-devel in smaller batches to avoid OOM..."
 check_mem 524288 "base-devel install"
-sync 2>/dev/null || true
-_safe_sleep 1
-BASE_DEVEL_BATCHES=(
-    "m4 autoconf automake binutils"
-    "bison debugedit diffutils fakeroot"
-    "flex"
-    "gcc"
-    "gettext groff"
-    "gzip libtool make patch"
-    "pkgconf sed texinfo which"
-)
-for batch in "${BASE_DEVEL_BATCHES[@]}"; do
-echo "Installing batch: $batch"
-check_mem 262144 "base-devel batch"
-sync 2>/dev/null || true
-_safe_sleep 1
-if ! safe_install $batch; then
-        echo "Warning: batch install failed for: $batch"
-    fi
-done
-if ! pacman -Q base-devel >/dev/null 2>&1 && ! safe_install base-devel; then
-    echo "Warning: base-devel group meta-package could not be installed."
-fi
+install_base_devel_batched
 
 echo "Installing go..."
 check_mem 262144 "go install"
@@ -1760,6 +1856,9 @@ DYNAMIC_USER=false
 CACHE_DIR=""
 WORK_DIR=""
 SKIP_NEXT=false
+PIPE_MODE=false
+WAIT_MODE=false
+DESCRIPTION=""
 CMD_ARGS=()
 for arg in "$@"; do
 if $SKIP_NEXT; then
@@ -1769,14 +1868,26 @@ fi
 case "$arg" in
 --service-type=*) continue ;;
 --service-type) SKIP_NEXT=true; continue ;;
---pipe|--wait|--pty|-q|--quiet|--no-block) continue ;;
+--pipe) PIPE_MODE=true; continue ;;
+--wait) WAIT_MODE=true; continue ;;
+--pty|-q|--quiet|--no-block) continue ;;
+--description=*) DESCRIPTION="${arg#--description=}"; continue ;;
+--description) SKIP_NEXT=true; continue ;;
+--unit=*) continue ;;
+--unit) SKIP_NEXT=true; continue ;;
 --property=DynamicUser=yes) DYNAMIC_USER=true; continue ;;
 --property=CacheDirectory=*) CACHE_DIR="${arg#--property=CacheDirectory=}"; continue ;;
 --property=WorkingDirectory=*) WORK_DIR="${arg#--property=WorkingDirectory=}"; continue ;;
+--property=StateDirectory=*) continue ;;
+--property=LogsDirectory=*) continue ;;
+--property=RuntimeDirectory=*) continue ;;
+--property=Type=*) continue ;;
+--property=RemainAfterExit=*) continue ;;
 --property=*) continue ;;
 --property) SKIP_NEXT=true; continue ;;
 --user|--uid=*|--gid=*|--setenv=*) continue ;;
 --user|--setenv) SKIP_NEXT=true; continue ;;
+--) shift; CMD_ARGS+=("$@"); break ;;
 *) CMD_ARGS+=("$arg") ;;
 esac
 done
@@ -1808,7 +1919,7 @@ sed -i "s/HOST_USER_PLACEHOLDER/$HOST_USER/g" /usr/local/sbin/systemd-run
 echo "Fake systemd-run installed at /usr/local/sbin/systemd-run."
 
 printf '%s\n' '#!/bin/bash' \
-'/usr/local/bin/pamac-session-bootstrap.sh 2>/dev/null &' > /etc/profile.d/pamac-daemon.sh
+    '/usr/local/bin/pamac-session-bootstrap.sh 2>/dev/null &' > /etc/profile.d/pamac-daemon.sh
 chmod +x /etc/profile.d/pamac-daemon.sh
 echo "Non-systemd bootstrap profile hook installed."
 else
@@ -1997,6 +2108,9 @@ DYNAMIC_USER=false
 CACHE_DIR=""
 WORK_DIR=""
 SKIP_NEXT=false
+PIPE_MODE=false
+WAIT_MODE=false
+DESCRIPTION=""
 CMD_ARGS=()
 for arg in "$@"; do
 if $SKIP_NEXT; then
@@ -2006,14 +2120,26 @@ fi
 case "$arg" in
 --service-type=*) continue ;;
 --service-type) SKIP_NEXT=true; continue ;;
---pipe|--wait|--pty|-q|--quiet|--no-block) continue ;;
+--pipe) PIPE_MODE=true; continue ;;
+--wait) WAIT_MODE=true; continue ;;
+--pty|-q|--quiet|--no-block) continue ;;
+--description=*) DESCRIPTION="${arg#--description=}"; continue ;;
+--description) SKIP_NEXT=true; continue ;;
+--unit=*) continue ;;
+--unit) SKIP_NEXT=true; continue ;;
 --property=DynamicUser=yes) DYNAMIC_USER=true; continue ;;
 --property=CacheDirectory=*) CACHE_DIR="${arg#--property=CacheDirectory=}"; continue ;;
 --property=WorkingDirectory=*) WORK_DIR="${arg#--property=WorkingDirectory=}"; continue ;;
+--property=StateDirectory=*) continue ;;
+--property=LogsDirectory=*) continue ;;
+--property=RuntimeDirectory=*) continue ;;
+--property=Type=*) continue ;;
+--property=RemainAfterExit=*) continue ;;
 --property=*) continue ;;
 --property) SKIP_NEXT=true; continue ;;
 --user|--uid=*|--gid=*|--setenv=*) continue ;;
 --user|--setenv) SKIP_NEXT=true; continue ;;
+--) shift; CMD_ARGS+=("$@"); break ;;
 *) CMD_ARGS+=("$arg") ;;
 esac
 done
@@ -2327,55 +2453,9 @@ command -v go >/dev/null 2>&1 || _missing="$_missing go"
 
 if [[ -n "$_missing" ]]; then
 	echo "Missing build dependencies:$_missing — installing..."
-	safe_install() {
-		local attempt=0
-		local max_attempts=3
-		local rc=0
-		while [[ $attempt -lt $max_attempts ]]; do
-			rm -f /var/lib/pacman/db.lck
-			if pacman -S --noconfirm --needed "$@"; then
-				ldconfig 2>/dev/null || true
-				return 0
-			fi
-			rc=$?
-			attempt=$((attempt + 1))
-			if [[ $attempt -lt $max_attempts ]]; then
-				echo "Install failed (attempt $attempt/$max_attempts, exit=$rc), repairing DB..."
-				if [[ $rc -eq 137 ]]; then
-					echo "Exit code 137 indicates OOM kill. Syncing and retrying..."
-					sync 2>/dev/null || true
-					_safe_sleep 3
-				fi
-				pacman -Dk 2>/dev/null || true
-				pacman -Syy --noconfirm 2>/dev/null || true
-				_safe_sleep 3
-			fi
-		done
-		return $rc
-	}
-
 	for pkg in $_missing; do
 		if [[ "$pkg" == "base-devel" ]]; then
-			BASE_DEVEL_BATCHES=(
-				"m4 autoconf automake binutils"
-				"bison debugedit diffutils fakeroot"
-				"flex"
-				"gcc"
-				"gettext groff"
-				"gzip libtool make patch"
-				"pkgconf sed texinfo which"
-			)
-			for batch in "${BASE_DEVEL_BATCHES[@]}"; do
-				echo "Installing batch: $batch"
-				sync 2>/dev/null || true
-				_safe_sleep 1
-				if ! safe_install $batch; then
-					echo "Warning: batch install failed for: $batch"
-				fi
-			done
-			if ! pacman -Q base-devel >/dev/null 2>&1 && ! safe_install base-devel; then
-				echo "Warning: base-devel group meta-package could not be installed."
-			fi
+			install_base_devel_batched
 		else
 			echo "Installing $pkg..."
 			if ! safe_install "$pkg"; then
@@ -2910,38 +2990,42 @@ export_pamac_to_host() {
     fi
 
     log_info "Creating pamac-manager launch wrapper inside container..."
-    container_root_exec bash -c 'cat > /usr/local/bin/pamac-manager-wrapper' << CONTAINER_WRAPPER_EOF
+    local _desktop_path="/home/${CURRENT_USER}/.local/share/applications/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
+    local _wrapper_content
+    read -r -d '' _wrapper_content <<'CONTAINER_WRAPPER_EOF'
 #!/bin/bash
 set +e
 
 /usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true
 
-export DISPLAY=\${DISPLAY:-:0}
-DESKTOP_FILE="/home/${CURRENT_USER}/.local/share/applications/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
+export DISPLAY=${DISPLAY:-:0}
+DESKTOP_FILE="__DESKTOP_PATH__"
 
-pamac-manager "\$@" &
-PAMAC_PID=\$!
+pamac-manager "$@" &
+PAMAC_PID=$!
 
 WAIT_MAX=30
 WAITED=0
 FOUND=0
 
-while [[ \$WAITED -lt \$WAIT_MAX && \$FOUND -eq 0 ]]; do
+while [[ $WAITED -lt $WAIT_MAX && $FOUND -eq 0 ]]; do
   sleep 2
-  WAITED=\$((WAITED + 2))
-  for wid in \$(xdotool search --class "pamac-manager" 2>/dev/null); do
-    width=\$(xwininfo -id "\$wid" 2>/dev/null | awk '/Width:/{print \$NF}')
-    if [[ -n "\$width" ]] && [[ "\$width" -gt 1 ]]; then
-      xprop -id "\$wid" -f _KDE_NET_WM_DESKTOP_FILE 8u \
-        -set _KDE_NET_WM_DESKTOP_FILE "\$DESKTOP_FILE" 2>/dev/null
+  WAITED=$((WAITED + 2))
+  for wid in $(xdotool search --class "pamac-manager" 2>/dev/null); do
+    width=$(xwininfo -id "$wid" 2>/dev/null | awk '/Width:/{print $NF}')
+    if [[ -n "$width" ]] && [[ "$width" -gt 1 ]]; then
+      xprop -id "$wid" -f _KDE_NET_WM_DESKTOP_FILE 8u \
+        -set _KDE_NET_WM_DESKTOP_FILE "$DESKTOP_FILE" 2>/dev/null
       FOUND=1
       break
     fi
   done
 done
 
-wait "\$PAMAC_PID" 2>/dev/null
+wait "$PAMAC_PID" 2>/dev/null
 CONTAINER_WRAPPER_EOF
+    _wrapper_content="${_wrapper_content/__DESKTOP_PATH__/$_desktop_path}"
+    printf '%s\n' "$_wrapper_content" | container_root_exec bash -c 'cat > /usr/local/bin/pamac-manager-wrapper'
     container_root_exec chmod +x /usr/local/bin/pamac-manager-wrapper
     log_info "pamac-manager-wrapper created inside container."
 
@@ -4112,6 +4196,19 @@ main() {
 
     if [[ "$UNINSTALL" == "true" ]]; then
         uninstall_setup
+        exit 0
+    fi
+
+    if [[ "$EXPORT_ONLY" == "true" ]]; then
+        if ! distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
+            log_error "Container '$CONTAINER_NAME' not found. Run full setup first."
+            exit 1
+        fi
+        ensure_podman
+        export_pamac_to_host
+        setup_post_install_hooks
+        export_existing_apps
+        log_success "Export-only complete. Apps re-exported to host menu."
         exit 0
     fi
 

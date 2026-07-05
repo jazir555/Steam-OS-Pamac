@@ -442,6 +442,7 @@ validate_container_name() {
 check_memory_ok() {
     local min_avail_kb="${1:-524288}"
     local desc="${2:-operation}"
+    local critical_kb="${3:-262144}"
 
     if [[ ! -f /proc/meminfo ]]; then
         log_debug "Cannot check /proc/meminfo, skipping memory check."
@@ -456,15 +457,19 @@ check_memory_ok() {
         return 0
     fi
 
+    if [[ "$mem_avail_kb" -lt "$critical_kb" ]]; then
+        local mem_avail_mb=$(( mem_avail_kb / 1024 ))
+        local critical_mb=$(( critical_kb / 1024 ))
+        log_error "Critically low memory: ${mem_avail_mb}MB available (minimum ${critical_mb}MB required for $desc)."
+        log_error "Aborting to prevent OOM kills and data loss."
+        return 1
+    fi
+
     if [[ "$mem_avail_kb" -lt "$min_avail_kb" ]]; then
         local mem_avail_mb=$(( mem_avail_kb / 1024 ))
         local min_avail_mb=$(( min_avail_kb / 1024 ))
         log_warn "Low available memory: ${mem_avail_mb}MB (need at least ${min_avail_mb}MB for $desc)."
         log_warn "The operation may be killed by OOM. Consider closing other applications."
-        if [[ "$mem_avail_kb" -lt $(( min_avail_kb / 2 )) ]]; then
-            log_error "Insufficient memory for $desc. Skipping this operation."
-            return 1
-        fi
     else
         log_debug "Memory check OK: $(( mem_avail_kb / 1024 ))MB available for $desc."
     fi
@@ -1182,6 +1187,11 @@ create_container() {
         --yes
     )
 
+    log_info "Pulling latest archlinux:latest image..."
+    if ! run_command container_runtime pull archlinux:latest; then
+        log_warn "Image pull failed, proceeding with cached image."
+    fi
+
     if [[ "$CONTAINER_HAS_INIT" == "true" ]]; then
         create_args+=(--init)
         log_info "Creating container with init (systemd) support."
@@ -1330,7 +1340,7 @@ install_base_devel_batched() {
 }
 '
 
-    _script_file=$(mktemp /tmp/pamac-script-XXXXXXXX)
+    _script_file=$(mktemp --tmpdir pamac-script-XXXXXXXX)
     _TEMP_FILES+=("$_script_file")
     printf '%s\n' "${_preamble}${_script}" > "$_script_file"
 
@@ -1453,7 +1463,7 @@ install_base_devel_batched() {
 }
 '
 
-    _script_file=$(mktemp /tmp/pamac-pipe-XXXXXXXX)
+    _script_file=$(mktemp --tmpdir pamac-pipe-XXXXXXXX)
     _TEMP_FILES+=("$_script_file")
     printf '%s' "$_preamble" > "$_script_file"
     cat >> "$_script_file"
@@ -1539,12 +1549,12 @@ set -uo pipefail
 rm -f /var/lib/pacman/db.lck
 
 echo "Step 0/5: Checking for leftover insecure SigLevel from previous crash..."
-if grep -q '^SigLevel\s*=\s*Never' /etc/pacman.conf 2>/dev/null; then
+if grep -q '^SigLevel\s*=\s*TrustAll' /etc/pacman.conf 2>/dev/null; then
     if [[ -f /etc/pacman.conf.siglevel-backup ]]; then
-        echo "WARNING: Found SigLevel=Never from a previous interrupted run. Restoring from backup."
+        echo "WARNING: Found SigLevel=TrustAll from a previous interrupted run. Restoring from backup."
         cp -f /etc/pacman.conf.siglevel-backup /etc/pacman.conf
     else
-        echo "WARNING: Found SigLevel=Never with no backup. Forcing restore to safe default."
+        echo "WARNING: Found SigLevel=TrustAll with no backup. Forcing restore to safe default."
         sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf
         grep -q '^SigLevel' /etc/pacman.conf || echo 'SigLevel = Required DatabaseOptional' >> /etc/pacman.conf
     fi
@@ -1553,7 +1563,7 @@ fi
 # Crash-safe SigLevel restoration: if this script is killed, restore the backup
 _rollback_siglevel() {
     local exit_code=$?
-    if [[ -f /etc/pacman.conf.siglevel-backup ]] && grep -q '^SigLevel\s*=\s*Never' /etc/pacman.conf 2>/dev/null; then
+    if [[ -f /etc/pacman.conf.siglevel-backup ]] && grep -q '^SigLevel\s*=\s*TrustAll' /etc/pacman.conf 2>/dev/null; then
         echo "Trap: Restoring SigLevel from backup (exit code $exit_code)..."
         cp -f /etc/pacman.conf.siglevel-backup /etc/pacman.conf
     fi
@@ -1587,10 +1597,13 @@ chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
 
 echo "Step 2/5: Temporarily relaxing signature verification for self-healing..."
 # Create a backup BEFORE weakening security, so a crash can be recovered
-cp -f /etc/pacman.conf /etc/pacman.conf.siglevel-backup
-sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+# Atomic backup: write to temp file first, then rename to avoid partial writes
+_tmp_siglevel_bak=$(mktemp /etc/pacman.conf.siglevel-backup.XXXXXX)
+cp -f /etc/pacman.conf "$_tmp_siglevel_bak"
+mv -f "$_tmp_siglevel_bak" /etc/pacman.conf.siglevel-backup
+sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = TrustAll/' /etc/pacman.conf
 if ! grep -q '^SigLevel' /etc/pacman.conf; then
-    echo 'SigLevel = Never' >> /etc/pacman.conf
+    echo 'SigLevel = TrustAll' >> /etc/pacman.conf
 fi
 echo "Backup saved to /etc/pacman.conf.siglevel-backup for crash recovery."
 
@@ -4561,12 +4574,9 @@ main() {
     echo
 
     log_info "Checking available system resources..."
-    check_memory_ok 262144 "container creation" || {
-        log_warn "Low memory detected. Some operations may be skipped to avoid OOM kills."
-        if [[ "$ENABLE_GAMING_PACKAGES" == "true" ]]; then
-            log_warn "Disabling gaming packages to conserve memory."
-            ENABLE_GAMING_PACKAGES="false"
-        fi
+    check_memory_ok 262144 "container creation" 262144 || {
+        log_error "Insufficient memory for container creation (need at least 256MB). Aborting."
+        exit 1
     }
 
   if [[ "$FORCE_REBUILD" == "true" ]] && distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
@@ -4636,7 +4646,10 @@ main() {
     esac
   fi
 
-    check_memory_ok 262144 "base setup" || log_warn "Low memory may cause OOM kills during base setup."
+    check_memory_ok 262144 "base setup" 262144 || {
+        log_error "Insufficient memory for base setup (need at least 256MB). Aborting."
+        exit 1
+    }
 
 	if ! configure_container_base; then
 		log_error "Container base setup failed permanently. Aborting installation."
@@ -4657,7 +4670,10 @@ configure_multilib
 
     _ensure_healthy_or_recreate "after base setup" || exit 1
 
-	check_memory_ok 524288 "AUR helper build" || log_warn "Low memory may cause OOM kills during yay compilation."
+	check_memory_ok 524288 "AUR helper build" 262144 || {
+		log_error "Insufficient memory for AUR helper build (need at least 256MB). Aborting."
+		exit 1
+	}
 	check_battery_power || log_warn "Battery low, but continuing AUR helper build..."
 
 	if ! install_aur_helper; then

@@ -23,6 +23,8 @@ ENABLE_EXTRA_REPOS="${ENABLE_EXTRA_REPOS:-true}"
 FORCE_REBUILD="${FORCE_REBUILD:-false}"
 OPTIMIZE_MIRRORS="${OPTIMIZE_MIRRORS:-true}"
 
+: "${DISTROBOX_CONTAINER_MANAGER:=podman}"
+
 DRY_RUN="${DRY_RUN:-false}"
 CHECK_ONLY="${CHECK_ONLY:-false}"
 UNINSTALL="${UNINSTALL:-false}"
@@ -68,7 +70,7 @@ _log() {
     timestamp=$(date +'%Y-%m-%d %H:%M:%S')
 
     local plain_message
-    plain_message=$(echo "$message" | sed 's/\x1B\[[0-9;]*[A-Za-z]//g')
+    plain_message=$(printf '%s' "$message" | sed 's/\x1B\[[0-9;]*[A-Za-z]//g' || printf '%s' "$message")
 
     echo "[$timestamp] $level: $plain_message" >> "$LOG_FILE"
 
@@ -217,7 +219,15 @@ ensure_container_healthy() {
 				;;
 			"improper")
 				log_warn "Container in improper state. Attempting forced recovery..."
-				force_remove_container "$CONTAINER_NAME"
+				if ! force_remove_container "$CONTAINER_NAME"; then
+					log_warn "force_remove_container may not have fully removed '$CONTAINER_NAME'. Checking..."
+				fi
+				sleep 1
+				if container_runtime inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+					log_error "Container '$CONTAINER_NAME' still exists after force_remove. Manual intervention required."
+					log_info "Try: podman rm -f $CONTAINER_NAME && distrobox rm -f $CONTAINER_NAME"
+					return 1
+				fi
 				log_info "Container removed due to improper state. Signaling recreate."
 				return 2
 				;;
@@ -249,19 +259,24 @@ _ensure_healthy_or_recreate() {
         _RECREATE_COUNT=0
         return 0
     elif [[ "$healthy_rc" -eq 2 ]]; then
-        _RECREATE_COUNT=$((_RECREATE_COUNT + 1))
-        if [[ $_RECREATE_COUNT -gt $_MAX_RECREATES ]]; then
+        if [[ ${_RECREATE_COUNT:-0} -ge ${_MAX_RECREATES:-2} ]]; then
             log_error "Container recreated $_MAX_RECREATES times without success. Aborting."
             return 1
         fi
+        _RECREATE_COUNT=$((_RECREATE_COUNT + 1))
         log_info "Container signaled for recreation ($desc), attempt $_RECREATE_COUNT/$_MAX_RECREATES. Recreating..."
         force_remove_container "$CONTAINER_NAME"
         sleep 2
+        local saved_guard="${_CREATE_RECREATION_GUARD:-}"
+        unset _CREATE_RECREATION_GUARD
         if ! create_container; then
+            _CREATE_RECREATION_GUARD="$saved_guard"
             log_error "Failed to recreate container after '$desc' recovery."
             return 1
         fi
+        _CREATE_RECREATION_GUARD="$saved_guard"
         log_success "Container recreated successfully after '$desc' issue."
+        _RECREATE_COUNT=0
         return 0
     else
         return 1
@@ -313,7 +328,11 @@ force_remove_container() {
  if $runtime_cmd inspect "$name" >/dev/null 2>&1; then
  log_debug "User $runtime_cmd rm failed, trying sudo..."
  if sudo -n true 2>/dev/null; then
+ if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
+ sudo docker rm -f "$name" 2>/dev/null || true
+ else
  sudo podman rm -f "$name" 2>/dev/null || true
+ fi
  else
  log_warn "User $runtime_cmd rm failed and passwordless sudo not available. Skipping sudo fallback to avoid hang."
  fi
@@ -352,7 +371,11 @@ force_remove_container() {
 		fi
 		$runtime_cmd rm -f "$name" 2>/dev/null || true
 		if sudo -n true 2>/dev/null; then
-			sudo podman rm -f "$name" 2>/dev/null || true
+			if [[ "${DISTROBOX_CONTAINER_MANAGER:-podman}" == "docker" ]]; then
+				sudo docker rm -f "$name" 2>/dev/null || true
+			else
+				sudo podman rm -f "$name" 2>/dev/null || true
+			fi
 		fi
   fi
 }
@@ -368,6 +391,8 @@ validate_container_name() {
         log_error "Container name too long (max 63 characters): $CONTAINER_NAME"
         return 1
     fi
+
+    return 0
 }
 
 check_memory_ok() {
@@ -496,6 +521,11 @@ repair_podman() {
 
     log_warn "Podman database may be corrupted. A full system reset is required but is DESTRUCTIVE."
     log_warn "WARNING: 'podman system reset --force' will remove ALL containers, images, and volumes — not just the Pamac container. Any other distroboxes or podman workloads will be lost."
+    local existing_containers
+    existing_containers=$(podman ps -aq 2>/dev/null | wc -l 2>/dev/null || echo "0")
+    if [[ "$existing_containers" != "0" ]]; then
+        log_warn "Note: $existing_containers container(s) currently exist and will ALL be destroyed by reset."
+    fi
     local skip_reset=false
     if [[ -t 0 ]]; then
         echo -ne "${RED}${BOLD}Type 'yes' to proceed with podman system reset, or anything else to skip: ${NC}" >&2
@@ -732,6 +762,10 @@ uninstall_setup() {
     log_success "Uninstallation completed."
 }
 
+_restore_errexit() {
+  [[ "${_SAVED_ERREXIT:-}" == "on" ]] && set -e || true
+}
+
 wait_for_container() {
   if [[ "$DRY_RUN" == "true" ]]; then
     log_warn "[DRY RUN] Would wait for container '$CONTAINER_NAME'"
@@ -739,11 +773,12 @@ wait_for_container() {
   fi
   local max_attempts=30
   local attempt=0
-  local _saved_e
-  _saved_e=$(set -o | grep 'errexit' | awk '{print $NF}')
+  _SAVED_ERREXIT=$(set -o | grep 'errexit' | awk '{print $NF}')
   log_info "Waiting for container '$CONTAINER_NAME' to become ready..."
 
   set +e
+  trap '_restore_errexit' RETURN
+
   while true; do
     attempt=$((attempt + 1))
 
@@ -754,7 +789,6 @@ wait_for_container() {
     case "$status" in
       "running")
         if container_root_exec bash -c "echo ready" 2>/dev/null | grep -q "ready"; then
-          [[ "$_saved_e" == "on" ]] && set -e
           log_success "Container is ready." || true
           return 0
         fi
@@ -765,7 +799,6 @@ wait_for_container() {
         else
           log_warn "Container stuck in '$status' state - removing and recreating" || true
           force_remove_container "$CONTAINER_NAME" || true
-          [[ "$_saved_e" == "on" ]] && set -e
           return 2
         fi
         ;;
@@ -775,14 +808,12 @@ wait_for_container() {
       container_start || true
       sleep 3
       if container_is_usable; then
-        [[ "$_saved_e" == "on" ]] && set -e
         log_success "Container restarted and ready (non-init mode)." || true
         return 0
       fi
       if [[ $attempt -gt 5 ]]; then
         log_warn "Non-init container not responding after restart. Removing and recreating." || true
         force_remove_container "$CONTAINER_NAME" || true
-        [[ "$_saved_e" == "on" ]] && set -e
         return 2
       fi
     elif [[ $attempt -le 2 ]]; then
@@ -801,13 +832,11 @@ wait_for_container() {
     else
       log_warn "Container stuck in 'exited' state - removing and recreating" || true
       force_remove_container "$CONTAINER_NAME" || true
-      [[ "$_saved_e" == "on" ]] && set -e
       return 2
     fi
     ;;
       "not_found")
         log_error "Container '$CONTAINER_NAME' not found." || true
-        [[ "$_saved_e" == "on" ]] && set -e
         return 1
         ;;
       "created")
@@ -819,7 +848,6 @@ wait_for_container() {
     if [[ $attempt -gt $max_attempts ]]; then
       log_error "Container failed to become ready after $((max_attempts * 2)) seconds." || true
       log_info "Try removing with: podman rm -f $CONTAINER_NAME" || true
-      [[ "$_saved_e" == "on" ]] && set -e
       return 1
     fi
 
@@ -921,11 +949,20 @@ create_container() {
     log_info "Starting container..."
     container_start 2>/dev/null || true
 
+  if [[ -z "${_CREATE_RECREATION_GUARD:-}" ]]; then
+    _CREATE_RECREATION_GUARD=1
+  else
+    log_error "Container creation already attempted recreation internally - refusing nested retry."
+    return 1
+  fi
+
   local wait_result=0
   wait_for_container || wait_result=$?
 
   if [[ "$wait_result" -eq 2 ]]; then
     log_info "Container was stuck, recreating..."
+    force_remove_container "$CONTAINER_NAME"
+    sleep 2
     if run_command distrobox create "${create_args[@]}"; then
       container_start
       wait_for_container || return 1
@@ -977,15 +1014,19 @@ exec_container_script() {
     local _script="$1"
     local _desc="$2"
     shift 2
+    if [[ -z "$_script" ]]; then
+        log_error "Internal error: container script '$_desc' is empty (heredoc delimiter may be missing/misfound). Aborting stage."
+        return 1
+    fi
     local _rc=0
     local _script_file
-    local _preamble='_safe_sleep() { if ! sleep "$1" 2>/dev/null; then read -t "$1" -r _ 2>/dev/null || true; fi; }
+    local _preamble='_safe_sleep() { if ! sleep "$1" 2>/dev/null; then read -t "$1" -r _ </dev/null 2>/dev/null || true; fi; }
 '
 
     _script_file=$(mktemp /tmp/pamac-script-XXXXXXXX)
     printf '%s\n' "${_preamble}${_script}" > "$_script_file"
 
-    local _marker="PAMAC_SCRIPT_OK_$(head -c 16 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$_$(date +%s%N)")"
+    local _marker="PAMAC_SCRIPT_OK_$(head -c 16 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$_$(date +%s)")"
   printf '\necho "%s"\n' "$_marker" >> "$_script_file"
 
   set +e
@@ -1021,7 +1062,7 @@ exec_container_script() {
  if [[ $_rc -ne 0 ]] && ! { [[ "$CONTAINER_HAS_INIT" == "false" ]] && echo "$_output" | grep -q "$_marker"; }; then
         log_warn "Script '$_desc' failed (exit=$_rc)."
         container_root_exec bash -c "rm -f /var/lib/pacman/db.lck; pkill -9 gpg-agent 2>/dev/null || true" 2>/dev/null || true
-        ensure_container_healthy "$_desc" || return 1
+        container_start 2>/dev/null || true
         repair_pacman_db
         return $_rc
     fi
@@ -1033,8 +1074,8 @@ exec_container_pipe() {
     shift
     local _rc=0
     local _script_file
-    local _marker="PAMAC_PIPE_OK_$(head -c 16 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$_$(date +%s%N)")"
-    local _preamble='_safe_sleep() { if ! sleep "$1" 2>/dev/null; then read -t "$1" -r _ 2>/dev/null || true; fi; }
+    local _marker="PAMAC_PIPE_OK_$(head -c 16 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$_$(date +%s)")"
+    local _preamble='_safe_sleep() { if ! sleep "$1" 2>/dev/null; then read -t "$1" -r _ </dev/null 2>/dev/null || true; fi; }
 '
 
     _script_file=$(mktemp /tmp/pamac-pipe-XXXXXXXX)
@@ -1075,7 +1116,7 @@ exec_container_pipe() {
  if [[ $_rc -ne 0 ]] && ! { [[ "$CONTAINER_HAS_INIT" == "false" ]] && echo "$_output" | grep -q "$_marker"; }; then
         log_warn "Piped script '$_desc' failed (exit=$_rc)."
         container_root_exec bash -c "rm -f /var/lib/pacman/db.lck; pkill -9 gpg-agent 2>/dev/null || true" 2>/dev/null || true
-        ensure_container_healthy "$_desc" || return 1
+        container_start 2>/dev/null || true
         repair_pacman_db
         return $_rc
     fi
@@ -2048,7 +2089,10 @@ configure_multilib() {
 
   if ! grep -q '^\[multilib\]' /etc/pacman.conf; then
     echo "Enabling multilib repository..."
-    printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' >> /etc/pacman.conf
+    if [[ -s /etc/pacman.conf ]] && [[ "$(tail -c1 /etc/pacman.conf 2>/dev/null)" != "" ]]; then
+        printf '\n' >> /etc/pacman.conf
+    fi
+    printf '[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' >> /etc/pacman.conf
     echo "Multilib repository enabled."
 else
     echo "Multilib repository is already enabled."
@@ -2092,11 +2136,12 @@ if ! _repo_already_enabled "chaotic-aur"; then
         echo "Chaotic keyring not in default repos. Installing from mirror..."
         if command -v curl >/dev/null 2>&1; then
             keyring_tmp="$(mktemp -d)"
-            if curl -sL "https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst" -o "$keyring_tmp/chaotic-keyring.pkg.tar.zst" 2>/dev/null && \
-               [[ -s "$keyring_tmp/chaotic-keyring.pkg.tar.zst" ]]; then
+            _curl_rc=0
+            curl -sL "https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst" -o "$keyring_tmp/chaotic-keyring.pkg.tar.zst" 2>/dev/null || _curl_rc=$?
+            if [[ $_curl_rc -eq 0 ]] && [[ -s "$keyring_tmp/chaotic-keyring.pkg.tar.zst" ]]; then
                 pacman -U --noconfirm "$keyring_tmp/chaotic-keyring.pkg.tar.zst" 2>/dev/null || echo "Warning: Chaotic keyring install from mirror failed."
             else
-                echo "Warning: Could not download chaotic-keyring."
+                echo "Warning: Could not download chaotic-keyring (curl exit code: $_curl_rc). Continuing with keyring utilities."
             fi
             rm -rf "$keyring_tmp"
         else
@@ -2399,6 +2444,12 @@ rm -f /var/lib/pacman/db.lck
 
 echo "Installing pamac-aur from AUR..."
 pamac_installed=false
+
+if ! sudo -n true 2>/dev/null; then
+    echo "Warning: passwordless sudo not available. yay build may hang waiting for password."
+    echo "If build hangs, ensure NOPASSWD sudo is configured for the current user in the container."
+fi
+
 for attempt in 1 2 3; do
     if sudo -Hu "$current_user" bash -lc "yay -S --noconfirm --needed --noprogressbar pamac-aur"; then
         pamac_installed=true
@@ -2723,8 +2774,34 @@ export_pamac_to_host() {
     command -v gtk-update-icon-cache >/dev/null 2>&1 && \
         gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" -f 2>/dev/null || true
 
-    log_info "Installing X11 tools for window integration (xdotool, xprop)..."
+    log_info "Installing X11 tools for window integration (xdotool, xprop, xwininfo)..."
     container_root_exec bash -c 'pacman -S --noconfirm --needed xdotool xorg-xprop xorg-xwininfo 2>/dev/null || echo "Warning: x11 tools install failed (non-fatal)"'
+
+    log_info "Installing xdotool/xprop/xwininfo on host (required for wrapper taskbar integration)..."
+    local host_x11_ok=true
+    for host_tool in xdotool xprop xwininfo; do
+        if ! command -v "$host_tool" >/dev/null 2>&1; then
+            if command -v pkcon >/dev/null 2>&1; then
+                log_info "Installing $host_tool on host via pkcon..."
+                pkcon install -y "$host_tool" 2>/dev/null || {
+                    log_warn "Failed to install $host_tool on host via pkcon. Window integration may not work."
+                    host_x11_ok=false
+                }
+            elif [[ -f /usr/bin/steamos-readonly ]] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+                log_info "SteamOS detected — attempting $host_tool via pacman with sudo..."
+                sudo pacman -S --noconfirm "$host_tool" 2>/dev/null || {
+                    log_warn "Failed to install $host_tool on host. Window integration may not work."
+                    host_x11_ok=false
+                }
+            else
+                log_warn "$host_tool not found on host and cannot auto-install. Window integration (taskbar icon) may not work."
+                host_x11_ok=false
+            fi
+        fi
+    done
+    if [[ "$host_x11_ok" == "true" ]]; then
+        log_success "xdotool, xprop, xwininfo are available on host."
+    fi
 
     log_info "Creating pamac-manager launch wrapper inside container..."
     container_root_exec bash -c 'cat > /usr/local/bin/pamac-manager-wrapper' << CONTAINER_WRAPPER_EOF

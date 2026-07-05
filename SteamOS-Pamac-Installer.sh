@@ -2279,33 +2279,6 @@ else
     echo "endeavouros already enabled."
 fi
 
-echo "=== Configuring blackarch repository ==="
-if ! _repo_already_enabled "blackarch"; then
-    echo "Adding repository [blackarch]..."
-    printf '\n[blackarch]\nSigLevel = TrustedOnly\nServer = https://blackarch.org/blackarch/$repo/os/$arch\n' >> /etc/pacman.conf
-    pacman -Sy --noconfirm 2>/dev/null || true
-    echo "Installing blackarch-keyring..."
-    if pacman -S --noconfirm --needed blackarch-keyring 2>/dev/null; then
-        echo "blackarch keyring installed."
-        if command -v pacman-key >/dev/null 2>&1; then
-            pacman-key --lsign-key 4345771566D76038C2C3A6AB9E8275C9E4D56107 2>/dev/null || true
-        fi
-    else
-        echo "Warning: blackarch-keyring install failed. Trying alternate method..."
-        if command -v curl >/dev/null 2>&1; then
-            strap_tmp="$(mktemp -d)"
-            if curl -sL "https://blackarch.org/strap.sh" -o "$strap_tmp/strap.sh" 2>/dev/null && \
-               [[ -s "$strap_tmp/strap.sh" ]]; then
-                chmod +x "$strap_tmp/strap.sh"
-                "$strap_tmp/strap.sh" 2>/dev/null || echo "Warning: blackarch strap.sh failed."
-            fi
-            rm -rf "$strap_tmp"
-        fi
-    fi
-else
-    echo "blackarch already enabled."
-fi
-
 echo "=== Configuring mesa-git repository (disabled by default - can break GPU drivers) ==="
 if ! _repo_already_enabled "mesa-git"; then
     echo "Skipping mesa-git repo (can break GPU drivers on Steam Deck)."
@@ -2321,7 +2294,7 @@ echo "=== Syncing package databases with new repositories ==="
 pacman -Sy --noconfirm 2>/dev/null || echo "Warning: database sync with new repos had issues."
 
 echo "Third-party repository configuration complete."
-echo "Available additional repos: chaotic-aur, archlinuxcn, endeavouros, blackarch"
+echo "Available additional repos: chaotic-aur, archlinuxcn, endeavouros"
 REPOS_EOF
 
     if ! exec_container_script "$repos_script" "extra-repos"; then
@@ -4097,7 +4070,7 @@ show_completion_message() {
     [[ "$OPTIMIZE_MIRRORS" == "true" ]] && echo "  Pacman mirrors optimized for performance"
 [[ "$ENABLE_MULTILIB" == "true" ]] && echo " 32-bit package support enabled"
     [[ "$ENABLE_GAMING_PACKAGES" == "true" ]] && echo " Gaming packages installed"
-    [[ "$ENABLE_EXTRA_REPOS" == "true" ]] && echo " Third-party repos enabled: chaotic-aur, archlinuxcn, endeavouros, blackarch"
+    [[ "$ENABLE_EXTRA_REPOS" == "true" ]] && echo " Third-party repos enabled: chaotic-aur, archlinuxcn, endeavouros"
     [[ "$ENABLE_BUILD_CACHE" == "true" ]] && echo " Persistent build cache enabled"
     echo
     echo -e "${BOLD}${GREEN}--- How to Use ---${NC}"

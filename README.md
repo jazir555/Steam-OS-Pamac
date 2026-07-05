@@ -73,10 +73,13 @@
 
 ```bash
 # Installation - Run once:
-./setup-pamac.sh
+./SteamOS-Pamac-Installer.sh
+
+1. Run installation script
+2. Select from options in terminal via 1,2,3
 
 # Daily usage - Just like any native app:
-# 1. Open Steam menu
+# 1. Open Start menu
 # 2. Navigate to "System" or "All Applications" 
 # 3. Click "Pamac Manager"
 # 4. Install/remove software normally

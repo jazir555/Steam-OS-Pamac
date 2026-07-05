@@ -906,6 +906,9 @@ ENVIRONMENT VARIABLES:
   ALLOW_SUDO_FALLBACK      Set to 'true' to allow sudo podman fallback (INSECURE:
                            runs container as host root instead of subuid/subgid,
                            reducing isolation if a malicious AUR package is installed)
+  CHAOTIC_AUR_KEY_ID       Override the Chaotic-AUR signing key fingerprint
+  ARCHLINUXCN_KEY_ID       Override the archlinuxcn signing key fingerprint
+  ENDEAVOUROS_KEY_ID       Override the EndeavourOS signing key fingerprint
 
 EXAMPLES:
   $0                                       # Basic setup
@@ -1362,8 +1365,17 @@ safe_install() {
     done
     return $rc
 }
+_assert_installed() {
+    local _pkg="$1" _desc="${2:-$_pkg}"
+    if ! pacman -Q "$_pkg" >/dev/null 2>&1; then
+        echo "FATAL: $_desc ($_pkg) is not installed. Aborting."
+        return 1
+    fi
+    echo "Verified: $_desc ($_pkg) installed."
+}
 install_base_devel_batched() {
     echo "Installing base-devel in smaller batches to avoid OOM..."
+    local _failed_critical=false
     local BASE_DEVEL_BATCHES=(
         "m4 autoconf automake binutils"
         "bison debugedit diffutils fakeroot"
@@ -1378,11 +1390,26 @@ install_base_devel_batched() {
         sync 2>/dev/null || true
         _safe_sleep 1
         if ! safe_install $batch; then
-            echo "Warning: batch install failed for: $batch"
+            echo "ERROR: batch install failed for: $batch"
+            for pkg in $batch; do
+                if ! pacman -Q "$pkg" >/dev/null 2>&1; then
+                    echo "  Missing from failed batch: $pkg"
+                    case "$pkg" in
+                        gcc|binutils|make|fakeroot|pkgconf)
+                            echo "FATAL: Critical build tool '$pkg' missing. Cannot continue."
+                            _failed_critical=true
+                            ;;
+                    esac
+                fi
+            done
         fi
     done
+    if [[ "$_failed_critical" == "true" ]]; then
+        echo "FATAL: Critical base-devel components failed to install. Aborting."
+        return 1
+    fi
     if ! pacman -Q base-devel >/dev/null 2>&1 && ! safe_install base-devel; then
-        echo "Warning: base-devel group meta-package could not be installed."
+        echo "Warning: base-devel group meta-package could not be installed (individual packages verified above)."
     fi
 }
 '
@@ -1517,8 +1544,17 @@ safe_install() {
     done
     return $rc
 }
+_assert_installed() {
+    local _pkg="$1" _desc="${2:-$_pkg}"
+    if ! pacman -Q "$_pkg" >/dev/null 2>&1; then
+        echo "FATAL: $_desc ($_pkg) is not installed. Aborting."
+        return 1
+    fi
+    echo "Verified: $_desc ($_pkg) installed."
+}
 install_base_devel_batched() {
     echo "Installing base-devel in smaller batches to avoid OOM..."
+    local _failed_critical=false
     local BASE_DEVEL_BATCHES=(
         "m4 autoconf automake binutils"
         "bison debugedit diffutils fakeroot"
@@ -1533,11 +1569,26 @@ install_base_devel_batched() {
         sync 2>/dev/null || true
         _safe_sleep 1
         if ! safe_install $batch; then
-            echo "Warning: batch install failed for: $batch"
+            echo "ERROR: batch install failed for: $batch"
+            for pkg in $batch; do
+                if ! pacman -Q "$pkg" >/dev/null 2>&1; then
+                    echo "  Missing from failed batch: $pkg"
+                    case "$pkg" in
+                        gcc|binutils|make|fakeroot|pkgconf)
+                            echo "FATAL: Critical build tool '$pkg' missing. Cannot continue."
+                            _failed_critical=true
+                            ;;
+                    esac
+                fi
+            done
         fi
     done
+    if [[ "$_failed_critical" == "true" ]]; then
+        echo "FATAL: Critical base-devel components failed to install. Aborting."
+        return 1
+    fi
     if ! pacman -Q base-devel >/dev/null 2>&1 && ! safe_install base-devel; then
-        echo "Warning: base-devel group meta-package could not be installed."
+        echo "Warning: base-devel group meta-package could not be installed (individual packages verified above)."
     fi
 }
 '
@@ -2070,9 +2121,15 @@ if ! safe_install git; then
     echo "Failed to install git."
     exit 1
 fi
+_assert_installed git
 
 check_mem 524288 "base-devel install"
-install_base_devel_batched
+if ! install_base_devel_batched; then
+    echo "FATAL: base-devel batch install failed (critical tools missing)."
+    exit 1
+fi
+_assert_installed gcc "C compiler"
+_assert_installed make "build tool"
 
 echo "Installing go..."
 check_mem 262144 "go install"
@@ -2082,6 +2139,7 @@ if ! safe_install go; then
     echo "Failed to install go."
     exit 1
 fi
+_assert_installed go "Go compiler"
 
 echo "Development packages installed."
 DEV_EOF
@@ -2098,6 +2156,13 @@ DEV_EOF
             }
         fi
     fi
+
+    for _dep in git gcc go; do
+        if ! container_root_exec bash -c "command -v $_dep >/dev/null 2>&1 || pacman -Q $_dep >/dev/null 2>&1" 2>/dev/null; then
+            log_warn "Development dependency '$_dep' not found after install stage. Attempting recovery..."
+            container_root_exec bash -c "rm -f /var/lib/pacman/db.lck; pacman -S --noconfirm --needed $_dep" 2>/dev/null || true
+        fi
+    done
 
     log_info "Stage 5/7: Creating user and configuring sudo..."
     local user_script
@@ -2893,7 +2958,7 @@ _import_key_with_retry() {
 _enable_repo_with_fallback() {
     local repo_name="$1"
     local keyring_pkg="$2"
-    local key_id="$3"
+    local default_key_id="$3"
     shift 3
     local mirror_urls=("$@")
 
@@ -2902,30 +2967,73 @@ _enable_repo_with_fallback() {
         return 0
     fi
 
-    echo "Adding repository [$repo_name]..."
+    # Allow environment variable override for key ID (e.g. CHAOTIC_AUR_KEY_ID=NEWID)
+    local env_var_name
+    env_var_name=$(echo "${repo_name}" | tr '[:lower:]-' '[:upper:]_')_KEY_ID
+    local key_id="${!env_var_name:-$default_key_id}"
+
+    echo "Adding repository [$repo_name] (key_id=$key_id)..."
+
     local server_lines=""
     for url in "${mirror_urls[@]}"; do
         server_lines="${server_lines}Server = $url\n"
     done
-    printf '\n[%s]\nSigLevel = TrustedOnly\n%b' "$repo_name" "$server_lines" >> /etc/pacman.conf
+
+    local key_ok=false
 
     pacman -Sy --noconfirm 2>/dev/null || true
 
-    local keyring_installed=false
+    # Step 1: Install keyring package from already-configured repos (best path)
     if pacman -S --noconfirm --needed "$keyring_pkg" 2>/dev/null; then
-        echo "$repo_name keyring installed successfully."
-        keyring_installed=true
-    else
-        echo "Warning: $keyring_pkg install from repos failed. Attempting key import..."
+        echo "$repo_name keyring installed successfully from repos."
+        key_ok=true
     fi
 
-    if [[ "$keyring_installed" != "true" ]]; then
-        if command -v pacman-key >/dev/null 2>&1; then
-            _import_key_with_retry "$key_id" || true
+    # Step 2: Download and install keyring package directly from mirrors
+    if [[ "$key_ok" != "true" ]]; then
+        echo "Attempting direct keyring package download from mirrors..."
+        local host_arch
+        host_arch=$(uname -m 2>/dev/null || echo "x86_64")
+        for url in "${mirror_urls[@]}"; do
+            local direct_url="${url}"
+            direct_url="${direct_url//\\\$arch/$host_arch}"
+            direct_url="${direct_url//\$arch/$host_arch}"
+            direct_url="${direct_url//\\\$repo/$repo_name}"
+            direct_url="${direct_url//\$repo/$repo_name}"
+            local pkg_url="${direct_url%/}/${keyring_pkg}.pkg.tar.zst"
+            if timeout 30 curl -fsSL --connect-timeout 10 -o "/tmp/${keyring_pkg}.pkg.tar.zst" "$pkg_url" 2>/dev/null; then
+                if pacman -U --noconfirm "/tmp/${keyring_pkg}.pkg.tar.zst" 2>/dev/null; then
+                    echo "$repo_name keyring installed from direct download: $pkg_url"
+                    key_ok=true
+                    rm -f "/tmp/${keyring_pkg}.pkg.tar.zst"
+                    break
+                fi
+                rm -f "/tmp/${keyring_pkg}.pkg.tar.zst"
+            fi
+        done
+    fi
+
+    # Step 3: Import the signing key from keyservers as a last resort
+    if [[ "$key_ok" != "true" ]] && command -v pacman-key >/dev/null 2>&1; then
+        echo "Attempting key import from keyservers (key_id=$key_id)..."
+        if _import_key_with_retry "$key_id"; then
+            key_ok=true
         fi
     fi
 
-    echo "$repo_name repository configured."
+    # Step 4: Write the repo entry with appropriate SigLevel
+    if [[ "$key_ok" == "true" ]]; then
+        printf '\n[%s]\nSigLevel = TrustedOnly\n%b' "$repo_name" "$server_lines" >> /etc/pacman.conf
+        echo "$repo_name repository configured (TrustedOnly)."
+    else
+        echo "Warning: All key setup methods failed for $repo_name (key_id=$key_id)."
+        echo "Adding $repo_name with SigLevel = TrustAll as degraded fallback."
+        echo "This allows the repo to function but skips signature verification."
+        echo "Consider manually importing the correct signing key later, or set"
+        echo "  ${env_var_name}=<KEY_ID>  before running this script."
+        printf '\n[%s]\nSigLevel = TrustAll\n%b' "$repo_name" "$server_lines" >> /etc/pacman.conf
+    fi
+
     return 0
 }
 
@@ -2934,21 +3042,24 @@ _enable_repo_with_fallback \
     "chaotic-aur" "chaotic-keyring" "30565AC3868033CA" \
     "https://cdn-mirror.chaotic.cx/chaotic-aur/\$arch" \
     "https://geo-mirror.chaotic.cx/chaotic-aur/\$arch" \
-    "https://mirror.chaotic.cx/chaotic-aur/\$arch" || echo "Warning: Chaotic-AUR setup failed. It will not be available."
+    "https://mirror.chaotic.cx/chaotic-aur/\$arch"
+echo "Note: Set CHAOTIC_AUR_KEY_ID=<FINGERPRINT> to override the default signing key."
 
 echo "=== Configuring archlinuxcn repository ==="
 _enable_repo_with_fallback \
     "archlinuxcn" "archlinuxcn-keyring" "11C2E2D1D43CF75C" \
     "https://repo.archlinuxcn.org/\$arch" \
     "https://mirrors.tuna.tsinghua.edu.cn/archlinuxcn/\$arch" \
-    "https://mirror.sjtu.edu.cn/archlinuxcn/\$arch" || echo "Warning: archlinuxcn setup failed. It will not be available."
+    "https://mirror.sjtu.edu.cn/archlinuxcn/\$arch"
+echo "Note: Set ARCHLINUXCN_KEY_ID=<FINGERPRINT> to override the default signing key."
 
 echo "=== Configuring endeavouros repository ==="
 _enable_repo_with_fallback \
     "endeavouros" "endeavouros-keyring" "F52611D11AFD4556" \
     "https://mirror.freedif.org/EndeavourOS/repo/\$repo/\$arch" \
     "https://mirror.endeavouros.com/EndeavourOS/repo/\$repo/\$arch" \
-    "https://mirror.enderunix.org/endeavouros/repo/\$repo/\$arch" || echo "Warning: EndeavourOS setup failed. It will not be available."
+    "https://mirror.enderunix.org/endeavouros/repo/\$repo/\$arch"
+echo "Note: Set ENDEAVOUROS_KEY_ID=<FINGERPRINT> to override the default signing key."
 
 echo "=== Configuring mesa-git repository (disabled by default - can break GPU drivers) ==="
 if ! _repo_already_enabled "mesa-git"; then
@@ -3006,7 +3117,10 @@ if [[ -n "$_missing" ]]; then
 	echo "Missing build dependencies:$_missing — installing..."
 	for pkg in $_missing; do
 		if [[ "$pkg" == "base-devel" ]]; then
-			install_base_devel_batched
+			if ! install_base_devel_batched; then
+				echo "FATAL: base-devel installation failed."
+				exit 1
+			fi
 		else
 			echo "Installing $pkg..."
 			if ! safe_install "$pkg"; then
@@ -3019,6 +3133,10 @@ if [[ -n "$_missing" ]]; then
 else
 	echo "All build dependencies already present."
 fi
+
+_assert_installed git
+_assert_installed gcc "C compiler"
+_assert_installed go "Go compiler"
 VERIFY_EOF
 
 	if ! exec_container_script "$verify_script" "yay-deps-verify"; then
@@ -3091,6 +3209,26 @@ done
 chown -R "$current_user:$current_user" /tmp/yay
 _set_makepkg_jobs
 sudo -Hu "$current_user" bash -lc "cd /tmp/yay && makepkg -si --noconfirm --clean"
+build_rc=$?
+
+if [[ $build_rc -ne 0 ]]; then
+    echo "ERROR: makepkg failed for yay (exit $build_rc)."
+    exit 1
+fi
+
+if ! command -v yay >/dev/null 2>&1; then
+    echo "FATAL: yay binary not found after successful makepkg. Installation may have failed silently."
+    echo "Attempting direct reinstall from built package..."
+    _yay_pkg=$(ls -t /tmp/yay/*.pkg.tar.* 2>/dev/null | head -1)
+    if [[ -n "$_yay_pkg" ]]; then
+        pacman -U --noconfirm "$_yay_pkg" || true
+    fi
+    if ! command -v yay >/dev/null 2>&1; then
+        echo "FATAL: yay is still not available after build. Aborting."
+        exit 1
+    fi
+fi
+echo "yay verified installed: $(yay --version 2>/dev/null || echo 'unknown version')"
 BUILD_EOF
 
     if ! exec_container_script "$build_script" "yay-build" "$CURRENT_USER"; then

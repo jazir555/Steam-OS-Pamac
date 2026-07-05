@@ -373,8 +373,13 @@ force_remove_container() {
 
   container_runtime_privileged rm -f "$name" 2>/dev/null || true
 
+  if container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
+    log_debug "podman rm -f did not remove '$name'. Retrying with --time 0 (immediate SIGKILL)..."
+    container_runtime_privileged rm -f --time 0 "$name" 2>/dev/null || true
+  fi
+
 	if container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
-		log_warn "podman rm -f still failed for '$name'. The container engine may be corrupted."
+		log_warn "podman rm -f --time 0 still failed for '$name'. The container engine may be corrupted."
 		log_warn ""
 		log_warn "IMPORTANT: A full 'podman system reset --force' would destroy ALL containers,"
 		log_warn "images, and volumes — not just this one. This script will NOT do that"
@@ -392,7 +397,7 @@ force_remove_container() {
 		fi
 
 		log_warn "Manual recovery options (in order of safety):"
-		log_warn "  1. podman rm -f '$name'           (retry force removal)"
+		log_warn "  1. podman rm -f --time 0 '$name'  (immediate SIGKILL, no grace period)"
 		log_warn "  2. podman stop '$name' && podman rm '$name'  (stop then remove)"
 		log_warn "  3. systemctl --user restart podman  (restart the engine)"
 		log_warn "  4. podman system reset --force     (DESTRUCTIVE: removes ALL containers)"

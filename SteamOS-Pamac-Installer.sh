@@ -2597,15 +2597,15 @@ if [[ -f /etc/pamac.conf ]]; then
     fi
     echo "Pamac configuration updated for AUR support."
 
-echo "Setting BuildDirectory for AUR builds (container-native, not host-mounted)..."
+echo "Setting BuildDirectory for AUR builds (writable by non-root)..."
 if grep -q '^BuildDirectory' /etc/pamac.conf; then
-sed -i 's|^BuildDirectory.*|BuildDirectory = /var/cache/pamac-build|' /etc/pamac.conf
+sed -i 's|^BuildDirectory.*|BuildDirectory = /home/'"$current_user"'/\.pamac-build|' /etc/pamac.conf
 else
-echo "BuildDirectory = /var/cache/pamac-build" >> /etc/pamac.conf
+echo "BuildDirectory = /home/$current_user/.pamac-build" >> /etc/pamac.conf
 fi
-mkdir -p /var/cache/pamac-build
-chown "$current_user:$current_user" /var/cache/pamac-build 2>/dev/null || true
-echo "BuildDirectory set to /var/cache/pamac-build"
+mkdir -p "/home/$current_user/.pamac-build"
+chown "$current_user:$current_user" "/home/$current_user/.pamac-build" 2>/dev/null || true
+echo "BuildDirectory set to /home/$current_user/.pamac-build"
 
 echo "Leaving Pamac polkit policy at auth_admin_keep defaults."
 pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
@@ -2622,9 +2622,9 @@ fi
 else
 echo "Warning: /etc/pamac.conf not found. Creating minimal config."
 mkdir -p /etc
-printf 'EnableAUR\nCheckAURUpdates\nCheckAURVCSUpdates\nBuildDirectory = /var/cache/pamac-build\n' > /etc/pamac.conf
-mkdir -p /var/cache/pamac-build
-chown "$current_user:$current_user" /var/cache/pamac-build 2>/dev/null || true
+printf 'EnableAUR\nCheckAURUpdates\nCheckAURVCSUpdates\nBuildDirectory = /home/'"$current_user"'/.pamac-build\n' > /etc/pamac.conf
+mkdir -p "/home/$current_user/.pamac-build"
+chown "$current_user:$current_user" "/home/$current_user/.pamac-build" 2>/dev/null || true
 fi
 
     echo "Syncing package database..."

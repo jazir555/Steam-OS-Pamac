@@ -10,16 +10,36 @@ podman exec arch-pamac cat /etc/pacman.d/chaotic-mirrorlist
 echo ""
 echo "=== Fixing archlinuxcn keyring ==="
 podman exec arch-pamac bash -c '
-  pacman-key --recv-key 11C2E2D1D43CF75C 2>/dev/null || true
-  pacman-key --lsign-key 11C2E2D1D43CF75C 2>/dev/null || true
+  _import_key_multi_server() {
+      local key_id="$1"
+      local keyservers=("hkps://keyserver.ubuntu.com" "hkps://keys.openpgp.org" "hkps://pgp.mit.edu")
+      for server in "${keyservers[@]}"; do
+          if timeout 30 pacman-key --recv-key --keyserver "$server" "$key_id" 2>/dev/null; then
+              timeout 30 pacman-key --lsign-key "$key_id" 2>/dev/null && return 0
+          fi
+      done
+      echo "Warning: Could not import key $key_id from any keyserver."
+      return 1
+  }
+  _import_key_multi_server 11C2E2D1D43CF75C || true
   echo "archlinuxcn key signed"
 '
 
 echo ""
 echo "=== Fixing endeavouros keyring ==="
 podman exec arch-pamac bash -c '
-  pacman-key --recv-key F52611D11AFD4556 2>/dev/null || true
-  pacman-key --lsign-key F52611D11AFD4556 2>/dev/null || true
+  _import_key_multi_server() {
+      local key_id="$1"
+      local keyservers=("hkps://keyserver.ubuntu.com" "hkps://keys.openpgp.org" "hkps://pgp.mit.edu")
+      for server in "${keyservers[@]}"; do
+          if timeout 30 pacman-key --recv-key --keyserver "$server" "$key_id" 2>/dev/null; then
+              timeout 30 pacman-key --lsign-key "$key_id" 2>/dev/null && return 0
+          fi
+      done
+      echo "Warning: Could not import key $key_id from any keyserver."
+      return 1
+  }
+  _import_key_multi_server F52611D11AFD4556 || true
   echo "endeavouros key signed"
 '
 

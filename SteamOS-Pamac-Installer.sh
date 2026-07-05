@@ -2645,17 +2645,27 @@ _repo_already_enabled() {
 
 _import_key_with_retry() {
     local key_id="$1"
+    shift
+    local keyserver_urls=("$@")
     local max_attempts=3
-    local attempt=1
-    while [[ $attempt -le $max_attempts ]]; do
-        if timeout 30 pacman-key --recv-key "$key_id" 2>/dev/null; then
-            timeout 30 pacman-key --lsign-key "$key_id" 2>/dev/null && return 0
-        fi
-        echo "Key import attempt $attempt/$max_attempts failed for $key_id."
-        attempt=$((attempt + 1))
-        [[ $attempt -le $max_attempts ]] && sleep 2
+
+    if [[ ${#keyserver_urls[@]} -eq 0 ]]; then
+        keyserver_urls=("hkps://keyserver.ubuntu.com" "hkps://keys.openpgp.org" "hkps://pgp.mit.edu")
+    fi
+
+    for server in "${keyserver_urls[@]}"; do
+        local attempt=1
+        while [[ $attempt -le $max_attempts ]]; do
+            if timeout 30 pacman-key --recv-key --keyserver "$server" "$key_id" 2>/dev/null; then
+                timeout 30 pacman-key --lsign-key "$key_id" 2>/dev/null && return 0
+            fi
+            echo "Key import attempt $attempt/$max_attempts failed for $key_id from $server."
+            attempt=$((attempt + 1))
+            [[ $attempt -le $max_attempts ]] && sleep 2
+        done
     done
-    echo "Warning: Could not import key $key_id after $max_attempts attempts."
+    echo "Warning: Could not import key $key_id after ${max_attempts}x${#keyserver_urls[@]} attempts from ${#keyserver_urls[@]} keyservers."
+    echo "The key may have been rotated. Try updating the keyring package or importing the key manually."
     return 1
 }
 
@@ -2680,17 +2690,18 @@ _enable_repo_with_fallback() {
 
     pacman -Sy --noconfirm 2>/dev/null || true
 
+    local keyring_installed=false
     if pacman -S --noconfirm --needed "$keyring_pkg" 2>/dev/null; then
         echo "$repo_name keyring installed successfully."
+        keyring_installed=true
     else
         echo "Warning: $keyring_pkg install from repos failed. Attempting key import..."
+    fi
+
+    if [[ "$keyring_installed" != "true" ]]; then
         if command -v pacman-key >/dev/null 2>&1; then
             _import_key_with_retry "$key_id" || true
         fi
-    fi
-
-    if command -v pacman-key >/dev/null 2>&1; then
-        _import_key_with_retry "$key_id" || true
     fi
 
     echo "$repo_name repository configured."

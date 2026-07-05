@@ -33,6 +33,7 @@ ENABLE_GAMING_PACKAGES="${ENABLE_GAMING_PACKAGES:-false}"
 ENABLE_EXTRA_REPOS="${ENABLE_EXTRA_REPOS:-true}"
 FORCE_REBUILD="${FORCE_REBUILD:-false}"
 OPTIMIZE_MIRRORS="${OPTIMIZE_MIRRORS:-true}"
+ALLOW_SUDO_FALLBACK="${ALLOW_SUDO_FALLBACK:-false}"
 
 : "${DISTROBOX_CONTAINER_MANAGER:=podman}"
 
@@ -129,11 +130,48 @@ container_runtime() {
     fi
 }
 
-# Use sudo only for privileged operations (create, rm, system) when rootless is broken
+# Use sudo only for privileged operations (create, rm, system) when rootless is broken.
+# SECURITY: Running as host root significantly weakens container isolation.
+# Only used when: (1) rootless podman is broken, (2) sudo podman works, AND
+# (3) the user has explicitly opted in via --allow-sudo-fallback or ALLOW_SUDO_FALLBACK=true.
 _SUDO_VERIFIED=""
+_SUDO_FALLBACK_CONFIRMED=""
 container_runtime_privileged() {
     local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
-    if [[ -n "${PODMAN_SUDO_FALLBACK:-}" ]]; then
+    if [[ "${PODMAN_SUDO_FALLBACK:-}" == "true" ]]; then
+        # Refuse sudo fallback unless explicitly allowed
+        if [[ "$ALLOW_SUDO_FALLBACK" != "true" ]]; then
+            if [[ -z "$_SUDO_FALLBACK_CONFIRMED" ]]; then
+                log_warn "Rootless Podman is broken and sudo fallback is available."
+                log_warn "SECURITY WARNING: Running as host root weakens container isolation."
+                log_warn "A malicious AUR package could more easily compromise your system."
+                if [[ -t 0 ]]; then
+                    echo -ne "${RED}${BOLD}Enable sudo fallback anyway? (y/N): ${NC}" >&2
+                    local sudo_confirm
+                    read -r sudo_confirm
+                    if [[ "$sudo_confirm" == "y" || "$sudo_confirm" == "Y" ]]; then
+                        log_warn "User accepted sudo fallback. Container will run as host root."
+                        _SUDO_FALLBACK_CONFIRMED="ok"
+                    else
+                        log_info "Sudo fallback declined. Falling back to rootless podman."
+                        _SUDO_FALLBACK_CONFIRMED="refused"
+                        unset PODMAN_SUDO_FALLBACK
+                        container_runtime "$@"
+                        return $?
+                    fi
+                else
+                    log_error "Non-interactive session: sudo fallback requires --allow-sudo-fallback flag."
+                    log_error "Run with --allow-sudo-fallback to enable insecure sudo podman mode."
+                    _SUDO_FALLBACK_CONFIRMED="refused"
+                    unset PODMAN_SUDO_FALLBACK
+                    container_runtime "$@"
+                    return $?
+                fi
+            elif [[ "$_SUDO_FALLBACK_CONFIRMED" == "refused" ]]; then
+                container_runtime "$@"
+                return $?
+            fi
+        fi
         if [[ "$_SUDO_VERIFIED" != "ok" ]]; then
             if sudo -n true 2>/dev/null; then
                 _SUDO_VERIFIED="ok"
@@ -674,7 +712,10 @@ repair_podman() {
 
     log_info "Trying podman with sudo fallback..."
     if sudo podman info >/dev/null 2>&1; then
-        log_warn "Rootless podman broken, root podman works. Using sudo for container create/remove operations."
+        log_warn "Rootless podman broken, root podman works."
+        log_warn "SECURITY: Using sudo means the container runs as host root, not as a"
+        log_warn "sandboxed subuid/subgid user. This weakens isolation significantly."
+        log_warn "A malicious AUR package could more easily compromise your host system."
         export PODMAN_SUDO_FALLBACK=true
         if container_runtime_privileged info >/dev/null 2>&1; then
             log_success "Using root podman fallback (privileged ops only)."
@@ -728,6 +769,7 @@ USAGE:
 
 OPTIONS:
   --container-name NAME     Set container name (default: ${DEFAULT_CONTAINER_NAME})
+  --allow-sudo-fallback     Allow rootless Podman sudo fallback (INSECURE: see security note)
   --force-rebuild           Rebuild existing container if it exists
   --enable-multilib         Enable 32-bit package support (default)
   --disable-multilib        Explicitly disable 32-bit package support
@@ -752,6 +794,9 @@ ENVIRONMENT VARIABLES:
   CONTAINER_NAME            Override default container name (default: arch-pamac)
   FORCE_REBUILD            Set to 'true' to force-rebuild existing container
   ENABLE_GAMING_PACKAGES   Set to 'true' to install gaming packages
+  ALLOW_SUDO_FALLBACK      Set to 'true' to allow sudo podman fallback (INSECURE:
+                           runs container as host root instead of subuid/subgid,
+                           reducing isolation if a malicious AUR package is installed)
 
 EXAMPLES:
   $0                                       # Basic setup
@@ -770,6 +815,7 @@ parse_arguments() {
                 CONTAINER_NAME="$2"
                 shift 2
                 ;;
+            --allow-sudo-fallback) ALLOW_SUDO_FALLBACK="true"; shift ;;
             --force-rebuild) FORCE_REBUILD="true"; shift ;;
             --enable-multilib) ENABLE_MULTILIB="true"; shift ;;
             --disable-multilib) ENABLE_MULTILIB="false"; shift ;;
@@ -1397,6 +1443,32 @@ set -uo pipefail
 
 rm -f /var/lib/pacman/db.lck
 
+echo "Step 0/5: Checking for leftover insecure SigLevel from previous crash..."
+if grep -q '^SigLevel\s*=\s*Never' /etc/pacman.conf 2>/dev/null; then
+    if [[ -f /etc/pacman.conf.siglevel-backup ]]; then
+        echo "WARNING: Found SigLevel=Never from a previous interrupted run. Restoring from backup."
+        cp -f /etc/pacman.conf.siglevel-backup /etc/pacman.conf
+    else
+        echo "WARNING: Found SigLevel=Never with no backup. Forcing restore to safe default."
+        sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf
+        grep -q '^SigLevel' /etc/pacman.conf || echo 'SigLevel = Required DatabaseOptional' >> /etc/pacman.conf
+    fi
+fi
+
+# Crash-safe SigLevel restoration: if this script is killed, restore the backup
+_rollback_siglevel() {
+    local exit_code=$?
+    if [[ -f /etc/pacman.conf.siglevel-backup ]] && grep -q '^SigLevel\s*=\s*Never' /etc/pacman.conf 2>/dev/null; then
+        echo "Trap: Restoring SigLevel from backup (exit code $exit_code)..."
+        cp -f /etc/pacman.conf.siglevel-backup /etc/pacman.conf
+    fi
+    # Clean up backup on normal completion (restored by script logic below)
+    if [[ $exit_code -eq 0 ]] && [[ -f /etc/pacman.conf.siglevel-backup ]]; then
+        rm -f /etc/pacman.conf.siglevel-backup
+    fi
+}
+trap _rollback_siglevel EXIT
+
 echo "Step 1/5: Cleaning up stale GPG state..."
 pkill -9 gpg-agent 2>/dev/null || true
 pkill -9 dirmngr 2>/dev/null || true
@@ -1419,10 +1491,13 @@ export GPG_AGENT_INFO=
 chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
 
 echo "Step 2/5: Temporarily relaxing signature verification for self-healing..."
+# Create a backup BEFORE weakening security, so a crash can be recovered
+cp -f /etc/pacman.conf /etc/pacman.conf.siglevel-backup
 sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Never/' /etc/pacman.conf
 if ! grep -q '^SigLevel' /etc/pacman.conf; then
     echo 'SigLevel = Never' >> /etc/pacman.conf
 fi
+echo "Backup saved to /etc/pacman.conf.siglevel-backup for crash recovery."
 
 echo "Step 3/5: Updating keyring, GPG, and certificate packages..."
 rm -f /var/lib/pacman/db.lck
@@ -1492,6 +1567,9 @@ if [[ "$keyring_ok" == "true" ]]; then
     sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf
     grep -q '^SigLevel' /etc/pacman.conf || echo 'SigLevel = Required DatabaseOptional' >> /etc/pacman.conf
 
+    # Remove the backup since we've successfully restored
+    rm -f /etc/pacman.conf.siglevel-backup
+
     echo "Testing database sync with restored signature verification..."
     if pacman -Syy --noconfirm 2>/dev/null; then
         echo "Signature verification restored and functional."
@@ -1506,6 +1584,7 @@ if [[ "$keyring_ok" != "true" ]]; then
     echo "FATAL: Aborting installation to prevent running without signature verification."
     # Ensure we don't leave the container in a wide-open state
     sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf 2>/dev/null || true
+    rm -f /etc/pacman.conf.siglevel-backup 2>/dev/null || true
     exit 100
 fi
 
@@ -1946,6 +2025,20 @@ echo "Installing fake systemd-run wrapper for non-systemd AUR builds..."
 if ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/dev/null 2>&1; then
 cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE'
 #!/bin/bash
+# Fake systemd-run for non-systemd containers (Distrobox).
+# Mimics the subset of systemd-run used by Pamac/makepkg for DynamicUser builds.
+# Logs unrecognized arguments to /tmp/systemd-run-fake.log for diagnostics.
+_DSR_LOG="/tmp/systemd-run-fake.log"
+_log_dsr() { echo "[$(date '+%H:%M:%S')] $*" >> "$_DSR_LOG" 2>/dev/null; }
+
+# Passthrough: --help and --version are not meaningful here
+for _a in "$@"; do
+    case "$_a" in
+        --help|-h) echo "systemd-run (fake): Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo "Recognized options: --property=DynamicUser=yes, --property=CacheDirectory=*, --property=WorkingDirectory=*, --pipe, --wait, --quiet, --no-block, --description=*, --unit=*, --service-type=*, --user, --uid=*, --gid=*, --setenv=*, --"; exit 0 ;;
+        --version) echo "systemd-run (fake) v1.0 (SteamOS-Pamac)"; exit 0 ;;
+    esac
+done
+
 DYNAMIC_USER=false
 CACHE_DIR=""
 WORK_DIR=""
@@ -1953,6 +2046,7 @@ SKIP_NEXT=false
 PIPE_MODE=false
 WAIT_MODE=false
 DESCRIPTION=""
+UNRECOGNIZED_PROPS=()
 CMD_ARGS=()
 for arg in "$@"; do
 if $SKIP_NEXT; then
@@ -1977,7 +2071,7 @@ case "$arg" in
 --property=RuntimeDirectory=*) continue ;;
 --property=Type=*) continue ;;
 --property=RemainAfterExit=*) continue ;;
---property=*) continue ;;
+--property=*) UNRECOGNIZED_PROPS+=("$arg"); _log_dsr "WARN: Unrecognized --property: $arg"; continue ;;
 --property) SKIP_NEXT=true; continue ;;
 --user|--uid=*|--gid=*|--setenv=*) continue ;;
 --user|--setenv) SKIP_NEXT=true; continue ;;
@@ -1985,7 +2079,14 @@ case "$arg" in
 *) CMD_ARGS+=("$arg") ;;
 esac
 done
-if [[ ${#CMD_ARGS[@]} -eq 0 ]]; then exit 1; fi
+if [[ ${#CMD_ARGS[@]} -eq 0 ]]; then
+    _log_dsr "ERROR: No command arguments found after parsing. Raw args: $*"
+    exit 1
+fi
+if [[ ${#UNRECOGNIZED_PROPS[@]} -gt 0 ]]; then
+    _log_dsr "INFO: Unrecognized properties were ignored (${#UNRECOGNIZED_PROPS[@]} total): ${UNRECOGNIZED_PROPS[*]}"
+    _log_dsr "INFO: If AUR builds fail, check $_DSR_LOG for which properties Pamac now expects."
+fi
 if [[ -n "$WORK_DIR" ]]; then
 mkdir -p "$WORK_DIR" 2>/dev/null || true
 if $DYNAMIC_USER; then chown HOST_USER_PLACEHOLDER:HOST_USER_PLACEHOLDER "$WORK_DIR" 2>/dev/null || true; fi
@@ -1999,18 +2100,22 @@ if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
 BUILD_USER="HOST_USER_PLACEHOLDER"
 if ! id "$BUILD_USER" >/dev/null 2>&1; then BUILD_USER="nobody"; fi
 if [[ -n "$WORK_DIR" ]]; then
+_log_dsr "EXEC: sudo -u $BUILD_USER -- cd $WORK_DIR; ${CMD_ARGS[*]}"
 exec sudo -u "$BUILD_USER" -H -- bash -c "cd '$WORK_DIR' 2>/dev/null; exec ${CMD_ARGS[*]}"
 else
+_log_dsr "EXEC: sudo -u $BUILD_USER -- ${CMD_ARGS[*]}"
 exec sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
 fi
 else
 if [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR" ]]; then cd "$WORK_DIR" 2>/dev/null || true; fi
+_log_dsr "EXEC: ${CMD_ARGS[*]}"
 exec "${CMD_ARGS[@]}"
 fi
 SYSTEMD_RUN_FAKE
 chmod +x /usr/local/sbin/systemd-run
 sed -i "s/HOST_USER_PLACEHOLDER/$HOST_USER/g" /usr/local/sbin/systemd-run
 echo "Fake systemd-run installed at /usr/local/sbin/systemd-run."
+echo "Unrecognized arguments will be logged to /tmp/systemd-run-fake.log for debugging."
 
 printf '%s\n' '#!/bin/bash' \
     '/usr/local/bin/pamac-session-bootstrap.sh 2>/dev/null &' > /etc/profile.d/pamac-daemon.sh
@@ -2198,6 +2303,20 @@ if ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/dev/
 mkdir -p /usr/local/sbin
 cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE'
 #!/bin/bash
+# Fake systemd-run for non-systemd containers (Distrobox).
+# Mimics the subset of systemd-run used by Pamac/makepkg for DynamicUser builds.
+# Logs unrecognized arguments to /tmp/systemd-run-fake.log for diagnostics.
+_DSR_LOG="/tmp/systemd-run-fake.log"
+_log_dsr() { echo "[$(date '+%H:%M:%S')] $*" >> "$_DSR_LOG" 2>/dev/null; }
+
+# Passthrough: --help and --version are not meaningful here
+for _a in "$@"; do
+    case "$_a" in
+        --help|-h) echo "systemd-run (fake): Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo "Recognized options: --property=DynamicUser=yes, --property=CacheDirectory=*, --property=WorkingDirectory=*, --pipe, --wait, --quiet, --no-block, --description=*, --unit=*, --service-type=*, --user, --uid=*, --gid=*, --setenv=*, --"; exit 0 ;;
+        --version) echo "systemd-run (fake) v1.0 (SteamOS-Pamac)"; exit 0 ;;
+    esac
+done
+
 DYNAMIC_USER=false
 CACHE_DIR=""
 WORK_DIR=""
@@ -2205,6 +2324,7 @@ SKIP_NEXT=false
 PIPE_MODE=false
 WAIT_MODE=false
 DESCRIPTION=""
+UNRECOGNIZED_PROPS=()
 CMD_ARGS=()
 for arg in "$@"; do
 if $SKIP_NEXT; then
@@ -2229,7 +2349,7 @@ case "$arg" in
 --property=RuntimeDirectory=*) continue ;;
 --property=Type=*) continue ;;
 --property=RemainAfterExit=*) continue ;;
---property=*) continue ;;
+--property=*) UNRECOGNIZED_PROPS+=("$arg"); _log_dsr "WARN: Unrecognized --property: $arg"; continue ;;
 --property) SKIP_NEXT=true; continue ;;
 --user|--uid=*|--gid=*|--setenv=*) continue ;;
 --user|--setenv) SKIP_NEXT=true; continue ;;
@@ -2237,7 +2357,14 @@ case "$arg" in
 *) CMD_ARGS+=("$arg") ;;
 esac
 done
-if [[ ${#CMD_ARGS[@]} -eq 0 ]]; then exit 1; fi
+if [[ ${#CMD_ARGS[@]} -eq 0 ]]; then
+    _log_dsr "ERROR: No command arguments found after parsing. Raw args: $*"
+    exit 1
+fi
+if [[ ${#UNRECOGNIZED_PROPS[@]} -gt 0 ]]; then
+    _log_dsr "INFO: Unrecognized properties were ignored (${#UNRECOGNIZED_PROPS[@]} total): ${UNRECOGNIZED_PROPS[*]}"
+    _log_dsr "INFO: If AUR builds fail, check $_DSR_LOG for which properties Pamac now expects."
+fi
 if [[ -n "$WORK_DIR" ]]; then
 mkdir -p "$WORK_DIR" 2>/dev/null || true
 if $DYNAMIC_USER; then chown HOST_USER_PLACEHOLDER:HOST_USER_PLACEHOLDER "$WORK_DIR" 2>/dev/null || true; fi
@@ -2251,12 +2378,15 @@ if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
 BUILD_USER="HOST_USER_PLACEHOLDER"
 if ! id "$BUILD_USER" >/dev/null 2>&1; then BUILD_USER="nobody"; fi
 if [[ -n "$WORK_DIR" ]]; then
+_log_dsr "EXEC: sudo -u $BUILD_USER -- cd $WORK_DIR; ${CMD_ARGS[*]}"
 exec sudo -u "$BUILD_USER" -H -- bash -c "cd '$WORK_DIR' 2>/dev/null; exec ${CMD_ARGS[*]}"
 else
+_log_dsr "EXEC: sudo -u $BUILD_USER -- ${CMD_ARGS[*]}"
 exec sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
 fi
 else
 if [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR" ]]; then cd "$WORK_DIR" 2>/dev/null || true; fi
+_log_dsr "EXEC: ${CMD_ARGS[*]}"
 exec "${CMD_ARGS[@]}"
 fi
 SYSTEMD_RUN_FAKE
@@ -2264,6 +2394,7 @@ chmod +x /usr/local/sbin/systemd-run
 sed -i "s/HOST_USER_PLACEHOLDER/$HOST_USER/g" /usr/local/sbin/systemd-run
 repaired=$((repaired + 1))
 echo "Fake systemd-run repaired."
+echo "Unrecognized arguments will be logged to /tmp/systemd-run-fake.log for debugging."
 
 if [[ ! -f /etc/profile.d/pamac-daemon.sh ]]; then
 printf '%s\n' '#!/bin/bash' \

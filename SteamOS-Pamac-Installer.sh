@@ -43,6 +43,7 @@ UNINSTALL="${UNINSTALL:-false}"
 EXPORT_ONLY="${EXPORT_ONLY:-false}"
 LOG_LEVEL="${LOG_LEVEL:-normal}"
 PAMAC_VERSION="${PAMAC_VERSION:-}"
+NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
 
 setup_colors() {
     if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
@@ -71,7 +72,7 @@ initialize_logging() {
         echo "User: $CURRENT_USER"
         echo "OS: $os_version"
         echo "Container: $CONTAINER_NAME"
-        echo "Features: MULTILIB=$ENABLE_MULTILIB GAMING=$ENABLE_GAMING_PACKAGES EXTRA_REPOS=$ENABLE_EXTRA_REPOS BUILD_CACHE=$ENABLE_BUILD_CACHE OPTIMIZE_MIRRORS=$OPTIMIZE_MIRRORS"
+        echo "Features: MULTILIB=$ENABLE_MULTILIB GAMING=$ENABLE_GAMING_PACKAGES EXTRA_REPOS=$ENABLE_EXTRA_REPOS BUILD_CACHE=$ENABLE_BUILD_CACHE OPTIMIZE_MIRRORS=$OPTIMIZE_MIRRORS NON_INTERACTIVE=$NON_INTERACTIVE"
         echo "=========================================="
     } > "$LOG_FILE"
 
@@ -403,6 +404,12 @@ force_remove_container() {
 		log_warn "  3. systemctl --user restart podman  (restart the engine)"
 		log_warn "  4. podman system reset --force     (DESTRUCTIVE: removes ALL containers)"
 
+		if [[ "$NON_INTERACTIVE" == "true" ]]; then
+			log_warn "Non-interactive mode (--non-interactive) — skipping podman system reset to avoid data loss."
+			log_info "Run this script without --non-interactive to approve, or try: podman system reset --force"
+			return
+		fi
+
 		if [[ -t 0 ]]; then
 			echo -ne "${RED}${BOLD}Type 'reset' to run 'podman system reset --force' (destroys ALL containers), or anything else to skip: ${NC}" >&2
 			local cleanup_confirm
@@ -539,7 +546,9 @@ check_battery_power() {
         log_warn "Battery is below 20% and not charging. Compiling yay and parsing"
         log_warn "heavy AUR packages can drain the battery quickly. Connect a"
         log_warn "charger or ensure the system is plugged in before continuing."
-        if [[ -t 0 ]]; then
+        if [[ "$NON_INTERACTIVE" == "true" ]]; then
+            log_warn "Non-interactive mode (--non-interactive) — continuing despite low battery."
+        elif [[ -t 0 ]]; then
             echo -ne "${YELLOW}${BOLD}Continue with low battery? (y/N): ${NC}" >&2
             local bat_confirm
             read -r bat_confirm
@@ -761,7 +770,11 @@ repair_podman() {
         done <<< "$existing_containers"
     fi
     local skip_reset=false
-    if [[ -t 0 ]]; then
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        log_warn "Non-interactive mode (--non-interactive) — skipping automatic podman system reset to avoid data loss."
+        log_info "Run this script without --non-interactive to approve, or try: podman system reset --force"
+        skip_reset=true
+    elif [[ -t 0 ]]; then
         echo -ne "${RED}${BOLD}Type 'reset' to proceed with podman system reset (destroys ALL containers), or anything else to skip: ${NC}" >&2
         local reset_confirm
         read -r reset_confirm
@@ -891,6 +904,7 @@ OPTIONS:
   --no-optimize-mirrors     Do not change default Pacman mirrors
   --uninstall               Remove container and all related files
   --export-only              Re-export apps to host menu without running full setup
+  --non-interactive          Skip all interactive prompts (safe for automation)
   --check                   Perform system checks and exit without installing
   --dry-run                 Show what would be done without making changes
   --verbose                 Show detailed output, including command logs
@@ -906,6 +920,8 @@ ENVIRONMENT VARIABLES:
   ALLOW_SUDO_FALLBACK      Set to 'true' to allow sudo podman fallback (INSECURE:
                            runs container as host root instead of subuid/subgid,
                            reducing isolation if a malicious AUR package is installed)
+  NON_INTERACTIVE          Set to 'true' to skip all interactive prompts (safe for
+                           background tools, automated installers, and cron jobs)
   CHAOTIC_AUR_KEY_ID       Override the Chaotic-AUR signing key fingerprint
   ARCHLINUXCN_KEY_ID       Override the archlinuxcn signing key fingerprint
   ENDEAVOUROS_KEY_ID       Override the EndeavourOS signing key fingerprint
@@ -947,6 +963,7 @@ parse_arguments() {
                 ;;
             --uninstall) UNINSTALL="true"; shift ;;
             --export-only) EXPORT_ONLY="true"; shift ;;
+            --non-interactive) NON_INTERACTIVE="true"; shift ;;
             --dry-run) DRY_RUN="true"; shift ;;
             --check) CHECK_ONLY="true"; shift ;;
             --verbose) LOG_LEVEL="verbose"; shift ;;
@@ -4180,69 +4197,21 @@ export_pamac_to_host() {
         log_info "X11 session detected. Installing X11 tools for window integration..."
         container_root_exec bash -c 'pacman -S --noconfirm --needed xdotool xorg-xprop xorg-xwininfo 2>/dev/null || echo "Warning: x11 tools install failed (non-fatal)"'
 
-        log_info "Compiling xdotool inside container and exporting to host (X11 fallback)..."
-        local has_wayland_tools=false
+        log_info "Installing xdotool inside container and creating host wrapper..."
 
-        local _container_tool_dir="/tmp/pamac-host-tools"
-        local _xdotool_build_rc=0
-
-        set +e
-        container_root_exec bash -c "
-set +e
-mkdir -p $_container_tool_dir
-
-pacman -S --noconfirm --needed base-devel git 2>/dev/null || true
-
-_build_xdotool() {
-    echo '--- Building xdotool from source ---'
-    local _src=\$(mktemp -d)
-    if ! git clone --depth 1 https://github.com/jordansissel/xdotool \$_src/xdotool 2>/tmp/xdotool_clone_err; then
-        echo 'xdotool: git clone FAILED'
-        cat /tmp/xdotool_clone_err 2>/dev/null | tail -3
-        echo 'xdotool: skipping build (clone failed — network or git issue)'
-        cd /; rm -rf \$_src; return 1
-    fi
-    cd \$_src/xdotool
-    if make xdotool 2>/tmp/xdotool_build_err; then
-        cp xdotool $_container_tool_dir/xdotool 2>/dev/null
-        echo 'xdotool: build OK'
-        cd /; rm -rf \$_src; return 0
-    fi
-    echo 'xdotool: make FAILED'
-    cat /tmp/xdotool_build_err 2>/dev/null | tail -5
-    cd /; rm -rf \$_src
-    return 1
-}
-
-_build_xdotool
-_rc=\$?
-if [[ \$_rc -ne 0 ]]; then
-    echo 'WARNING: xdotool source build failed (exit \$_rc). X11 window hint injection will be unavailable.'
-    echo 'This is non-fatal — Pamac will still launch, but X11 taskbar integration may not work.'
-fi
-exit \$_rc
-" 2>/dev/null
-        _xdotool_build_rc=$?
-        set -e
-
-        if [[ $_xdotool_build_rc -ne 0 ]]; then
-            log_warn "xdotool source build failed inside container (exit code: $_xdotool_build_rc)."
-            log_info "X11 window hint injection (StartupWMClass fallback) will be unavailable."
-            log_info "This is non-fatal — Pamac still works; Wayland uses XDG_ACTIVATION_TOKEN (no xdotool needed)."
+        if [[ -x "$_host_bindir/xdotool" ]] && file "$_host_bindir/xdotool" 2>/dev/null | grep -q "ELF"; then
+            log_warn "Removing previous host-compiled xdotool binary (shared library mismatch risk)."
+            rm -f "$_host_bindir/xdotool"
         fi
 
-        for _tool in xdotool; do
-            if container_cp_from "$_container_tool_dir/$_tool" "$_host_bindir/$_tool" 2>/dev/null; then
-                if [[ -s "$_host_bindir/$_tool" ]]; then
-                    chmod +x "$_host_bindir/$_tool"
-                    log_success "Exported $_tool to $_host_bindir/$_tool"
-                else
-                    rm -f "$_host_bindir/$_tool"
-                fi
-            fi
-        done
-
-        container_root_exec bash -c "rm -rf $_container_tool_dir" 2>/dev/null || true
+        if [[ ! -f "$_host_bindir/xdotool" ]]; then
+            cat > "$_host_bindir/xdotool" << XDOTOOL_WRAPPER
+#!/bin/bash
+exec distrobox enter "$CONTAINER_NAME" -- xdotool "\$@"
+XDOTOOL_WRAPPER
+            chmod +x "$_host_bindir/xdotool"
+            log_success "Created xdotool wrapper at $_host_bindir/xdotool (runs xdotool inside container)"
+        fi
     else
         log_info "Wayland session detected (or no DISPLAY). Skipping xdotool compilation."
         log_info "Wayland taskbar integration uses XDG_ACTIVATION_TOKEN — no xdotool needed."

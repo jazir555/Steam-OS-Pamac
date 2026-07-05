@@ -132,45 +132,16 @@ container_runtime() {
 
 # Use sudo only for privileged operations (create, rm, system) when rootless is broken.
 # SECURITY: Running as host root significantly weakens container isolation.
-# Only used when: (1) rootless podman is broken, (2) sudo podman works, AND
-# (3) the user has explicitly opted in via --allow-sudo-fallback or ALLOW_SUDO_FALLBACK=true.
+# PODMAN_SUDO_FALLBACK is only set by ensure_podman() when --allow-sudo-fallback is passed.
 _SUDO_VERIFIED=""
-_SUDO_FALLBACK_CONFIRMED=""
 container_runtime_privileged() {
     local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
     if [[ "${PODMAN_SUDO_FALLBACK:-}" == "true" ]]; then
-        # Refuse sudo fallback unless explicitly allowed
+        # Defense-in-depth: refuse if explicit opt-in wasn't given
         if [[ "$ALLOW_SUDO_FALLBACK" != "true" ]]; then
-            if [[ -z "$_SUDO_FALLBACK_CONFIRMED" ]]; then
-                log_warn "Rootless Podman is broken and sudo fallback is available."
-                log_warn "SECURITY WARNING: Running as host root weakens container isolation."
-                log_warn "A malicious AUR package could more easily compromise your system."
-                if [[ -t 0 ]]; then
-                    echo -ne "${RED}${BOLD}Enable sudo fallback anyway? (y/N): ${NC}" >&2
-                    local sudo_confirm
-                    read -r sudo_confirm
-                    if [[ "$sudo_confirm" == "y" || "$sudo_confirm" == "Y" ]]; then
-                        log_warn "User accepted sudo fallback. Container will run as host root."
-                        _SUDO_FALLBACK_CONFIRMED="ok"
-                    else
-                        log_info "Sudo fallback declined. Falling back to rootless podman."
-                        _SUDO_FALLBACK_CONFIRMED="refused"
-                        unset PODMAN_SUDO_FALLBACK
-                        container_runtime "$@"
-                        return $?
-                    fi
-                else
-                    log_error "Non-interactive session: sudo fallback requires --allow-sudo-fallback flag."
-                    log_error "Run with --allow-sudo-fallback to enable insecure sudo podman mode."
-                    _SUDO_FALLBACK_CONFIRMED="refused"
-                    unset PODMAN_SUDO_FALLBACK
-                    container_runtime "$@"
-                    return $?
-                fi
-            elif [[ "$_SUDO_FALLBACK_CONFIRMED" == "refused" ]]; then
-                container_runtime "$@"
-                return $?
-            fi
+            log_error "PODMAN_SUDO_FALLBACK is set but --allow-sudo-fallback was not passed. Refusing sudo."
+            container_runtime "$@"
+            return $?
         fi
         if [[ "$_SUDO_VERIFIED" != "ok" ]]; then
             if sudo -n true 2>/dev/null; then
@@ -599,6 +570,28 @@ check_system_requirements() {
         all_ok=false
     fi
 
+    if command -v podman >/dev/null 2>&1; then
+        local subuid_ok=true
+        if ! grep -q "^$(whoami):" /etc/subuid 2>/dev/null; then
+            log_warn "No subuid mapping for $(whoami). Rootless podman may fail."
+            log_info "Fix: sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(whoami)"
+            subuid_ok=false
+        fi
+        if ! grep -q "^$(whoami):" /etc/subgid 2>/dev/null; then
+            log_warn "No subgid mapping for $(whoami). Rootless podman may fail."
+            log_info "Fix: sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(whoami)"
+            subuid_ok=false
+        fi
+        if [[ "$subuid_ok" == "true" ]]; then
+            log_success "subuid/subgid mappings present."
+        fi
+
+        if [[ -z "${XDG_RUNTIME_DIR:-}" ]] || [[ ! -d "${XDG_RUNTIME_DIR:-/nonexistent}" ]]; then
+            log_warn "XDG_RUNTIME_DIR is unset or missing. Rootless podman may fail."
+            log_info "Fix: sudo loginctl enable-linger $(whoami), then log out and back in."
+        fi
+    fi
+
     if [[ ${#missing_tools[@]} -gt 0 ]]; then
         log_error "Missing required tools: ${missing_tools[*]}"
         log_info "On SteamOS, install distrobox with:"
@@ -631,11 +624,47 @@ check_system_requirements() {
 }
 
 repair_podman() {
-    log_step "Attempting podman repair..."
-    local repaired=false
+    log_step "Attempting rootless podman repair..."
 
+    # Step 1: Check and fix XDG_RUNTIME_DIR (required for rootless podman socket)
+    local runtime_dir="${XDG_RUNTIME_DIR:-}"
+    if [[ -z "$runtime_dir" ]]; then
+        runtime_dir="/run/user/$(id -u)"
+        export XDG_RUNTIME_DIR="$runtime_dir"
+        log_warn "XDG_RUNTIME_DIR was unset. Set to: $runtime_dir"
+    fi
+    if [[ ! -d "$runtime_dir" ]]; then
+        log_warn "XDG_RUNTIME_DIR ($runtime_dir) does not exist. Creating..."
+        mkdir -p "$runtime_dir" 2>/dev/null || true
+        chmod 0700 "$runtime_dir" 2>/dev/null || true
+    fi
+    if [[ ! -w "$runtime_dir" ]]; then
+        log_error "XDG_RUNTIME_DIR ($runtime_dir) is not writable."
+        log_info "This usually means your user session is not properly set up."
+        log_info "Try: loginctl enable-linger $(whoami)"
+        log_info "Or log out and back in to regenerate the user session."
+    fi
+
+    # Step 2: Check subuid/subgid mappings (required for rootless container UIDs)
+    local subuid_entry subgid_entry
+    subuid_entry=$(grep "^$(whoami):" /etc/subuid 2>/dev/null || true)
+    subgid_entry=$(grep "^$(whoami):" /etc/subgid 2>/dev/null || true)
+    if [[ -z "$subuid_entry" ]]; then
+        log_warn "No subuid mapping found for $(whoami) in /etc/subuid."
+        log_info "Rootless podman needs subuid/subgid mappings to run containers."
+        log_info "To fix: add to /etc/subuid:  $(whoami):100000:65536"
+        log_info "And:     to /etc/subgid:  $(whoami):100000:65536"
+        log_info "Then run: podman system reset --force && podman pull archlinux:latest"
+        log_info "On SteamOS, subuid/subgid are usually created automatically when podman is installed."
+        log_info "If missing, try: sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(whoami)"
+    else
+        log_debug "subuid entry: $subuid_entry"
+        log_debug "subgid entry: $subgid_entry"
+    fi
+
+    # Step 3: Start podman socket
     log_info "Checking rootless podman socket..."
-    local socket_path="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
+    local socket_path="${runtime_dir}/podman/podman.sock"
     if [[ -S "$socket_path" ]]; then
         log_debug "Podman socket exists at $socket_path"
     else
@@ -643,7 +672,8 @@ repair_podman() {
         if systemctl --user start podman.socket 2>/dev/null; then
             log_info "Started podman user socket."
             sleep 2
-            repaired=true
+        else
+            log_debug "systemctl --user start podman.socket failed (may not have systemd user session)."
         fi
     fi
 
@@ -652,6 +682,7 @@ repair_podman() {
         return 0
     fi
 
+    # Step 4: Clean stale lock files
     log_info "Checking for podman database lock files..."
     local podman_root="${XDG_DATA_HOME:-$HOME/.local/share}/containers/storage"
     if [[ -d "$podman_root" ]]; then
@@ -664,6 +695,48 @@ repair_podman() {
         return 0
     fi
 
+    # Step 5: Fix storage directory permissions
+    log_info "Checking storage directory permissions..."
+    if [[ -d "$podman_root" ]]; then
+        local storage_ok=true
+        # Check if key subdirectories are accessible
+        for subdir in "$podman_root"/{overlay,vfs-images,vfs-layers,db} tmp; do
+            if [[ -d "$subdir" ]] && [[ ! -w "$subdir" ]]; then
+                log_warn "Storage subdirectory not writable: $subdir"
+                storage_ok=false
+            fi
+        done
+        if [[ "$storage_ok" == "false" ]]; then
+            log_info "Fixing storage directory permissions..."
+            chmod -R u+rwX "$podman_root" 2>/dev/null || true
+            sleep 1
+            if podman info >/dev/null 2>&1; then
+                log_success "Podman recovered after permission fix."
+                return 0
+            fi
+        fi
+    fi
+
+    # Step 6: Check for corrupted storage by examining the database
+    log_info "Checking podman storage database integrity..."
+    local storage_conf="$podman_root/storage.conf"
+    local bolt_db="$podman_root/db/sqlite/podman-true.db"
+    if [[ -f "$bolt_db" ]]; then
+        local db_size
+        db_size=$(stat -c%s "$bolt_db" 2>/dev/null || echo "0")
+        if [[ "$db_size" -eq 0 ]]; then
+            log_warn "Podman database file is empty (0 bytes). Removing to force rebuild..."
+            rm -f "$bolt_db" 2>/dev/null || true
+            rm -f "${bolt_db}"-* 2>/dev/null || true
+            sleep 1
+            if podman info >/dev/null 2>&1; then
+                log_success "Podman recovered after removing empty database."
+                return 0
+            fi
+        fi
+    fi
+
+    # Step 7: System reset (destructive, requires user confirmation)
     log_warn "Podman database may be corrupted. A full system reset is required but is DESTRUCTIVE."
     log_warn "WARNING: 'podman system reset --force' will remove ALL containers, images, and volumes — not just the Pamac container. Any other distroboxes or podman workloads will be lost."
     local existing_containers
@@ -702,6 +775,7 @@ repair_podman() {
         return 0
     fi
 
+    # Step 8: Storage migration
     log_info "Attempting to migrate podman storage..."
     podman system migrate 2>/dev/null || true
 
@@ -710,20 +784,27 @@ repair_podman() {
         return 0
     fi
 
-    log_info "Trying podman with sudo fallback..."
-    if sudo podman info >/dev/null 2>&1; then
-        log_warn "Rootless podman broken, root podman works."
-        log_warn "SECURITY: Using sudo means the container runs as host root, not as a"
-        log_warn "sandboxed subuid/subgid user. This weakens isolation significantly."
-        log_warn "A malicious AUR package could more easily compromise your host system."
-        export PODMAN_SUDO_FALLBACK=true
-        if container_runtime_privileged info >/dev/null 2>&1; then
-            log_success "Using root podman fallback (privileged ops only)."
-            return 0
-        fi
-    fi
-
-    log_error "Podman repair failed. All recovery attempts exhausted."
+    # Step 9: All automated repairs failed. Diagnose and report.
+    log_error "All automated rootless podman repairs have failed."
+    log_error ""
+    log_error "Rootless podman cannot run containers. This is required for secure"
+    log_error "isolation — running containers as host root via sudo is INSECURE."
+    log_error ""
+    log_error "Common causes and manual fixes:"
+    log_error "  1. Missing subuid/subgid mappings:"
+    log_error "     sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(whoami)"
+    log_error "     Then log out and back in."
+    log_error "  2. Corrupted podman storage (nuclear option — destroys ALL podman data):"
+    log_error "     podman system reset --force"
+    log_error "  3. Missing XDG_RUNTIME_DIR (user session issue):"
+    log_error "     sudo loginctl enable-linger $(whoami)"
+    log_error "     Then log out and back in."
+    log_error "  4. SteamOS read-only rootfs blocking storage:"
+    log_error "     Ensure /home is writable (it should be by default on Steam Deck)."
+    log_error ""
+    log_error "After fixing, try running this script again."
+    log_error "As a LAST RESORT (INSECURE), you may use --allow-sudo-fallback"
+    log_error "to run the container as host root, but this weakens security significantly."
     return 1
 }
 
@@ -742,12 +823,26 @@ ensure_podman() {
     if command -v podman >/dev/null 2>&1; then
         log_warn "Podman installed but not functional."
         if ! repair_podman; then
+            # Rootless podman is broken and automated repairs failed.
+            # Check if sudo fallback is explicitly allowed.
+            if [[ "$ALLOW_SUDO_FALLBACK" == "true" ]] || [[ "${PODMAN_SUDO_FALLBACK:-}" == "true" ]]; then
+                log_warn "Attempting sudo podman fallback (explicitly allowed via --allow-sudo-fallback)..."
+                if sudo podman info >/dev/null 2>&1; then
+                    log_warn "SECURITY: Running as host root via sudo. Container isolation is weakened."
+                    log_warn "A malicious AUR package could more easily compromise your host system."
+                    export PODMAN_SUDO_FALLBACK=true
+                    export DISTROBOX_CONTAINER_MANAGER=podman
+                    return 0
+                fi
+                log_error "Even sudo podman is not functional."
+            fi
             if command -v docker >/dev/null 2>&1; then
                 log_warn "Podman repair failed. Falling back to docker."
                 export DISTROBOX_CONTAINER_MANAGER=docker
                 return 0
             fi
             log_error "No working container runtime available. Install podman or docker."
+            log_error "Run with --allow-sudo-fallback to try sudo podman (INSECURE)."
             return 1
         fi
         export DISTROBOX_CONTAINER_MANAGER=podman

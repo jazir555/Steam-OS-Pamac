@@ -14,7 +14,7 @@ readonly LOG_FILE="$HOME/distrobox-pamac-setup.log"
 readonly REQUIRED_TOOLS=("distrobox")
 CONTAINER_HAS_INIT="unknown"
 
-readonly ARCHLINUX_IMAGE="${ARCHLINUX_IMAGE:-archlinux:latest}"
+readonly ARCHLINUX_IMAGE="${ARCHLINUX_IMAGE:-archlinux:base-20260628.0.549485}"
 
 # Track temp files for cleanup on interrupt
 _TEMP_FILES=()
@@ -932,9 +932,8 @@ OPTIONS:
 
 ENVIRONMENT VARIABLES:
   CONTAINER_NAME            Override default container name (default: arch-pamac)
-  ARCHLINUX_IMAGE           Container base image (default: archlinux:latest)
-                            Pin to a specific tag for reproducibility, e.g.:
-                            ARCHLINUX_IMAGE=archlinux:base-devel-20260628.0.549485
+  ARCHLINUX_IMAGE           Container base image (default: archlinux:base-20260628.0.549485)
+                            Override with 'latest' or any other tag for different versions.
   FORCE_REBUILD            Set to 'true' to force-rebuild existing container
   ENABLE_GAMING_PACKAGES   Set to 'true' to install gaming packages
   PAMAC_VERSION            Specific pamac-aur version/commit to install (AUR fallback)

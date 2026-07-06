@@ -1,8 +1,16 @@
 #!/bin/bash
-# shellcheck disable=SC2034  # Variables used in nested heredocs or later
-# shellcheck disable=SC2317  # Unreachable code in trap handler patterns
 
 set -euo pipefail
+set -E
+
+# ERR trap for better error tracing in deeply nested calls (subshells, pipes, sub-functions)
+_err_trap() {
+    local _exit_code=$?
+    local _line=$1
+    local _cmd=$2
+    log_error "Error at line $_line (exit $_code): $_cmd"
+}
+trap '_err_trap $LINENO "$BASH_COMMAND"' ERR
 
 # Heredoc quoting convention:
 #   <<'EOF'  — no host variable expansion; content runs inside container
@@ -41,6 +49,7 @@ DRY_RUN="${DRY_RUN:-false}"
 CHECK_ONLY="${CHECK_ONLY:-false}"
 STATUS="${STATUS:-false}"
 UNINSTALL="${UNINSTALL:-false}"
+UPDATE="${UPDATE:-false}"
 EXPORT_ONLY="${EXPORT_ONLY:-false}"
 LOG_LEVEL="${LOG_LEVEL:-normal}"
 PAMAC_VERSION="${PAMAC_VERSION:-}"
@@ -104,6 +113,13 @@ log_warn()   { _log "WARN"    "$YELLOW" "⚠ $1"; }
 log_error()  { _log "ERROR"   "$RED"    "✗ $1"; }
 log_debug()  { _log "DEBUG"   ""        "$1"; }
 
+_filter_verbose_output() {
+    # Filter verbose container output to avoid overwhelming the user.
+    # Always pass through: errors, warnings, key operation markers, final status lines.
+    # Filter out: repetitive download progress, package resolution noise, blank lines.
+    grep -v -E '^\s*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database|^$)|^::(synchronizing|debug:|warning:|info:)|^:: Proceed|^:: Run|^warning:.*downgrading|^warning:.*removing' || cat
+}
+
 run_command() {
     log_debug "Executing: $*"
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -114,7 +130,7 @@ run_command() {
     local status=0
     set +e
     if [[ "$LOG_LEVEL" == "verbose" ]]; then
-        "$@" 2>&1 | tee -a "$LOG_FILE"; status=${PIPESTATUS[0]}
+        "$@" 2>&1 | tee -a "$LOG_FILE" | _filter_verbose_output; status=${PIPESTATUS[0]}
     else
         "$@" >> "$LOG_FILE" 2>&1; status=$?
     fi
@@ -438,7 +454,7 @@ force_remove_container() {
 		fi
 
 		log_warn "Running 'podman system reset --force' — this will destroy ALL containers, images, and volumes."
-		podman system reset --force 2>&1 | while IFS= read -r line; do
+		container_runtime_privileged system reset --force 2>&1 | while IFS= read -r line; do
 			log_warn "  $line"
 		done || true
 
@@ -807,7 +823,7 @@ repair_podman() {
     fi
     if [[ "$skip_reset" != "true" ]]; then
         local reset_output
-        reset_output=$(podman system reset --force 2>&1) && rc=0 || rc=$?
+        reset_output=$(container_runtime_privileged system reset --force 2>&1) && rc=0 || rc=$?
         log_debug "podman system reset: $reset_output"
     fi
 
@@ -920,6 +936,7 @@ OPTIONS:
   --optimize-mirrors        Select fastest Pacman mirrors (default)
   --no-optimize-mirrors     Do not change default Pacman mirrors
   --uninstall               Remove container and all related files
+  --update                  Update packages (pacman -Syu + yay -Syu) without full rebuild
   --status                  Check container health, Pamac installation, and export status
   --export-only              Re-export apps to host menu without running full setup
   --non-interactive          Skip all interactive prompts (safe for automation)
@@ -987,6 +1004,7 @@ parse_arguments() {
                 ;;
             --uninstall) UNINSTALL="true"; shift ;;
             --status) STATUS="true"; shift ;;
+            --update) UPDATE="true"; shift ;;
             --export-only) EXPORT_ONLY="true"; shift ;;
             --non-interactive) NON_INTERACTIVE="true"; shift ;;
             --dry-run) DRY_RUN="true"; shift ;;
@@ -1327,7 +1345,7 @@ if ! pacman -Dk 2>/dev/null; then
         fi
         if [[ ! -f "$db_dir/files" ]]; then
             echo "Reinstalling package with missing files DB: $pkg_name"
-            pkg_base=$(grep -m1 "^%NAME%$" "$db_dir/desc" 2>/dev/null | tail -1)
+            pkg_base=$(grep -A1 "^%NAME%$" "$db_dir/desc" 2>/dev/null | grep -v '^%NAME%$' | head -1)
             [[ -z "$pkg_base" ]] && pkg_base=$(echo "$pkg_name" | sed "s/-[0-9].*//")
             pacman -S --noconfirm --needed "$pkg_base" 2>/dev/null || true
         fi
@@ -1467,7 +1485,7 @@ exec_container_script() {
   set +e
   local _output=""
   if [[ "$LOG_LEVEL" == "verbose" ]]; then
-    _output=$(container_root_exec bash -s "$@" < "$_script_file" 2>&1 | tee -a "$LOG_FILE")
+    _output=$(container_root_exec bash -s "$@" < "$_script_file" 2>&1 | tee -a "$LOG_FILE" | _filter_verbose_output)
     _rc=${PIPESTATUS[0]}
   else
     _output=$(container_root_exec bash -s "$@" < "$_script_file" 2>&1)
@@ -1548,7 +1566,7 @@ exec_container_pipe() {
     set +e
     local _output=""
     if [[ "$LOG_LEVEL" == "verbose" ]]; then
-        _output=$(container_root_exec bash -s "$@" < "$_script_file" 2>&1 | tee -a "$LOG_FILE")
+        _output=$(container_root_exec bash -s "$@" < "$_script_file" 2>&1 | tee -a "$LOG_FILE" | _filter_verbose_output)
         _rc=${PIPESTATUS[0]}
     else
         _output=$(container_root_exec bash -s "$@" < "$_script_file" 2>&1)
@@ -1686,7 +1704,15 @@ chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
 
 echo "Step 2/5: Attempting safe keyring recovery (no signature relaxation)..."
 
+_KEYRING_SENTINEL="/etc/pacman.d/gnupg/.keyring-recovery-pending"
 _safe_recovered=false
+
+# Check if keyring recovery was already completed (persists across container restarts)
+if [[ -f "$_KEYRING_SENTINEL" ]]; then
+    echo "Found keyring recovery sentinel from previous run. Keyring recovery already completed."
+    _safe_recovered=true
+    rm -f "$_KEYRING_SENTINEL" 2>/dev/null || true
+fi
 
 # Method A: Refresh keys from keyservers (uses GnuPG's built-in HTTP client, no curl needed)
 echo "Method A: Refreshing keys from keyservers..."
@@ -1749,6 +1775,8 @@ fi
 # No TrustAll fallback — skip repo if keyring recovery fails
 if [[ "$_safe_recovered" == "true" ]]; then
     echo "Safe keyring recovery succeeded."
+    # Persist recovery state across container restarts
+    touch "$_KEYRING_SENTINEL" 2>/dev/null || true
 else
     echo "FATAL: All safe recovery methods failed. Cannot proceed without valid keyring."
     echo "TrustAll is NOT used as it would disable all signature verification."
@@ -1854,6 +1882,8 @@ else
 fi
 
 echo "Keyring initialization and self-healing complete."
+# Clean up recovery sentinel on successful completion
+rm -f "$_KEYRING_SENTINEL" 2>/dev/null || true
 KEYRING_EOF
 
     if ! exec_container_script "$keyring_script" "keyring-init"; then
@@ -2913,10 +2943,20 @@ _import_key_with_retry() {
                 local _verify_fp
                 _verify_fp=$(GNUPGHOME=/etc/pacman.d/gnupg gpg --with-colons --list-keys "$key_id" 2>/dev/null \
                     | grep '^fpr' | head -1 | cut -d: -f10 || echo "")
-                if [[ -n "$_verify_fp" ]] && [[ "$_verify_fp" == *"$key_id" ]]; then
-                    timeout 30 pacman-key --lsign-key "$key_id" 2>/dev/null && return 0
+                local _fp_len=${#_verify_fp}
+                local _kid_len=${#key_id}
+                if [[ -n "$_verify_fp" ]] && {
+                    # Full fingerprint match (40 chars) — exact
+                    [[ "$_verify_fp" == "$key_id" ]] ||
+                    # Long ID (16+ chars) — require exact suffix match (no partial matches)
+                    { [[ $_kid_len -ge 16 ]] && [[ "$_verify_fp" == *"$key_id" ]]; } ||
+                    # Exact 40-char fingerprint provided by caller — verify full match
+                    { [[ $_kid_len -eq 40 ]] && [[ "$_verify_fp" == "$key_id" ]]; }
+                }; then
+                    timeout 30 pacman-key --lsign-key "$_verify_fp" 2>/dev/null && return 0
                 else
-                    echo "Fingerprint verification failed for key $key_id (got $_verify_fp). Refusing to sign."
+                    echo "Fingerprint verification failed for key $key_id (got $_verify_fp)."
+                    echo "Short-ID or substring matches are rejected for security. Use full fingerprint (40 chars)."
                 fi
             fi
             echo "Key import attempt $attempt/$max_attempts failed for $key_id from $server."
@@ -3656,7 +3696,7 @@ COMPAT_EOF
     set +e
     local _compat_output=""
     if [[ "$LOG_LEVEL" == "verbose" ]]; then
-        _compat_output=$(container_root_exec bash -s "$@" < "$_compat_script_file" 2>&1 | tee -a "$LOG_FILE")
+        _compat_output=$(container_root_exec bash -s "$@" < "$_compat_script_file" 2>&1 | tee -a "$LOG_FILE" | _filter_verbose_output)
         _compat_rc=${PIPESTATUS[0]}
     else
         _compat_output=$(container_root_exec bash -s "$@" < "$_compat_script_file" 2>&1)
@@ -3783,12 +3823,36 @@ install_from_aur_commit() {
         return 1
     }
     if ! sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git checkout '$commit'" 2>/tmp/pamac_checkout_err; then
-        echo "Checkout failed (commit ${commit:0:12}):"
-        cat /tmp/pamac_checkout_err 2>/dev/null | tail -5
-        echo "Attempting to find closest ancestor..."
-        sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git log --oneline -5" 2>/dev/null || true
-        rm -rf "$work_dir"
-        return 1
+        echo "Checkout failed at depth 50, attempting progressive fetch to reach commit ${commit:0:12}..."
+        local _depth=50
+        local _max_depth=500
+        local _found=false
+        while [[ $_depth -lt $_max_depth ]]; do
+            _depth=$((_depth + 100))
+            if sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git fetch --deepen 100" 2>/dev/null; then
+                echo "  Deepened to $_depth commits..."
+                if sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git checkout '$commit'" 2>/dev/null; then
+                    _found=true
+                    echo "  Found commit after deepening to $_depth commits."
+                    break
+                fi
+            else
+                echo "  git fetch --deepen failed at depth $_depth. Trying full fetch..."
+                sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git fetch --unshallow" 2>/dev/null || true
+                if sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git checkout '$commit'" 2>/dev/null; then
+                    _found=true
+                    echo "  Found commit after full fetch."
+                fi
+                break
+            fi
+        done
+        if [[ "$_found" != "true" ]]; then
+            echo "Checkout failed (commit ${commit:0:12}) after progressive fetch:"
+            cat /tmp/pamac_checkout_err 2>/dev/null | tail -5
+            sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git log --oneline -5" 2>/dev/null || true
+            rm -rf "$work_dir"
+            return 1
+        fi
     fi
     echo "Building pamac-aur from commit ${commit:0:12}..."
     _set_makepkg_jobs
@@ -5360,6 +5424,45 @@ show_completion_message() {
     echo
 }
 
+run_update() {
+    log_step "Updating packages in container $CONTAINER_NAME"
+
+    if ! distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
+        log_error "Container '$CONTAINER_NAME' not found. Run full setup first."
+        return 1
+    fi
+
+    if ! container_is_usable; then
+        log_info "Container not usable, attempting to start..."
+        container_start 2>/dev/null || true
+        if ! container_is_usable; then
+            log_error "Container is not usable after start attempt."
+            return 1
+        fi
+    fi
+
+    log_info "Syncing package databases..."
+    if ! container_root_exec bash -c 'rm -f /var/lib/pacman/db.lck; pacman -Syy --noconfirm' 2>/dev/null; then
+        log_warn "Database sync had issues. Continuing..."
+    fi
+
+    log_info "Running pacman -Syu..."
+    if ! container_root_exec bash -c 'rm -f /var/lib/pacman/db.lck; pacman -Syu --noconfirm' 2>/dev/null; then
+        log_warn "pacman -Syu had issues."
+    fi
+
+    if container_user_exec bash -c "command -v yay >/dev/null 2>&1" 2>/dev/null; then
+        log_info "Running yay -Syu..."
+        if ! container_user_exec bash -c "yay -Syu --noconfirm --needed --noprogressbar" 2>/dev/null; then
+            log_warn "yay -Syu had issues. Some AUR packages may not have updated."
+        fi
+    else
+        log_info "yay not installed, skipping AUR updates."
+    fi
+
+    log_success "Package update complete."
+}
+
 show_status() {
     setup_colors
 
@@ -5514,6 +5617,12 @@ main() {
     if [[ "$UNINSTALL" == "true" ]]; then
         uninstall_setup
         exit 0
+    fi
+
+    if [[ "$UPDATE" == "true" ]]; then
+        ensure_podman
+        run_update
+        exit $?
     fi
 
     if [[ "$STATUS" == "true" ]]; then

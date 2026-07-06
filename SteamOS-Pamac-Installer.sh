@@ -2623,6 +2623,7 @@ if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
 # Use a dedicated build user to isolate AUR builds from the host user's
 # home directory. A malicious AUR package gains only build-user access.
 BUILD_USER="_builduser"
+_BL_TMP_HOME=""
 if ! id "$BUILD_USER" >/dev/null 2>&1; then
     if ! useradd -r -d /var/lib/builduser -s /usr/bin/nologin "$BUILD_USER" 2>/dev/null; then
         _warn_dsr "useradd -r failed — trying ad-hoc non-root build user as fallback"
@@ -2632,6 +2633,8 @@ if ! id "$BUILD_USER" >/dev/null 2>&1; then
             if ! useradd -M -d "$_bl_tmp" -s /bin/bash "$BUILD_USER" 2>/dev/null; then
                 rmdir "$_bl_tmp" 2>/dev/null || true
                 BUILD_USER=""
+            else
+                _BL_TMP_HOME="$_bl_tmp"
             fi
         fi
         if [[ -z "$BUILD_USER" ]] || ! id "$BUILD_USER" >/dev/null 2>&1; then
@@ -2647,10 +2650,26 @@ if ! id "$BUILD_USER" >/dev/null 2>&1; then
 fi
 if [[ -n "$WORK_DIR" ]]; then
 _log_dsr "EXEC: sudo -u $BUILD_USER -- cd $WORK_DIR; ${CMD_ARGS[*]}"
-exec sudo -u "$BUILD_USER" -H -- bash -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$WORK_DIR" "${CMD_ARGS[@]}"
+if [[ -n "$_BL_TMP_HOME" ]]; then
+    sudo -u "$BUILD_USER" -H -- bash -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$WORK_DIR" "${CMD_ARGS[@]}"
+    _user_cmd_exit=$?
+    userdel -r "$BUILD_USER" 2>/dev/null || true
+    rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
+    exit $_user_cmd_exit
+else
+    exec sudo -u "$BUILD_USER" -H -- bash -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$WORK_DIR" "${CMD_ARGS[@]}"
+fi
 else
 _log_dsr "EXEC: sudo -u $BUILD_USER -- ${CMD_ARGS[*]}"
-exec sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
+if [[ -n "$_BL_TMP_HOME" ]]; then
+    sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
+    _user_cmd_exit=$?
+    userdel -r "$BUILD_USER" 2>/dev/null || true
+    rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
+    exit $_user_cmd_exit
+else
+    exec sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
+fi
 fi
 else
 if [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR" ]]; then cd "$WORK_DIR" 2>/dev/null || true; fi
@@ -2660,7 +2679,7 @@ fi
 SYSTEMD_RUN_FAKE
 chmod +x /usr/local/sbin/systemd-run
 _atomic_sed_inplace /usr/local/sbin/systemd-run "s/HOST_USER_PLACEHOLDER/$HOST_USER/g"
-echo "Fake systemd-run installed at /usr/local/sbin/systemd-run."
+echo "Fake systemd-run installed at /usr/local/sbin/systemd-run (with ad-hoc build-user cleanup)."
 echo "Unrecognized arguments will be logged to /tmp/systemd-run-fake.log for debugging."
 
 printf '%s\n' '#!/bin/bash' \
@@ -2989,6 +3008,7 @@ if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
 # Use a dedicated build user to isolate AUR builds from the host user's
 # home directory. A malicious AUR package gains only build-user access.
 BUILD_USER="_builduser"
+_BL_TMP_HOME=""
 if ! id "$BUILD_USER" >/dev/null 2>&1; then
     if ! useradd -r -d /var/lib/builduser -s /usr/bin/nologin "$BUILD_USER" 2>/dev/null; then
         _warn_dsr "useradd -r failed — trying ad-hoc non-root build user as fallback"
@@ -2998,6 +3018,8 @@ if ! id "$BUILD_USER" >/dev/null 2>&1; then
             if ! useradd -M -d "$_bl_tmp" -s /bin/bash "$BUILD_USER" 2>/dev/null; then
                 rmdir "$_bl_tmp" 2>/dev/null || true
                 BUILD_USER=""
+            else
+                _BL_TMP_HOME="$_bl_tmp"
             fi
         fi
         if [[ -z "$BUILD_USER" ]] || ! id "$BUILD_USER" >/dev/null 2>&1; then
@@ -3013,10 +3035,26 @@ if ! id "$BUILD_USER" >/dev/null 2>&1; then
 fi
 if [[ -n "$WORK_DIR" ]]; then
 _log_dsr "EXEC: sudo -u $BUILD_USER -- cd $WORK_DIR; ${CMD_ARGS[*]}"
-exec sudo -u "$BUILD_USER" -H -- bash -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$WORK_DIR" "${CMD_ARGS[@]}"
+if [[ -n "$_BL_TMP_HOME" ]]; then
+    sudo -u "$BUILD_USER" -H -- bash -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$WORK_DIR" "${CMD_ARGS[@]}"
+    _user_cmd_exit=$?
+    userdel -r "$BUILD_USER" 2>/dev/null || true
+    rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
+    exit $_user_cmd_exit
+else
+    exec sudo -u "$BUILD_USER" -H -- bash -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$WORK_DIR" "${CMD_ARGS[@]}"
+fi
 else
 _log_dsr "EXEC: sudo -u $BUILD_USER -- ${CMD_ARGS[*]}"
-exec sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
+if [[ -n "$_BL_TMP_HOME" ]]; then
+    sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
+    _user_cmd_exit=$?
+    userdel -r "$BUILD_USER" 2>/dev/null || true
+    rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
+    exit $_user_cmd_exit
+else
+    exec sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
+fi
 fi
 else
 if [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR" ]]; then cd "$WORK_DIR" 2>/dev/null || true; fi
@@ -3027,7 +3065,7 @@ SYSTEMD_RUN_FAKE
 chmod +x /usr/local/sbin/systemd-run
 _atomic_sed_inplace /usr/local/sbin/systemd-run "s/HOST_USER_PLACEHOLDER/$HOST_USER/g"
 repaired=$((repaired + 1))
-echo "Fake systemd-run repaired."
+echo "Fake systemd-run repaired (with ad-hoc build-user cleanup)."
 echo "Unrecognized arguments will be logged to /tmp/systemd-run-fake.log for debugging."
 
 if [[ ! -f /etc/profile.d/pamac-daemon.sh ]]; then

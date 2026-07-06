@@ -117,7 +117,7 @@ _filter_verbose_output() {
     # Filter verbose container output to avoid overwhelming the user.
     # Always pass through: errors, warnings, key operation markers, final status lines.
     # Filter out: repetitive download progress, package resolution noise, blank lines.
-    grep -v -E '^\s*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database|^$)|^::(synchronizing|debug:|warning:|info:)|^:: Proceed|^:: Run|^warning:.*downgrading|^warning:.*removing' || true
+    grep -v -E '^\s*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database)|^::(synchronizing|debug:|warning:|info:)|^:: Proceed|^:: Run|^warning:.*downgrading|^warning:.*removing' || true
 }
 
 run_command() {
@@ -383,21 +383,7 @@ force_remove_container() {
   fi
 
   if [[ "$status" == "stopping" || "$status" == "stopped" || "$status" == "improper" ]]; then
-    log_debug "Container '$name' in '$status' state - killing container processes"
-    local pid
-    pid=$(container_runtime_privileged inspect "$name" --format '{{.State.Pid}}' 2>/dev/null || echo "0")
-    if [[ "$pid" -gt 0 ]]; then
-      kill -9 "$pid" 2>/dev/null || true
-    fi
-    local conmon_pid_file
-    conmon_pid_file=$(container_runtime_privileged inspect "$name" --format '{{.ConmonPidFile}}' 2>/dev/null || true)
-    if [[ -n "$conmon_pid_file" && -f "$conmon_pid_file" ]]; then
-      local cpid
-      cpid=$(cat "$conmon_pid_file" 2>/dev/null || echo "0")
-      if [[ "$cpid" -gt 0 ]]; then
-        kill -9 "$cpid" 2>/dev/null || true
-      fi
-    fi
+    log_debug "Container '$name' in '$status' state - will rely on podman rm -f for cleanup"
     sleep 1
   fi
 
@@ -1496,23 +1482,23 @@ exec_container_script() {
 
   rm -f "$_script_file"
 
- if [[ "$CONTAINER_HAS_INIT" == "false" ]] && [[ $_rc -ne 0 ]]; then
- if echo "$_output" | grep -q "$_marker"; then
- log_debug "Script '$_desc' completed successfully (exit $_rc is expected in non-init container - podman may kill entry process after completion)."
- container_start 2>/dev/null || true
- repair_pacman_db
- return 0
- fi
- if [[ $_rc -eq 137 ]]; then
- log_warn "Script '$_desc' got exit 137 without completion marker. May be OOM or signal kill. Attempting DB repair..."
- else
- log_warn "Script '$_desc' got exit $_rc without completion marker in non-init container. May be premature container stop. Attempting DB repair..."
- fi
- container_start 2>/dev/null || true
- repair_pacman_db
- fi
+    if [[ "$CONTAINER_HAS_INIT" == "false" ]] && [[ $_rc -ne 0 ]]; then
+        if echo "$_output" | grep -q "$_marker"; then
+            log_debug "Script '$_desc' completed successfully (exit $_rc is expected in non-init container - podman may kill entry process after completion)."
+            container_start 2>/dev/null || true
+            repair_pacman_db
+            return 0
+        fi
+        if [[ $_rc -eq 137 ]]; then
+            log_warn "Script '$_desc' got exit 137 without completion marker. May be OOM or signal kill. Attempting DB repair..."
+        else
+            log_warn "Script '$_desc' got exit $_rc without completion marker in non-init container. May be premature container stop. Attempting DB repair..."
+        fi
+        container_start 2>/dev/null || true
+        repair_pacman_db
+    fi
 
- if [[ $_rc -ne 0 ]] && ! { [[ "$CONTAINER_HAS_INIT" == "false" ]] && echo "$_output" | grep -q "$_marker"; }; then
+    if [[ $_rc -ne 0 ]] && ! { [[ "$CONTAINER_HAS_INIT" == "false" ]] && echo "$_output" | grep -q "$_marker"; }; then
         log_warn "Script '$_desc' failed (exit=$_rc)."
         if [[ $_rc -eq 100 ]]; then
             log_error "Fatal keyring/security error in script '$_desc'. Last 20 lines of output:"
@@ -1577,23 +1563,23 @@ exec_container_pipe() {
 
     rm -f "$_script_file"
 
- if [[ "$CONTAINER_HAS_INIT" == "false" ]] && [[ $_rc -ne 0 ]]; then
- if echo "$_output" | grep -q "$_marker"; then
- log_debug "Piped script '$_desc' completed successfully (exit $_rc is expected in non-init container - podman may kill entry process after completion)."
- container_start 2>/dev/null || true
- repair_pacman_db
- return 0
- fi
- if [[ $_rc -eq 137 ]]; then
- log_warn "Piped script '$_desc' got exit 137 without completion marker. May be OOM or signal kill. Attempting DB repair..."
- else
- log_warn "Piped script '$_desc' got exit $_rc without completion marker in non-init container. May be premature container stop. Attempting DB repair..."
- fi
- container_start 2>/dev/null || true
- repair_pacman_db
- fi
+    if [[ "$CONTAINER_HAS_INIT" == "false" ]] && [[ $_rc -ne 0 ]]; then
+        if echo "$_output" | grep -q "$_marker"; then
+            log_debug "Piped script '$_desc' completed successfully (exit $_rc is expected in non-init container - podman may kill entry process after completion)."
+            container_start 2>/dev/null || true
+            repair_pacman_db
+            return 0
+        fi
+        if [[ $_rc -eq 137 ]]; then
+            log_warn "Piped script '$_desc' got exit 137 without completion marker. May be OOM or signal kill. Attempting DB repair..."
+        else
+            log_warn "Piped script '$_desc' got exit $_rc without completion marker in non-init container. May be premature container stop. Attempting DB repair..."
+        fi
+        container_start 2>/dev/null || true
+        repair_pacman_db
+    fi
 
- if [[ $_rc -ne 0 ]] && ! { [[ "$CONTAINER_HAS_INIT" == "false" ]] && echo "$_output" | grep -q "$_marker"; }; then
+    if [[ $_rc -ne 0 ]] && ! { [[ "$CONTAINER_HAS_INIT" == "false" ]] && echo "$_output" | grep -q "$_marker"; }; then
         log_warn "Piped script '$_desc' failed (exit=$_rc)."
         if [[ $_rc -eq 100 ]]; then
             log_error "Fatal keyring/security error in piped script '$_desc'. Last 20 lines of output:"
@@ -2120,17 +2106,11 @@ fi
 
 cat > /etc/sudoers.d/99-wheel-nopasswd <<'SUDOERS'
 Cmnd_Alias PAMAC_CMDS = /usr/bin/pacman, \
-    /usr/bin/pamac, \
-    /usr/bin/pamac-manager, \
-    /usr/bin/pamac-daemon, \
     /usr/bin/yay, \
     /usr/bin/makepkg, \
     /usr/bin/pacman-key, \
     /usr/bin/paccache, \
-    /usr/bin/pacscripts, \
-    /usr/bin/lsblk, \
-    /usr/bin/blkid, \
-    /usr/bin/findmnt
+    /usr/bin/pacscripts
 
 %wheel ALL=(ALL:ALL) NOPASSWD: PAMAC_CMDS
 SUDOERS
@@ -2352,7 +2332,7 @@ case "$arg" in
 --property=*) UNRECOGNIZED_PROPS+=("$arg"); _log_dsr "WARN: Unrecognized --property: $arg"; continue ;;
 --property) SKIP_NEXT=true; continue ;;
 --user|--uid=*|--gid=*|--setenv=*) continue ;;
---user|--setenv) SKIP_NEXT=true; continue ;;
+--setenv) SKIP_NEXT=true; continue ;;
 --) shift; CMD_ARGS+=("$@"); break ;;
 *) CMD_ARGS+=("$arg") ;;
 esac
@@ -2636,7 +2616,7 @@ case "$arg" in
 --property=*) UNRECOGNIZED_PROPS+=("$arg"); _log_dsr "WARN: Unrecognized --property: $arg"; continue ;;
 --property) SKIP_NEXT=true; continue ;;
 --user|--uid=*|--gid=*|--setenv=*) continue ;;
---user|--setenv) SKIP_NEXT=true; continue ;;
+--setenv) SKIP_NEXT=true; continue ;;
 --) shift; CMD_ARGS+=("$@"); break ;;
 *) CMD_ARGS+=("$arg") ;;
 esac
@@ -4250,7 +4230,7 @@ PAMAC_PID=$!
 # after a brief delay. This avoids the brittle 30-second polling loop that
 # depends on xdotool/wlrctl/hyprctl — tools that are increasingly restricted
 # by Wayland compositors for security reasons.
-if [[ -z "${WAYLAND_DISPLAY:-}" ]] && command -v xprop >/dev/null 2>&1; then
+if [[ -z "${WAYLAND_DISPLAY:-}" ]] && command -v xprop >/dev/null 2>&1 && command -v xdotool >/dev/null 2>&1 && command -v xwininfo >/dev/null 2>&1; then
     sleep 3
     for wid in $(xdotool search --class "pamac-manager" 2>/dev/null | head -5); do
         width=$(xwininfo -id "$wid" 2>/dev/null | awk '/Width:/{print $NF}')
@@ -4308,7 +4288,7 @@ log_warn "distrobox-export did not produce a desktop file. Creating manually..."
 [Desktop Entry]
 Name=Pamac
 Comment=Add/Remove Software
-Exec=${HOME}/.local/bin/pamac-manager-wrapper-host %U
+Exec=$HOME/.local/bin/pamac-manager-wrapper-host %U
 Icon=system-software-install
 Terminal=false
 Type=Application
@@ -4325,7 +4305,7 @@ X-SteamOS-Pamac-SourcePackage=pamac-aur
 
 [Desktop Action uninstall]
 Name=Uninstall Packages
-Exec=${HOME}/.local/bin/steamos-pamac-uninstall --desktop-file ${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop
+Exec=$HOME/.local/bin/steamos-pamac-uninstall --desktop-file ${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop
 Icon=edit-delete
 DESKTOP_EOF
         chmod +x "$exported_desktop"
@@ -4342,7 +4322,7 @@ DESKTOP_EOF
 Type=Application
 Name=Pamac
 Comment=Add/Remove Software
-Exec=${HOME}/.local/bin/pamac-manager-wrapper-host %U
+Exec=$HOME/.local/bin/pamac-manager-wrapper-host %U
 Icon=system-software-install
 Terminal=false
 Categories=System;PackageManager;Settings;
@@ -4360,7 +4340,7 @@ X-SteamOS-Pamac-SourcePackage=pamac-aur
 
 [Desktop Action uninstall]
 Name=Uninstall Packages
-Exec=${HOME}/.local/bin/steamos-pamac-uninstall --desktop-file "${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
+Exec=$HOME/.local/bin/steamos-pamac-uninstall --desktop-file "${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
 Icon=edit-delete
 DESKTOP_EOF
     chmod +x "$exported_desktop"
@@ -4437,7 +4417,7 @@ LAUNCHER_PID=\$!
 # and GNOME (42+) use StartupWMClass and XDG_ACTIVATION_TOKEN instead.
 # We avoid the old 30-second polling loop with xdotool/wlrctl/hyprctl because those
 # tools are increasingly restricted by Wayland compositors and are unreliable.
-if [[ "\$IS_WAYLAND" == "false" ]] && command -v xprop >/dev/null 2>&1 && command -v xdotool >/dev/null 2>&1; then
+if [[ "\$IS_WAYLAND" == "false" ]] && command -v xprop >/dev/null 2>&1 && command -v xdotool >/dev/null 2>&1 && command -v xwininfo >/dev/null 2>&1; then
     sleep 3
     for wid in \$(xdotool search --class "pamac-manager" 2>/dev/null | head -5); do
         width=\$(xwininfo -id "\$wid" 2>/dev/null | awk -F': ' '/Width:/{print \$2}')
@@ -5521,7 +5501,9 @@ main() {
     initialize_logging
 
     # Prevent concurrent execution with file locking
-    local _lock_file="/tmp/steamos-pamac-setup.lock"
+    local _lock_dir="${XDG_RUNTIME_DIR:-$HOME/.local/state}"
+    mkdir -p "$_lock_dir" 2>/dev/null || _lock_dir="/tmp"
+    local _lock_file="$_lock_dir/steamos-pamac-setup.lock"
     exec 9>"$_lock_file"
     if ! flock -n 9; then
         log_error "Another instance of this script is already running (lock file: $_lock_file)."
@@ -5584,7 +5566,7 @@ main() {
     echo
 
     log_info "Checking available system resources..."
-    check_memory_ok 262144 "container creation" 262144 || {
+    check_memory_ok 524288 "container creation" 262144 || {
         log_error "Insufficient memory for container creation (need at least 256MB). Aborting."
         exit 1
     }
@@ -5656,7 +5638,7 @@ main() {
     esac
   fi
 
-    check_memory_ok 262144 "base setup" 262144 || {
+    check_memory_ok 524288 "base setup" 262144 || {
         log_error "Insufficient memory for base setup (need at least 256MB). Aborting."
         exit 1
     }

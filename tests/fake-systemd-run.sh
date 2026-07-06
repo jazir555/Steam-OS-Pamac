@@ -84,6 +84,7 @@ fi
 
 if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
     BUILD_USER="deck"
+    _BL_TMP_HOME=""
     if ! id "$BUILD_USER" >/dev/null 2>&1; then
         # 'nobody' has no writable home and is not safe for AUR builds.
         # Match the installer: try an ad-hoc build user, then refuse if that fails.
@@ -93,6 +94,8 @@ if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
             if ! useradd -M -d "$_bl_tmp" -s /bin/bash "$BUILD_USER" 2>/dev/null; then
                 rmdir "$_bl_tmp" 2>/dev/null || true
                 BUILD_USER=""
+            else
+                _BL_TMP_HOME="$_bl_tmp"
             fi
         fi
         if [[ -z "$BUILD_USER" ]] || ! id "$BUILD_USER" >/dev/null 2>&1; then
@@ -101,10 +104,18 @@ if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
         fi
     fi
 
+    _cleanup_builduser() {
+        if [[ -n "$_BL_TMP_HOME" ]]; then
+            userdel -r "$BUILD_USER" 2>/dev/null || true
+            rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
+        fi
+    }
+    trap _cleanup_builduser EXIT
+
     if [[ -n "$WORK_DIR" ]]; then
-        exec sudo -u "$BUILD_USER" -H -- bash -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$WORK_DIR" "${CMD_ARGS[@]}"
+        sudo -u "$BUILD_USER" -H -- bash -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$WORK_DIR" "${CMD_ARGS[@]}"
     else
-        exec sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
+        sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
     fi
 else
     if [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR" ]]; then

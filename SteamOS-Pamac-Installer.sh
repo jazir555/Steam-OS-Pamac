@@ -1266,6 +1266,12 @@ create_container() {
         log_info "Enabled persistent build cache: $cache_dir"
     fi
 
+  if [[ -n "${_CREATE_RECREATION_GUARD:-}" ]]; then
+    log_error "Container creation already attempted recreation internally - refusing nested retry."
+    return 1
+  fi
+  _CREATE_RECREATION_GUARD=1
+
   if ! run_command distrobox create "${create_args[@]}"; then
     log_warn "Container create failed - attempting cleanup and retry..."
     force_remove_container "$CONTAINER_NAME"
@@ -1278,13 +1284,6 @@ create_container() {
 
     log_info "Starting container..."
     container_start 2>/dev/null || true
-
-  if [[ -z "${_CREATE_RECREATION_GUARD:-}" ]]; then
-    _CREATE_RECREATION_GUARD=1
-  else
-    log_error "Container creation already attempted recreation internally - refusing nested retry."
-    return 1
-  fi
 
   local wait_result=0
   wait_for_container || wait_result=$?
@@ -1747,23 +1746,15 @@ if [[ "$_safe_recovered" != "true" ]]; then
     fi
 fi
 
-# Fallback: TrustAll (only if all safe methods failed)
+# No TrustAll fallback — skip repo if keyring recovery fails
 if [[ "$_safe_recovered" == "true" ]]; then
-    echo "Safe keyring recovery succeeded. No TrustAll fallback needed."
+    echo "Safe keyring recovery succeeded."
 else
-    echo "WARNING: All safe recovery methods failed. Falling back to temporary TrustAll (last resort)."
-    echo "TrustAll is insecure and will be restored immediately after keyring update."
-    # Create atomic backup (mktemp + mv is already atomic on POSIX)
-    _tmp_siglevel_bak=$(mktemp /etc/pacman.conf.siglevel-backup.XXXXXX)
-    cp -f /etc/pacman.conf "$_tmp_siglevel_bak"
-    sync 2>/dev/null || true
-    mv -f "$_tmp_siglevel_bak" /etc/pacman.conf.siglevel-backup
-    # Create sentinel BEFORE weakening security — survives power loss / SIGKILL
-    touch "$_SIGLEVEL_SENTINEL"
-    sync 2>/dev/null || true
-    # Atomically write TrustAll to pacman.conf
-    _atomic_write_pacman_conf "TrustAll"
-    echo "Backup saved to $_SIGLEVEL_BACKUP; crash sentinel at $_SIGLEVEL_SENTINEL."
+    echo "FATAL: All safe recovery methods failed. Cannot proceed without valid keyring."
+    echo "TrustAll is NOT used as it would disable all signature verification."
+    echo "Try: pacman-key --init && pacman-key --populate archlinux"
+    echo "Or: install archlinux-keyring from a trusted source manually."
+    exit 100
 fi
 
 echo "Step 3/5: Updating keyring, GPG, and certificate packages..."
@@ -2147,7 +2138,16 @@ Cmnd_Alias PAMAC_CMDS = /usr/bin/pacman, \
 %wheel ALL=(ALL:ALL) NOPASSWD: PAMAC_CMDS
 SUDOERS
 chmod 0440 /etc/sudoers.d/99-wheel-nopasswd
-echo "Configured strict sudo allowlist for package management only."
+if command -v visudo >/dev/null 2>&1; then
+    if visudo -c -f /etc/sudoers.d/99-wheel-nopasswd 2>/dev/null; then
+        echo "Configured strict sudo allowlist for package management only (validated with visudo)."
+    else
+        echo "Warning: sudoers syntax check failed. Removing potentially broken sudoers file."
+        rm -f /etc/sudoers.d/99-wheel-nopasswd
+    fi
+else
+    echo "Configured strict sudo allowlist for package management only (visudo not available for validation)."
+fi
 USER_EOF
 
     exec_container_script "$user_script" "user-setup" "$CURRENT_USER" || return 1
@@ -2236,7 +2236,7 @@ cat > /usr/local/bin/pamac-session-bootstrap.sh << 'BOOTSTRAP'
 #!/bin/bash
 set +e
 BOOTSTRAP_LOG="/tmp/pamac-bootstrap.log"
-touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 666 "$BOOTSTRAP_LOG" 2>/dev/null
+touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
 
 # Crash recovery: if the previous keyring-init run was killed (power loss, SIGKILL),
 # the TrustAll SigLevel may be permanently set. The sentinel file persists across
@@ -2531,7 +2531,7 @@ cat > /usr/local/bin/pamac-session-bootstrap.sh << 'BOOTSTRAP'
 #!/bin/bash
 set +e
 BOOTSTRAP_LOG="/tmp/pamac-bootstrap.log"
-touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 666 "$BOOTSTRAP_LOG" 2>/dev/null
+touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
 
 if [[ -f /etc/pacman.conf.siglevel-pending ]] || grep -q '^SigLevel\s*=\s*TrustAll' /etc/pacman.conf 2>/dev/null; then
     if [[ -f /etc/pacman.conf.siglevel-backup ]]; then
@@ -2976,14 +2976,29 @@ _enable_repo_with_fallback() {
             direct_url="${direct_url//\\\$repo/$repo_name}"
             direct_url="${direct_url//\$repo/$repo_name}"
             local pkg_url="${direct_url%/}/${keyring_pkg}.pkg.tar.zst"
+            local pkg_sig_url="${pkg_url}.sig"
             if timeout 30 curl -fsSL --connect-timeout 10 -o "/tmp/${keyring_pkg}.pkg.tar.zst" "$pkg_url" 2>/dev/null; then
-                if pacman -U --noconfirm "/tmp/${keyring_pkg}.pkg.tar.zst" 2>/dev/null; then
-                    echo "$repo_name keyring installed from direct download: $pkg_url"
-                    key_ok=true
-                    rm -f "/tmp/${keyring_pkg}.pkg.tar.zst"
-                    break
+                # Verify package signature if available
+                local _sig_ok=false
+                if timeout 15 curl -fsSL --connect-timeout 5 -o "/tmp/${keyring_pkg}.pkg.tar.zst.sig" "$pkg_sig_url" 2>/dev/null; then
+                    if gpg --verify "/tmp/${keyring_pkg}.pkg.tar.zst.sig" "/tmp/${keyring_pkg}.pkg.tar.zst" 2>/dev/null; then
+                        _sig_ok=true
+                        echo "$repo_name keyring package signature verified."
+                    else
+                        echo "Warning: $repo_name keyring package signature verification FAILED. Skipping this mirror."
+                    fi
+                else
+                    echo "Warning: $repo_name keyring package has no signature file. Skipping this mirror."
                 fi
-                rm -f "/tmp/${keyring_pkg}.pkg.tar.zst"
+                if [[ "$_sig_ok" == "true" ]]; then
+                    if pacman -U --noconfirm "/tmp/${keyring_pkg}.pkg.tar.zst" 2>/dev/null; then
+                        echo "$repo_name keyring installed from direct download: $pkg_url"
+                        key_ok=true
+                        rm -f "/tmp/${keyring_pkg}.pkg.tar.zst" "/tmp/${keyring_pkg}.pkg.tar.zst.sig"
+                        break
+                    fi
+                fi
+                rm -f "/tmp/${keyring_pkg}.pkg.tar.zst" "/tmp/${keyring_pkg}.pkg.tar.zst.sig"
             fi
         done
     fi
@@ -3046,19 +3061,9 @@ _enable_repo_with_fallback() {
         echo "$repo_name repository configured (TrustedOnly)."
     else
         echo "Warning: All key setup methods failed for $repo_name (key_id=$key_id)."
-        echo "Adding $repo_name with SigLevel = TrustAll as degraded fallback."
-        echo "This allows the repo to function but skips signature verification."
+        echo "SKIPPING $repo_name repository: signature verification cannot be guaranteed."
         echo "Consider manually importing the correct signing key later, or set"
         echo "  ${env_var_name}=<KEY_ID>  before running this script."
-        # Crash-safe: back up pacman.conf before weakening security.
-        # If the script is killed here, the trap restores from backup.
-        if [[ ! -f "$_EXTRA_REPOS_BACKUP" ]]; then
-            cp -f /etc/pacman.conf "$_EXTRA_REPOS_BACKUP"
-            sync 2>/dev/null || true
-            touch "$_EXTRA_REPOS_SENTINEL"
-            sync 2>/dev/null || true
-        fi
-        printf '\n[%s]\nSigLevel = TrustAll\n%b' "$repo_name" "$server_lines" >> /etc/pacman.conf
     fi
 
     return 0
@@ -3093,7 +3098,7 @@ if ! _repo_already_enabled "mesa-git"; then
     echo "Skipping mesa-git repo (can break GPU drivers on Steam Deck)."
     echo "To enable manually, add to /etc/pacman.conf inside the container:"
     echo '  [mesa-git]'
-    echo '  SigLevel = TrustAll'
+    echo '  SigLevel = TrustedOnly'
     echo '  Server = https://cdn-mirror.chaotic.cx/chaotic-aur/mesa-git/$arch'
 else
     echo "mesa-git already enabled."
@@ -3213,10 +3218,9 @@ while [[ $clone_retry -lt $max_clone_retries ]]; do
     clone_retry=$((clone_retry + 1))
     if [[ $clone_retry -lt $max_clone_retries ]]; then
         if echo "$clone_err" | grep -qi "SSL\|TLS\|certificate"; then
-            echo "TLS error detected, retrying with SSL verification disabled..."
-            if sudo -Hu "$current_user" env GIT_SSL_NO_VERIFY=true git clone "https://aur.archlinux.org/yay.git" /tmp/yay 2>/tmp/yay_clone_err; then
-                break
-            fi
+            echo "TLS error detected. Ensuring CA certificates are installed..."
+            sudo -Hu "$current_user" bash -lc "pacman -S --noconfirm --needed ca-certificates-mozilla 2>/dev/null || true"
+            echo "Retrying clone without disabling SSL verification..."
         fi
 wait_time=$((2 ** clone_retry))
 echo "Clone failed (attempt $clone_retry/$max_clone_retries). Retrying in ${wait_time}s..."
@@ -4558,8 +4562,13 @@ fi
 exit 1
 fi
 
-_log "Removing \$pkg via pacman -Rns (as root, no D-Bus needed)..."
-local remove_output
+ _log "Removing \$pkg via pacman -Rns (as root, no D-Bus needed)..."
+ if ! echo "\$pkg" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9._+-]*$'; then
+ _log "Error: Invalid package name format: '\$pkg'"
+ echo "Error: Invalid package name: '\$pkg'" >&2
+ exit 1
+ fi
+ local remove_output
  remove_output=\$("\$CONTAINER_MANAGER" exec -u 0 "\$CONTAINER_NAME" bash -c "
 rm -f /var/lib/pacman/db.lck 2>/dev/null
 pacman -Rns --noconfirm \"\$pkg\" 2>&1
@@ -5492,6 +5501,15 @@ main() {
 
     parse_arguments "$@"
     initialize_logging
+
+    # Prevent concurrent execution with file locking
+    local _lock_file="/tmp/steamos-pamac-setup.lock"
+    exec 9>"$_lock_file"
+    if ! flock -n 9; then
+        log_error "Another instance of this script is already running (lock file: $_lock_file)."
+        log_error "If no other instance is running, remove the lock file and try again."
+        exit 1
+    fi
 
     if [[ "$UNINSTALL" == "true" ]]; then
         uninstall_setup

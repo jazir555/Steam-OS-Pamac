@@ -8,11 +8,13 @@ set -euo pipefail
 #   <<'EOF'  — no host variable expansion; content runs inside container
 #   <<EOF    — host variables expand at write-time; use \$ for literal $
 
-readonly SCRIPT_VERSION="5.2.0"
+readonly SCRIPT_VERSION="5.2.1"
 readonly DEFAULT_CONTAINER_NAME="arch-pamac"
 readonly LOG_FILE="$HOME/distrobox-pamac-setup.log"
 readonly REQUIRED_TOOLS=("distrobox")
 CONTAINER_HAS_INIT="unknown"
+
+readonly ARCHLINUX_IMAGE="${ARCHLINUX_IMAGE:-archlinux:latest}"
 
 # Track temp files for cleanup on interrupt
 _TEMP_FILES=()
@@ -37,6 +39,7 @@ ALLOW_SUDO_FALLBACK="${ALLOW_SUDO_FALLBACK:-false}"
 
 DRY_RUN="${DRY_RUN:-false}"
 CHECK_ONLY="${CHECK_ONLY:-false}"
+STATUS="${STATUS:-false}"
 UNINSTALL="${UNINSTALL:-false}"
 EXPORT_ONLY="${EXPORT_ONLY:-false}"
 LOG_LEVEL="${LOG_LEVEL:-normal}"
@@ -370,11 +373,11 @@ force_remove_container() {
     if [[ "$pid" -gt 0 ]]; then
       kill -9 "$pid" 2>/dev/null || true
     fi
-    local conmon_pid
-    conmon_pid=$(container_runtime_privileged inspect "$name" --format '{{.ConmonPidFile}}' 2>/dev/null || true)
-    if [[ -n "$conmon_pid" && -f "$conmon_pid" ]]; then
+    local conmon_pid_file
+    conmon_pid_file=$(container_runtime_privileged inspect "$name" --format '{{.ConmonPidFile}}' 2>/dev/null || true)
+    if [[ -n "$conmon_pid_file" && -f "$conmon_pid_file" ]]; then
       local cpid
-      cpid=$(cat "$conmon_pid" 2>/dev/null || echo "0")
+      cpid=$(cat "$conmon_pid_file" 2>/dev/null || echo "0")
       if [[ "$cpid" -gt 0 ]]; then
         kill -9 "$cpid" 2>/dev/null || true
       fi
@@ -688,7 +691,7 @@ repair_podman() {
         log_info "Rootless podman needs subuid/subgid mappings to run containers."
         log_info "To fix: add to /etc/subuid:  $(whoami):100000:65536"
         log_info "And:     to /etc/subgid:  $(whoami):100000:65536"
-        log_info "Then run: podman system reset --force && podman pull archlinux:latest"
+        log_info "Then run: podman system reset --force && podman pull $ARCHLINUX_IMAGE"
         log_info "On SteamOS, subuid/subgid are usually created automatically when podman is installed."
         log_info "If missing, try: sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(whoami)"
     else
@@ -917,6 +920,7 @@ OPTIONS:
   --optimize-mirrors        Select fastest Pacman mirrors (default)
   --no-optimize-mirrors     Do not change default Pacman mirrors
   --uninstall               Remove container and all related files
+  --status                  Check container health, Pamac installation, and export status
   --export-only              Re-export apps to host menu without running full setup
   --non-interactive          Skip all interactive prompts (safe for automation)
   --check                   Perform system checks and exit without installing
@@ -928,6 +932,9 @@ OPTIONS:
 
 ENVIRONMENT VARIABLES:
   CONTAINER_NAME            Override default container name (default: arch-pamac)
+  ARCHLINUX_IMAGE           Container base image (default: archlinux:latest)
+                            Pin to a specific tag for reproducibility, e.g.:
+                            ARCHLINUX_IMAGE=archlinux:base-devel-20260628.0.549485
   FORCE_REBUILD            Set to 'true' to force-rebuild existing container
   ENABLE_GAMING_PACKAGES   Set to 'true' to install gaming packages
   PAMAC_VERSION            Specific pamac-aur version/commit to install (AUR fallback)
@@ -980,6 +987,7 @@ parse_arguments() {
                 shift 2
                 ;;
             --uninstall) UNINSTALL="true"; shift ;;
+            --status) STATUS="true"; shift ;;
             --export-only) EXPORT_ONLY="true"; shift ;;
             --non-interactive) NON_INTERACTIVE="true"; shift ;;
             --dry-run) DRY_RUN="true"; shift ;;
@@ -1236,12 +1244,12 @@ create_container() {
 
     local -a create_args=(
         --name "$CONTAINER_NAME"
-        --image "archlinux:latest"
+        --image "$ARCHLINUX_IMAGE"
         --yes
     )
 
-    log_info "Pulling latest archlinux:latest image..."
-    if ! run_command container_runtime pull archlinux:latest; then
+    log_info "Pulling ${ARCHLINUX_IMAGE} image..."
+    if ! run_command container_runtime pull "$ARCHLINUX_IMAGE"; then
         log_warn "Image pull failed, proceeding with cached image."
     fi
 
@@ -1433,7 +1441,7 @@ install_base_devel_batched() {
         echo "FATAL: Critical base-devel components failed to install. Aborting."
         return 1
     fi
-    if ! pacman -Q base-devel >/dev/null 2>&1 && ! safe_install base-devel; then
+    if ! pacman -Qg base-devel >/dev/null 2>&1 && ! safe_install base-devel; then
         echo "Warning: base-devel group meta-package could not be installed (individual packages verified above)."
     fi
 }
@@ -2397,7 +2405,7 @@ BUILD_USER="HOST_USER_PLACEHOLDER"
 if ! id "$BUILD_USER" >/dev/null 2>&1; then BUILD_USER="nobody"; fi
 if [[ -n "$WORK_DIR" ]]; then
 _log_dsr "EXEC: sudo -u $BUILD_USER -- cd $WORK_DIR; ${CMD_ARGS[*]}"
-exec sudo -u "$BUILD_USER" -H -- bash -c "cd '$WORK_DIR' 2>/dev/null; exec ${CMD_ARGS[*]}"
+exec sudo -u "$BUILD_USER" -H -- bash -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$WORK_DIR" "${CMD_ARGS[@]}"
 else
 _log_dsr "EXEC: sudo -u $BUILD_USER -- ${CMD_ARGS[*]}"
 exec sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
@@ -2693,7 +2701,7 @@ BUILD_USER="HOST_USER_PLACEHOLDER"
 if ! id "$BUILD_USER" >/dev/null 2>&1; then BUILD_USER="nobody"; fi
 if [[ -n "$WORK_DIR" ]]; then
 _log_dsr "EXEC: sudo -u $BUILD_USER -- cd $WORK_DIR; ${CMD_ARGS[*]}"
-exec sudo -u "$BUILD_USER" -H -- bash -c "cd '$WORK_DIR' 2>/dev/null; exec ${CMD_ARGS[*]}"
+exec sudo -u "$BUILD_USER" -H -- bash -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$WORK_DIR" "${CMD_ARGS[@]}"
 else
 _log_dsr "EXEC: sudo -u $BUILD_USER -- ${CMD_ARGS[*]}"
 exec sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
@@ -3133,7 +3141,7 @@ rm -f /var/lib/pacman/db.lck
 
 _missing=""
 command -v git >/dev/null 2>&1 || _missing="$_missing git"
-pacman -Q base-devel >/dev/null 2>&1 || _missing="$_missing base-devel"
+pacman -Qg base-devel >/dev/null 2>&1 || _missing="$_missing base-devel"
 command -v go >/dev/null 2>&1 || _missing="$_missing go"
 
 if [[ -n "$_missing" ]]; then
@@ -5344,6 +5352,125 @@ show_completion_message() {
     echo
 }
 
+show_status() {
+    setup_colors
+
+    echo -e "${BOLD}${BLUE}Steam Deck Pamac Setup Status v${SCRIPT_VERSION}${NC}"
+    echo
+
+    local has_issues=false
+
+    echo -e "${BOLD}--- Container ---${NC}"
+    if ! distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
+        echo -e "  Container: ${RED}NOT FOUND${NC} ('$CONTAINER_NAME')"
+        echo -e "  ${YELLOW}Run the full setup to create the container.${NC}"
+        echo
+        return 1
+    fi
+    echo -e "  Container: ${GREEN}EXISTS${NC} ('$CONTAINER_NAME')"
+
+    local container_state
+    container_state=$(container_get_status_safe)
+    case "$container_state" in
+        "running")
+            if container_is_usable; then
+                echo -e "  State:    ${GREEN}RUNNING & RESPONSIVE${NC}"
+            else
+                echo -e "  State:    ${YELLOW}RUNNING but NOT RESPONSIVE${NC}"
+                has_issues=true
+            fi
+            ;;
+        "stopped"|"exited")
+            echo -e "  State:    ${YELLOW}STOPPED/EXITED${NC} (may be normal for non-init containers)"
+            ;;
+        *)
+            echo -e "  State:    ${RED}${container_state^^}${NC}"
+            has_issues=true
+            ;;
+    esac
+
+    echo
+    echo -e "${BOLD}--- Pamac Installation ---${NC}"
+    local pamac_ok=true
+
+    if container_is_usable 2>/dev/null || container_root_exec bash -c "echo ok" 2>/dev/null | grep -q ok; then
+        if container_root_exec bash -c "command -v pamac-manager >/dev/null 2>&1 && command -v pamac >/dev/null 2>&1" 2>/dev/null; then
+            local pamac_ver
+            pamac_ver=$(container_root_exec bash -c "pamac --version 2>/dev/null | head -1" 2>/dev/null || echo "unknown")
+            echo -e "  Pamac CLI:     ${GREEN}INSTALLED${NC} ($pamac_ver)"
+        else
+            echo -e "  Pamac CLI:     ${RED}NOT FOUND${NC}"
+            pamac_ok=false
+            has_issues=true
+        fi
+
+        if container_root_exec bash -c "command -v pamac-manager >/dev/null 2>&1" 2>/dev/null; then
+            echo -e "  Pamac Manager: ${GREEN}INSTALLED${NC}"
+        else
+            echo -e "  Pamac Manager: ${RED}NOT FOUND${NC}"
+            pamac_ok=false
+            has_issues=true
+        fi
+
+        if container_root_exec bash -c "command -v yay >/dev/null 2>&1" 2>/dev/null; then
+            echo -e "  AUR helper:    ${GREEN}INSTALLED${NC}"
+        else
+            echo -e "  AUR helper:    ${YELLOW}NOT FOUND${NC} (yay)"
+        fi
+
+        if container_root_exec bash -c "command -v gcc >/dev/null 2>&1 && command -v make >/dev/null 2>&1" 2>/dev/null; then
+            echo -e "  Build tools:   ${GREEN}INSTALLED${NC}"
+        else
+            echo -e "  Build tools:   ${YELLOW}MISSING${NC} (gcc/make)"
+        fi
+    else
+        echo -e "  ${RED}Cannot check Pamac - container is not usable.${NC}"
+        has_issues=true
+    fi
+
+    echo
+    echo -e "${BOLD}--- Desktop Integration ---${NC}"
+    local desktop_dir="$HOME/.local/share/applications"
+    local exported_count=0
+    local state_dir="$HOME/.local/share/steamos-pamac/$CONTAINER_NAME"
+
+    if [[ -f "$state_dir/exported-apps.list" ]]; then
+        while IFS= read -r line; do
+            [[ -f "$line" ]] && exported_count=$((exported_count + 1))
+        done < "$state_dir/exported-apps.list"
+    fi
+
+    local desktop_files
+    desktop_files=$(find "$desktop_dir" -maxdepth 1 -type f -name "${CONTAINER_NAME}-*.desktop" 2>/dev/null | wc -l || echo "0")
+
+    echo "  Desktop files:  $desktop_files"
+    echo "  Exported apps:  $exported_count"
+
+    local bin_dir="$HOME/.local/bin"
+    if [[ -f "$bin_dir/pamac-${CONTAINER_NAME}" ]]; then
+        echo -e "  CLI wrapper:    ${GREEN}PRESENT${NC} ($bin_dir/pamac-${CONTAINER_NAME})"
+    else
+        echo -e "  CLI wrapper:    ${YELLOW}MISSING${NC}"
+    fi
+
+    if [[ -f "$bin_dir/pamac-manager-wrapper-host" ]]; then
+        echo -e "  GUI wrapper:    ${GREEN}PRESENT${NC}"
+    else
+        echo -e "  GUI wrapper:    ${YELLOW}MISSING${NC}"
+    fi
+
+    echo
+    if [[ "$has_issues" == "true" ]]; then
+        echo -e "${BOLD}${YELLOW}--- Issues Detected ---${NC}"
+        echo "  Some components need attention. Run the full setup again to fix:"
+        echo "    $0"
+        echo
+    else
+        echo -e "${BOLD}${GREEN}--- All Checks Passed ---${NC}"
+        echo
+    fi
+}
+
 run_pre_flight_checks() {
     log_step "Running pre-flight system checks..."
     if check_system_requirements; then
@@ -5370,6 +5497,11 @@ main() {
     if [[ "$UNINSTALL" == "true" ]]; then
         uninstall_setup
         exit 0
+    fi
+
+    if [[ "$STATUS" == "true" ]]; then
+        show_status
+        exit $?
     fi
 
     if [[ "$EXPORT_ONLY" == "true" ]]; then

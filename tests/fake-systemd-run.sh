@@ -89,7 +89,7 @@ if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
     fi
 
     if [[ -n "$WORK_DIR" ]]; then
-        exec sudo -u "$BUILD_USER" -H -- bash -c "cd '$WORK_DIR' 2>/dev/null; exec ${CMD_ARGS[*]}"
+        exec sudo -u "$BUILD_USER" -H -- bash -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$WORK_DIR" "${CMD_ARGS[@]}"
     else
         exec sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
     fi

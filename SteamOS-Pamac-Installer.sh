@@ -1674,47 +1674,82 @@ echo "Method A: Refreshing keys from keyservers..."
 pkill -9 gpg-agent 2>/dev/null || true
 pkill -9 dirmngr 2>/dev/null || true
 _safe_sleep 1
+
+# Pre-flight: check which keyservers are reachable (TCP connect test, 3s timeout)
+echo "Pre-flight: testing keyserver reachability..."
+_KS_REACHABLE=()
+_KS_UNREACHABLE=()
 for _ks in "hkps://keyserver.ubuntu.com" "hkps://keys.openpgp.org" "hkps://pgp.mit.edu"; do
+    _ks_host="${_ks#hkps://}"
+    _ks_host="${_ks_host#https://}"
+    _ks_host="${_ks_host#http://}"
+    # Try port 443 (HTTPS) first, then 11371 (HKPS)
+    if timeout 3 bash -c "echo >/dev/tcp/$_ks_host/443" 2>/dev/null || \
+       timeout 3 bash -c "echo >/dev/tcp/$_ks_host/11371" 2>/dev/null; then
+        echo "  $_ks: REACHABLE"
+        _KS_REACHABLE+=("$_ks")
+    else
+        echo "  $_ks: UNREACHABLE (will skip)"
+        _KS_UNREACHABLE+=("$_ks")
+    fi
+done
+
+if [[ ${#_KS_REACHABLE[@]} -eq 0 ]]; then
+    echo "  WARNING: No keyservers reachable. All keyserver methods will be skipped."
+    echo "  This may be due to firewall restrictions on ports 443/11371."
+    echo "  Falling back to direct HTTPS keyring download..."
+fi
+
+for _ks in "${_KS_REACHABLE[@]}"; do
     echo "  Trying keyserver: $_ks"
-    if timeout 45 pacman-key --refresh-keys --keyserver "$_ks" 2>/dev/null; then
+    if timeout 20 pacman-key --refresh-keys --keyserver "$_ks" 2>/dev/null; then
         echo "  Key refresh succeeded from $_ks."
         _safe_recovered=true
         break
     fi
-    echo "  Keyserver $_ks failed or timed out."
+    echo "  Keyserver $_ks failed or timed out (20s limit)."
 done
 
 # Method B: Download keyring package directly via HTTPS and import keys manually
 if [[ "$_safe_recovered" != "true" ]] && command -v curl >/dev/null 2>&1; then
     echo "Method B: Attempting direct keyring package download via HTTPS..."
     _SECURE_TMP=$(mktemp -d /var/tmp/pamac-kr-XXXXXX) && chmod 700 "$_SECURE_TMP" 2>/dev/null || _SECURE_TMP=$(mktemp -d)
-    _mirror_url="https://geo.mirror.pkgbuild.com/core/os/x86_64"
-    _kr_pkg=$(curl -sLf --connect-timeout 10 --max-time 30 "${_mirror_url}/" 2>/dev/null | \
-        grep -oP 'archlinux-keyring-[0-9]+-[0-9]+-any\.pkg\.tar\.zst' | sort -V | tail -1 || true)
-    if [[ -n "$_kr_pkg" ]]; then
-        echo "  Found keyring package: $_kr_pkg"
-        _tmp_kr="$_SECURE_TMP/kr.pkg.tar.zst"
-        if curl -sLf --connect-timeout 10 --max-time 120 -o "$_tmp_kr" "${_mirror_url}/${_kr_pkg}" 2>/dev/null; then
-            _tmp_kr_dir="$_SECURE_TMP/kr-extract"
-            mkdir -p "$_tmp_kr_dir" && chmod 700 "$_tmp_kr_dir" 2>/dev/null || true
-            if tar -xf "$_tmp_kr" -C "$_tmp_kr_dir" 2>/dev/null; then
-                for _kr_file in "$_tmp_kr_dir"/usr/share/pacman/keyrings/archlinux*; do
-                    [[ -f "$_kr_file" ]] && cp -f "$_kr_file" /etc/pacman.d/gnupg/ 2>/dev/null || true
-                done
-                echo "  Keyring files extracted. Populating..."
-                if pacman-key --populate archlinux 2>/dev/null; then
-                    echo "  Direct keyring import succeeded."
-                    _safe_recovered=true
-                else
-                    echo "  Keyring populate failed after direct import."
+    # Try multiple mirrors for keyring package download
+    _mirror_urls=(
+        "https://geo.mirror.pkgbuild.com/core/os/x86_64"
+        "https://mirror.rackspace.com/archlinux/core/os/x86_64"
+        "https://archlinux.umn.edu/repos/core/os/x86_64"
+    )
+    for _mirror_url in "${_mirror_urls[@]}"; do
+        echo "  Trying mirror: $_mirror_url"
+        _kr_pkg=$(curl -sLf --connect-timeout 5 --max-time 15 "${_mirror_url}/" 2>/dev/null | \
+            grep -oP 'archlinux-keyring-[0-9]+-[0-9]+-any\.pkg\.tar\.zst' | sort -V | tail -1 || true)
+        if [[ -n "$_kr_pkg" ]]; then
+            echo "  Found keyring package: $_kr_pkg"
+            _tmp_kr="$_SECURE_TMP/kr.pkg.tar.zst"
+            if curl -sLf --connect-timeout 5 --max-time 60 -o "$_tmp_kr" "${_mirror_url}/${_kr_pkg}" 2>/dev/null; then
+                _tmp_kr_dir="$_SECURE_TMP/kr-extract"
+                mkdir -p "$_tmp_kr_dir" && chmod 700 "$_tmp_kr_dir" 2>/dev/null || true
+                if tar -xf "$_tmp_kr" -C "$_tmp_kr_dir" 2>/dev/null; then
+                    for _kr_file in "$_tmp_kr_dir"/usr/share/pacman/keyrings/archlinux*; do
+                        [[ -f "$_kr_file" ]] && cp -f "$_kr_file" /etc/pacman.d/gnupg/ 2>/dev/null || true
+                    done
+                    echo "  Keyring files extracted. Populating..."
+                    if pacman-key --populate archlinux 2>/dev/null; then
+                        echo "  Direct keyring import succeeded."
+                        _safe_recovered=true
+                        break
+                    else
+                        echo "  Keyring populate failed after direct import."
+                    fi
                 fi
+                rm -rf "$_tmp_kr_dir"
             fi
-            rm -rf "$_tmp_kr_dir"
+            rm -f "$_tmp_kr"
+        else
+            echo "  Could not find keyring package on mirror."
         fi
-        rm -f "$_tmp_kr"
-    else
-        echo "  Could not find keyring package on mirror."
-    fi
+    done
     rm -rf "$_SECURE_TMP" 2>/dev/null || true
 fi
 
@@ -1738,8 +1773,21 @@ if [[ "$_safe_recovered" == "true" ]]; then
 else
     echo "FATAL: All safe recovery methods failed. Cannot proceed without valid keyring."
     echo "TrustAll is NOT used as it would disable all signature verification."
-    echo "Try: pacman-key --init && pacman-key --populate archlinux"
-    echo "Or: install archlinux-keyring from a trusted source manually."
+    echo ""
+    echo "DIAGNOSIS: Keyring recovery can fail due to:"
+    echo "  1. Network restrictions: firewall blocking ports 443/11371 (HKPS protocol)"
+    echo "  2. DNS resolution failure: keyservers cannot be resolved"
+    echo "  3. All mirrors unreachable: HTTPS keyring package download failed"
+    echo "  4. Corrupted base image: keyring files missing or damaged"
+    echo ""
+    echo "MANUAL FIXES:"
+    echo "  1. Try: pacman-key --init && pacman-key --populate archlinux"
+    echo "  2. Try: pacman -S --noconfirm archlinux-keyring (if repos are accessible)"
+    echo "  3. Check network: curl -I https://archlinux.org (should return 200)"
+    echo "  4. If behind a corporate firewall, configure HTTPS proxy:"
+    echo "     export http_proxy=http://proxy:port"
+    echo "     export https_proxy=http://proxy:port"
+    echo "  5. Install archlinux-keyring from a trusted source manually."
     exit 100
 fi
 
@@ -2286,14 +2334,17 @@ cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE'
 # Fake systemd-run for non-systemd containers (Distrobox).
 # Mimics the subset of systemd-run used by Pamac/makepkg for DynamicUser builds.
 # Logs unrecognized arguments to /tmp/systemd-run-fake.log for diagnostics.
+# Prints visible warnings to stderr when unrecognized properties are detected.
 _DSR_LOG="/tmp/systemd-run-fake.log"
+DSR_VERSION="2.0"
 _log_dsr() { echo "[$(date '+%H:%M:%S')] $*" >> "$_DSR_LOG" 2>/dev/null; }
+_warn_dsr() { echo "systemd-run(fake): WARNING: $*" >> "$_DSR_LOG" 2>/dev/null; echo "systemd-run(fake): WARNING: $*" >&2 2>/dev/null || true; }
 
 # Passthrough: --help and --version are not meaningful here
 for _a in "$@"; do
     case "$_a" in
-        --help|-h) echo "systemd-run (fake): Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo "Recognized options: --property=DynamicUser=yes, --property=CacheDirectory=*, --property=WorkingDirectory=*, --pipe, --wait, --quiet, --no-block, --description=*, --unit=*, --service-type=*, --user, --uid=*, --gid=*, --setenv=*, --"; exit 0 ;;
-        --version) echo "systemd-run (fake) v1.0 (SteamOS-Pamac)"; exit 0 ;;
+        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo "Recognized options: --property=DynamicUser=yes, --property=CacheDirectory=*, --property=WorkingDirectory=*, --property=StateDirectory=*, --property=LogsDirectory=*, --property=RuntimeDirectory=*, --property=TemporaryFileSystem=*, --property=BindPaths=*, --property=BindReadOnlyPaths=*, --property=ProtectSystem=*, --property=ProtectHome=*, --property=PrivateTmp=*, --property=NoNewPrivileges=*, --property=MemoryDenyWriteExecute=*, --property=SystemCallFilter=*, --property=CapabilityBoundingSet=*, --property=User=*, --property=Group=*, --property=SupplementaryGroups=*, --property=AmbientCapabilities=*, --property=EnvironmentFile=*, --property=Type=*, --property=RemainAfterExit=*, --property=Ephemeral=*, --property=Slice=*, --property=IOSchedulingClass=*, --property=CPUSchedulingPolicy=*, --property=RestrictNamespaces=*, --property=RestrictSUIDSGID=*, --property=LockPersonality=*, --property=RestrictRealtime=*, --property=RestrictAddressFamilies=*, --property=RemoveIPC=*, --property=UMask=*, --property=KeyringMode=*, --property=ProtectClock=*, --property=ProtectKernelTunables=*, --property=ProtectKernelModules=*, --property=ProtectKernelLogs=*, --property=ProtectControlGroups=*, --property=ProtectHostname=*, --property=ProtectProc=*, --property=ProcSubset=*, --property=MemorySwapMax=*, --property=CPUQuota=*, --property=DeviceAllow=*, --property=DevicePolicy=*, --property=RestrictFileSystems=*, --property=SocketBindDeny=*, --property=SocketBindAllow=*, --property=IPAddressAllow=*, --property=IPAddressDeny=*, --pipe, --wait, --quiet, --no-block, --description=*, --unit=*, --service-type=*, --user, --uid=*, --gid=*, --setenv=*, --"; exit 0 ;;
+        --version) echo "systemd-run (fake) v${DSR_VERSION} (SteamOS-Pamac)"; exit 0 ;;
     esac
 done
 
@@ -2324,12 +2375,58 @@ case "$arg" in
 --property=DynamicUser=yes) DYNAMIC_USER=true; continue ;;
 --property=CacheDirectory=*) CACHE_DIR="${arg#--property=CacheDirectory=}"; continue ;;
 --property=WorkingDirectory=*) WORK_DIR="${arg#--property=WorkingDirectory=}"; continue ;;
+# Recognized but silently ignored properties (safe to drop in non-systemd env)
 --property=StateDirectory=*) continue ;;
 --property=LogsDirectory=*) continue ;;
 --property=RuntimeDirectory=*) continue ;;
 --property=Type=*) continue ;;
 --property=RemainAfterExit=*) continue ;;
---property=*) UNRECOGNIZED_PROPS+=("$arg"); _log_dsr "WARN: Unrecognized --property: $arg"; continue ;;
+--property=TemporaryFileSystem=*) continue ;;
+--property=BindPaths=*) continue ;;
+--property=BindReadOnlyPaths=*) continue ;;
+--property=ProtectSystem=*) continue ;;
+--property=ProtectHome=*) continue ;;
+--property=PrivateTmp=*) continue ;;
+--property=NoNewPrivileges=*) continue ;;
+--property=MemoryDenyWriteExecute=*) continue ;;
+--property=SystemCallFilter=*) continue ;;
+--property=CapabilityBoundingSet=*) continue ;;
+--property=User=*) continue ;;
+--property=Group=*) continue ;;
+--property=SupplementaryGroups=*) continue ;;
+--property=AmbientCapabilities=*) continue ;;
+--property=EnvironmentFile=*) continue ;;
+--property=Ephemeral=*) continue ;;
+--property=Slice=*) continue ;;
+--property=IOSchedulingClass=*) continue ;;
+--property=CPUSchedulingPolicy=*) continue ;;
+--property=RestrictNamespaces=*) continue ;;
+--property=RestrictSUIDSGID=*) continue ;;
+--property=LockPersonality=*) continue ;;
+--property=RestrictRealtime=*) continue ;;
+--property=RestrictAddressFamilies=*) continue ;;
+--property=RemoveIPC=*) continue ;;
+--property=UMask=*) continue ;;
+--property=KeyringMode=*) continue ;;
+--property=ProtectClock=*) continue ;;
+--property=ProtectKernelTunables=*) continue ;;
+--property=ProtectKernelModules=*) continue ;;
+--property=ProtectKernelLogs=*) continue ;;
+--property=ProtectControlGroups=*) continue ;;
+--property=ProtectHostname=*) continue ;;
+--property=ProtectProc=*) continue ;;
+--property=ProcSubset=*) continue ;;
+--property=MemorySwapMax=*) continue ;;
+--property=CPUQuota=*) continue ;;
+--property=DeviceAllow=*) continue ;;
+--property=DevicePolicy=*) continue ;;
+--property=RestrictFileSystems=*) continue ;;
+--property=SocketBindDeny=*) continue ;;
+--property=SocketBindAllow=*) continue ;;
+--property=IPAddressAllow=*) continue ;;
+--property=IPAddressDeny=*) continue ;;
+# Unrecognized properties - log and warn visibly
+--property=*) UNRECOGNIZED_PROPS+=("$arg"); _warn_dsr "Unrecognized --property: $arg"; continue ;;
 --property) SKIP_NEXT=true; continue ;;
 --user|--uid=*|--gid=*|--setenv=*) continue ;;
 --setenv) SKIP_NEXT=true; continue ;;
@@ -2342,8 +2439,15 @@ if [[ ${#CMD_ARGS[@]} -eq 0 ]]; then
     exit 1
 fi
 if [[ ${#UNRECOGNIZED_PROPS[@]} -gt 0 ]]; then
-    _log_dsr "INFO: Unrecognized properties were ignored (${#UNRECOGNIZED_PROPS[@]} total): ${UNRECOGNIZED_PROPS[*]}"
-    _log_dsr "INFO: If AUR builds fail, check $_DSR_LOG for which properties Pamac now expects."
+    _warn_dsr "=========================================="
+    _warn_dsr "UNRECOGNIZED PROPERTIES DETECTED (${#UNRECOGNIZED_PROPS[@]} total):"
+    for _up in "${UNRECOGNIZED_PROPS[@]}"; do
+        _warn_dsr "  - $_up"
+    done
+    _warn_dsr "These properties were IGNORED. If AUR builds fail, check $_DSR_LOG"
+    _warn_dsr "for which properties Pamac/makepkg now expects."
+    _warn_dsr "You may need to update this fake systemd-run wrapper."
+    _warn_dsr "=========================================="
 fi
 if [[ -n "$WORK_DIR" ]]; then
 mkdir -p "$WORK_DIR" 2>/dev/null || true
@@ -2570,14 +2674,17 @@ cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE'
 # Fake systemd-run for non-systemd containers (Distrobox).
 # Mimics the subset of systemd-run used by Pamac/makepkg for DynamicUser builds.
 # Logs unrecognized arguments to /tmp/systemd-run-fake.log for diagnostics.
+# Prints visible warnings to stderr when unrecognized properties are detected.
 _DSR_LOG="/tmp/systemd-run-fake.log"
+DSR_VERSION="2.0"
 _log_dsr() { echo "[$(date '+%H:%M:%S')] $*" >> "$_DSR_LOG" 2>/dev/null; }
+_warn_dsr() { echo "systemd-run(fake): WARNING: $*" >> "$_DSR_LOG" 2>/dev/null; echo "systemd-run(fake): WARNING: $*" >&2 2>/dev/null || true; }
 
 # Passthrough: --help and --version are not meaningful here
 for _a in "$@"; do
     case "$_a" in
-        --help|-h) echo "systemd-run (fake): Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo "Recognized options: --property=DynamicUser=yes, --property=CacheDirectory=*, --property=WorkingDirectory=*, --pipe, --wait, --quiet, --no-block, --description=*, --unit=*, --service-type=*, --user, --uid=*, --gid=*, --setenv=*, --"; exit 0 ;;
-        --version) echo "systemd-run (fake) v1.0 (SteamOS-Pamac)"; exit 0 ;;
+        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo "Recognized options: --property=DynamicUser=yes, --property=CacheDirectory=*, --property=WorkingDirectory=*, --property=StateDirectory=*, --property=LogsDirectory=*, --property=RuntimeDirectory=*, --property=TemporaryFileSystem=*, --property=BindPaths=*, --property=BindReadOnlyPaths=*, --property=ProtectSystem=*, --property=ProtectHome=*, --property=PrivateTmp=*, --property=NoNewPrivileges=*, --property=MemoryDenyWriteExecute=*, --property=SystemCallFilter=*, --property=CapabilityBoundingSet=*, --property=User=*, --property=Group=*, --property=SupplementaryGroups=*, --property=AmbientCapabilities=*, --property=EnvironmentFile=*, --property=Type=*, --property=RemainAfterExit=*, --property=Ephemeral=*, --property=Slice=*, --property=IOSchedulingClass=*, --property=CPUSchedulingPolicy=*, --property=RestrictNamespaces=*, --property=RestrictSUIDSGID=*, --property=LockPersonality=*, --property=RestrictRealtime=*, --property=RestrictAddressFamilies=*, --property=RemoveIPC=*, --property=UMask=*, --property=KeyringMode=*, --property=ProtectClock=*, --property=ProtectKernelTunables=*, --property=ProtectKernelModules=*, --property=ProtectKernelLogs=*, --property=ProtectControlGroups=*, --property=ProtectHostname=*, --property=ProtectProc=*, --property=ProcSubset=*, --property=MemorySwapMax=*, --property=CPUQuota=*, --property=DeviceAllow=*, --property=DevicePolicy=*, --property=RestrictFileSystems=*, --property=SocketBindDeny=*, --property=SocketBindAllow=*, --property=IPAddressAllow=*, --property=IPAddressDeny=*, --pipe, --wait, --quiet, --no-block, --description=*, --unit=*, --service-type=*, --user, --uid=*, --gid=*, --setenv=*, --"; exit 0 ;;
+        --version) echo "systemd-run (fake) v${DSR_VERSION} (SteamOS-Pamac)"; exit 0 ;;
     esac
 done
 
@@ -2608,12 +2715,58 @@ case "$arg" in
 --property=DynamicUser=yes) DYNAMIC_USER=true; continue ;;
 --property=CacheDirectory=*) CACHE_DIR="${arg#--property=CacheDirectory=}"; continue ;;
 --property=WorkingDirectory=*) WORK_DIR="${arg#--property=WorkingDirectory=}"; continue ;;
+# Recognized but silently ignored properties (safe to drop in non-systemd env)
 --property=StateDirectory=*) continue ;;
 --property=LogsDirectory=*) continue ;;
 --property=RuntimeDirectory=*) continue ;;
 --property=Type=*) continue ;;
 --property=RemainAfterExit=*) continue ;;
---property=*) UNRECOGNIZED_PROPS+=("$arg"); _log_dsr "WARN: Unrecognized --property: $arg"; continue ;;
+--property=TemporaryFileSystem=*) continue ;;
+--property=BindPaths=*) continue ;;
+--property=BindReadOnlyPaths=*) continue ;;
+--property=ProtectSystem=*) continue ;;
+--property=ProtectHome=*) continue ;;
+--property=PrivateTmp=*) continue ;;
+--property=NoNewPrivileges=*) continue ;;
+--property=MemoryDenyWriteExecute=*) continue ;;
+--property=SystemCallFilter=*) continue ;;
+--property=CapabilityBoundingSet=*) continue ;;
+--property=User=*) continue ;;
+--property=Group=*) continue ;;
+--property=SupplementaryGroups=*) continue ;;
+--property=AmbientCapabilities=*) continue ;;
+--property=EnvironmentFile=*) continue ;;
+--property=Ephemeral=*) continue ;;
+--property=Slice=*) continue ;;
+--property=IOSchedulingClass=*) continue ;;
+--property=CPUSchedulingPolicy=*) continue ;;
+--property=RestrictNamespaces=*) continue ;;
+--property=RestrictSUIDSGID=*) continue ;;
+--property=LockPersonality=*) continue ;;
+--property=RestrictRealtime=*) continue ;;
+--property=RestrictAddressFamilies=*) continue ;;
+--property=RemoveIPC=*) continue ;;
+--property=UMask=*) continue ;;
+--property=KeyringMode=*) continue ;;
+--property=ProtectClock=*) continue ;;
+--property=ProtectKernelTunables=*) continue ;;
+--property=ProtectKernelModules=*) continue ;;
+--property=ProtectKernelLogs=*) continue ;;
+--property=ProtectControlGroups=*) continue ;;
+--property=ProtectHostname=*) continue ;;
+--property=ProtectProc=*) continue ;;
+--property=ProcSubset=*) continue ;;
+--property=MemorySwapMax=*) continue ;;
+--property=CPUQuota=*) continue ;;
+--property=DeviceAllow=*) continue ;;
+--property=DevicePolicy=*) continue ;;
+--property=RestrictFileSystems=*) continue ;;
+--property=SocketBindDeny=*) continue ;;
+--property=SocketBindAllow=*) continue ;;
+--property=IPAddressAllow=*) continue ;;
+--property=IPAddressDeny=*) continue ;;
+# Unrecognized properties - log and warn visibly
+--property=*) UNRECOGNIZED_PROPS+=("$arg"); _warn_dsr "Unrecognized --property: $arg"; continue ;;
 --property) SKIP_NEXT=true; continue ;;
 --user|--uid=*|--gid=*|--setenv=*) continue ;;
 --setenv) SKIP_NEXT=true; continue ;;
@@ -2626,8 +2779,15 @@ if [[ ${#CMD_ARGS[@]} -eq 0 ]]; then
     exit 1
 fi
 if [[ ${#UNRECOGNIZED_PROPS[@]} -gt 0 ]]; then
-    _log_dsr "INFO: Unrecognized properties were ignored (${#UNRECOGNIZED_PROPS[@]} total): ${UNRECOGNIZED_PROPS[*]}"
-    _log_dsr "INFO: If AUR builds fail, check $_DSR_LOG for which properties Pamac now expects."
+    _warn_dsr "=========================================="
+    _warn_dsr "UNRECOGNIZED PROPERTIES DETECTED (${#UNRECOGNIZED_PROPS[@]} total):"
+    for _up in "${UNRECOGNIZED_PROPS[@]}"; do
+        _warn_dsr "  - $_up"
+    done
+    _warn_dsr "These properties were IGNORED. If AUR builds fail, check $_DSR_LOG"
+    _warn_dsr "for which properties Pamac/makepkg now expects."
+    _warn_dsr "You may need to update this fake systemd-run wrapper."
+    _warn_dsr "=========================================="
 fi
 if [[ -n "$WORK_DIR" ]]; then
 mkdir -p "$WORK_DIR" 2>/dev/null || true
@@ -2822,16 +2982,31 @@ _import_key_with_retry() {
     local key_id="$1"
     shift
     local keyserver_urls=("$@")
-    local max_attempts=3
+    local max_attempts=2
 
     if [[ ${#keyserver_urls[@]} -eq 0 ]]; then
         keyserver_urls=("hkps://keyserver.ubuntu.com" "hkps://keys.openpgp.org" "hkps://pgp.mit.edu")
     fi
 
+    # Step 0: Try WKD (Web Key Directory) lookup first - no keyserver needed
+    # WKD uses DNS + HTTPS to the domain directly, bypassing keyservers entirely.
+    echo "  Attempting WKD (Web Key Directory) lookup for $key_id..."
+    if timeout 10 gpg --locate-external-keys "$key_id" 2>/dev/null; then
+        local _wkd_fp
+        _wkd_fp=$(GNUPGHOME=/etc/pacman.d/gnupg gpg --with-colons --list-keys "$key_id" 2>/dev/null \
+            | grep '^fpr' | head -1 | cut -d: -f10 || echo "")
+        if [[ -n "$_wkd_fp" ]]; then
+            echo "  WKD lookup found key: ${_wkd_fp: -8}"
+            timeout 15 pacman-key --lsign-key "$_wkd_fp" 2>/dev/null && return 0
+        fi
+    fi
+    echo "  WKD lookup did not resolve key $key_id."
+
+    # Step 1: Try keyservers with reduced timeouts
     for server in "${keyserver_urls[@]}"; do
         local attempt=1
         while [[ $attempt -le $max_attempts ]]; do
-            if timeout 30 pacman-key --recv-key --keyserver "$server" "$key_id" 2>/dev/null; then
+            if timeout 12 pacman-key --recv-key --keyserver "$server" "$key_id" 2>/dev/null; then
                 local _verify_fp
                 _verify_fp=$(GNUPGHOME=/etc/pacman.d/gnupg gpg --with-colons --list-keys "$key_id" 2>/dev/null \
                     | grep '^fpr' | head -1 | cut -d: -f10 || echo "")
@@ -2845,18 +3020,46 @@ _import_key_with_retry() {
                     # Exact 40-char fingerprint provided by caller — verify full match
                     { [[ $_kid_len -eq 40 ]] && [[ "$_verify_fp" == "$key_id" ]]; }
                 }; then
-                    timeout 30 pacman-key --lsign-key "$_verify_fp" 2>/dev/null && return 0
+                    timeout 15 pacman-key --lsign-key "$_verify_fp" 2>/dev/null && return 0
                 else
                     echo "Fingerprint verification failed for key $key_id (got $_verify_fp)."
                     echo "Short-ID or substring matches are rejected for security. Use full fingerprint (40 chars)."
                 fi
             fi
-            echo "Key import attempt $attempt/$max_attempts failed for $key_id from $server."
+            echo "Key import attempt $attempt/$max_attempts failed for $key_id from $server (12s timeout)."
             attempt=$((attempt + 1))
             [[ $attempt -le $max_attempts ]] && sleep 2
         done
     done
-    echo "Warning: Could not import key $key_id after ${max_attempts}x${#keyserver_urls[@]} attempts from ${#keyserver_urls[@]} keyservers."
+
+    # Step 2: Try downloading key directly from common key distribution paths
+    echo "  Attempting direct key download from common distribution paths..."
+    local _key_dl_urls=(
+        "https://archlinux.org/packages/core/x86_64/archlinux-keyring/files/"
+        "https://geo.mirror.pkgbuild.com/core/os/x86_64/"
+    )
+    local _key_tmp
+    _key_tmp=$(mktemp /var/tmp/pamac-key-dl-XXXXXX) && chmod 700 "$_key_tmp" 2>/dev/null || _key_tmp=$(mktemp)
+    for _base_url in "${_key_dl_urls[@]}"; do
+        local _kr_url="${_base_url}archlinux-keyring-"*.pkg.tar.zst
+        if timeout 15 curl -fsSL --connect-timeout 5 -o "$_key_tmp/kr.pkg.tar.zst" "$_kr_url" 2>/dev/null; then
+            local _kr_dir="$_key_tmp/kr-extract"
+            mkdir -p "$_kr_dir" && chmod 700 "$_kr_dir" 2>/dev/null || true
+            if tar -xf "$_key_tmp/kr.pkg.tar.zst" -C "$_kr_dir" 2>/dev/null; then
+                for _kr_file in "$_kr_dir"/usr/share/pacman/keyrings/archlinux*; do
+                    [[ -f "$_kr_file" ]] && cp -f "$_kr_file" /etc/pacman.d/gnupg/ 2>/dev/null || true
+                done
+                if pacman-key --populate archlinux 2>/dev/null; then
+                    rm -rf "$_key_tmp"
+                    return 0
+                fi
+            fi
+            rm -rf "$_kr_dir"
+        fi
+    done
+    rm -rf "$_key_tmp" 2>/dev/null || true
+
+    echo "Warning: Could not import key $key_id after all methods (WKD + keyservers + direct download)."
     echo "The key may have been rotated. Try updating the keyring package or importing the key manually."
     return 1
 }
@@ -3509,8 +3712,8 @@ _AUR_GIT_URL="https://aur.archlinux.org/pamac-aur.git"
 _AUR_WORK=$(mktemp -d /var/tmp/pamac-aur-history-XXXXXX) && chmod 700 "$_AUR_WORK" 2>/dev/null || _AUR_WORK=$(mktemp -d)
 rm -rf "$_AUR_WORK"
 
-echo "Cloning pamac-aur repository (shallow) for commit history..."
-if ! git clone --depth=50 --single-branch "$_AUR_GIT_URL" "$_AUR_WORK" 2>/tmp/pamac_aur_clone_err; then
+echo "Cloning pamac-aur repository (depth=200) for commit history..."
+if ! git clone --depth=200 --single-branch "$_AUR_GIT_URL" "$_AUR_WORK" 2>/tmp/pamac_aur_clone_err; then
     echo "WARN: git clone of pamac-aur failed:"
     cat /tmp/pamac_aur_clone_err 2>/dev/null | tail -3
     rm -rf "$_AUR_WORK"
@@ -3711,14 +3914,14 @@ install_from_aur_commit() {
     work_dir=$(mktemp -d /var/tmp/pamac-pkg-XXXXXX) && chmod 700 "$work_dir" 2>/dev/null || work_dir=$(mktemp -d)
     echo "Cloning pamac-aur at commit ${commit:0:12}..."
     rm -rf "$work_dir"
-    sudo -Hu "$current_user" bash -lc "git clone --depth=50 https://aur.archlinux.org/pamac-aur.git '$work_dir'" 2>/tmp/pamac_clone_err || {
+    sudo -Hu "$current_user" bash -lc "git clone --depth=200 https://aur.archlinux.org/pamac-aur.git '$work_dir'" 2>/tmp/pamac_clone_err || {
         echo "Git clone failed:"
         cat /tmp/pamac_clone_err 2>/dev/null | tail -5
         return 1
     }
     if ! sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git checkout '$commit'" 2>/tmp/pamac_checkout_err; then
-        echo "Checkout failed at depth 50, attempting progressive fetch to reach commit ${commit:0:12}..."
-        local _depth=50
+        echo "Checkout failed at depth 200, attempting progressive fetch to reach commit ${commit:0:12}..."
+        local _depth=200
         local _max_depth=500
         local _found=false
         while [[ $_depth -lt $_max_depth ]]; do
@@ -3777,10 +3980,170 @@ install_from_yay() {
     return 1
 }
 
+validate_pamac_build_deps() {
+    echo "=== Pre-build dependency validation ==="
+    local _missing=""
+    local _warnings=""
+
+    # Critical build system tools
+    for tool in meson vala gcc make ninja; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            _missing="$_missing $tool"
+        fi
+    done
+
+    # Check libalpm development headers via pkg-config
+    if command -v pkg-config >/dev/null 2>&1; then
+        if ! pkg-config --exists libalpm 2>/dev/null; then
+            _warnings="$_warnings libalpm-dev (pkg-config); "
+            echo "  WARNING: libalpm development headers not found via pkg-config."
+            echo "  This may cause build failures if the libalpm API has changed."
+            echo "  Installing pacman and libalpm development files..."
+            rm -f /var/lib/pacman/db.lck
+            pacman -S --noconfirm --needed pacman 2>/dev/null || true
+            if ! pkg-config --exists libalpm 2>/dev/null; then
+                _missing="$_missing libalpm-dev"
+                echo "  ERROR: libalpm development headers still not available."
+                echo "  This strongly suggests a libalpm API incompatibility."
+            fi
+        else
+            local _libalpm_ver
+            _libalpm_ver=$(pkg-config --modversion libalpm 2>/dev/null || echo "unknown")
+            echo "  libalpm version: $_libalpm_ver"
+        fi
+    else
+        _warnings="$_warnings pkg-config; "
+        echo "  WARNING: pkg-config not found. Cannot verify libalpm compatibility."
+    fi
+
+    # Check for vala compiler version (pamac requires recent vala)
+    if command -v valac >/dev/null 2>&1; then
+        local _vala_ver
+        _vala_ver=$(valac --version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+' || echo "unknown")
+        echo "  vala compiler version: $_vala_ver"
+    fi
+
+    if [[ -n "$_missing" ]]; then
+        echo ""
+        echo "FATAL: Missing critical build dependencies:$_missing"
+        echo "These are required to compile pamac-aur from source."
+        echo "Attempting to install missing dependencies..."
+        rm -f /var/lib/pacman/db.lck
+        pacman -Sy --noconfirm 2>/dev/null || true
+        for pkg in $_missing; do
+            case "$pkg" in
+                meson) pacman -S --noconfirm --needed meson 2>/dev/null || true ;;
+                vala) pacman -S --noconfirm --needed vala 2>/dev/null || true ;;
+                gcc) pacman -S --noconfirm --needed gcc 2>/dev/null || true ;;
+                make) pacman -S --noconfirm --needed make 2>/dev/null || true ;;
+                ninja) pacman -S --noconfirm --needed ninja 2>/dev/null || true ;;
+                libalpm-dev) pacman -S --noconfirm --needed pacman 2>/dev/null || true ;;
+            esac
+        done
+        # Re-check after install
+        local _still_missing=""
+        for tool in meson vala gcc make ninja; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+                _still_missing="$_still_missing $tool"
+            fi
+        done
+        if [[ -n "$_still_missing" ]]; then
+            echo "FATAL: Could not install:$_still_missing"
+            echo "Cannot build pamac-aur without these tools."
+            return 1
+        fi
+        echo "All missing dependencies installed successfully."
+    fi
+
+    if [[ -n "$_warnings" ]]; then
+        echo ""
+        echo "WARNING: Non-critical dependency issues:$_warnings"
+        echo "Build may succeed but could fail if these are actually required."
+    fi
+
+    echo "=== Build dependency validation complete ==="
+    return 0
+}
+
+verify_pamac_libalpm_compat() {
+    echo "=== Post-install libalpm compatibility verification ==="
+    local _pamac_binary=""
+    local _issues=0
+
+    # Find the pamac binary
+    for candidate in /usr/bin/pamac /usr/bin/pamac-manager /usr/lib/pamac/pamac-daemon; do
+        if [[ -f "$candidate" ]]; then
+            _pamac_binary="$candidate"
+            break
+        fi
+    done
+
+    if [[ -z "$_pamac_binary" ]]; then
+        echo "  WARNING: Could not locate pamac binary for libalpm verification."
+        return 0
+    fi
+
+    echo "  Checking binary: $_pamac_binary"
+
+    # Check if the binary links against libalpm
+    if command -v ldd >/dev/null 2>&1; then
+        local _alpm_link
+        _alpm_link=$(ldd "$_pamac_binary" 2>/dev/null | grep libalpm || echo "")
+        if [[ -n "$_alpm_link" ]]; then
+            echo "  Binary links against: $_alpm_link"
+            # Check if the linked library actually exists
+            local _lib_path
+            _lib_path=$(echo "$_alpm_link" | awk '{print $3}' | head -1 || echo "")
+            if [[ -n "$_lib_path" && -f "$_lib_path" ]]; then
+                echo "  libalpm library found: $_lib_path"
+            elif [[ -n "$_lib_path" ]]; then
+                echo "  ERROR: libalpm library NOT FOUND at: $_lib_path"
+                echo "  This indicates a library mismatch - pamac was compiled against a different libalpm version."
+                _issues=$((_issues + 1))
+            fi
+        else
+            echo "  Binary does not link against libalpm (may be a wrapper)."
+        fi
+    fi
+
+    # Check if pamac can at least print its version (basic smoke test)
+    if /usr/bin/pamac --version >/dev/null 2>&1; then
+        echo "  pamac --version: $(/usr/bin/pamac --version 2>&1 | head -1)"
+        echo "  Basic smoke test: PASSED"
+    else
+        local _exit_code=$?
+        echo "  WARNING: pamac --version failed (exit $_exit_code)"
+        echo "  This may indicate a runtime library incompatibility."
+        _issues=$((_issues + 1))
+    fi
+
+    if [[ $_issues -gt 0 ]]; then
+        echo ""
+        echo "  libalpm compatibility issues detected ($_issues problems)."
+        echo "  The pamac binary may have been compiled against a different libalpm version."
+        echo "  Possible causes:"
+        echo "    - Container pacman was upgraded but pamac was compiled against older headers"
+        echo "    - pamac-aur AUR package requires a different libalpm version than installed"
+        echo "    - Shared library symlinks are broken"
+        echo "  Try: pacman -S --noconfirm --needed pacman (to sync libalpm)"
+        echo "  Or:  yay -S --rebuild pamac-aur (to force recompilation)"
+        return 1
+    fi
+
+    echo "  libalpm compatibility verification: PASSED"
+    return 0
+}
+
 case "$compat_strategy" in
     use_commit)
         if [[ -n "$compat_commit" ]]; then
             echo "Strategy: install from compatible AUR commit ${compat_commit:0:12}"
+            validate_pamac_build_deps || {
+                echo "FATAL: Build dependency validation failed. Cannot compile pamac-aur."
+                echo "This usually indicates a C++ toolchain or library incompatibility."
+                echo "Try: pacman -Syu (full system upgrade) then re-run this script."
+                exit 1
+            }
             if install_from_aur_commit "$compat_commit"; then
                 pamac_installed=true
             else
@@ -3791,6 +4154,7 @@ case "$compat_strategy" in
             fi
         else
             echo "No commit specified. Falling back to yay install..."
+            validate_pamac_build_deps || true
             if install_from_yay; then
                 pamac_installed=true
             fi
@@ -3798,6 +4162,12 @@ case "$compat_strategy" in
         ;;
     try_latest|ok|"")
         echo "Strategy: install latest pamac-aur via yay"
+        validate_pamac_build_deps || {
+            echo "FATAL: Build dependency validation failed. Cannot compile pamac-aur."
+            echo "This usually indicates a C++ toolchain or library incompatibility."
+            echo "Try: pacman -Syu (full system upgrade) then re-run this script."
+            exit 1
+        }
         if install_from_yay; then
             pamac_installed=true
         else
@@ -3847,6 +4217,17 @@ if ! command -v pamac >/dev/null 2>&1; then
     exit 1
 fi
 echo "pamac-manager and pamac CLI installed successfully."
+
+# Post-build verification: ensure pamac binary is compatible with installed libalpm
+if ! verify_pamac_libalpm_compat; then
+    echo ""
+    echo "WARNING: Post-install libalpm compatibility check detected issues."
+    echo "pamac may not function correctly. Consider:"
+    echo "  1. pacman -S --noconfirm --needed pacman  (sync libalpm)"
+    echo "  2. yay -S --rebuild pamac-aur              (force recompilation)"
+    echo "  3. Check: ldd /usr/bin/pamac | grep libalpm"
+    echo "Continuing installation despite compatibility warnings..."
+fi
 PAMAC_INSTALL_EOF
 
     if ! exec_container_script "$pamac_install" "pamac-install" "$CURRENT_USER" "$_compat_strategy" "$_compat_commit"; then
@@ -3866,10 +4247,19 @@ PAMAC_INSTALL_EOF
                     log_error "Failed to install Pamac after recovery retry."
                     log_error ""
                     log_error "The pamac-aur AUR package may be broken upstream."
-                    log_error "Options:"
+                    log_error "This can happen when Arch rolls a major libalpm/pacman upgrade"
+                    log_error "and pamac-aur's C++ build system hasn't been updated yet."
+                    log_error ""
+                    log_error "Diagnostic steps:"
+                    log_error "  1. Check container pacman version: distrobox enter $CONTAINER_NAME -- pacman -Q pacman"
+                    log_error "  2. Check libalpm headers: distrobox enter $CONTAINER_NAME -- pkg-config --modversion libalpm"
+                    log_error "  3. Check for C++ build errors in log: grep -i 'error\\|fatal' $LOG_FILE | tail -20"
+                    log_error ""
+                    log_error "Recovery options:"
                     log_error "  1. Check https://aur.archlinux.org/packages/pamac-aur for current status"
                     log_error "  2. Try: --pamac-version <tag>  to pin a specific working version"
                     log_error "  3. Wait for the AUR maintainer to update pamac-aur for the latest pacman"
+                    log_error "  4. Try: distrobox enter $CONTAINER_NAME -- pacman -Syu && yay -S --rebuild pamac-aur"
                     log_error ""
                     return 1
                 fi
@@ -3877,10 +4267,19 @@ PAMAC_INSTALL_EOF
                 log_error "Failed to install Pamac after retry."
                 log_error ""
                 log_error "The pamac-aur AUR package may be broken upstream."
-                log_error "Options:"
+                log_error "This can happen when Arch rolls a major libalpm/pacman upgrade"
+                log_error "and pamac-aur's C++ build system hasn't been updated yet."
+                log_error ""
+                log_error "Diagnostic steps:"
+                log_error "  1. Check container pacman version: distrobox enter $CONTAINER_NAME -- pacman -Q pacman"
+                log_error "  2. Check libalpm headers: distrobox enter $CONTAINER_NAME -- pkg-config --modversion libalpm"
+                log_error "  3. Check for C++ build errors in log: grep -i 'error\\|fatal' $LOG_FILE | tail -20"
+                log_error ""
+                log_error "Recovery options:"
                 log_error "  1. Check https://aur.archlinux.org/packages/pamac-aur for current status"
                 log_error "  2. Try: --pamac-version <tag>  to pin a specific working version"
                 log_error "  3. Wait for the AUR maintainer to update pamac-aur for the latest pacman"
+                log_error "  4. Try: distrobox enter $CONTAINER_NAME -- pacman -Syu && yay -S --rebuild pamac-aur"
                 log_error ""
                 return 1
             fi

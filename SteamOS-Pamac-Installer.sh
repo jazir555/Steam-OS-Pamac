@@ -2501,6 +2501,28 @@ DSR_VERSION="2.0"
 _log_dsr() { echo "[$(date '+%H:%M:%S')] $*" >> "$_DSR_LOG" 2>/dev/null; }
 _warn_dsr() { echo "systemd-run(fake): WARNING: $*" >> "$_DSR_LOG" 2>/dev/null; echo "systemd-run(fake): WARNING: $*" >&2 2>/dev/null || true; }
 
+# Pre-flight: clean up orphaned ad-hoc build users and temp home directories
+# left behind by interrupted builds. Ad-hoc users are named _brecover* and
+# own /var/tmp/builduser-home-* directories.
+_cleanup_orphaned_buildusers() {
+    local _orphan_users=""
+    _orphan_users=$(getent passwd 2>/dev/null | awk -F: '$1 ~ /^_brecover/ { print $1 }' || true)
+    for _ou in $_orphan_users; do
+        _warn_dsr "Cleaning up orphaned build user: $_ou"
+        userdel -r "$_ou" 2>/dev/null || userdel "$_ou" 2>/dev/null || true
+    done
+    for _dir in /var/tmp/builduser-home-*; do
+        [[ -d "$_dir" ]] || continue
+        # Only remove if owned by root (build users run as non-root, so a
+        # non-root-owned directory might be an active build's workspace).
+        if [[ "$(stat -c '%U' "$_dir" 2>/dev/null || echo root)" == "root" ]]; then
+            _warn_dsr "Removing orphaned build-user home: $_dir"
+            rm -rf "$_dir" 2>/dev/null || true
+        fi
+    done
+}
+_cleanup_orphaned_buildusers
+
 # Passthrough: --help and --version are not meaningful here
 for _a in "$@"; do
     case "$_a" in
@@ -2885,6 +2907,26 @@ _DSR_LOG="/tmp/systemd-run-fake.log"
 DSR_VERSION="2.0"
 _log_dsr() { echo "[$(date '+%H:%M:%S')] $*" >> "$_DSR_LOG" 2>/dev/null; }
 _warn_dsr() { echo "systemd-run(fake): WARNING: $*" >> "$_DSR_LOG" 2>/dev/null; echo "systemd-run(fake): WARNING: $*" >&2 2>/dev/null || true; }
+
+# Pre-flight: clean up orphaned ad-hoc build users and temp home directories
+# left behind by interrupted builds. Ad-hoc users are named _brecover* and
+# own /var/tmp/builduser-home-* directories.
+_cleanup_orphaned_buildusers() {
+    local _orphan_users=""
+    _orphan_users=$(getent passwd 2>/dev/null | awk -F: '$1 ~ /^_brecover/ { print $1 }' || true)
+    for _ou in $_orphan_users; do
+        _warn_dsr "Cleaning up orphaned build user: $_ou"
+        userdel -r "$_ou" 2>/dev/null || userdel "$_ou" 2>/dev/null || true
+    done
+    for _dir in /var/tmp/builduser-home-*; do
+        [[ -d "$_dir" ]] || continue
+        if [[ "$(stat -c '%U' "$_dir" 2>/dev/null || echo root)" == "root" ]]; then
+            _warn_dsr "Removing orphaned build-user home: $_dir"
+            rm -rf "$_dir" 2>/dev/null || true
+        fi
+    done
+}
+_cleanup_orphaned_buildusers
 
 # Passthrough: --help and --version are not meaningful here
 for _a in "$@"; do

@@ -11,6 +11,25 @@ WORK_DIR=""
 SKIP_NEXT=false
 CMD_ARGS=()
 
+# Pre-flight: clean up orphaned ad-hoc build users and temp home directories
+# left behind by interrupted builds.
+_cleanup_orphaned_buildusers() {
+    local _orphan_users=""
+    _orphan_users=$(getent passwd 2>/dev/null | awk -F: '$1 ~ /^_brecover/ { print $1 }' || true)
+    for _ou in $_orphan_users; do
+        echo "Cleaning up orphaned build user: $_ou" >&2
+        userdel -r "$_ou" 2>/dev/null || userdel "$_ou" 2>/dev/null || true
+    done
+    for _dir in /var/tmp/builduser-home-*; do
+        [[ -d "$_dir" ]] || continue
+        if [[ "$(stat -c '%U' "$_dir" 2>/dev/null || echo root)" == "root" ]]; then
+            echo "Removing orphaned build-user home: $_dir" >&2
+            rm -rf "$_dir" 2>/dev/null || true
+        fi
+    done
+}
+_cleanup_orphaned_buildusers
+
 for arg in "$@"; do
     if $SKIP_NEXT; then
         SKIP_NEXT=false

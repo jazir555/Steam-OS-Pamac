@@ -85,7 +85,20 @@ fi
 if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
     BUILD_USER="deck"
     if ! id "$BUILD_USER" >/dev/null 2>&1; then
-        BUILD_USER="nobody"
+        # 'nobody' has no writable home and is not safe for AUR builds.
+        # Match the installer: try an ad-hoc build user, then refuse if that fails.
+        _bl_tmp=$(mktemp -d /tmp/builduser-home-XXXXXX) || _bl_tmp=""
+        if [[ -n "$_bl_tmp" ]]; then
+            BUILD_USER="_brecover$(date +%s | tail -c7)"
+            if ! useradd -M -d "$_bl_tmp" -s /bin/bash "$BUILD_USER" 2>/dev/null; then
+                rmdir "$_bl_tmp" 2>/dev/null || true
+                BUILD_USER=""
+            fi
+        fi
+        if [[ -z "$BUILD_USER" ]] || ! id "$BUILD_USER" >/dev/null 2>&1; then
+            echo "systemd-run(fake): FATAL: no build user available, refusing to run as nobody" >&2
+            exit 127
+        fi
     fi
 
     if [[ -n "$WORK_DIR" ]]; then

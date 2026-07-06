@@ -302,6 +302,10 @@ ensure_container_healthy() {
 				if [[ "$wait_rc" -eq 2 ]]; then
 					log_info "Container was stuck and removed (wait_for_container rc=2). Signaling recreate."
 					return 2
+				elif [[ "$wait_rc" -eq 3 ]]; then
+					log_error "wait_for_container rc=3: force_remove_container failed inside wait_for_container. Container likely still stuck."
+					log_info "Manual intervention required: podman rm -f $CONTAINER_NAME && distrobox rm -f $CONTAINER_NAME"
+					return 1
 				elif [[ "$wait_rc" -ne 0 ]]; then
 					log_error "Failed to start container."
 					return 1
@@ -1144,8 +1148,14 @@ wait_for_container() {
           log_debug "Container in '$status' state, waiting..."
         else
           log_warn "Container stuck in '$status' state - removing and recreating" || true
-          force_remove_container "$CONTAINER_NAME" || true
-          return 2
+          local _frc_rc=0
+          force_remove_container "$CONTAINER_NAME" || _frc_rc=$?
+          if [[ "$_frc_rc" -eq 0 ]]; then
+            return 2
+          else
+            log_error "force_remove_container failed for '$CONTAINER_NAME' (exit $_frc_rc). Container may still be stuck — recovery may fail."
+            return 3
+          fi
         fi
         ;;
   "exited")
@@ -1159,8 +1169,14 @@ wait_for_container() {
       fi
       if [[ $attempt -gt 5 ]]; then
         log_warn "Non-init container not responding after restart. Removing and recreating." || true
-        force_remove_container "$CONTAINER_NAME" || true
-        return 2
+        local _frc_rc=0
+        force_remove_container "$CONTAINER_NAME" || _frc_rc=$?
+        if [[ "$_frc_rc" -eq 0 ]]; then
+          return 2
+        else
+          log_warn "force_remove_container failed for '$CONTAINER_NAME' (exit $_frc_rc). Container may still be stuck."
+          return 3
+        fi
       fi
     elif [[ $attempt -le 2 ]]; then
       log_debug "Container exited. Attempting restart (attempt $attempt)..." || true
@@ -1177,8 +1193,14 @@ wait_for_container() {
       log_debug "Waiting longer before next restart attempt..." || true
     else
       log_warn "Container stuck in 'exited' state - removing and recreating" || true
-      force_remove_container "$CONTAINER_NAME" || true
-      return 2
+      local _frc_rc=0
+      force_remove_container "$CONTAINER_NAME" || _frc_rc=$?
+      if [[ "$_frc_rc" -eq 0 ]]; then
+        return 2
+      else
+        log_error "force_remove_container failed for '$CONTAINER_NAME' (exit $_frc_rc). Container may still be stuck."
+        return 3
+      fi
     fi
     ;;
       "not_found")
@@ -1320,6 +1342,10 @@ create_container() {
       log_error "Failed to recreate container after removal."
       return 1
     fi
+  elif [[ "$wait_result" -eq 3 ]]; then
+    log_error "wait_for_container returned 3: force_remove_container already failed internally. Container likely still stuck."
+    log_info "Recreation attempt skipped — prior removal failure makes recreation unlikely to succeed."
+    return 1
   elif [[ "$wait_result" -ne 0 ]]; then
     return 1
   fi
@@ -1501,7 +1527,24 @@ exec_container_script() {
     printf '%s\n' "${_preamble}${_script}" > "$_script_file"
 
     local _marker="PAMAC_SCRIPT_OK_$(head -c 16 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$_$(date +%s)")"
-  printf '\necho "%s"\n' "$_marker" >> "$_script_file"
+    # Marker race fix: prepend an EXIT trap that emits the marker exactly once
+    # ONLY when the script exits successfully (code 0), regardless of where that
+    # exit occurs (mid-body `exit 0`, a returned-from function, or normal
+    # fallthrough to the end). The trap intentionally stays silent on non-zero
+    # exits so the existing "no marker => failure" proxy still works. Previously
+    # the marker was only appended after the body, so an early `exit 0` in the
+    # middle of a script would suppress the marker and (falsely) read as failure.
+    # The guard variable keeps emission idempotent if the trailing echo also runs.
+    {
+        printf 'PAMAC_SCRIPT_MARKER="%s"\n' "$_marker"
+        printf '%s\n' "pamac_script_marked=''"
+        printf '%s\n' "pamac_emit_marker() { local _rc=$?; [ -z \"\$pamac_script_marked\" ] || return 0; [ \"\$_rc\" -eq 0 ] || return 0; pamac_script_marked=1; echo \"\$PAMAC_SCRIPT_MARKER\"; }"
+        printf '%s\n' "trap pamac_emit_marker EXIT"
+    } > "${_script_file}.trap"
+    cat "${_script_file}.trap" "$_script_file" > "${_script_file}.new" 2>/dev/null && mv -f "${_script_file}.new" "$_script_file" && rm -f "${_script_file}.trap"
+    # Trailing redundant emission (normal fallthrough, exit-code-0 path); trap
+    # covers early exits. Both paths are gated by the guard and exit-code check.
+    printf '\n[ $? -eq 0 ] && echo "%s"\ntrap - EXIT\n' "$_marker" >> "$_script_file"
 
   set +e
   local _output=""
@@ -1574,15 +1617,32 @@ exec_container_pipe() {
     _script_file=$(mktemp --tmpdir pamac-pipe-XXXXXXXX)
     _TEMP_FILES+=("$_script_file")
     printf '%s' "$_preamble" > "$_script_file"
+    # Marker race fix (see exec_container_script): install an EXIT trap BEFORE
+    # the streamed body so early `exit 0` mid-body still emits the marker. Trap
+    # only emits on a successful (exit-code 0) exit to preserve the existing
+    # failure-detection proxy. The trailing echo below is a redundant fallback
+    # for normal fallthrough; both paths are guarded by pamac_script_marked.
+    {
+        printf 'PAMAC_SCRIPT_MARKER="%s"\n' "$_marker"
+        printf '%s\n' "pamac_script_marked=''"
+        printf '%s\n' "pamac_emit_marker() { local _rc=$?; [ -z \"\$pamac_script_marked\" ] || return 0; [ \"\$_rc\" -eq 0 ] || return 0; pamac_script_marked=1; echo \"\$PAMAC_SCRIPT_MARKER\"; }"
+        printf '%s\n' "trap pamac_emit_marker EXIT"
+    } >> "$_script_file"
+    # Baseline size = preamble + trap. An empty body yields exactly this size,
+    # so we detect empty heredocs by comparing the post-cat size against it.
+    local _trap_baseline
+    _trap_baseline=$(wc -c < "$_script_file" 2>/dev/null || echo "0")
     cat >> "$_script_file"
     local _piped_size
     _piped_size=$(wc -c < "$_script_file" 2>/dev/null || echo "0")
-    if [[ "$_piped_size" -le ${#_preamble} ]]; then
+    if [[ "$_piped_size" -le "${_trap_baseline:-0}" ]]; then
         log_error "Internal error: piped script '$_desc' is empty (heredoc delimiter may be missing/misfound). Aborting stage."
         rm -f "$_script_file"
         return 1
     fi
-    printf '\necho "%s"\n' "$_marker" >> "$_script_file"
+    # Trailing redundant emission (normal-fallthrough, exit-code-0 path); the
+    # EXIT trap covers early `exit 0` cases. Both gated by pamac_script_marked.
+    printf '\n[ $? -eq 0 ] && echo "%s"\ntrap - EXIT\n' "$_marker" >> "$_script_file"
 
     set +e
     local _output=""
@@ -1695,21 +1755,59 @@ chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
 echo "Step 2/5: Attempting safe keyring recovery (no signature relaxation)..."
 
 _KEYRING_SENTINEL="/etc/pacman.d/gnupg/.keyring-recovery-pending"
+_PUBRING_FILE="/etc/pacman.d/gnupg/pubring.gpg"
 _safe_recovered=false
 
 # Trade-off note: the sentinel persists recovery completion state across
 # container restarts to avoid the cost of re-running keyring recovery on
-# every bootstrap. It is NOT a substitute for live-integrity checking —
-# if the keyring later becomes corrupted (disk error, partial restore,
-# manual gnupg modification), this sentinel will NOT be re-validated and
-# the stale "already recovered" state will be trusted. If you suspect
+# every bootstrap. To detect later corruption (disk error, partial restore,
+# manual gnupg modification), the sentinel file now stores a sha256 checksum
+# plus the byte size of pubring.gpg captured at recovery time. On the next
+# bootstrap the stored checksum is re-validated against the current pubring.gpg;
+# a mismatch discards the sentinel and forces a full recovery re-run. If sha256
+# is unavailable the sentinel still behaves as before (presence-only trust) so
+# we never hard-block recovery on a missing checksum tool. If you suspect
 # keyring corruption, delete /etc/pacman.d/gnupg/.keyring-recovery-pending
 # (and ideally /etc/pacman.d/gnupg) manually so the next bootstrap repeats
 # recovery from scratch.
+_keyring_checksum() {
+    # Print "<size>:<sha256>" for $_PUBRING_FILE, or empty string when unavailable.
+    [[ -f "$_PUBRING_FILE" ]] || { echo ""; return 0; }
+    local _size
+    _size=$(wc -c < "$_PUBRING_FILE" 2>/dev/null | awk '{print $1}' || echo "0")
+    local _sum=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        _sum=$(sha256sum "$_PUBRING_FILE" 2>/dev/null | awk '{print $1}')
+    elif command -v sha256 >/dev/null 2>&1; then
+        _sum=$(sha256 -q "$_PUBRING_FILE" 2>/dev/null)
+    elif command -v shasum >/dev/null 2>&1; then
+        _sum=$(shasum -a 256 "$_PUBRING_FILE" 2>/dev/null | awk '{print $1}')
+    fi
+    echo "${_size}:${_sum}"
+}
+
 if [[ -f "$_KEYRING_SENTINEL" ]]; then
-    echo "Found keyring recovery sentinel from previous run. Keyring recovery already completed."
-    _safe_recovered=true
-    rm -f "$_KEYRING_SENTINEL" 2>/dev/null || true
+    _sentinel_stored=""
+    _sentinel_stored=$(cat "$_KEYRING_SENTINEL" 2>/dev/null | head -1 || echo "")
+    _sentinel_current=""
+    _sentinel_current=$(_keyring_checksum)
+    # A sentinel is trusted only when it carries a matching checksum, OR when
+    # no checksum tool is available (then fall back to presence-only trust so
+    # recovery is not blocked on a missing sha256).
+    if [[ -n "$_sentinel_stored" && "$_sentinel_stored" == "$_sentinel_current" && -n "$_sentinel_current" ]]; then
+        echo "Found valid keyring recovery sentinel from previous run (pubring.gpg checksum matches). Keyring recovery already completed."
+        _safe_recovered=true
+        rm -f "$_KEYRING_SENTINEL" 2>/dev/null || true
+    elif [[ -z "$_sentinel_current" || "$_sentinel_current" == *":*" && "${_sentinel_current##*:}" == "" ]]; then
+        # No checksum tool available — preserve presence-only trust as a fallback
+        # so recovery is not blocked purely because sha256 is missing.
+        echo "Found keyring recovery sentinel, but no checksum tool is available to validate pubring.gpg. Trusting sentinel (presence-only)."
+        _safe_recovered=true
+        rm -f "$_KEYRING_SENTINEL" 2>/dev/null || true
+    else
+        echo "Found keyring recovery sentinel, but pubring.gpg checksum mismatch (stored='$_sentinel_stored' current='$_sentinel_current'). Keyring may have been corrupted since recovery — re-running recovery from scratch."
+        rm -f "$_KEYRING_SENTINEL" 2>/dev/null || true
+    fi
 fi
 
 # Method A: Refresh keys from keyservers (uses GnuPG's built-in HTTP client, no curl needed)
@@ -1811,12 +1909,19 @@ fi
 # No TrustAll fallback — skip repo if keyring recovery fails
 if [[ "$_safe_recovered" == "true" ]]; then
     echo "Safe keyring recovery succeeded."
-    # Persist recovery state across container restarts.
-    # See the trade-off note near the sentinel definition above: this file
-    # marks "recovery once completed" and is not re-checked for later
-    # corruption. Delete it (and /etc/pacman.d/gnupg if needed) to force a
-    # full recovery re-run.
-    touch "$_KEYRING_SENTINEL" 2>/dev/null || true
+    # Persist recovery state across container restarts together with a
+    # checksum of pubring.gpg, so the next bootstrap can detect later
+    # corruption (see _keyring_checksum above). Falls back to a plain
+    # sentinel when no checksum tool is available.
+    _kr_sum=""
+    _kr_sum=$(_keyring_checksum)
+    if [[ -n "$_kr_sum" && "$_kr_sum" != *":*" && "${_kr_sum##*:}" != "" ]] || \
+       { [[ "$_kr_sum" == *":*" ]] && [[ -n "${_kr_sum##*:}" ]]; }; then
+        printf '%s\n' "$_kr_sum" > "$_KEYRING_SENTINEL" 2>/dev/null || \
+            touch "$_KEYRING_SENTINEL" 2>/dev/null || true
+    else
+        touch "$_KEYRING_SENTINEL" 2>/dev/null || true
+    fi
 else
     echo "FATAL: All safe recovery methods failed. Cannot proceed without valid keyring."
     echo "TrustAll is NOT used as it would disable all signature verification."
@@ -2519,7 +2624,24 @@ if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
 # home directory. A malicious AUR package gains only build-user access.
 BUILD_USER="_builduser"
 if ! id "$BUILD_USER" >/dev/null 2>&1; then
-    useradd -r -d /var/lib/builduser -s /usr/bin/nologin "$BUILD_USER" 2>/dev/null || BUILD_USER="nobody"
+    if ! useradd -r -d /var/lib/builduser -s /usr/bin/nologin "$BUILD_USER" 2>/dev/null; then
+        _warn_dsr "useradd -r failed — trying ad-hoc non-root build user as fallback"
+        _bl_tmp=$(mktemp -d /var/tmp/builduser-home-XXXXXX) || _bl_tmp=""
+        if [[ -n "$_bl_tmp" ]]; then
+            BUILD_USER="_brecover$(date +%s|tail -c7)"
+            if ! useradd -M -d "$_bl_tmp" -s /bin/bash "$BUILD_USER" 2>/dev/null; then
+                rmdir "$_bl_tmp" 2>/dev/null || true
+                BUILD_USER=""
+            fi
+        fi
+        if [[ -z "$BUILD_USER" ]] || ! id "$BUILD_USER" >/dev/null 2>&1; then
+            _warn_dsr "FATAL: Cannot create a dedicated build user (useradd -r and ad-hoc user both failed)."
+            _warn_dsr "Refusing to drop privileges to 'nobody' — it lacks a writable home and is unsafe for AUR builds."
+            _warn_dsr "Aborting DynamicUser build to avoid running a potentially untrusted package with no isolation."
+            echo "systemd-run(fake): FATAL: no build user available, refusing to run as nobody" >&2
+            exit 127
+        fi
+    fi
     mkdir -p /var/lib/builduser 2>/dev/null || true
     chown "$BUILD_USER:$BUILD_USER" /var/lib/builduser 2>/dev/null || true
 fi
@@ -2868,7 +2990,24 @@ if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
 # home directory. A malicious AUR package gains only build-user access.
 BUILD_USER="_builduser"
 if ! id "$BUILD_USER" >/dev/null 2>&1; then
-    useradd -r -d /var/lib/builduser -s /usr/bin/nologin "$BUILD_USER" 2>/dev/null || BUILD_USER="nobody"
+    if ! useradd -r -d /var/lib/builduser -s /usr/bin/nologin "$BUILD_USER" 2>/dev/null; then
+        _warn_dsr "useradd -r failed — trying ad-hoc non-root build user as fallback"
+        _bl_tmp=$(mktemp -d /var/tmp/builduser-home-XXXXXX) || _bl_tmp=""
+        if [[ -n "$_bl_tmp" ]]; then
+            BUILD_USER="_brecover$(date +%s|tail -c7)"
+            if ! useradd -M -d "$_bl_tmp" -s /bin/bash "$BUILD_USER" 2>/dev/null; then
+                rmdir "$_bl_tmp" 2>/dev/null || true
+                BUILD_USER=""
+            fi
+        fi
+        if [[ -z "$BUILD_USER" ]] || ! id "$BUILD_USER" >/dev/null 2>&1; then
+            _warn_dsr "FATAL: Cannot create a dedicated build user (useradd -r and ad-hoc user both failed)."
+            _warn_dsr "Refusing to drop privileges to 'nobody' — it lacks a writable home and is unsafe for AUR builds."
+            _warn_dsr "Aborting DynamicUser build to avoid running a potentially untrusted package with no isolation."
+            echo "systemd-run(fake): FATAL: no build user available, refusing to run as nobody" >&2
+            exit 127
+        fi
+    fi
     mkdir -p /var/lib/builduser 2>/dev/null || true
     chown "$BUILD_USER:$BUILD_USER" /var/lib/builduser 2>/dev/null || true
 fi

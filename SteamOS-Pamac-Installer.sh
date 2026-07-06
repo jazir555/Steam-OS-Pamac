@@ -8,7 +8,7 @@ _err_trap() {
     local _exit_code=$?
     local _line=$1
     local _cmd=$2
-    log_error "Error at line $_line (exit $_code): $_cmd"
+    log_error "Error at line $_line (exit $_exit_code): $_cmd"
 }
 trap '_err_trap $LINENO "$BASH_COMMAND"' ERR
 
@@ -22,7 +22,7 @@ readonly LOG_FILE="$HOME/distrobox-pamac-setup.log"
 readonly REQUIRED_TOOLS=("distrobox")
 CONTAINER_HAS_INIT="unknown"
 
-readonly ARCHLINUX_IMAGE="${ARCHLINUX_IMAGE:-archlinux:base-20260628.0.549485}"
+readonly ARCHLINUX_IMAGE="${ARCHLINUX_IMAGE:-archlinux:latest}"
 
 # Track temp files for cleanup on interrupt
 _TEMP_FILES=()
@@ -117,7 +117,7 @@ _filter_verbose_output() {
     # Filter verbose container output to avoid overwhelming the user.
     # Always pass through: errors, warnings, key operation markers, final status lines.
     # Filter out: repetitive download progress, package resolution noise, blank lines.
-    grep -v -E '^\s*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database|^$)|^::(synchronizing|debug:|warning:|info:)|^:: Proceed|^:: Run|^warning:.*downgrading|^warning:.*removing' || cat
+    grep -v -E '^\s*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database|^$)|^::(synchronizing|debug:|warning:|info:)|^:: Proceed|^:: Run|^warning:.*downgrading|^warning:.*removing' || true
 }
 
 run_command() {
@@ -949,8 +949,8 @@ OPTIONS:
 
 ENVIRONMENT VARIABLES:
   CONTAINER_NAME            Override default container name (default: arch-pamac)
-  ARCHLINUX_IMAGE           Container base image (default: archlinux:base-20260628.0.549485)
-                            Override with 'latest' or any other tag for different versions.
+  ARCHLINUX_IMAGE           Container base image (default: archlinux:latest)
+                            Override with any valid tag for different versions.
   FORCE_REBUILD            Set to 'true' to force-rebuild existing container
   ENABLE_GAMING_PACKAGES   Set to 'true' to install gaming packages
   PAMAC_VERSION            Specific pamac-aur version/commit to install (AUR fallback)
@@ -1650,37 +1650,6 @@ _atomic_write_pacman_conf() {
     mv -f "$tmp" "$target"
 }
 
-echo "Step 0/5: Checking for leftover insecure SigLevel from previous crash..."
-# The sentinel file marks that a TrustAll operation was in progress when the
-# previous run was interrupted. It survives reboots and container restarts,
-# unlike traps which only fire during the current process lifetime.
-_SIGLEVEL_SENTINEL="/etc/pacman.conf.siglevel-pending"
-_SIGLEVEL_BACKUP="/etc/pacman.conf.siglevel-backup"
-if [[ -f "$_SIGLEVEL_SENTINEL" ]] || grep -q '^SigLevel\s*=\s*TrustAll' /etc/pacman.conf 2>/dev/null; then
-    if [[ -f "$_SIGLEVEL_BACKUP" ]]; then
-        echo "WARNING: Found SigLevel=TrustAll from a previous interrupted run. Restoring from backup."
-        cp -f "$_SIGLEVEL_BACKUP" /etc/pacman.conf
-    else
-        echo "WARNING: Found SigLevel=TrustAll with no backup. Forcing restore to safe default."
-        _atomic_write_pacman_conf "Required DatabaseOptional"
-    fi
-    rm -f "$_SIGLEVEL_SENTINEL" "$_SIGLEVEL_BACKUP" 2>/dev/null || true
-fi
-
-# Crash-safe SigLevel restoration: if this script is killed, restore the backup.
-# The sentinel file is also checked on next boot for defense-in-depth.
-_rollback_siglevel() {
-    local exit_code=$?
-    if [[ -f "$_SIGLEVEL_BACKUP" ]] && grep -q '^SigLevel\s*=\s*TrustAll' /etc/pacman.conf 2>/dev/null; then
-        echo "Trap: Restoring SigLevel from backup (exit code $exit_code)..."
-        cp -f "$_SIGLEVEL_BACKUP" /etc/pacman.conf
-    fi
-    if [[ $exit_code -eq 0 ]] && [[ -f "$_SIGLEVEL_BACKUP" ]]; then
-        rm -f "$_SIGLEVEL_BACKUP" "$_SIGLEVEL_SENTINEL" 2>/dev/null || true
-    fi
-}
-trap _rollback_siglevel EXIT
-
 echo "Step 1/5: Cleaning up stale GPG state..."
 pkill -9 gpg-agent 2>/dev/null || true
 pkill -9 dirmngr 2>/dev/null || true
@@ -1732,14 +1701,16 @@ done
 # Method B: Download keyring package directly via HTTPS and import keys manually
 if [[ "$_safe_recovered" != "true" ]] && command -v curl >/dev/null 2>&1; then
     echo "Method B: Attempting direct keyring package download via HTTPS..."
+    _SECURE_TMP=$(mktemp -d /var/tmp/pamac-kr-XXXXXX) && chmod 700 "$_SECURE_TMP" 2>/dev/null || _SECURE_TMP=$(mktemp -d)
     _mirror_url="https://geo.mirror.pkgbuild.com/core/os/x86_64"
     _kr_pkg=$(curl -sLf --connect-timeout 10 --max-time 30 "${_mirror_url}/" 2>/dev/null | \
         grep -oP 'archlinux-keyring-[0-9]+-[0-9]+-any\.pkg\.tar\.zst' | sort -V | tail -1 || true)
     if [[ -n "$_kr_pkg" ]]; then
         echo "  Found keyring package: $_kr_pkg"
-        _tmp_kr=$(mktemp /tmp/kr-XXXXXX.pkg.tar.zst)
+        _tmp_kr="$_SECURE_TMP/kr.pkg.tar.zst"
         if curl -sLf --connect-timeout 10 --max-time 120 -o "$_tmp_kr" "${_mirror_url}/${_kr_pkg}" 2>/dev/null; then
-            _tmp_kr_dir=$(mktemp -d /tmp/kr-extract-XXXXXX)
+            _tmp_kr_dir="$_SECURE_TMP/kr-extract"
+            mkdir -p "$_tmp_kr_dir" && chmod 700 "$_tmp_kr_dir" 2>/dev/null || true
             if tar -xf "$_tmp_kr" -C "$_tmp_kr_dir" 2>/dev/null; then
                 for _kr_file in "$_tmp_kr_dir"/usr/share/pacman/keyrings/archlinux*; do
                     [[ -f "$_kr_file" ]] && cp -f "$_kr_file" /etc/pacman.d/gnupg/ 2>/dev/null || true
@@ -1758,6 +1729,7 @@ if [[ "$_safe_recovered" != "true" ]] && command -v curl >/dev/null 2>&1; then
     else
         echo "  Could not find keyring package on mirror."
     fi
+    rm -rf "$_SECURE_TMP" 2>/dev/null || true
 fi
 
 # Method C: Try standard database sync (works if keys are only slightly stale)
@@ -1852,9 +1824,6 @@ if [[ "$keyring_ok" == "true" ]]; then
     echo "Restoring SigLevel to Required DatabaseOptional..."
     _atomic_write_pacman_conf "Required DatabaseOptional"
 
-    # Remove the backup and sentinel since we've successfully restored
-    rm -f "$_SIGLEVEL_BACKUP" "$_SIGLEVEL_SENTINEL" 2>/dev/null || true
-
     echo "Testing database sync with restored signature verification..."
     if pacman -Syy --noconfirm 2>/dev/null; then
         echo "Signature verification restored and functional."
@@ -1867,10 +1836,8 @@ fi
 if [[ "$keyring_ok" != "true" ]]; then
     echo "FATAL: Pacman keyring could not be repaired. The container is in an unsecure state."
     echo "FATAL: Aborting installation to prevent running without signature verification."
-    # Ensure we don't leave the container in a wide-open state
     _atomic_write_pacman_conf "Required DatabaseOptional" 2>/dev/null || \
         _atomic_sed_inplace /etc/pacman.conf 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' 2>/dev/null || true
-    rm -f "$_SIGLEVEL_BACKUP" "$_SIGLEVEL_SENTINEL" 2>/dev/null || true
     exit 100
 fi
 
@@ -2221,15 +2188,14 @@ dbus-daemon --system --fork 2>/dev/null || echo "Note: dbus-daemon start failed 
 fi
 fi
 
-echo "Leaving Pamac polkit policy at auth_admin_keep defaults."
-echo "Passwordless package ops for wheel group are handled by 10-pamac-nopasswd.rules (overrides this policy file)."
+echo "Leaving Pamac polkit policy at auth_admin defaults."
 pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
 if [[ -f "$pamac_policy" ]]; then
     if grep -q '<allow_any>yes</allow_any>' "$pamac_policy"; then
         _atomic_sed_inplace "$pamac_policy" \
-            's|<allow_any>yes</allow_any>|<allow_any>auth_admin_keep</allow_any>|' \
-            's|<allow_inactive>yes</allow_inactive>|<allow_inactive>auth_admin_keep</allow_inactive>|' \
-            's|<allow_active>yes</allow_active>|<allow_active>auth_admin_keep</allow_active>|'
+            's|<allow_any>yes</allow_any>|<allow_any>auth_admin</allow_any>|' \
+            's|<allow_inactive>yes</allow_inactive>|<allow_inactive>auth_admin</allow_inactive>|' \
+            's|<allow_active>yes</allow_active>|<allow_active>auth_admin</allow_active>|'
         echo "Restored least-privilege polkit policy (was previously relaxed to allow_any=yes)."
     fi
 else
@@ -2267,27 +2233,6 @@ cat > /usr/local/bin/pamac-session-bootstrap.sh << 'BOOTSTRAP'
 set +e
 BOOTSTRAP_LOG="/tmp/pamac-bootstrap.log"
 touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
-
-# Crash recovery: if the previous keyring-init run was killed (power loss, SIGKILL),
-# the TrustAll SigLevel may be permanently set. The sentinel file persists across
-# container restarts and reboots — check and restore on every shell entry.
-if [[ -f /etc/pacman.conf.siglevel-pending ]] || grep -q '^SigLevel\s*=\s*TrustAll' /etc/pacman.conf 2>/dev/null; then
-    if [[ -f /etc/pacman.conf.siglevel-backup ]]; then
-        echo "[$(date '+%H:%M:%S')] CRASH RECOVERY: Restoring SigLevel from backup (sentinel found)" >> "$BOOTSTRAP_LOG" 2>/dev/null || true
-        cp -f /etc/pacman.conf.siglevel-backup /etc/pacman.conf 2>/dev/null || true
-    else
-        echo "[$(date '+%H:%M:%S')] CRASH RECOVERY: SigLevel=TrustAll with no backup, forcing safe default" >> "$BOOTSTRAP_LOG" 2>/dev/null || true
-        _tmp_pac=$(mktemp /etc/pacman.conf.atomic.XXXXXX) 2>/dev/null && {
-            cp -f /etc/pacman.conf "$_tmp_pac" 2>/dev/null && {
-                sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' "$_tmp_pac" 2>/dev/null
-                grep -q '^SigLevel' "$_tmp_pac" 2>/dev/null || echo 'SigLevel = Required DatabaseOptional' >> "$_tmp_pac"
-                sync "$_tmp_pac" 2>/dev/null || sync 2>/dev/null || true
-                mv -f "$_tmp_pac" /etc/pacman.conf 2>/dev/null
-            } || rm -f "$_tmp_pac" 2>/dev/null
-        } || sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf 2>/dev/null || true
-    fi
-    rm -f /etc/pacman.conf.siglevel-pending /etc/pacman.conf.siglevel-backup 2>/dev/null || true
-fi
 
 _safe_sleep() {
 if ! sleep "$1" 2>/dev/null; then
@@ -2430,8 +2375,14 @@ mkdir -p "$CACHE_FULL" 2>/dev/null || true
 if $DYNAMIC_USER; then chown -R HOST_USER_PLACEHOLDER:HOST_USER_PLACEHOLDER "$CACHE_FULL" 2>/dev/null || true; fi
 fi
 if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
-BUILD_USER="HOST_USER_PLACEHOLDER"
-if ! id "$BUILD_USER" >/dev/null 2>&1; then BUILD_USER="nobody"; fi
+# Use a dedicated build user to isolate AUR builds from the host user's
+# home directory. A malicious AUR package gains only build-user access.
+BUILD_USER="_builduser"
+if ! id "$BUILD_USER" >/dev/null 2>&1; then
+    useradd -r -d /var/lib/builduser -s /usr/bin/nologin "$BUILD_USER" 2>/dev/null || BUILD_USER="nobody"
+    mkdir -p /var/lib/builduser 2>/dev/null || true
+    chown "$BUILD_USER:$BUILD_USER" /var/lib/builduser 2>/dev/null || true
+fi
 if [[ -n "$WORK_DIR" ]]; then
 _log_dsr "EXEC: sudo -u $BUILD_USER -- cd $WORK_DIR; ${CMD_ARGS[*]}"
 exec sudo -u "$BUILD_USER" -H -- bash -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$WORK_DIR" "${CMD_ARGS[@]}"
@@ -2562,24 +2513,6 @@ cat > /usr/local/bin/pamac-session-bootstrap.sh << 'BOOTSTRAP'
 set +e
 BOOTSTRAP_LOG="/tmp/pamac-bootstrap.log"
 touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
-
-if [[ -f /etc/pacman.conf.siglevel-pending ]] || grep -q '^SigLevel\s*=\s*TrustAll' /etc/pacman.conf 2>/dev/null; then
-    if [[ -f /etc/pacman.conf.siglevel-backup ]]; then
-        echo "[$(date '+%H:%M:%S')] CRASH RECOVERY: Restoring SigLevel from backup (sentinel found)" >> "$BOOTSTRAP_LOG" 2>/dev/null || true
-        cp -f /etc/pacman.conf.siglevel-backup /etc/pacman.conf 2>/dev/null || true
-    else
-        echo "[$(date '+%H:%M:%S')] CRASH RECOVERY: SigLevel=TrustAll with no backup, forcing safe default" >> "$BOOTSTRAP_LOG" 2>/dev/null || true
-        _tmp_pac=$(mktemp /etc/pacman.conf.atomic.XXXXXX) 2>/dev/null && {
-            cp -f /etc/pacman.conf "$_tmp_pac" 2>/dev/null && {
-                sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' "$_tmp_pac" 2>/dev/null
-                grep -q '^SigLevel' "$_tmp_pac" 2>/dev/null || echo 'SigLevel = Required DatabaseOptional' >> "$_tmp_pac"
-                sync "$_tmp_pac" 2>/dev/null || sync 2>/dev/null || true
-                mv -f "$_tmp_pac" /etc/pacman.conf 2>/dev/null
-            } || rm -f "$_tmp_pac" 2>/dev/null
-        } || sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' /etc/pacman.conf 2>/dev/null || true
-    fi
-    rm -f /etc/pacman.conf.siglevel-pending /etc/pacman.conf.siglevel-backup 2>/dev/null || true
-fi
 
 _safe_sleep() {
 if ! sleep "$1" 2>/dev/null; then
@@ -2726,8 +2659,14 @@ mkdir -p "$CACHE_FULL" 2>/dev/null || true
 if $DYNAMIC_USER; then chown -R HOST_USER_PLACEHOLDER:HOST_USER_PLACEHOLDER "$CACHE_FULL" 2>/dev/null || true; fi
 fi
 if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
-BUILD_USER="HOST_USER_PLACEHOLDER"
-if ! id "$BUILD_USER" >/dev/null 2>&1; then BUILD_USER="nobody"; fi
+# Use a dedicated build user to isolate AUR builds from the host user's
+# home directory. A malicious AUR package gains only build-user access.
+BUILD_USER="_builduser"
+if ! id "$BUILD_USER" >/dev/null 2>&1; then
+    useradd -r -d /var/lib/builduser -s /usr/bin/nologin "$BUILD_USER" 2>/dev/null || BUILD_USER="nobody"
+    mkdir -p /var/lib/builduser 2>/dev/null || true
+    chown "$BUILD_USER:$BUILD_USER" /var/lib/builduser 2>/dev/null || true
+fi
 if [[ -n "$WORK_DIR" ]]; then
 _log_dsr "EXEC: sudo -u $BUILD_USER -- cd $WORK_DIR; ${CMD_ARGS[*]}"
 exec sudo -u "$BUILD_USER" -H -- bash -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$WORK_DIR" "${CMD_ARGS[@]}"
@@ -2895,33 +2834,6 @@ set -uo pipefail
 
 rm -f /var/lib/pacman/db.lck
 
-# Crash recovery: detect leftover TrustAll from previous interrupted run
-_EXTRA_REPOS_SENTINEL="/etc/pacman.conf.extrarepos-pending"
-_EXTRA_REPOS_BACKUP="/etc/pacman.conf.extrarepos-backup"
-if [[ -f "$_EXTRA_REPOS_SENTINEL" ]]; then
-    if [[ -f "$_EXTRA_REPOS_BACKUP" ]]; then
-        echo "CRASH RECOVERY: Restoring pacman.conf from backup (TrustAll was in progress)."
-        cp -f "$_EXTRA_REPOS_BACKUP" /etc/pacman.conf
-    else
-        echo "CRASH RECOVERY: TrustAll sentinel found with no backup. Setting safe SigLevel."
-        sed -i 's/^SigLevel\s*=\s*TrustAll/SigLevel = Required DatabaseOptional/' /etc/pacman.conf 2>/dev/null || true
-    fi
-    rm -f "$_EXTRA_REPOS_SENTINEL" "$_EXTRA_REPOS_BACKUP" 2>/dev/null || true
-fi
-
-# Crash-safe rollback for TrustAll fallback
-_rollback_extra_repos() {
-    local exit_code=$?
-    if [[ -f "$_EXTRA_REPOS_BACKUP" ]]; then
-        if grep -q 'SigLevel\s*=\s*TrustAll' /etc/pacman.conf 2>/dev/null; then
-            echo "CRASH RECOVERY: Restoring pacman.conf from backup (exit code $exit_code)..."
-            cp -f "$_EXTRA_REPOS_BACKUP" /etc/pacman.conf
-        fi
-        rm -f "$_EXTRA_REPOS_BACKUP" "$_EXTRA_REPOS_SENTINEL" 2>/dev/null || true
-    fi
-}
-trap _rollback_extra_repos EXIT
-
 _repo_already_enabled() {
     grep -q "^\[$1\]" /etc/pacman.conf
 }
@@ -3009,6 +2921,8 @@ _enable_repo_with_fallback() {
         echo "Attempting direct keyring package download from mirrors..."
         local host_arch
         host_arch=$(uname -m 2>/dev/null || echo "x86_64")
+        local _kr_tmp_dir
+        _kr_tmp_dir=$(mktemp -d /var/tmp/pamac-kr-XXXXXX) && chmod 700 "$_kr_tmp_dir" 2>/dev/null || _kr_tmp_dir=$(mktemp -d)
         for url in "${mirror_urls[@]}"; do
             local direct_url="${url}"
             direct_url="${direct_url//\\\$arch/$host_arch}"
@@ -3017,11 +2931,11 @@ _enable_repo_with_fallback() {
             direct_url="${direct_url//\$repo/$repo_name}"
             local pkg_url="${direct_url%/}/${keyring_pkg}.pkg.tar.zst"
             local pkg_sig_url="${pkg_url}.sig"
-            if timeout 30 curl -fsSL --connect-timeout 10 -o "/tmp/${keyring_pkg}.pkg.tar.zst" "$pkg_url" 2>/dev/null; then
+            if timeout 30 curl -fsSL --connect-timeout 10 -o "$_kr_tmp_dir/${keyring_pkg}.pkg.tar.zst" "$pkg_url" 2>/dev/null; then
                 # Verify package signature if available
                 local _sig_ok=false
-                if timeout 15 curl -fsSL --connect-timeout 5 -o "/tmp/${keyring_pkg}.pkg.tar.zst.sig" "$pkg_sig_url" 2>/dev/null; then
-                    if gpg --verify "/tmp/${keyring_pkg}.pkg.tar.zst.sig" "/tmp/${keyring_pkg}.pkg.tar.zst" 2>/dev/null; then
+                if timeout 15 curl -fsSL --connect-timeout 5 -o "$_kr_tmp_dir/${keyring_pkg}.pkg.tar.zst.sig" "$pkg_sig_url" 2>/dev/null; then
+                    if gpg --verify "$_kr_tmp_dir/${keyring_pkg}.pkg.tar.zst.sig" "$_kr_tmp_dir/${keyring_pkg}.pkg.tar.zst" 2>/dev/null; then
                         _sig_ok=true
                         echo "$repo_name keyring package signature verified."
                     else
@@ -3031,16 +2945,17 @@ _enable_repo_with_fallback() {
                     echo "Warning: $repo_name keyring package has no signature file. Skipping this mirror."
                 fi
                 if [[ "$_sig_ok" == "true" ]]; then
-                    if pacman -U --noconfirm "/tmp/${keyring_pkg}.pkg.tar.zst" 2>/dev/null; then
+                    if pacman -U --noconfirm "$_kr_tmp_dir/${keyring_pkg}.pkg.tar.zst" 2>/dev/null; then
                         echo "$repo_name keyring installed from direct download: $pkg_url"
                         key_ok=true
-                        rm -f "/tmp/${keyring_pkg}.pkg.tar.zst" "/tmp/${keyring_pkg}.pkg.tar.zst.sig"
+                        rm -f "$_kr_tmp_dir/${keyring_pkg}.pkg.tar.zst" "$_kr_tmp_dir/${keyring_pkg}.pkg.tar.zst.sig"
                         break
                     fi
                 fi
-                rm -f "/tmp/${keyring_pkg}.pkg.tar.zst" "/tmp/${keyring_pkg}.pkg.tar.zst.sig"
+                rm -f "$_kr_tmp_dir/${keyring_pkg}.pkg.tar.zst" "$_kr_tmp_dir/${keyring_pkg}.pkg.tar.zst.sig"
             fi
         done
+        rm -rf "$_kr_tmp_dir" 2>/dev/null || true
     fi
 
     # Step 3: Dynamically discover and import GPG key from repo mirrors
@@ -3050,6 +2965,8 @@ _enable_repo_with_fallback() {
         echo "Attempting dynamic key discovery from repo mirrors..."
         local host_arch
         host_arch=$(uname -m 2>/dev/null || echo "x86_64")
+        local _key_tmp_dir
+        _key_tmp_dir=$(mktemp -d /var/tmp/pamac-key-XXXXXX) && chmod 700 "$_key_tmp_dir" 2>/dev/null || _key_tmp_dir=$(mktemp -d)
         for url in "${mirror_urls[@]}"; do
             local direct_url="${url}"
             direct_url="${direct_url//\\\$arch/$host_arch}"
@@ -3059,7 +2976,7 @@ _enable_repo_with_fallback() {
             # Try common GPG key distribution filenames used by Arch repos
             for keyfile in "pub.gpg" "archlinuxcn.gpg" "key.gpg"; do
                 local key_url="${direct_url%/}/$keyfile"
-                local _tmp_key="/tmp/repo-key-discover-${repo_name}.gpg"
+                local _tmp_key="$_key_tmp_dir/repo-key.gpg"
                 if timeout 15 curl -fsSL --connect-timeout 5 -o "$_tmp_key" "$key_url" 2>/dev/null; then
                     if file "$_tmp_key" 2>/dev/null | grep -qi "GPG\|PGP"; then
                         echo "  Found GPG key at $key_url"
@@ -3081,6 +2998,7 @@ _enable_repo_with_fallback() {
                 fi
             done
         done
+        rm -rf "$_key_tmp_dir" 2>/dev/null || true
         if [[ "$key_ok" != "true" ]]; then
             echo "  No GPG key found at common mirror paths. Trying keyserver fallback..."
         fi
@@ -3149,9 +3067,6 @@ pacman -Sy --noconfirm 2>/dev/null || echo "Warning: database sync with new repo
 
 echo "Third-party repository configuration complete."
 echo "Available additional repos: chaotic-aur, archlinuxcn, endeavouros"
-
-# Clean up crash recovery files on successful completion
-rm -f "$_EXTRA_REPOS_BACKUP" "$_EXTRA_REPOS_SENTINEL" 2>/dev/null || true
 REPOS_EOF
 
     if ! exec_container_script "$repos_script" "extra-repos"; then
@@ -3243,7 +3158,8 @@ current_user="$1"
 rm -f /var/lib/pacman/db.lck
 
 echo "Cloning and building yay from AUR..."
-rm -rf /tmp/yay
+_YAY_WORK=$(mktemp -d /var/tmp/pamac-yay-XXXXXX) && chmod 700 "$_YAY_WORK" 2>/dev/null || _YAY_WORK=$(mktemp -d)
+rm -rf "$_YAY_WORK" && mkdir -p "$_YAY_WORK" && chmod 700 "$_YAY_WORK"
 
 echo "Ensuring CA certificates are available for HTTPS..."
 pacman -S --noconfirm --needed ca-certificates-mozilla 2>/dev/null || true
@@ -3251,10 +3167,10 @@ pacman -S --noconfirm --needed ca-certificates-mozilla 2>/dev/null || true
 clone_retry=0
 max_clone_retries=3
 while [[ $clone_retry -lt $max_clone_retries ]]; do
-    if sudo -Hu "$current_user" git clone "https://aur.archlinux.org/yay.git" /tmp/yay 2>/tmp/yay_clone_err; then
+    if sudo -Hu "$current_user" git clone "https://aur.archlinux.org/yay.git" "$_YAY_WORK/yay" 2>"$_YAY_WORK/clone_err"; then
         break
     fi
-    clone_err=$(cat /tmp/yay_clone_err 2>/dev/null || true)
+    clone_err=$(cat "$_YAY_WORK/clone_err" 2>/dev/null || true)
     clone_retry=$((clone_retry + 1))
     if [[ $clone_retry -lt $max_clone_retries ]]; then
         if echo "$clone_err" | grep -qi "SSL\|TLS\|certificate"; then
@@ -3267,22 +3183,22 @@ echo "Clone failed (attempt $clone_retry/$max_clone_retries). Retrying in ${wait
 _safe_sleep "$wait_time"
     else
         echo "Clone failed after $max_clone_retries attempts."
-        cat /tmp/yay_clone_err 2>/dev/null || true
+        cat "$_YAY_WORK/clone_err" 2>/dev/null || true
         echo "AUR clone failed. Trying to download yay from GitHub..."
-        rm -rf /tmp/yay
-        if sudo -Hu "$current_user" git clone --depth=1 "https://github.com/Jguer/yay.git" /tmp/yay 2>/tmp/yay_gh_err; then
+        rm -rf "$_YAY_WORK/yay"
+        if sudo -Hu "$current_user" git clone --depth=1 "https://github.com/Jguer/yay.git" "$_YAY_WORK/yay" 2>"$_YAY_WORK/gh_err"; then
             echo "Successfully cloned yay from GitHub."
         else
             echo "GitHub clone also failed."
-            cat /tmp/yay_gh_err 2>/dev/null || true
+            cat "$_YAY_WORK/gh_err" 2>/dev/null || true
             exit 1
         fi
     fi
 done
 
-chown -R "$current_user:$current_user" /tmp/yay
+chown -R "$current_user:$current_user" "$_YAY_WORK/yay"
 _set_makepkg_jobs
-sudo -Hu "$current_user" bash -lc "cd /tmp/yay && makepkg -si --noconfirm --clean"
+sudo -Hu "$current_user" bash -lc "cd '$_YAY_WORK/yay' && makepkg -si --noconfirm --clean"
 build_rc=$?
 
 if [[ $build_rc -ne 0 ]]; then
@@ -3293,7 +3209,7 @@ fi
 if ! command -v yay >/dev/null 2>&1; then
     echo "FATAL: yay binary not found after successful makepkg. Installation may have failed silently."
     echo "Attempting direct reinstall from built package..."
-    _yay_pkg=$(ls -t /tmp/yay/*.pkg.tar.* 2>/dev/null | head -1)
+    _yay_pkg=$(ls -t "$_YAY_WORK/yay"/*.pkg.tar.* 2>/dev/null | head -1)
     if [[ -n "$_yay_pkg" ]]; then
         pacman -U --noconfirm "$_yay_pkg" || true
     fi
@@ -3303,6 +3219,7 @@ if ! command -v yay >/dev/null 2>&1; then
     fi
 fi
 echo "yay verified installed: $(yay --version 2>/dev/null || echo 'unknown version')"
+rm -rf "$_YAY_WORK" 2>/dev/null || true
 BUILD_EOF
 
     if ! exec_container_script "$build_script" "yay-build" "$CURRENT_USER"; then
@@ -3360,17 +3277,18 @@ if [[ -n "$pamac_version_pin" && "$pamac_version_pin" != "latest" ]]; then
         exit 0
     fi
     echo "Direct version install failed. Trying git clone approach..."
-    rm -rf /tmp/pamac-aur-compat
-    if sudo -Hu "$current_user" bash -lc "git clone --depth 1 --branch '$pamac_version_pin' https://aur.archlinux.org/pamac-aur.git /tmp/pamac-aur-compat" 2>&1 || \
-       sudo -Hu "$current_user" bash -lc "git clone --depth 1 https://aur.archlinux.org/pamac-aur.git /tmp/pamac-aur-compat && cd /tmp/pamac-aur-compat && git checkout '$pamac_version_pin'" 2>&1; then
+    local _compat_work
+    _compat_work=$(mktemp -d /var/tmp/pamac-compat-XXXXXX) && chmod 700 "$_compat_work" 2>/dev/null || _compat_work=$(mktemp -d)
+    if sudo -Hu "$current_user" bash -lc "git clone --depth 1 --branch '$pamac_version_pin' https://aur.archlinux.org/pamac-aur.git '$_compat_work/pamac-aur'" 2>&1 || \
+       sudo -Hu "$current_user" bash -lc "git clone --depth 1 https://aur.archlinux.org/pamac-aur.git '$_compat_work/pamac-aur' && cd '$_compat_work/pamac-aur' && git checkout '$pamac_version_pin'" 2>&1; then
         _set_makepkg_jobs
-        if sudo -Hu "$current_user" bash -lc "cd /tmp/pamac-aur-compat && makepkg -si --noconfirm --clean" 2>&1; then
+        if sudo -Hu "$current_user" bash -lc "cd '$_compat_work/pamac-aur' && makepkg -si --noconfirm --clean" 2>&1; then
             echo "SUCCESS: pamac-aur $pamac_version_pin installed from git."
-            rm -rf /tmp/pamac-aur-compat
+            rm -rf "$_compat_work"
             exit 0
         fi
     fi
-    rm -rf /tmp/pamac-aur-compat
+    rm -rf "$_compat_work"
     echo "WARN: --pamac-version=$pamac_version_pin failed. Falling back to automatic detection..."
 fi
 
@@ -3393,21 +3311,16 @@ _fetch_aur_pkgbuild() {
     local _rpc_resp
     _rpc_resp=$(curl -sf --connect-timeout 10 --max-time 30 "$_rpc_url" 2>/dev/null || echo "")
     if [[ -n "$_rpc_resp" ]] && echo "$_rpc_resp" | grep -q '"resultcount":1'; then
-        # Extract Depends array elements (handle empty arrays too)
-        local _deps_raw _makedeps_raw
-        _deps_raw=$(echo "$_rpc_resp" | sed -n 's/.*"Depends":\[\([^]]*\)\].*/\1/p' 2>/dev/null || echo "")
-        _makedeps_raw=$(echo "$_rpc_resp" | sed -n 's/.*"MakeDepends":\[\([^]]*\)\].*/\1/p' 2>/dev/null || echo "")
-        # Format as PKGBUILD-like lines for downstream grep compatibility
-        if [[ -n "$_deps_raw" ]]; then
-            _deps_formatted=$(echo "$_deps_raw" | sed 's/","/\n/g; s/"//g')
+        local _deps_formatted _makedeps_formatted
+        _deps_formatted=$(echo "$_rpc_resp" | jq -r '.results[0].Depends // [] | join("\n")' 2>/dev/null || echo "")
+        _makedeps_formatted=$(echo "$_rpc_resp" | jq -r '.results[0].MakeDepends // [] | join("\n")' 2>/dev/null || echo "")
+        if [[ -n "$_deps_formatted" ]]; then
             echo "depends=($_deps_formatted)"
         fi
-        if [[ -n "$_makedeps_raw" ]]; then
-            _makedeps_formatted=$(echo "$_makedeps_raw" | sed 's/","/\n/g; s/"//g')
+        if [[ -n "$_makedeps_formatted" ]]; then
             echo "makedepends=($_makedeps_formatted)"
         fi
-        # If we got at least one dependency line, RPC was successful
-        if [[ -n "$_deps_raw" || -n "$_makedeps_raw" ]]; then
+        if [[ -n "$_deps_formatted" || -n "$_makedeps_formatted" ]]; then
             echo "# Generated from AUR RPC v5 API"
             return 0
         fi
@@ -3613,7 +3526,7 @@ echo ">>> Strategy B: Finding older pamac-aur revision compatible with pacman $i
 # Use git directly to iterate commits — this is frontend-agnostic and does not
 # depend on the AUR web interface (CGIT, GitLab, Gitea, etc.).
 _AUR_GIT_URL="https://aur.archlinux.org/pamac-aur.git"
-_AUR_WORK="/tmp/pamac-aur-compat-history"
+_AUR_WORK=$(mktemp -d /var/tmp/pamac-aur-history-XXXXXX) && chmod 700 "$_AUR_WORK" 2>/dev/null || _AUR_WORK=$(mktemp -d)
 rm -rf "$_AUR_WORK"
 
 echo "Cloning pamac-aur repository (shallow) for commit history..."
@@ -3814,7 +3727,8 @@ fi
 
 install_from_aur_commit() {
     local commit="$1"
-    local work_dir="/tmp/pamac-aur-pkg-$$"
+    local work_dir
+    work_dir=$(mktemp -d /var/tmp/pamac-pkg-XXXXXX) && chmod 700 "$work_dir" 2>/dev/null || work_dir=$(mktemp -d)
     echo "Cloning pamac-aur at commit ${commit:0:12}..."
     rm -rf "$work_dir"
     sudo -Hu "$current_user" bash -lc "git clone --depth=50 https://aur.archlinux.org/pamac-aur.git '$work_dir'" 2>/tmp/pamac_clone_err || {
@@ -3908,16 +3822,17 @@ case "$compat_strategy" in
             pamac_installed=true
         else
             echo "Standard yay install failed. Attempting direct clone..."
-            rm -rf /tmp/pamac-aur-fallback
-            if sudo -Hu "$current_user" bash -lc "git clone --depth=1 https://aur.archlinux.org/pamac-aur.git /tmp/pamac-aur-fallback" 2>/tmp/pamac_fb_err; then
+            local _fb_work
+            _fb_work=$(mktemp -d /var/tmp/pamac-fb-XXXXXX) && chmod 700 "$_fb_work" 2>/dev/null || _fb_work=$(mktemp -d)
+            if sudo -Hu "$current_user" bash -lc "git clone --depth=1 https://aur.archlinux.org/pamac-aur.git '$_fb_work/pamac-aur'" 2>"$_fb_work/err"; then
                 _set_makepkg_jobs
-                if sudo -Hu "$current_user" bash -lc "cd /tmp/pamac-aur-fallback && makepkg -si --noconfirm --clean" 2>&1 | tail -15; then
+                if sudo -Hu "$current_user" bash -lc "cd '$_fb_work/pamac-aur' && makepkg -si --noconfirm --clean" 2>&1 | tail -15; then
                     pamac_installed=true
                 fi
-                rm -rf /tmp/pamac-aur-fallback
+                rm -rf "$_fb_work"
             else
                 echo "Direct clone also failed:"
-                cat /tmp/pamac_fb_err 2>/dev/null | tail -5
+                cat "$_fb_work/err" 2>/dev/null | tail -5
             fi
         fi
         ;;
@@ -4040,15 +3955,15 @@ mkdir -p "/home/$current_user/.pamac-build"
 chown "$current_user:$current_user" "/home/$current_user/.pamac-build" 2>/dev/null || true
 echo "BuildDirectory set to /home/$current_user/.pamac-build"
 
-echo "Leaving Pamac polkit policy at auth_admin_keep defaults."
+echo "Leaving Pamac polkit policy at auth_admin defaults."
 pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
 if [[ -f "$pamac_policy" ]]; then
 if grep -q '<allow_any>yes</allow_any>' "$pamac_policy"; then
     _atomic_sed_inplace "$pamac_policy" \
-        's|<allow_any>yes</allow_any>|<allow_any>auth_admin_keep</allow_any>|' \
-        's|<allow_inactive>yes</allow_inactive>|<allow_inactive>auth_admin_keep</allow_inactive>|' \
-        's|<allow_active>yes</allow_active>|<allow_active>auth_admin_keep</allow_active>|'
-    echo "Restored auth_admin_keep in polkit policy (was previously relaxed to allow_any=yes)."
+        's|<allow_any>yes</allow_any>|<allow_any>auth_admin</allow_any>|' \
+        's|<allow_inactive>yes</allow_inactive>|<allow_inactive>auth_admin</allow_inactive>|' \
+        's|<allow_active>yes</allow_active>|<allow_active>auth_admin</allow_active>|'
+    echo "Restored auth_admin in polkit policy (was previously relaxed to allow_any=yes)."
 fi
 else
 echo "Warning: pamac polkit policy file not found at $pamac_policy"
@@ -5740,46 +5655,6 @@ main() {
         ;;
     esac
   fi
-
-    # Safety check: detect stale SigLevel=TrustAll from a previous crashed run.
-    # The keyring script sets SigLevel=TrustAll temporarily, with a backup for crash recovery.
-    # If the script was killed mid-run, the container is left in an insecure state.
-    # We MUST detect this BEFORE re-running configure_container_base to prevent re-entering
-    # a TrustAll state on top of an already-compromised state.
-    if container_is_usable 2>/dev/null; then
-        local _stale_siglevel
-        _stale_siglevel=$(container_runtime_privileged exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" \
-            bash -c 'grep -q "^SigLevel\s*=\s*TrustAll" /etc/pacman.conf 2>/dev/null && [[ -f /etc/pacman.conf.siglevel-backup ]] && echo "stale"' 2>/dev/null || true)
-        if [[ "$_stale_siglevel" == "stale" ]]; then
-            log_error "CRITICAL: Container has leftover SigLevel=TrustAll from a previous interrupted run."
-            log_error "This means signature verification is disabled, which is a security risk."
-            log_error "Attempting automatic recovery from backup..."
-            if container_root_exec bash -c 'cp -f /etc/pacman.conf.siglevel-backup /etc/pacman.conf' 2>/dev/null; then
-                log_success "Auto-reverted SigLevel from backup. Container is secure."
-            else
-                log_error "Auto-revert failed. Refusing to proceed until manually fixed."
-                log_info "Manual fix: distrobox enter $CONTAINER_NAME -- bash -c '"
-                log_info "  cp -f /etc/pacman.conf.siglevel-backup /etc/pacman.conf || true"
-                log_info "  sed -i \"s/^SigLevel.*/SigLevel = Required DatabaseOptional/\" /etc/pacman.conf'"
-                exit 1
-            fi
-        fi
-        # Also catch TrustAll without backup (worst case: script died before backup was created
-        # or backup was cleaned up while SigLevel was still TrustAll)
-        _stale_siglevel=$(container_runtime_privileged exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" \
-            bash -c 'grep -q "^SigLevel\s*=\s*TrustAll" /etc/pacman.conf 2>/dev/null && [[ ! -f /etc/pacman.conf.siglevel-backup ]] && echo "trustall_nobak"' 2>/dev/null || true)
-        if [[ "$_stale_siglevel" == "trustall_nobak" ]]; then
-            log_error "CRITICAL: Container has SigLevel=TrustAll with no backup file."
-            log_error "Previous run may have been interrupted before backup was created."
-            log_error "Forcing SigLevel to safe default..."
-            if container_root_exec bash -c 'tmp=$(mktemp /etc/pacman.conf.atomic.XXXXXX) && cp -f /etc/pacman.conf "$tmp" && sed -i "s/^SigLevel.*/SigLevel = Required DatabaseOptional/" "$tmp" && (grep -q "^SigLevel" "$tmp" || echo "SigLevel = Required DatabaseOptional" >> "$tmp") && sync "$tmp" 2>/dev/null || sync 2>/dev/null || true && mv -f "$tmp" /etc/pacman.conf' 2>/dev/null; then
-                log_success "Restored SigLevel to Required DatabaseOptional."
-            else
-                log_error "Failed to restore SigLevel. Manual intervention required."
-                exit 1
-            fi
-        fi
-    fi
 
     check_memory_ok 262144 "base setup" 262144 || {
         log_error "Insufficient memory for base setup (need at least 256MB). Aborting."

@@ -55,6 +55,11 @@ LOG_LEVEL="${LOG_LEVEL:-normal}"
 PAMAC_VERSION="${PAMAC_VERSION:-}"
 NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
 
+# Exit code used when the user declines an interactive prompt (e.g. low battery).
+# 130 is the conventional shell exit for "terminated by SIGINT" — distinct from a
+# genuine success (0) so wrapper scripts can tell an abort from a clean run.
+readonly EXIT_USER_ABORT=130
+
 setup_colors() {
     if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
         readonly GREEN=$(tput setaf 2)
@@ -117,7 +122,10 @@ _filter_verbose_output() {
     # Filter verbose container output to avoid overwhelming the user.
     # Always pass through: errors, warnings, key operation markers, final status lines.
     # Filter out: repetitive download progress, package resolution noise, blank lines.
-    grep -v -E '^\s*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database)|^::(synchronizing|debug:|warning:|info:)|^:: Proceed|^:: Run|^warning:.*downgrading|^warning:.*removing' || true
+    # NOTE: warning:.*downgrading and warning:.*removing are intentionally NOT
+    # filtered — unexpected downgrades/removals during upgrades are exactly the
+    # kind of issue a user must see, and hiding them can mask broken upgrades.
+    grep -v -E '^\s*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database)|^::(synchronizing|debug:|warning:|info:)|^:: Proceed|^:: Run' || true
 }
 
 run_command() {
@@ -153,6 +161,11 @@ container_runtime() {
 # SECURITY: Running as host root significantly weakens container isolation.
 # PODMAN_SUDO_FALLBACK is only set by ensure_podman() when --allow-sudo-fallback is passed.
 _SUDO_VERIFIED=""
+# sudo credentials can expire mid-run (timestamp_timeout). Cache the last-known
+# successful verification timestamp and re-check after SUDO_REVALIDATE_SECONDS
+# so a privileged call doesn't hang on a password prompt once creds lapse.
+_SUDO_VERIFIED_AT=0
+SUDO_REVALIDATE_SECONDS="${SUDO_REVALIDATE_SECONDS:-60}"
 container_runtime_privileged() {
     local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
     if [[ "${PODMAN_SUDO_FALLBACK:-}" == "true" ]]; then
@@ -162,20 +175,24 @@ container_runtime_privileged() {
             container_runtime "$@"
             return $?
         fi
-        if [[ "$_SUDO_VERIFIED" != "ok" ]]; then
+        # Re-verify sudo -n periodically instead of trusting a single early check.
+        # If sudo timestamps are still valid, sudo -n true is effectively free.
+        local _now=$SECONDS
+        if [[ "$_SUDO_VERIFIED" != "ok" ]] || (( _now - _SUDO_VERIFIED_AT >= SUDO_REVALIDATE_SECONDS )); then
             if sudo -n true 2>/dev/null; then
                 _SUDO_VERIFIED="ok"
+                _SUDO_VERIFIED_AT=$_now
             else
-                log_warn "sudo -n true failed (password may be required). Falling back to rootless podman."
+                log_warn "sudo -n true failed (password may be required or creds expired). Falling back to rootless podman."
                 unset PODMAN_SUDO_FALLBACK
                 container_runtime "$@"
                 return $?
             fi
         fi
         if [[ "$mgr" == "docker" ]]; then
-            sudo docker "$@"
+            sudo -n docker "$@"
         else
-            sudo podman "$@"
+            sudo -n podman "$@"
         fi
     else
         container_runtime "$@"
@@ -1343,7 +1360,25 @@ fi
 ' 2>/dev/null || true
 }
 
-_CONTAINER_PREAMBLE='_safe_sleep() { if ! sleep "$1" 2>/dev/null; then read -t "$1" -r _ </dev/null 2>/dev/null || true; fi; }
+_CONTAINER_PREAMBLE='_safe_sleep() {
+local _d="$1"
+# Sanitize argument to a positive number (default 1s) before passing to timers.
+case "$_d" in
+    ''|*[!0-9.]*) _d=1 ;;
+esac
+if sleep "$_d" 2>/dev/null; then return 0; fi
+# sleep is unavailable/broken — try a real timer that actually delays.
+# (read -t </dev/null returns immediately on EOF, so it is NOT a sleep.)
+if command -v python3 >/dev/null 2>&1; then
+    python3 -c "import time,sys; time.sleep(float(sys.argv[1]))" "$_d" 2>/dev/null && return 0
+fi
+if command -v perl >/dev/null 2>&1; then
+    perl -e "select undef,undef,undef,\$ARGV[0]" "$_d" 2>/dev/null && return 0
+fi
+# No working timer available: degrade to no-op. Reliability of retry loops
+# then depends on the surrounding condition checks, not on a timed delay.
+return 0
+}
 _atomic_sed_inplace() {
     local _target="$1"; shift
     local _tmp; _tmp=$(mktemp "${_target}.atomic.XXXXXX") || { echo "FATAL: mktemp failed for atomic sed on $_target"; return 1; }
@@ -1662,7 +1697,15 @@ echo "Step 2/5: Attempting safe keyring recovery (no signature relaxation)..."
 _KEYRING_SENTINEL="/etc/pacman.d/gnupg/.keyring-recovery-pending"
 _safe_recovered=false
 
-# Check if keyring recovery was already completed (persists across container restarts)
+# Trade-off note: the sentinel persists recovery completion state across
+# container restarts to avoid the cost of re-running keyring recovery on
+# every bootstrap. It is NOT a substitute for live-integrity checking —
+# if the keyring later becomes corrupted (disk error, partial restore,
+# manual gnupg modification), this sentinel will NOT be re-validated and
+# the stale "already recovered" state will be trusted. If you suspect
+# keyring corruption, delete /etc/pacman.d/gnupg/.keyring-recovery-pending
+# (and ideally /etc/pacman.d/gnupg) manually so the next bootstrap repeats
+# recovery from scratch.
 if [[ -f "$_KEYRING_SENTINEL" ]]; then
     echo "Found keyring recovery sentinel from previous run. Keyring recovery already completed."
     _safe_recovered=true
@@ -1768,7 +1811,11 @@ fi
 # No TrustAll fallback — skip repo if keyring recovery fails
 if [[ "$_safe_recovered" == "true" ]]; then
     echo "Safe keyring recovery succeeded."
-    # Persist recovery state across container restarts
+    # Persist recovery state across container restarts.
+    # See the trade-off note near the sentinel definition above: this file
+    # marks "recovery once completed" and is not re-checked for later
+    # corruption. Delete it (and /etc/pacman.d/gnupg if needed) to force a
+    # full recovery re-run.
     touch "$_KEYRING_SENTINEL" 2>/dev/null || true
 else
     echo "FATAL: All safe recovery methods failed. Cannot proceed without valid keyring."
@@ -2263,9 +2310,18 @@ BOOTSTRAP_LOG="/tmp/pamac-bootstrap.log"
 touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
 
 _safe_sleep() {
-if ! sleep "$1" 2>/dev/null; then
-read -t "$1" -r _ 2>/dev/null || true
+local _d="$1"
+case "$_d" in ''|*[!0-9.]*) _d=1 ;; esac
+if sleep "$_d" 2>/dev/null; then return 0; fi
+# sleep is unavailable/broken — try a real timer that actually delays.
+# (read -t </dev/null returns immediately on EOF, so it is NOT a sleep.)
+if command -v python3 >/dev/null 2>&1; then
+    python3 -c "import time,sys; time.sleep(float(sys.argv[1]))" "$_d" 2>/dev/null && return 0
 fi
+if command -v perl >/dev/null 2>&1; then
+    perl -e "select undef,undef,undef,\$ARGV[0]" "$_d" 2>/dev/null && return 0
+fi
+return 0
 }
 
 log_bootstrap() {
@@ -2599,9 +2655,18 @@ BOOTSTRAP_LOG="/tmp/pamac-bootstrap.log"
 touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
 
 _safe_sleep() {
-if ! sleep "$1" 2>/dev/null; then
-read -t "$1" -r _ 2>/dev/null || true
+local _d="$1"
+case "$_d" in ''|*[!0-9.]*) _d=1 ;; esac
+if sleep "$_d" 2>/dev/null; then return 0; fi
+# sleep is unavailable/broken — try a real timer that actually delays.
+# (read -t </dev/null returns immediately on EOF, so it is NOT a sleep.)
+if command -v python3 >/dev/null 2>&1; then
+    python3 -c "import time,sys; time.sleep(float(sys.argv[1]))" "$_d" 2>/dev/null && return 0
 fi
+if command -v perl >/dev/null 2>&1; then
+    perl -e "select undef,undef,undef,\$ARGV[0]" "$_d" 2>/dev/null && return 0
+fi
+return 0
 }
 
 log_bootstrap() {
@@ -3016,9 +3081,7 @@ _import_key_with_retry() {
                     # Full fingerprint match (40 chars) — exact
                     [[ "$_verify_fp" == "$key_id" ]] ||
                     # Long ID (16+ chars) — require exact suffix match (no partial matches)
-                    { [[ $_kid_len -ge 16 ]] && [[ "$_verify_fp" == *"$key_id" ]]; } ||
-                    # Exact 40-char fingerprint provided by caller — verify full match
-                    { [[ $_kid_len -eq 40 ]] && [[ "$_verify_fp" == "$key_id" ]]; }
+                    { [[ $_kid_len -ge 16 ]] && [[ "$_verify_fp" == *"$key_id" ]]; }
                 }; then
                     timeout 15 pacman-key --lsign-key "$_verify_fp" 2>/dev/null && return 0
                 else
@@ -4598,7 +4661,7 @@ XDOTOOL_WRAPPER
         fi
     else
         log_info "Wayland session detected (or no DISPLAY). Skipping xdotool compilation."
-        log_info "Wayland taskbar integration uses XDG_ACTIVATION_TOKEN — no xdotool needed."
+        log_info "Wayland taskbar integration uses StartupWMClass — no xdotool needed."
     fi
 
     local host_tools_available=false
@@ -4607,7 +4670,7 @@ XDOTOOL_WRAPPER
         log_success "X11 window tools available (xdotool — X11 fallback)."
     fi
     if [[ "$host_tools_available" == "false" ]]; then
-        log_info "No xdotool available on host. Wayland taskbar integration uses XDG_ACTIVATION_TOKEN (no tools needed)."
+        log_info "No xdotool available on host. Wayland taskbar integration uses StartupWMClass (no tools needed)."
     fi
 
     log_info "Creating pamac-manager launch wrapper inside container..."
@@ -4802,10 +4865,13 @@ if [[ -d "\$HOME/.local/bin" ]]; then
     export PATH="\$HOME/.local/bin:\$PATH"
 fi
 
-# Modern desktop environments use XDG_ACTIVATION_TOKEN to match windows to
-# .desktop files. Set it before launch so the compositor can associate the
-# window correctly — no polling or window-property injection needed.
-export XDG_ACTIVATION_TOKEN="${CONTAINER_NAME}-pamac-manager"
+# Compositor window matching is handled by StartupWMClass=pamac-manager in the
+# .desktop file (set in annotate_desktop). No activation token or window-property
+# injection is needed for modern KDE Plasma (5.27+) and GNOME (42+).
+# Generating a unique XDG_ACTIVATION_TOKEN per launch would be the correct
+# protocol usage if we ever needed focus-stealing prevention, but the static
+# value previously exported here was both predictable (insecure as a token)
+# and unused for desktop-file association.
 
 # Launch Pamac in the background via distrobox
 distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper "\$@" &
@@ -4813,7 +4879,7 @@ LAUNCHER_PID=\$!
 
 # On X11 only: make a single best-effort attempt to set the _KDE_NET_WM_DESKTOP_FILE
 # property after a brief delay. This is a legacy fallback — modern KDE Plasma (5.27+)
-# and GNOME (42+) use StartupWMClass and XDG_ACTIVATION_TOKEN instead.
+# and GNOME (42+) use StartupWMClass for window matching instead.
 # We avoid the old 30-second polling loop with xdotool/wlrctl/hyprctl because those
 # tools are increasingly restricted by Wayland compositors and are unreliable.
 if [[ "\$IS_WAYLAND" == "false" ]] && command -v xprop >/dev/null 2>&1 && command -v xdotool >/dev/null 2>&1 && command -v xwininfo >/dev/null 2>&1; then
@@ -5322,16 +5388,29 @@ trap 'rm -f "\$EXPLICIT_FILE" "\$NEW_STATE_FILE"' EXIT
 
 pacman -Qeq > "\$EXPLICIT_FILE" 2>/dev/null || true
 
+# Build a hash that captures BOTH the explicit package list AND the desktop
+# files shipped by those packages. Hashing only the package list would miss
+# package updates that change the .desktop contents (new Actions, renamed
+# Exec, updated Icon) without changing the explicit-install set — leaving
+# users with stale host menu entries until the package list changes.
+# We hash mtimes+sizes of every /usr/share/applications/*.desktop file; this
+# changes whenever a package update rewrites a desktop file, while staying
+# cheap (one stat per file, no content read).
 CURRENT_HASH="\$(md5sum "\$EXPLICIT_FILE" 2>/dev/null | awk '{print \$1}')"
+if [[ -d /usr/share/applications ]]; then
+    DESKTOP_SIG="\$(find /usr/share/applications -maxdepth 1 -type f -name '*.desktop' \
+        -printf '%p %s %T@\n' 2>/dev/null | sort | md5sum | awk '{print \$1}')"
+    CURRENT_HASH="\${CURRENT_HASH}:\${DESKTOP_SIG}"
+fi
 if [[ -f "\$HASH_FILE" ]]; then
     LAST_HASH="\$(cat "\$HASH_FILE" 2>/dev/null || echo "")"
     if [[ "\$CURRENT_HASH" == "\$LAST_HASH" ]]; then
-        echo "\$(date): Explicit package list unchanged (hash=\${CURRENT_HASH:0:8}). Skipping export." >> "\$EXPORT_LOG"
+        echo "\$(date): Package list and desktop files unchanged (hash=\${CURRENT_HASH:0:8}). Skipping export." >> "\$EXPORT_LOG"
         exit 0
     fi
 fi
 echo "\$CURRENT_HASH" > "\$HASH_FILE" 2>/dev/null || true
-echo "\$(date): Package list changed (hash=\${CURRENT_HASH:0:8}). Running export." >> "\$EXPORT_LOG"
+echo "\$(date): Package list or desktop files changed (hash=\${CURRENT_HASH:0:8}). Running export." >> "\$EXPORT_LOG"
 
 should_export_desktop() {
     local desktop_file="\$1"
@@ -5416,92 +5495,101 @@ PAMAC_DESKTOP
     return 0
   fi
 
-local tmp_file
-tmp_file="\$(mktemp)"
-local existing_actions=""
-{
-local in_action=false
-while IFS= read -r line || [[ -n "\$line" ]]; do
-case "\$line" in
-'X-SteamOS-Pamac-Managed='*) continue ;;
-'X-SteamOS-Pamac-Container='*) continue ;;
-'X-SteamOS-Pamac-SourceApp='*) continue ;;
-'X-SteamOS-Pamac-SourceDesktop='*) continue ;;
-'X-SteamOS-Pamac-SourcePackage='*) continue ;;
-'Actions='*)
-existing_actions="\${line#Actions=}"
-continue
-;;
-'[Desktop Action uninstall]')
-in_action=true
-continue
-;;
-esac
- if \$in_action; then
- case "\$line" in
- 'Name=Uninstall'|'Name=Uninstall '*|'Exec='*steamos-pamac-uninstall*|'Icon=edit-delete'|'['*)
- if [[ "\$line" == '['* ]]; then
- in_action=false
- printf '%s\n' "\$line"
- fi
- continue
- ;;
- esac
- fi
- if [[ "\$line" == '['Desktop\ Action* ]]; then
- in_action=true
- fi
- if \$in_action; then
- case "\$line" in
- 'StartupWMClass='*) continue ;;
- esac
- fi
- printf '%s\n' "\$line"
-done < "\$desktop_file"
-} > "\$tmp_file"
-mv "\$tmp_file" "\$desktop_file"
+  # Robust rewrite of the host desktop file. The previous line-by-line bash
+  # parser had fragile state tracking that mishandled: (a) upstream packages
+  # that ship their own [Desktop Action uninstall] section — our parser could
+  # clobber it; (b) multi-line Exec= values (continuation with trailing \);
+  # (c) re-entry into action sections. The awk pass below tracks the current
+  # section explicitly and preserves every line except the exact content we
+  # own:
+  #   - X-SteamOS-Pamac-* keys in [Desktop Entry] only
+  #   - the Actions= line in [Desktop Entry] (we recompute it)
+  #   - our own [Desktop Action uninstall] section, identified by an Exec=
+  #     line referencing steamos-pamac-uninstall (this is what distrobox-export
+  #     rewrites to point at our host helper each hook run, NOT upstream's
+  #     container-internal uninstall action, which is rewritten by
+  #     distrobox-export to "distrobox enter ..." and is preserved untouched)
+  desktop_basename="\$(basename "\$desktop_file")"
 
-	local combined_actions=""
-	if [[ -n "\$existing_actions" ]]; then
-		local stripped="\${existing_actions%%;}"
-		combined_actions="\${stripped};uninstall;"
-	else
-		combined_actions="uninstall;"
-	fi
+  tmp_file="\$(mktemp)"
+  _kept_actions_file="\$(mktemp)"
+  awk -v OUR_HELPER="steamos-pamac-uninstall" -v KA="\$_kept_actions_file" '
+    function flush_uninstall(   i) {
+        # Emit a buffered [Desktop Action uninstall] section UNLESS it contains
+        # our helper in any Exec= line (in which case it was previously ours).
+        if (bufcnt == 0) return
+        for (i=0; i<bufcnt; i++)
+            if (buf[i] ~ ("Exec=" ".*" OUR_HELPER)) return
+        print "[Desktop Action uninstall]"
+        for (i=0; i<bufcnt; i++) print buf[i]
+        bufcnt=0
+    }
+    function remember_actions(v) {
+        if (have_actions) return
+        have_actions=1
+        print v >> KA
+        close(KA)
+    }
+    BEGIN { section="entry"; bufcnt=0; have_actions=0 }
+    /^\[Desktop Entry\]/ { flush_uninstall(); bufcnt=0; section="entry"; print; next }
+    /^\[Desktop Action uninstall\]/ { flush_uninstall(); bufcnt=0; section="skipbuf"; next }
+    /^\[/              { flush_uninstall(); bufcnt=0; section="other"; print; next }
+    section == "entry" {
+        if (\$0 ~ /^X-SteamOS-Pamac-(Managed|Container|SourceApp|SourceDesktop|SourcePackage)=/) next
+        if (\$0 ~ /^Actions=/) { remember_actions(substr(\$0, 9)); next }
+        print; next
+    }
+    section == "skipbuf" { buf[bufcnt++]=\$0; next }
+    { flush_uninstall(); bufcnt=0; print }
+    END { flush_uninstall() }
+  ' "\$desktop_file" > "\$tmp_file" 2>/dev/null
+  mv "\$tmp_file" "\$desktop_file"
 
-	desktop_basename="\$(basename "\$desktop_file")"
+  # Read the previously-captured Actions= value (empty if the upstream desktop
+  # file did not declare one). Strip any stale trailing "uninstall" entry we
+  # may have contributed in a prior run, then append our own "uninstall".
+  existing_actions=""
+  [[ -s "\$_kept_actions_file" ]] && existing_actions="\$(cat "\$_kept_actions_file" 2>/dev/null)"
+  rm -f "\$_kept_actions_file" 2>/dev/null || true
+  cleaned_actions=""
+  IFS=';' read -ra _act_parts <<< "\${existing_actions%;}"
+  for _ap in "\${_act_parts[@]}"; do
+      [[ -z "\$_ap" ]] && continue
+      [[ "\$_ap" == "uninstall" || "\$_ap" == "Uninstall" ]] && continue
+      cleaned_actions+="\${_ap};"
+  done
+  combined_actions="\${cleaned_actions}uninstall;"
 
-	# Insert Actions= key into [Desktop Entry] section (before first [Desktop Action...])
-	# and append X-SteamOS markers + [Desktop Action uninstall] at the end
-	local actions_inserted=false
-	tmp_file="\$(mktemp)"
-	{
-		while IFS= read -r line || [[ -n "\$line" ]]; do
-			if ! \$actions_inserted && [[ "\$line" == '[Desktop Action'* ]]; then
-				printf 'Actions=%s\n' "\$combined_actions"
-				printf 'X-SteamOS-Pamac-Managed=true\n'
-				printf 'X-SteamOS-Pamac-Container=%s\n' "${container_name}"
-				printf 'X-SteamOS-Pamac-SourceApp=%s\n' "\$export_name"
-				printf 'X-SteamOS-Pamac-SourceDesktop=%s.desktop\n' "\$app_name"
-				printf 'X-SteamOS-Pamac-SourcePackage=%s\n' "\$owner_pkg"
-				printf '\n'
-				actions_inserted=true
-			fi
-			printf '%s\n' "\$line"
-		done < "\$desktop_file"
+  # Inject Actions= + X-SteamOS-* markers right before the first
+  # [Desktop Action ...] header (so they sit in [Desktop Entry] per spec),
+  # and append our own [Desktop Action uninstall] at the end. If there are no
+  # action sections yet, just append both blocks to the trailing content.
+  local _marker_block="Actions=\${combined_actions}
+X-SteamOS-Pamac-Managed=true
+X-SteamOS-Pamac-Container=${container_name}
+X-SteamOS-Pamac-SourceApp=\$export_name
+X-SteamOS-Pamac-SourceDesktop=\$app_name.desktop
+X-SteamOS-Pamac-SourcePackage=\$owner_pkg"
 
-		if ! \$actions_inserted; then
-			printf 'Actions=%s\n' "\$combined_actions"
-			printf 'X-SteamOS-Pamac-Managed=true\n'
-			printf 'X-SteamOS-Pamac-Container=%s\n' "${container_name}"
-			printf 'X-SteamOS-Pamac-SourceApp=%s\n' "\$export_name"
-			printf 'X-SteamOS-Pamac-SourceDesktop=%s.desktop\n' "\$app_name"
-			printf 'X-SteamOS-Pamac-SourcePackage=%s\n' "\$owner_pkg"
-		fi
+  local _action_block="[Desktop Action uninstall]
+Name=Uninstall
+Exec=/home/${current_user}/.local/bin/steamos-pamac-uninstall --desktop-file \$desktop_basename
+Icon=edit-delete"
 
-		printf '\n[Desktop Action uninstall]\nName=Uninstall\nExec=/home/${current_user}/.local/bin/steamos-pamac-uninstall --desktop-file %s\nIcon=edit-delete\n' "\$desktop_basename"
-	} > "\$tmp_file"
-	mv "\$tmp_file" "\$desktop_file"
+  tmp_file="\$(mktemp)"
+  awk -v MARKER="\$_marker_block" -v ACTION="\$_action_block" '
+    BEGIN { injected=0 }
+    # Insert marker keys immediately after the [Desktop Entry] header so they
+    # stay inside that section per the desktop spec.
+    /^\[Desktop Entry\]/ && !injected { print; print MARKER; injected=1; next }
+    { print }
+    END {
+        # Append our uninstall action section as the final section in the file.
+        print ""
+        print ACTION
+    }
+  ' "\$desktop_file" > "\$tmp_file" 2>/dev/null
+  mv "\$tmp_file" "\$desktop_file"
   _fix_desktop_permissions "\$desktop_file"
 }
 
@@ -5575,7 +5663,7 @@ if command -v distrobox-export >/dev/null 2>&1; then
       annotate_desktop "\$host_desktop" "\$app_name" "\$export_name" "\$owner_pkg" || true
         printf '%s\n' "\$host_desktop" >> "\$NEW_STATE_FILE"
       fi
-      exported=\$((exported + 1))
+      exported=\$(( exported + 1 ))
     else
       echo "Failed to export \$app_name (tried: \$export_name, \$exec_binary)" >> "\$EXPORT_LOG"
     fi
@@ -5951,7 +6039,7 @@ main() {
   ensure_podman
   detect_init_support
 
-    check_battery_power || exit 0
+    check_battery_power || exit "$EXIT_USER_ABORT"
 
     if [[ "$DRY_RUN" == "true" ]]; then
         echo -e "${BOLD}${BLUE}Steam Deck Pamac Setup v${SCRIPT_VERSION}${NC} ${BOLD}${YELLOW}(DRY RUN)${NC}"

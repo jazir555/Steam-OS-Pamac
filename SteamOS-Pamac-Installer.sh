@@ -3495,8 +3495,9 @@ log_bootstrap "WARNING: $name may not have started after $retries attempts"
 return 1
 }
 
-start_dbus() {
+start_dbus_system() {
 mkdir -p /run/dbus
+rm -f /run/dbus/pid
 dbus-daemon --system --fork 2>/dev/null
 }
 
@@ -3516,7 +3517,9 @@ systemctl start polkit 2>/dev/null || true
 systemctl start pamac-daemon >/dev/null 2>&1 || true
 else
 log_bootstrap "Non-systemd environment, starting services manually"
-ensure_service "dbus-daemon" "dbus-daemon" start_dbus
+if ! pgrep -x dbus-daemon >/dev/null 2>&1 || ! dbus-send --system --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
+    ensure_service "dbus-daemon (system)" "dbus-daemon" start_dbus_system
+fi
 ensure_service "polkitd" "polkitd" start_polkitd
 ensure_service "pamac-daemon" "pamac-daemon" start_pamac_daemon
 fi
@@ -4004,10 +4007,15 @@ mkdir -p /usr/share/dbus-1/system.d
 cat > /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf << 'DBUS_CONF'
 <!DOCTYPE busconfig PUBLIC
 "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
-"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+"http://www.freedesktop.org/standards/dbus-1.0/busconfig.dtd">
 <busconfig>
 
 <policy user="root">
+<allow own="org.manjaro.pamac.daemon"/>
+<allow send_destination="org.manjaro.pamac.daemon"/>
+</policy>
+
+<policy user="deck">
 <allow own="org.manjaro.pamac.daemon"/>
 <allow send_destination="org.manjaro.pamac.daemon"/>
 </policy>
@@ -4016,7 +4024,7 @@ cat > /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf << 'DBUS_CONF'
 <allow send_destination="org.manjaro.pamac.daemon"/>
 </policy>
 
-<policy group="wheel">
+<policy context="default">
 <allow send_destination="org.manjaro.pamac.daemon"/>
 </policy>
 
@@ -4165,8 +4173,9 @@ log_bootstrap "WARNING: $name may not have started after $retries attempts"
 return 1
 }
 
-start_dbus() {
+start_dbus_system() {
 mkdir -p /run/dbus
+rm -f /run/dbus/pid
 dbus-daemon --system --fork 2>/dev/null
 }
 
@@ -4186,7 +4195,9 @@ systemctl start polkit 2>/dev/null || true
 systemctl start pamac-daemon >/dev/null 2>&1 || true
 else
 log_bootstrap "Non-systemd environment, starting services manually"
-ensure_service "dbus-daemon" "dbus-daemon" start_dbus
+if ! pgrep -x dbus-daemon >/dev/null 2>&1 || ! dbus-send --system --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
+    ensure_service "dbus-daemon (system)" "dbus-daemon" start_dbus_system
+fi
 ensure_service "polkitd" "polkitd" start_polkitd
 ensure_service "pamac-daemon" "pamac-daemon" start_pamac_daemon
 fi
@@ -4671,16 +4682,21 @@ echo "Functional systemd detected, skipping fake systemd-run."
 fi
 fi
 
-if [[ ! -f /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf ]]; then
+if [[ ! -f /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf ]] || ! grep -q 'policy user="deck"' /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf 2>/dev/null; then
 echo "Repairing: D-Bus system policy for pamac-daemon..."
 mkdir -p /usr/share/dbus-1/system.d
 cat > /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf << 'DBUS_CONF'
 <!DOCTYPE busconfig PUBLIC
 "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
-"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+"http://www.freedesktop.org/standards/dbus-1.0/busconfig.dtd">
 <busconfig>
 
 <policy user="root">
+<allow own="org.manjaro.pamac.daemon"/>
+<allow send_destination="org.manjaro.pamac.daemon"/>
+</policy>
+
+<policy user="deck">
 <allow own="org.manjaro.pamac.daemon"/>
 <allow send_destination="org.manjaro.pamac.daemon"/>
 </policy>
@@ -4689,7 +4705,7 @@ cat > /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf << 'DBUS_CONF'
 <allow send_destination="org.manjaro.pamac.daemon"/>
 </policy>
 
-<policy group="wheel">
+<policy context="default">
 <allow send_destination="org.manjaro.pamac.daemon"/>
 </policy>
 
@@ -4697,6 +4713,26 @@ cat > /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf << 'DBUS_CONF'
 DBUS_CONF
 repaired=$((repaired + 1))
 echo "D-Bus daemon policy repaired."
+fi
+
+# Also fix D-Bus service file for non-systemd containers
+_dbus_svc="/usr/share/dbus-1/system-services/org.manjaro.pamac.daemon.service"
+if [[ -f "$_dbus_svc" ]] && grep -q "SystemdService" "$_dbus_svc" 2>/dev/null; then
+cat > "$_dbus_svc" << 'DBUS_SVC_FIX'
+[D-BUS Service]
+Name=org.manjaro.pamac.daemon
+Exec=/usr/bin/pamac-daemon
+DBUS_SVC_FIX
+repaired=$((repaired + 1))
+echo "D-Bus service file fixed for non-systemd."
+fi
+
+# Ensure system bus daemon is running
+if ! dbus-send --system --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
+mkdir -p /run/dbus
+rm -f /run/dbus/pid
+dbus-daemon --system --fork 2>/dev/null || true
+echo "Started system bus daemon."
 fi
 
 echo "Repaired $repaired critical item(s)."
@@ -6445,6 +6481,25 @@ else
 fi
 pacman -Sy --noconfirm >/dev/null 2>&1 || echo "Note: package database sync failed"
 
+# Fix D-Bus service file for non-systemd containers (remove User=root, SystemdService)
+_dbus_svc="/usr/share/dbus-1/system-services/org.manjaro.pamac.daemon.service"
+if [[ -f "$_dbus_svc" ]]; then
+    cat > "$_dbus_svc" << 'DBUS_SVC_FIX'
+[D-BUS Service]
+Name=org.manjaro.pamac.daemon
+Exec=/usr/bin/pamac-daemon
+DBUS_SVC_FIX
+    echo "Fixed D-Bus service file for non-systemd container."
+fi
+
+# Ensure system bus daemon is running (distrobox doesn't have systemd)
+if ! dbus-send --system --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
+    mkdir -p /run/dbus
+    rm -f /run/dbus/pid
+    dbus-daemon --system --fork 2>/dev/null || true
+    echo "Started system bus daemon."
+fi
+
 if command -v pamac-manager >/dev/null 2>&1; then
     echo "Pamac installed successfully."
     pamac --version 2>/dev/null || echo "Pamac version info not available"
@@ -6976,9 +7031,21 @@ XDOTOOL_WRAPPER
 #!/bin/bash
 set +e
 
+# Set up session environment BEFORE bootstrap (which starts pamac-daemon).
+# distrobox does not forward DBUS_SESSION_BUS_ADDRESS into the container.
+export DISPLAY=\${DISPLAY:-:0}
+export XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}
+
+if [[ -z "\${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+    if [[ -S "\$XDG_RUNTIME_DIR/bus" ]]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=\$XDG_RUNTIME_DIR/bus"
+    else
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$(id -u)/bus"
+    fi
+fi
+
 /usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true
 
-export DISPLAY=\${DISPLAY:-:0}
 DESKTOP_FILE="__DESKTOP_PATH__"
 
 pamac-manager "\$@" &
@@ -7013,6 +7080,12 @@ CONTAINER_WRAPPER_EOF
 
     printf '%s\n' '#!/bin/bash' \
         'set +e' \
+        'if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then' \
+        '    _xdr="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"' \
+        '    if [[ -S "$_xdr/bus" ]]; then' \
+        '        export DBUS_SESSION_BUS_ADDRESS="unix:path=$_xdr/bus"' \
+        '    fi' \
+        'fi' \
         '/usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true' \
         'exec pamac "$@"' \
         | container_root_exec tee /usr/local/bin/pamac-cli-wrapper > /dev/null
@@ -7143,6 +7216,14 @@ cat > "$gui_wrapper" << GUI_WRAPPER_EOF
 export HOME="/home/${current_user}"
 export DISPLAY=\${DISPLAY:-:0}
 
+# Ensure session bus is available for pamac-daemon inside the container
+if [[ -z "\${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+    _uid=\$(id -u)
+    if [[ -S "/run/user/\$_uid/bus" ]]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$_uid/bus"
+    fi
+fi
+
 # Detect display server
 IS_WAYLAND=false
 if [[ -n "\${WAYLAND_DISPLAY:-}" ]]; then
@@ -7175,6 +7256,8 @@ fi
 # injection is needed for modern KDE Plasma (5.27+) and GNOME (42+).
 
 # Launch Pamac in the background via distrobox
+# distrobox 1.8.x does not support --env; pass env via prefix instead
+DBUS_SESSION_BUS_ADDRESS="\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/\$(id -u)/bus}" \
 distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper "\$@" &
 LAUNCHER_PID=\$!
 

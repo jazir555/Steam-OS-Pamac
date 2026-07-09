@@ -7215,6 +7215,9 @@ rm -rf /var/lib/pacman/sync/download-* 2>/dev/null || true
 pkill -x pamac-daemon 2>/dev/null || true
 sleep 1
 
+# Clean stale pacman lock left by killed daemon
+rm -f /var/lib/pacman/db.lck 2>/dev/null || true
+
 /usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true
 
 DESKTOP_FILE="__DESKTOP_PATH__"

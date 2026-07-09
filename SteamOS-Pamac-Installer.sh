@@ -1445,9 +1445,12 @@ fi
 
 _CONTAINER_PREAMBLE='_safe_sleep() {
 local _d="$1"
-# Sanitize argument to a positive number (default 1s) before passing to timers.
+# Sanitize argument to a positive INTEGER (default 1s) before passing to
+# timers. Floats are NOT allowed: bash arithmetic ($(( ... ))) cannot handle
+# decimals and would crash the script under `set -e`, so we reject anything
+# containing a non-digit (including '.') and default to 1.
 case "$_d" in
-    ''|*[!0-9.]*) _d=1 ;;
+    ''|*[!0-9]*) _d=1 ;;
 esac
 if sleep "$_d" 2>/dev/null; then return 0; fi
 # sleep is unavailable/broken — try a real timer that actually delays.
@@ -1458,16 +1461,18 @@ fi
 if command -v perl >/dev/null 2>&1; then
     perl -e "select undef,undef,undef,\$ARGV[0]" "$_d" 2>/dev/null && return 0
 fi
-# No working timer available: degrade to a bounded busy-loop so retry loops
-# do NOT become tight CPU-pinning loops. We loop reading /dev/zero in fixed
-# chunks for approximately the requested duration (best-effort, not precise).
-# Returns 1 to signal that no precise timer was available; callers in
-# retry paths should treat non-zero as 'no real delay happened'.
-local _i=0
-local _iters=$(( _d * 1000 ))
-while [[ $_i -lt $_iters ]]; do
-    head -c 4096 /dev/zero >/dev/null 2>&1 || true
-    _i=$((_i + 1))
+# No working timer available: degrade to a \$SECONDS-based wall-clock wait so
+# retry loops neither busy-pin a core NOR return in <10ms. bashs \$SECONDS
+# advances once per real second of wall time, so we poll until the requested
+# number of whole seconds elapses. The case guard above restricted \$_d to
+# [0-9] (floats sanitized to 1), so the arithmetic here is integer-safe.
+# Returns 1 to signal that no precise sub-second timer ran; retry callers
+# should treat non-zero as \"no real delay happened\" (but a real delay did).
+local _target=\$(( _d + 0 ))
+[[ \$_target -lt 1 ]] && _target=1
+local _start=\$SECONDS
+while (( SECONDS - _start < _target )); do
+    :
 done
 return 1
 }
@@ -2494,7 +2499,7 @@ touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
 
 _safe_sleep() {
 local _d="$1"
-case "$_d" in ''|*[!0-9.]*) _d=1 ;; esac
+case "$_d" in ''|*[!0-9]*) _d=1 ;; esac
 if sleep "$_d" 2>/dev/null; then return 0; fi
 # sleep is unavailable/broken — try a real timer that actually delays.
 # (read -t </dev/null returns immediately on EOF, so it is NOT a sleep.)
@@ -2504,13 +2509,18 @@ fi
 if command -v perl >/dev/null 2>&1; then
     perl -e "select undef,undef,undef,\$ARGV[0]" "$_d" 2>/dev/null && return 0
 fi
-# No working timer available: degrade to a bounded busy-loop so retry loops
-# do NOT become tight CPU-pinning loops. Best-effort, not precise. Returns 1 to
-# signal no real timer ran; retry callers should honor non-zero accordingly.
-local _i=0 _iters=$(( _d * 1000 ))
-while [[ $_i -lt $_iters ]]; do
-    head -c 4096 /dev/zero >/dev/null 2>&1 || true
-    _i=$((_i + 1))
+# No working timer available: degrade to a $SECONDS-based wall-clock wait so
+# retry loops neither busy-pin a core NOR return in <10ms. bash's $SECONDS
+# advances once per real second of wall time, so we poll until the requested
+# number of whole seconds elapses. The case guard above restricted $_d to
+# [0-9] (floats sanitized to 1), so the arithmetic here is integer-safe.
+# Returns 1 to signal that no precise sub-second timer ran; retry callers
+# should treat non-zero as 'no real delay happened' (but a real delay did).
+local _target=$(( _d + 0 ))
+[[ $_target -lt 1 ]] && _target=1
+local _start=$SECONDS
+while (( SECONDS - _start < _target )); do
+    :
 done
 return 1
 }
@@ -2612,7 +2622,7 @@ _cleanup_orphaned_buildusers
 # Passthrough: --help and --version are not meaningful here
 for _a in "$@"; do
     case "$_a" in
-        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo "Recognized options: --property=DynamicUser=yes, --property=CacheDirectory=*, --property=WorkingDirectory=*, --property=StateDirectory=*, --property=LogsDirectory=*, --property=RuntimeDirectory=*, --property=TemporaryFileSystem=*, --property=BindPaths=*, --property=BindReadOnlyPaths=*, --property=ProtectSystem=*, --property=ProtectHome=*, --property=PrivateTmp=*, --property=NoNewPrivileges=*, --property=MemoryDenyWriteExecute=*, --property=SystemCallFilter=*, --property=CapabilityBoundingSet=*, --property=User=*, --property=Group=*, --property=SupplementaryGroups=*, --property=AmbientCapabilities=*, --property=EnvironmentFile=*, --property=Type=*, --property=RemainAfterExit=*, --property=Ephemeral=*, --property=Slice=*, --property=IOSchedulingClass=*, --property=CPUSchedulingPolicy=*, --property=RestrictNamespaces=*, --property=RestrictSUIDSGID=*, --property=LockPersonality=*, --property=RestrictRealtime=*, --property=RestrictAddressFamilies=*, --property=RemoveIPC=*, --property=UMask=*, --property=KeyringMode=*, --property=ProtectClock=*, --property=ProtectKernelTunables=*, --property=ProtectKernelModules=*, --property=ProtectKernelLogs=*, --property=ProtectControlGroups=*, --property=ProtectHostname=*, --property=ProtectProc=*, --property=ProcSubset=*, --property=MemorySwapMax=*, --property=CPUQuota=*, --property=DeviceAllow=*, --property=DevicePolicy=*, --property=RestrictFileSystems=*, --property=SocketBindDeny=*, --property=SocketBindAllow=*, --property=IPAddressAllow=*, --property=IPAddressDeny=*, --pipe, --wait, --quiet, --no-block, --description=*, --unit=*, --service-type=*, --user, --uid=*, --gid=*, --setenv=*, --"; exit 0 ;;
+        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo "Recognized options: --property=DynamicUser=yes, --property=CacheDirectory=*, --property=WorkingDirectory=*, --property=StateDirectory=*, --property=LogsDirectory=*, --property=RuntimeDirectory=*, --property=TemporaryFileSystem=*, --property=BindPaths=*, --property=BindReadOnlyPaths=*, --property=ProtectSystem=*, --property=ProtectHome=*, --property=PrivateTmp=*, --property=NoNewPrivileges=*, --property=MemoryDenyWriteExecute=*, --property=SystemCallFilter=*, --property=CapabilityBoundingSet=*, --property=User=*, --property=Group=*, --property=SupplementaryGroups=*, --property=AmbientCapabilities=*, --property=EnvironmentFile=*, --property=Type=*, --property=RemainAfterExit=*, --property=Ephemeral=*, --property=Slice=*, --property=IOSchedulingClass=*, --property=CPUSchedulingPolicy=*, --property=RestrictNamespaces=*, --property=RestrictSUIDSGID=*, --property=LockPersonality=*, --property=RestrictRealtime=*, --property=RestrictAddressFamilies=*, --property=RemoveIPC=*, --property=UMask=*, --property=KeyringMode=*, --property=ProtectClock=*, --property=ProtectKernelTunables=*, --property=ProtectKernelModules=*, --property=ProtectKernelLogs=*, --property=ProtectControlGroups=*, --property=ProtectHostname=*, --property=ProtectProc=*, --property=ProcSubset=*, --property=MemorySwapMax=*, --property=CPUQuota=*, --property=DeviceAllow=*, --property=DevicePolicy=*, --property=RestrictFileSystems=*, --property=SocketBindDeny=*, --property=SocketBindAllow=*, --property=IPAddressAllow=*, --property=IPAddressDeny=*, and all other systemd.exec(5)/resource-control(5)/service(5) --property= sandboxing (Private*, Protect*, ReadWritePaths, RootDirectory, ...), resource (Limit*, *Accounting, *Max, *Weight, IO*, Memory*, CPU*), logging (StandardIO, Syslog*, LogLevel*), Condition*, Assert*, and Timeout*/Restart* options (recognized and dropped in this non-systemd env; sandboxing drops are logged to /tmp/systemd-run-fake.log), --pipe, --wait, --quiet, --no-block, --description=*, --unit=*, --service-type=*, --user, --uid=*, --gid=*, --setenv=*, --"; exit 0 ;;
         --version) echo "systemd-run (fake) v${DSR_VERSION} (SteamOS-Pamac)"; exit 0 ;;
     esac
 done
@@ -2699,6 +2709,234 @@ case "$arg" in
 --property=SocketBindAllow=*) continue ;;
 --property=IPAddressAllow=*) continue ;;
 --property=IPAddressDeny=*) continue ;;
+# Additional recognized systemd-run properties (not previously handled).
+# Grouped per systemd.exec(5)/systemd.resource-control(5). Security/sandboxing
+# properties are logged via _warn_dsr when dropped (same convention as above);
+# resource/accounting/metadata/IO/log properties stay silent.
+# --- Filesystem / namespace sandboxing ---
+--property=PrivateDevices=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=PrivateMounts=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=PrivateNetwork=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=PrivateUsers=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=MountFlags=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=MountAPIVFS=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ReadWritePaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ReadOnlyPaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=InaccessiblePaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ExecPaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=NoExecPaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ConfigurationDirectory=*) continue ;;
+--property=RootDirectory=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=RootImage=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=RootHash=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=RootVerity=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=MountImages=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ExtensionImages=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=NamespacePath=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=NetworkNamespacePath=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=LogNamespace=*) continue ;;
+# --- Capabilities / privileges ---
+--property=InheritDescriptors=*) continue ;;
+--property=SecureBits=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+# --- Environment ---
+--property=Environment=*) continue ;;
+--property=PassEnvironment=*) continue ;;
+--property=UnsetEnvironment=*) continue ;;
+# --- Personality / arch ---
+--property=Personality=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=SystemCallArchitectures=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=SystemCallErrorNumber=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=SystemCallLog=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+# --- IPC / time / misc ---
+--property=TimerSlackNSec=*) continue ;;
+--property=SetLoginEnvironment=*) continue ;;
+--property=Delegate=*) continue ;;
+--property=DisableExtraFileDescriptors=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=CoredumpReceive=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=DynamicUser=*) continue ;;
+# --- Standard I/O / logging ---
+--property=StandardInput=*) continue ;;
+--property=StandardOutput=*) continue ;;
+--property=StandardError=*) continue ;;
+--property=StandardInputText=*) continue ;;
+--property=StandardInputFileDescriptor=*) continue ;;
+--property=StandardInputData=*) continue ;;
+--property=StandardOutputFileDescriptor=*) continue ;;
+--property=StandardErrorFileDescriptor=*) continue ;;
+--property=TTYPath=*) continue ;;
+--property=TTYReset=*) continue ;;
+--property=TTYVHangup=*) continue ;;
+--property=TTYVTDisallocate=*) continue ;;
+--property=SyslogIdentifier=*) continue ;;
+--property=SyslogFacility=*) continue ;;
+--property=SyslogLevel=*) continue ;;
+--property=SyslogLevelPrefix=*) continue ;;
+--property=LogLevelMax=*) continue ;;
+--property=LogRateLimitIntervalSec=*) continue ;;
+--property=LogRateLimitBurst=*) continue ;;
+--property=LogExtraFields=*) continue ;;
+--property=LogFilterPatterns=*) continue ;;
+--property=LogFilterAllow=*) continue ;;
+--property=LogFilterDeny=*) continue ;;
+--property=LogLevelOverride=*) continue ;;
+# --- Resource limits (RLIMIT_*) and accounting ---
+--property=LimitCPU=*) continue ;;
+--property=LimitCPUSoft=*) continue ;;
+--property=LimitFSIZE=*) continue ;;
+--property=LimitFIZESoft=*) continue ;;
+--property=LimitDATA=*) continue ;;
+--property=LimitDATASoft=*) continue ;;
+--property=LimitSTACK=*) continue ;;
+--property=LimitSTACKSoft=*) continue ;;
+--property=LimitCORE=*) continue ;;
+--property=LimitCORESoft=*) continue ;;
+--property=LimitRSS=*) continue ;;
+--property=LimitRSSSoft=*) continue ;;
+--property=LimitNOFILE=*) continue ;;
+--property=LimitNOFILESoft=*) continue ;;
+--property=LimitAS=*) continue ;;
+--property=LimitASSoft=*) continue ;;
+--property=LimitNPROC=*) continue ;;
+--property=LimitNPROCSoft=*) continue ;;
+--property=LimitMEMLOCK=*) continue ;;
+--property=LimitMEMLOCKSoft=*) continue ;;
+--property=LimitLOCKS=*) continue ;;
+--property=LimitLOCKSSoft=*) continue ;;
+--property=LimitSIGPENDING=*) continue ;;
+--property=LimitSIGPENDINGSoft=*) continue ;;
+--property=LimitMSGQUEUE=*) continue ;;
+--property=LimitMSGQUEUESoft=*) continue ;;
+--property=LimitNICE=*) continue ;;
+--property=LimitNICESoft=*) continue ;;
+--property=LimitRTPRIO=*) continue ;;
+--property=LimitRTPRIOSoft=*) continue ;;
+--property=LimitRTTIME=*) continue ;;
+--property=LimitRTTIMESoft=*) continue ;;
+--property=LimitNFILEVSZ=*) continue ;;
+--property=TasksMax=*) continue ;;
+--property=TasksAccounting=*) continue ;;
+--property=CPUAccounting=*) continue ;;
+--property=MemoryAccounting=*) continue ;;
+--property=IOAccounting=*) continue ;;
+--property=IPAccounting=*) continue ;;
+--property=TasksMaxScalePercent=*) continue ;;
+--property=TasksMaxInhibitPercent=*) continue ;;
+# --- CPU / scheduling control ---
+--property=CPUWeight=*) continue ;;
+--property=StartupCPUWeight=*) continue ;;
+--property=CPUWeightPerWeight=*) continue ;;
+--property=AllowedCPUs=*) continue ;;
+--property=StartupAllowedCPUs=*) continue ;;
+--property=AllowedMemoryNodes=*) continue ;;
+--property=StartupAllowedMemoryNodes=*) continue ;;
+--property=CPUQuotaPeriodSec=*) continue ;;
+--property=AllowedMemoryNodesPerWeight=*) continue ;;
+--property=DisableControllers=*) continue ;;
+--property=ManagedOOMSwap=*) continue ;;
+--property=ManagedOOMMemoryPressure=*) continue ;;
+--property=ManagedOOMMemoryPressureLimit=*) continue ;;
+--property=ManagedOOMPreference=*) continue ;;
+# --- IO / block control ---
+--property=IOWeight=*) continue ;;
+--property=StartupIOWeight=*) continue ;;
+--property=IODeviceWeight=*) continue ;;
+--property=IODeviceLatencyTargetSec=*) continue ;;
+--property=IOReadBandwidthMax=*) continue ;;
+--property=IOWriteBandwidthMax=*) continue ;;
+--property=IOReadIOPSMax=*) continue ;;
+--property=IOWriteIOPSMax=*) continue ;;
+--property=IODeviceWriteLatencyTargetSec=*) continue ;;
+--property=IODeviceReadIOPSMax=*) continue ;;
+--property=IODeviceWriteIOPSMax=*) continue ;;
+--property=IODeviceWeightPerWeight=*) continue ;;
+--property=IODeviceWeightPerWeightForWrites=*) continue ;;
+--property=BlockIOWeight=*|--property=BlockIODeviceWeight=*|--property=BlockIOReadBandwidth=*|--property=BlockIOWriteBandwidth=*) continue ;;
+# --- Memory control ---
+--property=MemoryLow=*) continue ;;
+--property=MemoryMin=*) continue ;;
+--property=MemoryHigh=*) continue ;;
+--property=MemoryMax=*) continue ;;
+--property=MemoryZswapMax=*) continue ;;
+--property=MemoryZswapWriteback=*) continue ;;
+--property=MemoryZswapCompression=*) continue ;;
+--property=MemoryZswapAcceptPercent=*) continue ;;
+--property=DisableMemoryMax=*) continue ;;
+--property=MemoryHighWriteback=*) continue ;;
+# --- OOM / pressure / cachettl ---
+--property=OOMScoreAdjust=*) continue ;;
+--property=OOMPolicy=*) continue ;;
+--property=OOMScoreAdjustPerWeight=*) continue ;;
+--property=MemoryPressureWatch=*) continue ;;
+--property=MemoryPressureThresholdSec=*) continue ;;
+# --- Slices / delegation / unit metadata ---
+--property=RequiresMountsFor=*) continue ;;
+--property=CollectMode=*) continue ;;
+--property=ConditionCPUFeature=*) continue ;;
+--property=ConditionCPUs=*) continue ;;
+--property=ConditionMemory=*) continue ;;
+--property=ConditionCPUPressure=*) continue ;;
+--property=ConditionMemoryPressure=*) continue ;;
+--property=ConditionPathIsMountPoint=*) continue ;;
+--property=ConditionDirectoryNotEmpty=*) continue ;;
+--property=ConditionFileNotEmpty=*) continue ;;
+--property=ConditionFileIsExecutable=*) continue ;;
+--property=ConditionPathIsReadWrite=*) continue ;;
+--property=ConditionPathIsSymbolicLink=*) continue ;;
+--property=ConditionUser=*) continue ;;
+--property=ConditionGroup=*) continue ;;
+--property=ConditionVirtualization=*) continue ;;
+--property=ConditionArchitecture=*) continue ;;
+--property=ConditionFirmware=*) continue ;;
+--property=ConditionFirstBoot=*) continue ;;
+--property=ConditionKernelCommandLine=*) continue ;;
+--property=ConditionKernelVersion=*) continue ;;
+--property=ConditionSecurity=*) continue ;;
+--property=ConditionControlGroupController=*) continue ;;
+--property=ConditionCapability=*) continue ;;
+--property=ConditionACPower=*) continue ;;
+--property=ConditionNeedsUpdate=*) continue ;;
+--property=ConditionNull=*) continue ;;
+--property=AssertUser=*) continue ;;
+--property=AssertDirectoryNotEmpty=*) continue ;;
+--property=AssertFileNotEmpty=*) continue ;;
+--property=AssertFileIsExecutable=*) continue ;;
+--property=AssertPathExists=*) continue ;;
+--property=AssertPathIsDirectory=*) continue ;;
+--property=AssertPathIsSymbolicLink=*) continue ;;
+--property=AssertPathIsMountPoint=*) continue ;;
+--property=AssertPathIsReadWrite=*) continue ;;
+--property=AssertPathIsEncrypted=*) continue ;;
+--property=AssertVirtualization=*) continue ;;
+--property=AssertArchitecture=*) continue ;;
+--property=AssertFirstBoot=*) continue ;;
+--property=AssertKernelVersion=*) continue ;;
+--property=AssertKernelCommandLine=*) continue ;;
+--property=AssertSecurity=*) continue ;;
+--property=AssertControlGroupController=*) continue ;;
+--property=AssertCapability=*) continue ;;
+--property=AssertCPUFeature=*) continue ;;
+--property=AssertCPUs=*) continue ;;
+--property=AssertMemory=*) continue ;;
+--property=AssertACPower=*) continue ;;
+--property=AssertNeedsUpdate=*) continue ;;
+--property=AssertNull=*) continue ;;
+# --- Misc unit ---
+--property=OnFailure=*) continue ;;
+--property=SuccessAction=*) continue ;;
+--property=FailureAction=*) continue ;;
+--property=Restart=*) continue ;;
+--property=RestartSec=*) continue ;;
+--property=RestartPreventExitStatus=*) continue ;;
+--property=RestartForceExitStatus=*) continue ;;
+--property=WatchdogSec=*) continue ;;
+--property=TimeoutStartSec=*) continue ;;
+--property=TimeoutStopSec=*) continue ;;
+--property=TimeoutAbortSec=*) continue ;;
+--property=TimeoutCleanSec=*) continue ;;
+--property=TimeoutStartFailureMode=*) continue ;;
+--property=TimeoutStopFailureMode=*) continue ;;
+--property=RuntimeMaxSec=*) continue ;;
+--property=RuntimeRandomizedExtraSec=*) continue ;;
 # Unrecognized properties - log and warn visibly
 --property=*) UNRECOGNIZED_PROPS+=("$arg"); _warn_dsr "Unrecognized --property: $arg"; continue ;;
 --property) SKIP_NEXT=true; continue ;;
@@ -2910,7 +3148,7 @@ touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
 
 _safe_sleep() {
 local _d="$1"
-case "$_d" in ''|*[!0-9.]*) _d=1 ;; esac
+case "$_d" in ''|*[!0-9]*) _d=1 ;; esac
 if sleep "$_d" 2>/dev/null; then return 0; fi
 # sleep is unavailable/broken — try a real timer that actually delays.
 # (read -t </dev/null returns immediately on EOF, so it is NOT a sleep.)
@@ -2920,13 +3158,18 @@ fi
 if command -v perl >/dev/null 2>&1; then
     perl -e "select undef,undef,undef,\$ARGV[0]" "$_d" 2>/dev/null && return 0
 fi
-# No working timer available: degrade to a bounded busy-loop so retry loops
-# do NOT become tight CPU-pinning loops. Best-effort, not precise. Returns 1 to
-# signal no real timer ran; retry callers should honor non-zero accordingly.
-local _i=0 _iters=$(( _d * 1000 ))
-while [[ $_i -lt $_iters ]]; do
-    head -c 4096 /dev/zero >/dev/null 2>&1 || true
-    _i=$((_i + 1))
+# No working timer available: degrade to a $SECONDS-based wall-clock wait so
+# retry loops neither busy-pin a core NOR return in <10ms. bash's $SECONDS
+# advances once per real second of wall time, so we poll until the requested
+# number of whole seconds elapses. The case guard above restricted $_d to
+# [0-9] (floats sanitized to 1), so the arithmetic here is integer-safe.
+# Returns 1 to signal that no precise sub-second timer ran; retry callers
+# should treat non-zero as 'no real delay happened' (but a real delay did).
+local _target=$(( _d + 0 ))
+[[ $_target -lt 1 ]] && _target=1
+local _start=$SECONDS
+while (( SECONDS - _start < _target )); do
+    :
 done
 return 1
 }
@@ -3030,7 +3273,7 @@ _cleanup_orphaned_buildusers
 # Passthrough: --help and --version are not meaningful here
 for _a in "$@"; do
     case "$_a" in
-        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo "Recognized options: --property=DynamicUser=yes, --property=CacheDirectory=*, --property=WorkingDirectory=*, --property=StateDirectory=*, --property=LogsDirectory=*, --property=RuntimeDirectory=*, --property=TemporaryFileSystem=*, --property=BindPaths=*, --property=BindReadOnlyPaths=*, --property=ProtectSystem=*, --property=ProtectHome=*, --property=PrivateTmp=*, --property=NoNewPrivileges=*, --property=MemoryDenyWriteExecute=*, --property=SystemCallFilter=*, --property=CapabilityBoundingSet=*, --property=User=*, --property=Group=*, --property=SupplementaryGroups=*, --property=AmbientCapabilities=*, --property=EnvironmentFile=*, --property=Type=*, --property=RemainAfterExit=*, --property=Ephemeral=*, --property=Slice=*, --property=IOSchedulingClass=*, --property=CPUSchedulingPolicy=*, --property=RestrictNamespaces=*, --property=RestrictSUIDSGID=*, --property=LockPersonality=*, --property=RestrictRealtime=*, --property=RestrictAddressFamilies=*, --property=RemoveIPC=*, --property=UMask=*, --property=KeyringMode=*, --property=ProtectClock=*, --property=ProtectKernelTunables=*, --property=ProtectKernelModules=*, --property=ProtectKernelLogs=*, --property=ProtectControlGroups=*, --property=ProtectHostname=*, --property=ProtectProc=*, --property=ProcSubset=*, --property=MemorySwapMax=*, --property=CPUQuota=*, --property=DeviceAllow=*, --property=DevicePolicy=*, --property=RestrictFileSystems=*, --property=SocketBindDeny=*, --property=SocketBindAllow=*, --property=IPAddressAllow=*, --property=IPAddressDeny=*, --pipe, --wait, --quiet, --no-block, --description=*, --unit=*, --service-type=*, --user, --uid=*, --gid=*, --setenv=*, --"; exit 0 ;;
+        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo "Recognized options: --property=DynamicUser=yes, --property=CacheDirectory=*, --property=WorkingDirectory=*, --property=StateDirectory=*, --property=LogsDirectory=*, --property=RuntimeDirectory=*, --property=TemporaryFileSystem=*, --property=BindPaths=*, --property=BindReadOnlyPaths=*, --property=ProtectSystem=*, --property=ProtectHome=*, --property=PrivateTmp=*, --property=NoNewPrivileges=*, --property=MemoryDenyWriteExecute=*, --property=SystemCallFilter=*, --property=CapabilityBoundingSet=*, --property=User=*, --property=Group=*, --property=SupplementaryGroups=*, --property=AmbientCapabilities=*, --property=EnvironmentFile=*, --property=Type=*, --property=RemainAfterExit=*, --property=Ephemeral=*, --property=Slice=*, --property=IOSchedulingClass=*, --property=CPUSchedulingPolicy=*, --property=RestrictNamespaces=*, --property=RestrictSUIDSGID=*, --property=LockPersonality=*, --property=RestrictRealtime=*, --property=RestrictAddressFamilies=*, --property=RemoveIPC=*, --property=UMask=*, --property=KeyringMode=*, --property=ProtectClock=*, --property=ProtectKernelTunables=*, --property=ProtectKernelModules=*, --property=ProtectKernelLogs=*, --property=ProtectControlGroups=*, --property=ProtectHostname=*, --property=ProtectProc=*, --property=ProcSubset=*, --property=MemorySwapMax=*, --property=CPUQuota=*, --property=DeviceAllow=*, --property=DevicePolicy=*, --property=RestrictFileSystems=*, --property=SocketBindDeny=*, --property=SocketBindAllow=*, --property=IPAddressAllow=*, --property=IPAddressDeny=*, and all other systemd.exec(5)/resource-control(5)/service(5) --property= sandboxing (Private*, Protect*, ReadWritePaths, RootDirectory, ...), resource (Limit*, *Accounting, *Max, *Weight, IO*, Memory*, CPU*), logging (StandardIO, Syslog*, LogLevel*), Condition*, Assert*, and Timeout*/Restart* options (recognized and dropped in this non-systemd env; sandboxing drops are logged to /tmp/systemd-run-fake.log), --pipe, --wait, --quiet, --no-block, --description=*, --unit=*, --service-type=*, --user, --uid=*, --gid=*, --setenv=*, --"; exit 0 ;;
         --version) echo "systemd-run (fake) v${DSR_VERSION} (SteamOS-Pamac)"; exit 0 ;;
     esac
 done
@@ -3117,6 +3360,234 @@ case "$arg" in
 --property=SocketBindAllow=*) continue ;;
 --property=IPAddressAllow=*) continue ;;
 --property=IPAddressDeny=*) continue ;;
+# Additional recognized systemd-run properties (not previously handled).
+# Grouped per systemd.exec(5)/systemd.resource-control(5). Security/sandboxing
+# properties are logged via _warn_dsr when dropped (same convention as above);
+# resource/accounting/metadata/IO/log properties stay silent.
+# --- Filesystem / namespace sandboxing ---
+--property=PrivateDevices=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=PrivateMounts=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=PrivateNetwork=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=PrivateUsers=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=MountFlags=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=MountAPIVFS=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ReadWritePaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ReadOnlyPaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=InaccessiblePaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ExecPaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=NoExecPaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ConfigurationDirectory=*) continue ;;
+--property=RootDirectory=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=RootImage=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=RootHash=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=RootVerity=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=MountImages=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ExtensionImages=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=NamespacePath=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=NetworkNamespacePath=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=LogNamespace=*) continue ;;
+# --- Capabilities / privileges ---
+--property=InheritDescriptors=*) continue ;;
+--property=SecureBits=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+# --- Environment ---
+--property=Environment=*) continue ;;
+--property=PassEnvironment=*) continue ;;
+--property=UnsetEnvironment=*) continue ;;
+# --- Personality / arch ---
+--property=Personality=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=SystemCallArchitectures=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=SystemCallErrorNumber=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=SystemCallLog=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+# --- IPC / time / misc ---
+--property=TimerSlackNSec=*) continue ;;
+--property=SetLoginEnvironment=*) continue ;;
+--property=Delegate=*) continue ;;
+--property=DisableExtraFileDescriptors=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=CoredumpReceive=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=DynamicUser=*) continue ;;
+# --- Standard I/O / logging ---
+--property=StandardInput=*) continue ;;
+--property=StandardOutput=*) continue ;;
+--property=StandardError=*) continue ;;
+--property=StandardInputText=*) continue ;;
+--property=StandardInputFileDescriptor=*) continue ;;
+--property=StandardInputData=*) continue ;;
+--property=StandardOutputFileDescriptor=*) continue ;;
+--property=StandardErrorFileDescriptor=*) continue ;;
+--property=TTYPath=*) continue ;;
+--property=TTYReset=*) continue ;;
+--property=TTYVHangup=*) continue ;;
+--property=TTYVTDisallocate=*) continue ;;
+--property=SyslogIdentifier=*) continue ;;
+--property=SyslogFacility=*) continue ;;
+--property=SyslogLevel=*) continue ;;
+--property=SyslogLevelPrefix=*) continue ;;
+--property=LogLevelMax=*) continue ;;
+--property=LogRateLimitIntervalSec=*) continue ;;
+--property=LogRateLimitBurst=*) continue ;;
+--property=LogExtraFields=*) continue ;;
+--property=LogFilterPatterns=*) continue ;;
+--property=LogFilterAllow=*) continue ;;
+--property=LogFilterDeny=*) continue ;;
+--property=LogLevelOverride=*) continue ;;
+# --- Resource limits (RLIMIT_*) and accounting ---
+--property=LimitCPU=*) continue ;;
+--property=LimitCPUSoft=*) continue ;;
+--property=LimitFSIZE=*) continue ;;
+--property=LimitFIZESoft=*) continue ;;
+--property=LimitDATA=*) continue ;;
+--property=LimitDATASoft=*) continue ;;
+--property=LimitSTACK=*) continue ;;
+--property=LimitSTACKSoft=*) continue ;;
+--property=LimitCORE=*) continue ;;
+--property=LimitCORESoft=*) continue ;;
+--property=LimitRSS=*) continue ;;
+--property=LimitRSSSoft=*) continue ;;
+--property=LimitNOFILE=*) continue ;;
+--property=LimitNOFILESoft=*) continue ;;
+--property=LimitAS=*) continue ;;
+--property=LimitASSoft=*) continue ;;
+--property=LimitNPROC=*) continue ;;
+--property=LimitNPROCSoft=*) continue ;;
+--property=LimitMEMLOCK=*) continue ;;
+--property=LimitMEMLOCKSoft=*) continue ;;
+--property=LimitLOCKS=*) continue ;;
+--property=LimitLOCKSSoft=*) continue ;;
+--property=LimitSIGPENDING=*) continue ;;
+--property=LimitSIGPENDINGSoft=*) continue ;;
+--property=LimitMSGQUEUE=*) continue ;;
+--property=LimitMSGQUEUESoft=*) continue ;;
+--property=LimitNICE=*) continue ;;
+--property=LimitNICESoft=*) continue ;;
+--property=LimitRTPRIO=*) continue ;;
+--property=LimitRTPRIOSoft=*) continue ;;
+--property=LimitRTTIME=*) continue ;;
+--property=LimitRTTIMESoft=*) continue ;;
+--property=LimitNFILEVSZ=*) continue ;;
+--property=TasksMax=*) continue ;;
+--property=TasksAccounting=*) continue ;;
+--property=CPUAccounting=*) continue ;;
+--property=MemoryAccounting=*) continue ;;
+--property=IOAccounting=*) continue ;;
+--property=IPAccounting=*) continue ;;
+--property=TasksMaxScalePercent=*) continue ;;
+--property=TasksMaxInhibitPercent=*) continue ;;
+# --- CPU / scheduling control ---
+--property=CPUWeight=*) continue ;;
+--property=StartupCPUWeight=*) continue ;;
+--property=CPUWeightPerWeight=*) continue ;;
+--property=AllowedCPUs=*) continue ;;
+--property=StartupAllowedCPUs=*) continue ;;
+--property=AllowedMemoryNodes=*) continue ;;
+--property=StartupAllowedMemoryNodes=*) continue ;;
+--property=CPUQuotaPeriodSec=*) continue ;;
+--property=AllowedMemoryNodesPerWeight=*) continue ;;
+--property=DisableControllers=*) continue ;;
+--property=ManagedOOMSwap=*) continue ;;
+--property=ManagedOOMMemoryPressure=*) continue ;;
+--property=ManagedOOMMemoryPressureLimit=*) continue ;;
+--property=ManagedOOMPreference=*) continue ;;
+# --- IO / block control ---
+--property=IOWeight=*) continue ;;
+--property=StartupIOWeight=*) continue ;;
+--property=IODeviceWeight=*) continue ;;
+--property=IODeviceLatencyTargetSec=*) continue ;;
+--property=IOReadBandwidthMax=*) continue ;;
+--property=IOWriteBandwidthMax=*) continue ;;
+--property=IOReadIOPSMax=*) continue ;;
+--property=IOWriteIOPSMax=*) continue ;;
+--property=IODeviceWriteLatencyTargetSec=*) continue ;;
+--property=IODeviceReadIOPSMax=*) continue ;;
+--property=IODeviceWriteIOPSMax=*) continue ;;
+--property=IODeviceWeightPerWeight=*) continue ;;
+--property=IODeviceWeightPerWeightForWrites=*) continue ;;
+--property=BlockIOWeight=*|--property=BlockIODeviceWeight=*|--property=BlockIOReadBandwidth=*|--property=BlockIOWriteBandwidth=*) continue ;;
+# --- Memory control ---
+--property=MemoryLow=*) continue ;;
+--property=MemoryMin=*) continue ;;
+--property=MemoryHigh=*) continue ;;
+--property=MemoryMax=*) continue ;;
+--property=MemoryZswapMax=*) continue ;;
+--property=MemoryZswapWriteback=*) continue ;;
+--property=MemoryZswapCompression=*) continue ;;
+--property=MemoryZswapAcceptPercent=*) continue ;;
+--property=DisableMemoryMax=*) continue ;;
+--property=MemoryHighWriteback=*) continue ;;
+# --- OOM / pressure / cachettl ---
+--property=OOMScoreAdjust=*) continue ;;
+--property=OOMPolicy=*) continue ;;
+--property=OOMScoreAdjustPerWeight=*) continue ;;
+--property=MemoryPressureWatch=*) continue ;;
+--property=MemoryPressureThresholdSec=*) continue ;;
+# --- Slices / delegation / unit metadata ---
+--property=RequiresMountsFor=*) continue ;;
+--property=CollectMode=*) continue ;;
+--property=ConditionCPUFeature=*) continue ;;
+--property=ConditionCPUs=*) continue ;;
+--property=ConditionMemory=*) continue ;;
+--property=ConditionCPUPressure=*) continue ;;
+--property=ConditionMemoryPressure=*) continue ;;
+--property=ConditionPathIsMountPoint=*) continue ;;
+--property=ConditionDirectoryNotEmpty=*) continue ;;
+--property=ConditionFileNotEmpty=*) continue ;;
+--property=ConditionFileIsExecutable=*) continue ;;
+--property=ConditionPathIsReadWrite=*) continue ;;
+--property=ConditionPathIsSymbolicLink=*) continue ;;
+--property=ConditionUser=*) continue ;;
+--property=ConditionGroup=*) continue ;;
+--property=ConditionVirtualization=*) continue ;;
+--property=ConditionArchitecture=*) continue ;;
+--property=ConditionFirmware=*) continue ;;
+--property=ConditionFirstBoot=*) continue ;;
+--property=ConditionKernelCommandLine=*) continue ;;
+--property=ConditionKernelVersion=*) continue ;;
+--property=ConditionSecurity=*) continue ;;
+--property=ConditionControlGroupController=*) continue ;;
+--property=ConditionCapability=*) continue ;;
+--property=ConditionACPower=*) continue ;;
+--property=ConditionNeedsUpdate=*) continue ;;
+--property=ConditionNull=*) continue ;;
+--property=AssertUser=*) continue ;;
+--property=AssertDirectoryNotEmpty=*) continue ;;
+--property=AssertFileNotEmpty=*) continue ;;
+--property=AssertFileIsExecutable=*) continue ;;
+--property=AssertPathExists=*) continue ;;
+--property=AssertPathIsDirectory=*) continue ;;
+--property=AssertPathIsSymbolicLink=*) continue ;;
+--property=AssertPathIsMountPoint=*) continue ;;
+--property=AssertPathIsReadWrite=*) continue ;;
+--property=AssertPathIsEncrypted=*) continue ;;
+--property=AssertVirtualization=*) continue ;;
+--property=AssertArchitecture=*) continue ;;
+--property=AssertFirstBoot=*) continue ;;
+--property=AssertKernelVersion=*) continue ;;
+--property=AssertKernelCommandLine=*) continue ;;
+--property=AssertSecurity=*) continue ;;
+--property=AssertControlGroupController=*) continue ;;
+--property=AssertCapability=*) continue ;;
+--property=AssertCPUFeature=*) continue ;;
+--property=AssertCPUs=*) continue ;;
+--property=AssertMemory=*) continue ;;
+--property=AssertACPower=*) continue ;;
+--property=AssertNeedsUpdate=*) continue ;;
+--property=AssertNull=*) continue ;;
+# --- Misc unit ---
+--property=OnFailure=*) continue ;;
+--property=SuccessAction=*) continue ;;
+--property=FailureAction=*) continue ;;
+--property=Restart=*) continue ;;
+--property=RestartSec=*) continue ;;
+--property=RestartPreventExitStatus=*) continue ;;
+--property=RestartForceExitStatus=*) continue ;;
+--property=WatchdogSec=*) continue ;;
+--property=TimeoutStartSec=*) continue ;;
+--property=TimeoutStopSec=*) continue ;;
+--property=TimeoutAbortSec=*) continue ;;
+--property=TimeoutCleanSec=*) continue ;;
+--property=TimeoutStartFailureMode=*) continue ;;
+--property=TimeoutStopFailureMode=*) continue ;;
+--property=RuntimeMaxSec=*) continue ;;
+--property=RuntimeRandomizedExtraSec=*) continue ;;
 # Unrecognized properties - log and warn visibly
 --property=*) UNRECOGNIZED_PROPS+=("$arg"); _warn_dsr "Unrecognized --property: $arg"; continue ;;
 --property) SKIP_NEXT=true; continue ;;

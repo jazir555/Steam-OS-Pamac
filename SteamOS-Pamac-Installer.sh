@@ -7981,6 +7981,22 @@ container_name="$2"
 hook_dir="/etc/pacman.d/hooks"
 mkdir -p "$hook_dir"
 
+# Hook to clean stale download dirs after every transaction
+# (prevents "invalid or corrupted database" errors in Pamac GUI)
+cat > "$hook_dir/99-cleanup-download-dirs.hook" << 'CLEANUP_HOOK'
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Cleaning stale pacman download directories...
+When = PostTransaction
+Exec = /usr/bin/rm -rf /var/lib/pacman/sync/download-*
+CLEANUP_HOOK
+
 cat > "$hook_dir/99-distrobox-export.hook" << 'HOOKDEF'
 [Trigger]
 Operation = Install
@@ -8633,6 +8649,24 @@ chmod 755 /usr/local/bin/pamac-keyring-refresh.sh
 # Create a pacman hook that refreshes the keyring before package operations
 hook_dir="/etc/pacman.d/hooks"
 mkdir -p "$hook_dir"
+
+# Hook to clean stale download dirs after every transaction
+if [[ ! -f "$hook_dir/99-cleanup-download-dirs.hook" ]]; then
+cat > "$hook_dir/99-cleanup-download-dirs.hook" << 'CLEANUP_HOOK'
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Cleaning stale pacman download directories...
+When = PostTransaction
+Exec = /usr/bin/rm -rf /var/lib/pacman/sync/download-*
+CLEANUP_HOOK
+fi
+
 cat > "$hook_dir/00-keyring-refresh.hook" << 'HOOK'
 [Trigger]
 Operation = Install

@@ -3433,7 +3433,8 @@ echo "Installing Pamac bootstrap helper..."
 cat > /usr/local/bin/pamac-session-bootstrap.sh << 'BOOTSTRAP'
 #!/bin/bash
 set +e
-BOOTSTRAP_LOG="/tmp/pamac-bootstrap.log"
+BOOTSTRAP_LOG="/var/log/pamac-bootstrap.log"
+mkdir -p /var/log 2>/dev/null || true
 touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
 
 _safe_sleep() {
@@ -3514,7 +3515,6 @@ start_pamac_daemon() {
 }
 
 # Auto-refresh pacman databases if stale (>12 hours old) or missing.
-# Runs in background so it doesn't block service startup.
 _refresh_pacman_databases() {
 local sync_dir="/var/lib/pacman/sync"
 local max_age=43200  # 12 hours in seconds
@@ -3523,7 +3523,12 @@ local max_age=43200  # 12 hours in seconds
 if ! ls "$sync_dir"/*.db >/dev/null 2>&1; then
     log_bootstrap "No sync databases found, syncing..."
     rm -rf "$sync_dir"/download-* 2>/dev/null || true
-    pacman -Sy --noconfirm >/dev/null 2>&1 || true
+    pacman -Sy --noconfirm 2>&1 | tail -5 >> "$BOOTSTRAP_LOG" || true
+    if ! ls "$sync_dir"/*.db >/dev/null 2>&1; then
+        log_bootstrap "ERROR: Database sync failed - no .db files after pacman -Sy"
+    else
+        log_bootstrap "Database sync complete."
+    fi
     return 0
 fi
 
@@ -3531,7 +3536,7 @@ fi
 local newest_db
 newest_db=$(ls -t "$sync_dir"/*.db 2>/dev/null | head -1)
 if [[ -z "$newest_db" ]]; then
-    pacman -Sy --noconfirm >/dev/null 2>&1 || true
+    pacman -Sy --noconfirm 2>&1 | tail -5 >> "$BOOTSTRAP_LOG" || true
     return 0
 fi
 
@@ -3543,7 +3548,7 @@ db_age=$(( now - db_mtime ))
 if [[ "$db_age" -gt "$max_age" ]]; then
     log_bootstrap "Sync databases are ${db_age}s old (max ${max_age}s). Refreshing..."
     rm -rf "$sync_dir"/download-* 2>/dev/null || true
-    pacman -Sy --noconfirm >/dev/null 2>&1 || true
+    pacman -Sy --noconfirm 2>&1 | tail -5 >> "$BOOTSTRAP_LOG" || true
     log_bootstrap "Database refresh complete."
 else
     log_bootstrap "Sync databases are ${db_age}s old (within ${max_age}s limit). OK."
@@ -3566,10 +3571,6 @@ else
 fi
 }
 
-# Run auto-refresh in background (non-blocking)
-_refresh_pacman_databases &
-_ensure_keyring
-
 # Clean stale pacman lock file
 if [[ -f /var/lib/pacman/db.lck ]]; then
     _lck_pid=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo "")
@@ -3580,6 +3581,12 @@ if [[ -f /var/lib/pacman/db.lck ]]; then
         rm -f /var/lib/pacman/db.lck 2>/dev/null || true
     fi
 fi
+
+# Ensure keyring BEFORE database refresh (pacman -Sy needs valid signatures)
+_ensure_keyring
+
+# Refresh databases synchronously (must complete before pamac-daemon starts)
+_refresh_pacman_databases
 
 if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
 log_bootstrap "systemd detected, starting services via systemctl"
@@ -4179,7 +4186,8 @@ echo "Repairing: pamac-session-bootstrap.sh..."
 cat > /usr/local/bin/pamac-session-bootstrap.sh << 'BOOTSTRAP'
 #!/bin/bash
 set +e
-BOOTSTRAP_LOG="/tmp/pamac-bootstrap.log"
+BOOTSTRAP_LOG="/var/log/pamac-bootstrap.log"
+mkdir -p /var/log 2>/dev/null || true
 touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
 
 _safe_sleep() {
@@ -4266,7 +4274,12 @@ local max_age=43200  # 12 hours in seconds
 if ! ls "$sync_dir"/*.db >/dev/null 2>&1; then
     log_bootstrap "No sync databases found, syncing..."
     rm -rf "$sync_dir"/download-* 2>/dev/null || true
-    pacman -Sy --noconfirm >/dev/null 2>&1 || true
+    pacman -Sy --noconfirm 2>&1 | tail -5 >> "$BOOTSTRAP_LOG" || true
+    if ! ls "$sync_dir"/*.db >/dev/null 2>&1; then
+        log_bootstrap "ERROR: Database sync failed - no .db files after pacman -Sy"
+    else
+        log_bootstrap "Database sync complete."
+    fi
     return 0
 fi
 local newest_db
@@ -4279,7 +4292,7 @@ db_age=$(( now - db_mtime ))
 if [[ "$db_age" -gt "$max_age" ]]; then
     log_bootstrap "Sync databases are ${db_age}s old. Refreshing..."
     rm -rf "$sync_dir"/download-* 2>/dev/null || true
-    pacman -Sy --noconfirm >/dev/null 2>&1 || true
+    pacman -Sy --noconfirm 2>&1 | tail -5 >> "$BOOTSTRAP_LOG" || true
     log_bootstrap "Database refresh complete."
 fi
 }
@@ -4295,9 +4308,6 @@ chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
 pacman-key --init 2>/dev/null && pacman-key --populate archlinux 2>/dev/null || true
 }
 
-_refresh_pacman_databases &
-_ensure_keyring
-
 # Clean stale pacman lock file
 if [[ -f /var/lib/pacman/db.lck ]]; then
     _lck_pid=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo "")
@@ -4308,6 +4318,12 @@ if [[ -f /var/lib/pacman/db.lck ]]; then
         rm -f /var/lib/pacman/db.lck 2>/dev/null || true
     fi
 fi
+
+# Ensure keyring BEFORE database refresh (pacman -Sy needs valid signatures)
+_ensure_keyring
+
+# Refresh databases synchronously (must complete before pamac-daemon starts)
+_refresh_pacman_databases
 
 if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
 log_bootstrap "systemd detected, starting services via systemctl"
@@ -6614,7 +6630,7 @@ if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null
     systemctl start polkit 2>/dev/null || true
     systemctl enable --now pamac-daemon 2>/dev/null || echo "Note: pamac-daemon service could not be enabled"
 else
-    /usr/local/bin/pamac-session-bootstrap.sh 2>/dev/null || true
+    /usr/local/bin/pamac-session-bootstrap.sh 2>&1 || true
 fi
 pacman -Sy --noconfirm >/dev/null 2>&1 || echo "Note: package database sync failed"
 
@@ -7218,7 +7234,7 @@ sleep 1
 # Clean stale pacman lock left by killed daemon
 rm -f /var/lib/pacman/db.lck 2>/dev/null || true
 
-/usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true
+/usr/local/bin/pamac-session-bootstrap.sh 2>&1 || true
 
 DESKTOP_FILE="__DESKTOP_PATH__"
 
@@ -7261,7 +7277,7 @@ CONTAINER_WRAPPER_EOF
         '    fi' \
         'fi' \
         'rm -rf /var/lib/pacman/sync/download-* 2>/dev/null || true' \
-        '/usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true' \
+        '/usr/local/bin/pamac-session-bootstrap.sh 2>&1 || true' \
         'exec pamac "$@"' \
         | container_root_exec tee /usr/local/bin/pamac-cli-wrapper > /dev/null
     container_root_exec chmod +x /usr/local/bin/pamac-cli-wrapper

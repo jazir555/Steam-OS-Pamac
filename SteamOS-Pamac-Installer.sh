@@ -6690,8 +6690,6 @@ for section in parser.sections():
                 break
         if not is_ours:
             ordered_actions.append((section, dict(parser.items(section))))
-    else:
-        other_sections[section] = dict(parser.items(section))
 
 # Strip our custom keys from Desktop Entry
 custom_keys = ['x-steamos-pamac-managed', 'x-steamos-pamac-container',

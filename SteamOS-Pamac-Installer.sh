@@ -6667,7 +6667,7 @@ PAMAC_DESKTOP
   # re-entry into action sections, and preserves all non-owned lines.
   desktop_basename="\$(basename "\$desktop_file")"
 
-  python3 - "\$desktop_file" "\$desktop_basename" "\$container_name" "\$current_user" "\$export_name" "\$app_name" "\$owner_pkg" << 'PYTHON_DESKTOP_REWRITE'
+  python3 - "\$desktop_file" "\$desktop_basename" "${container_name}" "${current_user}" "\$export_name" "\$app_name" "\$owner_pkg" << 'PYTHON_DESKTOP_REWRITE'
 import sys, configparser, io
 
 desktop_path = sys.argv[1]

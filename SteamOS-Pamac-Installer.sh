@@ -3513,6 +3513,63 @@ start_pamac_daemon() {
 /usr/bin/pamac-daemon &
 }
 
+# Auto-refresh pacman databases if stale (>12 hours old) or missing.
+# Runs in background so it doesn't block service startup.
+_refresh_pacman_databases() {
+local sync_dir="/var/lib/pacman/sync"
+local max_age=43200  # 12 hours in seconds
+
+# If no .db files exist, sync immediately
+if ! ls "$sync_dir"/*.db >/dev/null 2>&1; then
+    log_bootstrap "No sync databases found, syncing..."
+    rm -rf "$sync_dir"/download-* 2>/dev/null || true
+    pacman -Sy --noconfirm >/dev/null 2>&1 || true
+    return 0
+fi
+
+# Check age of newest database file
+local newest_db
+newest_db=$(ls -t "$sync_dir"/*.db 2>/dev/null | head -1)
+if [[ -z "$newest_db" ]]; then
+    pacman -Sy --noconfirm >/dev/null 2>&1 || true
+    return 0
+fi
+
+local db_mtime db_age now
+db_mtime=$(stat -c %Y "$newest_db" 2>/dev/null || echo "0")
+now=$(date +%s 2>/dev/null || echo "0")
+db_age=$(( now - db_mtime ))
+
+if [[ "$db_age" -gt "$max_age" ]]; then
+    log_bootstrap "Sync databases are ${db_age}s old (max ${max_age}s). Refreshing..."
+    rm -rf "$sync_dir"/download-* 2>/dev/null || true
+    pacman -Sy --noconfirm >/dev/null 2>&1 || true
+    log_bootstrap "Database refresh complete."
+else
+    log_bootstrap "Sync databases are ${db_age}s old (within ${max_age}s limit). OK."
+fi
+}
+
+# Ensure pacman keyring is initialized (first-run or corrupted)
+_ensure_keyring() {
+if [[ -f /etc/pacman.d/gnupg/pubring.gpg ]] && pacman-key --list-keys >/dev/null 2>&1; then
+    return 0
+fi
+log_bootstrap "Keyring missing or corrupted. Initializing..."
+rm -rf /etc/pacman.d/gnupg 2>/dev/null || true
+mkdir -p /etc/pacman.d/gnupg 2>/dev/null || true
+chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
+if pacman-key --init 2>/dev/null && pacman-key --populate archlinux 2>/dev/null; then
+    log_bootstrap "Keyring initialized successfully."
+else
+    log_bootstrap "WARNING: Keyring initialization failed."
+fi
+}
+
+# Run auto-refresh in background (non-blocking)
+_refresh_pacman_databases &
+_ensure_keyring
+
 if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
 log_bootstrap "systemd detected, starting services via systemctl"
 systemctl start polkit 2>/dev/null || true
@@ -4190,6 +4247,45 @@ fi
 start_pamac_daemon() {
 /usr/bin/pamac-daemon &
 }
+
+# Auto-refresh pacman databases if stale (>12 hours old) or missing.
+_refresh_pacman_databases() {
+local sync_dir="/var/lib/pacman/sync"
+local max_age=43200  # 12 hours in seconds
+if ! ls "$sync_dir"/*.db >/dev/null 2>&1; then
+    log_bootstrap "No sync databases found, syncing..."
+    rm -rf "$sync_dir"/download-* 2>/dev/null || true
+    pacman -Sy --noconfirm >/dev/null 2>&1 || true
+    return 0
+fi
+local newest_db
+newest_db=$(ls -t "$sync_dir"/*.db 2>/dev/null | head -1)
+[[ -z "$newest_db" ]] && return 0
+local db_mtime db_age now
+db_mtime=$(stat -c %Y "$newest_db" 2>/dev/null || echo "0")
+now=$(date +%s 2>/dev/null || echo "0")
+db_age=$(( now - db_mtime ))
+if [[ "$db_age" -gt "$max_age" ]]; then
+    log_bootstrap "Sync databases are ${db_age}s old. Refreshing..."
+    rm -rf "$sync_dir"/download-* 2>/dev/null || true
+    pacman -Sy --noconfirm >/dev/null 2>&1 || true
+    log_bootstrap "Database refresh complete."
+fi
+}
+
+_ensure_keyring() {
+if [[ -f /etc/pacman.d/gnupg/pubring.gpg ]] && pacman-key --list-keys >/dev/null 2>&1; then
+    return 0
+fi
+log_bootstrap "Keyring missing or corrupted. Initializing..."
+rm -rf /etc/pacman.d/gnupg 2>/dev/null || true
+mkdir -p /etc/pacman.d/gnupg 2>/dev/null || true
+chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
+pacman-key --init 2>/dev/null && pacman-key --populate archlinux 2>/dev/null || true
+}
+
+_refresh_pacman_databases &
+_ensure_keyring
 
 if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
 log_bootstrap "systemd detected, starting services via systemctl"
@@ -7079,6 +7175,9 @@ if [[ -z "\${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
     fi
 fi
 
+# Clean stale pacman download dirs that cause "invalid database" errors
+rm -rf /var/lib/pacman/sync/download-* 2>/dev/null || true
+
 /usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true
 
 DESKTOP_FILE="__DESKTOP_PATH__"
@@ -7121,6 +7220,7 @@ CONTAINER_WRAPPER_EOF
         '        export DBUS_SESSION_BUS_ADDRESS="unix:path=$_xdr/bus"' \
         '    fi' \
         'fi' \
+        'rm -rf /var/lib/pacman/sync/download-* 2>/dev/null || true' \
         '/usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true' \
         'exec pamac "$@"' \
         | container_root_exec tee /usr/local/bin/pamac-cli-wrapper > /dev/null

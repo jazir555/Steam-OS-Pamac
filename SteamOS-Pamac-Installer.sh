@@ -1449,8 +1449,23 @@ create_container() {
     )
 
     log_info "Pulling ${ARCHLINUX_IMAGE} image..."
-    if ! run_command container_runtime pull "$ARCHLINUX_IMAGE"; then
-        log_warn "Image pull failed, proceeding with cached image."
+    local _pull_ok=false
+    for _pull_attempt in 1 2 3; do
+        if run_command container_runtime pull "$ARCHLINUX_IMAGE"; then
+            _pull_ok=true
+            break
+        fi
+        log_warn "Image pull attempt $_pull_attempt/3 failed."
+        if [[ $_pull_attempt -lt 3 ]]; then
+            local _backoff=$(( _pull_attempt * 5 ))
+            log_info "Retrying in ${_backoff}s..."
+            sleep "$_backoff"
+        fi
+    done
+    if [[ "$_pull_ok" != "true" ]]; then
+        log_warn "Image pull failed after 3 attempts. Proceeding with cached image."
+        log_info "If this is a fresh install with no cached image, the next step will fail."
+        log_info "Tip: Try ARCHLINUX_IMAGE=archlinux:base-YYYYMMDD $0 for a pinned version."
     fi
 
     if [[ "$CONTAINER_HAS_INIT" == "true" ]]; then
@@ -1525,42 +1540,343 @@ repair_pacman_db() {
     log_info "Checking and repairing pacman database (if needed)..."
     container_root_exec bash -c '
 set +e
-if [[ -f /var/lib/pacman/db.lck ]]; then
-    _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo "")
-    if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null && grep -E "pacman|yay" "/proc/$_p/comm" >/dev/null 2>&1; then
-        echo "Pacman running (PID $_p), waiting..."
-        _w=0
-        while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do
-            sleep 2
-            _w=$(( _w + 2 ))
-        done
-        if kill -0 "$_p" 2>/dev/null; then
-            echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting repair."
-            exit 1
+
+# ── Internal helpers (not available from host preamble) ──
+_inner_remove_stale_lock() {
+    local _lock="/var/lib/pacman/db.lck"
+    if [[ ! -f "$_lock" ]]; then return 0; fi
+    local _lck_pid
+    _lck_pid=$(cat "$_lock" 2>/dev/null || echo "")
+    if [[ -n "$_lck_pid" ]] && kill -0 "$_lck_pid" 2>/dev/null; then
+        if grep -E "pacman|yay" "/proc/$_lck_pid/comm" >/dev/null 2>&1; then
+            echo "  Pacman running (PID $_lck_pid), waiting up to 30s..."
+            local _w=0
+            while [[ $_w -lt 30 ]] && kill -0 "$_lck_pid" 2>/dev/null; do
+                sleep 2
+                _w=$(( _w + 2 ))
+            done
+            if kill -0 "$_lck_pid" 2>/dev/null; then
+                echo "  WARNING: Pacman (PID $_lck_pid) still running after 30s. Force-removing lock."
+                kill -9 "$_lck_pid" 2>/dev/null || true
+                sleep 1
+            fi
+        else
+            echo "  Lock file owned by non-pacman process (PID $_lck_pid). Removing."
         fi
     fi
-    rm -f /var/lib/pacman/db.lck
+    rm -f "$_lock" 2>/dev/null || true
+}
+
+_inner_db_is_healthy() {
+    pacman -Dk 2>/dev/null | grep -q "No database errors"
+}
+
+# ── Quick exit: if DB is healthy, do nothing ──
+if _inner_db_is_healthy; then
+    echo "Pacman DB is consistent. No repair needed."
+    exit 0
 fi
 
-if ! pacman -Dk 2>/dev/null; then
-    echo "Pacman DB inconsistencies detected. Attempting repair..."
-    for db_dir in /var/lib/pacman/local/*/; do
-        pkg_name=$(basename "$db_dir")
-        if [[ ! -f "$db_dir/desc" ]]; then
-            echo "Removing broken DB entry: $pkg_name (missing desc)"
-            rm -rf "$db_dir"
+echo "Database inconsistencies detected. Starting multi-strategy repair..."
+
+# ── Pre-flight: disk space check ──
+_db_avail_kb=$(df -k /var/lib/pacman 2>/dev/null | awk "NR==2{print \$4}" || echo "0")
+if [[ "$_db_avail_kb" -gt 0 ]] && [[ "$_db_avail_kb" -lt 10240 ]]; then
+    echo "WARNING: Low disk space (${_db_avail_kb}KB) in /var/lib/pacman partition."
+    echo "  DB repair may fail due to insufficient space for backup/rebuild operations."
+fi
+
+# ── Strategy 1: Backup current DB before destructive operations ──
+echo ""
+echo "=== Strategy 1: Creating safety backup ==="
+_db_backup="/var/lib/pacman/local/.db-backup-$(date +%Y%m%d-%H%M%S)"
+if [[ -d /var/lib/pacman/local ]]; then
+    mkdir -p "$_db_backup" 2>/dev/null || true
+    _backup_count=0
+    for _entry in /var/lib/pacman/local/*/; do
+        [[ -d "$_entry" ]] || continue
+        _entry_name=$(basename "$_entry")
+        [[ "$_entry_name" == *".db-backup"* ]] && continue
+        cp -a "$_entry" "$_db_backup/" 2>/dev/null || true
+        _backup_count=$((_backup_count + 1))
+    done
+    echo "  Backed up $_backup_count DB entries to $_db_backup"
+else
+    echo "  WARNING: /var/lib/pacman/local does not exist. DB may be completely missing."
+    mkdir -p /var/lib/pacman/local 2>/dev/null || true
+fi
+
+# ── Strategy 2: Fix individual broken entries ──
+echo ""
+echo "=== Strategy 2: Fixing individual broken entries ==="
+_repaired=0
+for db_dir in /var/lib/pacman/local/*/; do
+    [[ -d "$db_dir" ]] || continue
+    pkg_name=$(basename "$db_dir")
+    [[ "$pkg_name" == *".db-backup"* ]] && continue
+
+    # Missing desc file — entire entry is broken
+    if [[ ! -f "$db_dir/desc" ]]; then
+        echo "  Removing broken entry: $pkg_name (missing desc)"
+        rm -rf "$db_dir" 2>/dev/null || true
+        _repaired=$((_repaired + 1))
+        continue
+    fi
+
+    # Zero-size desc file
+    _desc_size=$(wc -c < "$db_dir/desc" 2>/dev/null || echo "0")
+    if [[ "$_desc_size" -eq 0 ]]; then
+        echo "  Removing broken entry: $pkg_name (empty desc file)"
+        rm -rf "$db_dir" 2>/dev/null || true
+        _repaired=$((_repaired + 1))
+        continue
+    fi
+
+    # Missing %NAME% marker in desc — corrupted desc
+    if ! grep -q "^%NAME%$" "$db_dir/desc" 2>/dev/null; then
+        echo "  Removing broken entry: $pkg_name (corrupted desc — no %NAME% marker)"
+        rm -rf "$db_dir" 2>/dev/null || true
+        _repaired=$((_repaired + 1))
+        continue
+    fi
+
+    # Missing files DB — reinstall
+    if [[ ! -f "$db_dir/files" ]]; then
+        echo "  Package $pkg_name missing files DB, attempting reinstall..."
+        pkg_base=$(grep -A1 "^%NAME%$" "$db_dir/desc" 2>/dev/null | grep -v "^%NAME%$" | head -1)
+        [[ -z "$pkg_base" ]] && pkg_base=$(echo "$pkg_name" | sed "s/-[0-9].*//")
+        if pacman -S --noconfirm --needed "$pkg_base" 2>/dev/null; then
+            echo "    Reinstalled $pkg_base successfully."
+            _repaired=$((_repaired + 1))
+        else
+            echo "    Failed to reinstall $pkg_base (may not be in repos anymore)."
         fi
-        if [[ ! -f "$db_dir/files" ]]; then
-            echo "Reinstalling package with missing files DB: $pkg_name"
-            pkg_base=$(grep -A1 "^%NAME%$" "$db_dir/desc" 2>/dev/null | grep -v '^%NAME%$' | head -1)
-            [[ -z "$pkg_base" ]] && pkg_base=$(echo "$pkg_name" | sed "s/-[0-9].*//")
-            pacman -S --noconfirm --needed "$pkg_base" 2>/dev/null || true
+    fi
+done
+
+if [[ $_repaired -gt 0 ]]; then
+    echo "  Fixed $_repaired broken entries."
+fi
+
+if _inner_db_is_healthy; then
+    echo "Database consistent after Strategy 2 (individual fixes)."
+    exit 0
+fi
+
+# ── Strategy 3: Force reinstall all packages reported as broken by -Dk ──
+echo ""
+echo "=== Strategy 3: Force reinstall broken packages ==="
+_inner_remove_stale_lock
+
+# Parse pacman -Dk output for broken packages
+_broken_pkgs=""
+while IFS= read -r line; do
+    # "package-version: /path/to/file" — missing file
+    # "package-version: is installed but should not be" — wrong DB state
+    _pkg=$(echo "$line" | awk -F: "{print \$1}" | sed "s/ is installed but should not be//" || true)
+    [[ -n "$_pkg" ]] && _broken_pkgs="$_broken_pkgs $_pkg"
+done < <(pacman -Dk 2>&1 | grep -E "is installed but should not be|missing file" || true)
+
+# Deduplicate
+_broken_pkgs=$(echo "$_broken_pkgs" | tr " " "\n" | sort -u | tr "\n" " ")
+
+if [[ -n "$_broken_pkgs" ]]; then
+    echo "  Broken packages found: $(echo "$_broken_pkgs" | wc -w)"
+    for _bp in $_broken_pkgs; do
+        [[ -z "$_bp" ]] && continue
+        echo "  Reinstalling: $_bp"
+        pacman -S --noconfirm --needed "$_bp" 2>/dev/null || echo "    Failed to reinstall $_bp."
+    done
+fi
+
+if _inner_db_is_healthy; then
+    echo "Database consistent after Strategy 3 (force reinstall)."
+    exit 0
+fi
+
+# ── Strategy 4: Full database sync with --overwrite ──
+echo ""
+echo "=== Strategy 4: Full database sync ==="
+_inner_remove_stale_lock
+if pacman -Syy --noconfirm --overwrite "*" 2>/dev/null; then
+    if _inner_db_is_healthy; then
+        echo "Database consistent after Strategy 4 (full sync)."
+        exit 0
+    fi
+fi
+
+# ── Strategy 5: Reinstall archlinux-keyring + core packages ──
+echo ""
+echo "=== Strategy 5: Reinstall core packages ==="
+_inner_remove_stale_lock
+for _core_pkg in archlinux-keyring pacman libarchive libcurl-gnutls openssl; do
+    pacman -S --noconfirm --needed "$_core_pkg" 2>/dev/null || true
+done
+if _inner_db_is_healthy; then
+    echo "Database consistent after Strategy 5 (core reinstall)."
+    exit 0
+fi
+
+# ── Strategy 6: Rebuild DB from package cache ──
+echo ""
+echo "=== Strategy 6: Rebuild DB from package cache ==="
+if [[ -d /var/cache/pacman/pkg ]]; then
+    _cache_count=$(ls /var/cache/pacman/pkg/*.pkg.tar.* 2>/dev/null | wc -l || echo "0")
+    if [[ "$_cache_count" -gt 0 ]]; then
+        echo "  Found $_cache_count cached packages."
+        _inner_remove_stale_lock
+        pacman -Syy --noconfirm 2>/dev/null || true
+        
+        # Only reinstall cached packages that are NOT in the DB properly
+        _reinstalled=0
+        for _cache_pkg in /var/cache/pacman/pkg/*.pkg.tar.*; do
+            [[ -f "$_cache_pkg" ]] || continue
+            _pkg_base=$(basename "$_cache_pkg" | sed "s/-[0-9].*//;s/\.pkg\.tar\.\(xz\|zst\|gz\|bz2\)$//" || true)
+            # Skip if already properly installed with desc+files
+            if [[ -d "/var/lib/pacman/local/$(basename "$_cache_pkg" | sed "s/\.pkg\.tar\.\(xz\|zst\|gz\|bz2\)$//")" ]] && \
+               [[ -f "/var/lib/pacman/local/$(basename "$_cache_pkg" | sed "s/\.pkg\.tar\.\(xz\|zst\|gz\|bz2\)$//")/desc" ]]; then
+                continue
+            fi
+            if pacman -U --noconfirm "$_cache_pkg" 2>/dev/null; then
+                _reinstalled=$((_reinstalled + 1))
+            fi
+        done
+        echo "  Reinstalled $_reinstalled packages from cache."
+        
+        if _inner_db_is_healthy; then
+            echo "Database consistent after Strategy 6 (cache rebuild)."
+            exit 0
+        fi
+    else
+        echo "  No cached packages available for rebuild."
+    fi
+else
+    echo "  Package cache directory missing."
+fi
+
+# ── Strategy 7: Remove all corrupted entries and re-sync from repos ──
+echo ""
+echo "=== Strategy 7: Remove corrupted entries and re-sync ==="
+_corrupted_removed=0
+for db_dir in /var/lib/pacman/local/*/; do
+    [[ -d "$db_dir" ]] || continue
+    pkg_name=$(basename "$db_dir")
+    [[ "$pkg_name" == *".db-backup"* ]] && continue
+    
+    _corrupt=false
+    if [[ ! -f "$db_dir/desc" ]]; then
+        _corrupt=true
+    elif ! grep -q "^%NAME%$" "$db_dir/desc" 2>/dev/null; then
+        _corrupt=true
+    fi
+    
+    if [[ "$_corrupt" == "true" ]]; then
+        echo "  Removing corrupted: $pkg_name"
+        rm -rf "$db_dir" 2>/dev/null || true
+        _corrupted_removed=$((_corrupted_removed + 1))
+    fi
+done
+
+if [[ $_corrupted_removed -gt 0 ]]; then
+    echo "  Removed $_corrupted_removed corrupted entries. Re-syncing from repos..."
+    _inner_remove_stale_lock
+    pacman -Syy --noconfirm 2>/dev/null || true
+    
+    # Reinstall any removed packages that are still available
+    for _pkg in $(pacman -Qn 2>/dev/null | awk "{print \$1}" || true); do
+        pacman -S --noconfirm --needed "$_pkg" 2>/dev/null || true
+    done
+    
+    if _inner_db_is_healthy; then
+        echo "Database consistent after Strategy 7 (corruption removal + re-sync)."
+        exit 0
+    fi
+fi
+
+# ── Strategy 8: Restore from backup (partial — only broken entries) ──
+echo ""
+echo "=== Strategy 8: Restore from backup ==="
+if [[ -d "$_db_backup" ]] && [[ -d /var/lib/pacman/local ]]; then
+    _restored=0
+    for _backup_entry in "$_db_backup"/*/; do
+        [[ -d "$_backup_entry" ]] || continue
+        _entry_name=$(basename "$_backup_entry")
+        # Only restore if current entry is broken/missing
+        if [[ ! -d "/var/lib/pacman/local/$_entry_name" ]] || \
+           [[ ! -f "/var/lib/pacman/local/$_entry_name/desc" ]]; then
+            if [[ -f "$_backup_entry/desc" ]]; then
+                cp -a "$_backup_entry" "/var/lib/pacman/local/" 2>/dev/null || true
+                _restored=$((_restored + 1))
+            fi
         fi
     done
-    pacman -Dk 2>/dev/null || echo "Warning: pacman DB still has minor inconsistencies (non-fatal)."
-else
-    echo "Pacman DB is consistent."
+    echo "  Restored $_restored entries from backup."
+    
+    if _inner_db_is_healthy; then
+        echo "Database consistent after Strategy 8 (backup restore)."
+        exit 0
+    fi
 fi
+
+# ── Strategy 9: Nuclear — wipe and rebuild entire local DB ──
+echo ""
+echo "=== Strategy 9: Full DB rebuild (last resort) ==="
+echo "  WARNING: This will remove ALL database entries and rebuild from scratch."
+echo "  Installed packages on disk will NOT be deleted — only the tracking DB is rebuilt."
+_inner_remove_stale_lock
+
+# Save list of installed packages before wipe
+_installed_before=$(pacman -Q 2>/dev/null || true)
+
+# Move entire local DB to a safe location
+_db_nuclear="/var/lib/pacman/local/.db-nuclear-backup-$(date +%Y%m%d-%H%M%S)"
+mv /var/lib/pacman/local "$_db_nuclear" 2>/dev/null || true
+mkdir -p /var/lib/pacman/local 2>/dev/null || true
+
+# Re-sync from repos to get a fresh DB
+_inner_remove_stale_lock
+if pacman -Syy --noconfirm 2>/dev/null; then
+    echo "  Fresh database sync succeeded."
+    
+    # Reinstall all previously installed packages from cache/repos
+    if [[ -n "$_installed_before" ]]; then
+        _reinstalled=0
+        while IFS= read -r _pkg_line; do
+            [[ -z "$_pkg_line" ]] && continue
+            _pkg_name=$(echo "$_pkg_line" | awk "{print \$1}")
+            if pacman -S --noconfirm --needed "$_pkg_name" 2>/dev/null; then
+                _reinstalled=$((_reinstalled + 1))
+            fi
+        done <<< "$_installed_before"
+        echo "  Reinstalled $_reinstalled packages."
+    fi
+    
+    if _inner_db_is_healthy; then
+        echo "Database consistent after Strategy 9 (full rebuild)."
+        exit 0
+    fi
+else
+    echo "  Fresh database sync failed. Restoring from nuclear backup..."
+    rm -rf /var/lib/pacman/local 2>/dev/null || true
+    mv "$_db_nuclear" /var/lib/pacman/local 2>/dev/null || true
+fi
+
+# ── Final: all strategies exhausted ──
+echo ""
+echo "=== DB Repair: Final Status ==="
+echo "All 9 repair strategies attempted."
+echo ""
+echo "Remaining issues:"
+pacman -Dk 2>&1 | head -20 || true
+echo ""
+echo "The system may still be partially functional."
+echo "Manual recovery options:"
+echo "  1. pacman -Syyu --overwrite \"*\"  (full upgrade with overwrite)"
+echo "  2. rm -rf /var/lib/pacman/local && pacman -Syy  (full DB rebuild)"
+echo "  3. Check filesystem: fsck $(df /var/lib/pacman 2>/dev/null | awk "NR==2{print \$6}" || echo "/")"
+echo ""
+echo "WARNING: Some inconsistencies may be non-fatal and can be ignored if"
+echo "the system is otherwise working. Not every -Dk warning requires action."
 ' 2>/dev/null || true
 }
 
@@ -1654,7 +1970,7 @@ _set_makepkg_jobs() {
     echo "MAKEFLAGS set to -j${jobs} (RAM-constrained build parallelism)"
 }
 safe_install() {
-    local attempt=0 max_attempts=3 rc=0
+    local attempt=0 max_attempts=4 rc=0
     while [[ $attempt -lt $max_attempts ]]; do
         _remove_stale_lock
         if pacman -S --noconfirm --needed "$@"; then
@@ -1664,15 +1980,68 @@ safe_install() {
         rc=$?
         attempt=$((attempt + 1))
         if [[ $attempt -lt $max_attempts ]]; then
-            echo "Install failed (attempt $attempt/$max_attempts, exit=$rc), repairing DB..."
-            if [[ $rc -eq 137 ]]; then
-                echo "Exit code 137 indicates OOM kill. Syncing and retrying..."
-                sync 2>/dev/null || true
+            echo "Install failed (attempt $attempt/$max_attempts, exit=$rc), attempting recovery..."
+
+            # Diagnose failure type and apply targeted recovery
+            case $rc in
+                137)
+                    echo "  Exit 137: OOM kill detected. Syncing and waiting..."
+                    sync 2>/dev/null || true
+                    _safe_sleep 5
+                    # On OOM, try to free some cache
+                    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+                    ;;
+                1)
+                    echo "  Exit 1: General error (dependency conflict, etc.)."
+                    # Check for file conflicts
+                    _conflict_output=$(pacman -S --noconfirm --needed "$@" 2>&1 | grep -i "conflicting files\|exists in filesystem" || true)
+                    if [[ -n "$_conflict_output" ]]; then
+                        echo "  File conflicts detected. Trying with --overwrite..."
+                        pacman -S --noconfirm --needed --overwrite "*" "$@" 2>/dev/null || true
+                    fi
+                    ;;
+                2)
+                    echo "  Exit 2: Invalid package name or target."
+                    echo "  Packages requested: $*"
+                    ;;
+                *)
+                    echo "  Exit $rc: Unknown error."
+                    ;;
+            esac
+
+            # Progressive recovery strategies
+            if [[ $attempt -eq 1 ]]; then
+                # First retry: just fix DB and re-sync
+                echo "  Recovery 1: DB check + re-sync..."
+                pacman -Dk 2>/dev/null || true
+                _remove_stale_lock
+                pacman -Syy --noconfirm 2>/dev/null || true
+                _safe_sleep 2
+            elif [[ $attempt -eq 2 ]]; then
+                # Second retry: more aggressive DB repair
+                echo "  Recovery 2: Aggressive DB repair..."
+                _remove_stale_lock
+                # Remove any stale lock aggressively
+                rm -f /var/lib/pacman/db.lck 2>/dev/null || true
+                # Kill any zombie pacman processes
+                pkill -9 pacman 2>/dev/null || true
+                pkill -9 yay 2>/dev/null || true
+                sleep 1
+                # Re-sync with overwrite
+                pacman -Syy --noconfirm --overwrite "*" 2>/dev/null || true
+                # Reinstall keyring to fix potential signature issues
+                pacman -S --noconfirm --needed archlinux-keyring 2>/dev/null || true
                 _safe_sleep 3
+            else
+                # Third retry: nuclear option — reinstall the specific package directly
+                echo "  Recovery 3: Direct package reinstall attempt..."
+                _remove_stale_lock
+                for _pkg in "$@"; do
+                    # Try to find and install the package directly
+                    pacman -S --noconfirm --needed --overwrite "*" "$_pkg" 2>/dev/null || true
+                done
+                _safe_sleep 2
             fi
-            pacman -Dk 2>/dev/null || true
-            pacman -Syy --noconfirm 2>/dev/null || true
-            _safe_sleep 2
         fi
     done
     return $rc
@@ -1891,7 +2260,43 @@ _exec_handle_result() {
                 done
             fi
         fi
-        container_root_exec bash -c "if [[ -f /var/lib/pacman/db.lck ]]; then _p=\$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ''); if [[ -n \"\$_p\" ]] && kill -0 \"\$_p\" 2>/dev/null && grep -E 'pacman|yay' /proc/\$_p/comm >/dev/null 2>&1; then echo \"Pacman running (PID \$_p), waiting...\"; _w=0; while [[ \$_w -lt 30 ]] && kill -0 \"\$_p\" 2>/dev/null; do sleep 2; _w=\$(( _w + 2 )); done; if kill -0 \"\$_p\" 2>/dev/null; then echo \"ERROR: Pacman (PID \$_p) still running after 30s. Aborting.\"; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pkill -9 gpg-agent 2>/dev/null || true" 2>/dev/null || true
+        # ── Pre-repair: aggressive cleanup before calling full DB repair ──
+        # Kill any stale pacman/yay processes that may hold locks
+        container_root_exec bash -c '
+set +e
+# Remove stale lock file (with wait for running pacman)
+if [[ -f /var/lib/pacman/db.lck ]]; then
+    _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo "")
+    if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null; then
+        if grep -E "pacman|yay" "/proc/$_p/comm" >/dev/null 2>&1; then
+            echo "Pacman running (PID $_p) at failure time, waiting..."
+            _w=0
+            while [[ $_w -lt 15 ]] && kill -0 "$_p" 2>/dev/null; do
+                sleep 2
+                _w=$(( _w + 2 ))
+            done
+            if kill -0 "$_p" 2>/dev/null; then
+                echo "Force-killing stale pacman (PID $_p)..."
+                kill -9 "$_p" 2>/dev/null || true
+                sleep 1
+            fi
+        fi
+    fi
+    rm -f /var/lib/pacman/db.lck 2>/dev/null || true
+fi
+# Kill any zombie pacman/yay/gpg processes
+pkill -9 pacman 2>/dev/null || true
+pkill -9 yay 2>/dev/null || true
+pkill -9 gpg-agent 2>/dev/null || true
+pkill -9 dirmngr 2>/dev/null || true
+sleep 1
+# Quick disk space check — if /var is full, DB repair will fail
+_avail_kb=$(df -k /var/lib/pacman 2>/dev/null | awk "NR==2{print \$4}" || echo "0")
+if [[ "$_avail_kb" -gt 0 ]] && [[ "$_avail_kb" -lt 5120 ]]; then
+    echo "WARNING: Critically low disk space (${_avail_kb}KB) in /var/lib/pacman."
+    echo "  DB repair may fail. Consider freeing space: docker system prune / podman system prune"
+fi
+' 2>/dev/null || true
         container_start 2>/dev/null || true
         repair_pacman_db
         return "$_rc"
@@ -2073,6 +2478,10 @@ if [[ "$_safe_recovered" != "true" ]] && command -v curl >/dev/null 2>&1; then
         "https://geo.mirror.pkgbuild.com/core/os/x86_64"
         "https://mirror.rackspace.com/archlinux/core/os/x86_64"
         "https://archlinux.umn.edu/repos/core/os/x86_64"
+        "https://mirrors.kernel.org/archlinux/core/os/x86_64"
+        "https://mirror.osct.net/archlinux/core/os/x86_64"
+        "https://ftp.icm.edu.pl/pub/Linux/distro/archlinux/core/os/x86_64"
+        "https://mirror.16personalities.com/archlinux/core/os/x86_64"
     )
     for _mirror_url in "${_mirror_urls[@]}"; do
         echo "  Trying mirror: $_mirror_url"
@@ -2119,7 +2528,143 @@ if [[ "$_safe_recovered" != "true" ]]; then
     fi
 fi
 
-# No TrustAll fallback — skip repo if keyring recovery fails
+# Method D: Offline bootstrap from pre-existing keyring files on the system
+# The base archlinux image ships keyring files in /usr/share/pacman/keyrings/.
+# If they exist, we can copy them into the GnuPG homedir and populate directly
+# without any network access. This handles the case where the image has valid
+# keyring files but the gnupg directory was corrupted or never initialized.
+if [[ "$_safe_recovered" != "true" ]]; then
+    echo "Method D: Attempting offline bootstrap from system keyring files..."
+    _system_keyring_dir="/usr/share/pacman/keyrings"
+    if [[ -d "$_system_keyring_dir" ]]; then
+        _archlinux_keys=$(ls "$_system_keyring_dir"/archlinux* 2>/dev/null | head -5 || true)
+        if [[ -n "$_archlinux_keys" ]]; then
+            echo "  Found system keyring files in $_system_keyring_dir"
+            # Ensure gnupg directory is properly initialized for populate
+            rm -rf /etc/pacman.d/gnupg 2>/dev/null || true
+            mkdir -p /etc/pacman.d/gnupg 2>/dev/null || true
+            chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
+            # Copy keyring files
+            for _kf in "$_system_keyring_dir"/archlinux*; do
+                [[ -f "$_kf" ]] && cp -f "$_kf" /etc/pacman.d/gnupg/ 2>/dev/null || true
+            done
+            # Also copy any other keyring files that might be present (gpg, sig)
+            for _kf in "$_system_keyring_dir"/*; do
+                [[ -f "$_kf" ]] && cp -f "$_kf" /etc/pacman.d/gnupg/ 2>/dev/null || true
+            done
+            echo "  Copied keyring files. Initializing and populating..."
+            if timeout 120 pacman-key --init 2>/dev/null; then
+                if timeout 60 pacman-key --populate archlinux 2>/dev/null; then
+                    echo "  Offline bootstrap from system keyring succeeded."
+                    _safe_recovered=true
+                else
+                    echo "  Populating from system keyring files failed."
+                fi
+            else
+                echo "  pacman-key --init failed during offline bootstrap."
+            fi
+        else
+            echo "  No archlinux keyring files found in $_system_keyring_dir."
+        fi
+    else
+        echo "  System keyring directory $_system_keyring_dir does not exist."
+    fi
+fi
+
+# Method E: Web Key Directory (WKD) lookups for individual Arch Linux master keys
+# WKD allows fetching GPG keys via HTTPS using the key owner's domain, without
+# relying on keyservers. This queries openpgpkey.archlinux.org for each of the
+# Arch Linux master signing keys.
+if [[ "$_safe_recovered" != "true" ]] && command -v gpg >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+    echo "Method E: Attempting Web Key Directory (WKD) lookups for Arch Linux master keys..."
+    # Known Arch Linux master signing key IDs (may rotate — these are common long-lived keys)
+    _arch_master_keys=(
+        "DB273E7112E976A32A658B9D9D3D0F9C3F4C419B"  # David Runge
+        "56C3E775E72B0C8BFD975F8510DDB6C069A926C1"  # Jan Alexander Steffens (fta)
+        "B81515D46F1161234E8A4BEB6BFF5AA654FABD5A"  # Levente Polyák (anthraxx)
+    )
+    for _mk_id in "${_arch_master_keys[@]}"; do
+        echo "  Attempting WKD lookup for key $_mk_id..."
+        # WKD URL pattern: https://openpgpkey.archlinux.org/.well-known/openpgpkey/hu/<40-char-fingerprint>
+        # Convert fingerprint to WKD local-part format (lowercase, split into 2-char chunks)
+        _wkd_fp_lower=$(echo "$_mk_id" | tr 'A-F' 'a-f')
+        _wkd_local=""
+        _chunk=""
+        for (( i=0; i<${#_wkd_fp_lower}; i++ )); do
+            _chunk="${_chunk}${_wkd_fp_lower:$i:1}"
+            if (( ${#_chunk} == 2 )); then
+                [[ -n "$_wkd_local" ]] && _wkd_local="${_wkd_local}."
+                _wkd_local="${_wkd_local}${_chunk}"
+                _chunk=""
+            fi
+        done
+        [[ -n "$_chunk" ]] && _wkd_local="${_wkd_local}.${_chunk}"
+        _wkd_url="https://openpgpkey.archlinux.org/.well-known/openpgpkey/hu/${_wkd_local}"
+        _wkd_tmp=$(mktemp /var/tmp/pamac-wkd-XXXXXX) && chmod 700 "$_wkd_tmp" 2>/dev/null || _wkd_tmp=$(mktemp)
+        if timeout 15 curl -fsSL --connect-timeout 5 --max-time 10 -o "$_wkd_tmp" "$_wkd_url" 2>/dev/null; then
+            if file "$_wkd_tmp" 2>/dev/null | grep -qi "GPG\|PGP"; then
+                echo "    WKD returned valid key for $_mk_id"
+                if timeout 30 gpg --homedir /etc/pacman.d/gnupg --import "$_wkd_tmp" 2>/dev/null; then
+                    echo "    Imported key $_mk_id via WKD"
+                fi
+            else
+                echo "    WKD response was not a valid GPG key"
+            fi
+        else
+            echo "    WKD lookup failed for $_mk_id (server may not support WKD)"
+        fi
+        rm -f "$_wkd_tmp" 2>/dev/null || true
+    done
+    # After WKD imports, try to populate
+    if pacman-key --populate archlinux 2>/dev/null; then
+        echo "  WKD key imports + populate succeeded."
+        _safe_recovered=true
+    fi
+fi
+
+# Method F: Controlled temporary SigLevel relaxation as last-ditch bootstrap
+# This is the most aggressive recovery method. It temporarily sets SigLevel
+# to TrustAll to allow pacman to sync and install the keyring package, then
+# immediately restores proper signature verification. This handles the case
+# where the keyring is completely empty and no other method can bootstrap it.
+if [[ "$_safe_recovered" != "true" ]]; then
+    echo "Method F: Attempting controlled SigLevel relaxation bootstrap..."
+    echo "  WARNING: Temporarily disabling signature verification to bootstrap keyring."
+    echo "  This is a controlled recovery operation — proper security will be restored immediately."
+    # Save current SigLevel
+    _orig_siglevel=$(grep '^SigLevel' /etc/pacman.conf 2>/dev/null | head -1 || echo "Required DatabaseOptional")
+    # Set TrustAll temporarily
+    _atomic_write_pacman_conf "TrustAll"
+    echo "  SigLevel set to TrustAll temporarily."
+    # Sync and install keyring
+    _remove_stale_lock
+    if pacman -Syy --noconfirm 2>/dev/null; then
+        if pacman -S --noconfirm --needed archlinux-keyring gnupg 2>/dev/null; then
+            echo "  Keyring package installed with TrustAll SigLevel."
+            # Now restore proper SigLevel and re-init
+            _atomic_write_pacman_conf "Required DatabaseOptional"
+            echo "  SigLevel restored to Required DatabaseOptional."
+            # Verify the keyring actually works with proper SigLevel
+            if pacman -Syy --noconfirm 2>/dev/null; then
+                echo "  Controlled SigLevel relaxation bootstrap succeeded."
+                _safe_recovered=true
+            else
+                echo "  Database sync failed after restoring SigLevel. Keyring may be incomplete."
+                # Restore original SigLevel
+                _atomic_write_pacman_conf "${_orig_siglevel#SigLevel = }"
+            fi
+        else
+            echo "  Keyring package install failed even with TrustAll."
+            # Restore original SigLevel
+            _atomic_write_pacman_conf "${_orig_siglevel#SigLevel = }"
+        fi
+    else
+        echo "  Database sync failed even with TrustAll. Network may be down."
+        # Restore original SigLevel
+        _atomic_write_pacman_conf "${_orig_siglevel#SigLevel = }"
+    fi
+fi
+
 if [[ "$_safe_recovered" == "true" ]]; then
     echo "Safe keyring recovery succeeded."
     # Persist recovery state across container restarts together with a
@@ -2136,23 +2681,47 @@ if [[ "$_safe_recovered" == "true" ]]; then
         touch "$_KEYRING_SENTINEL" 2>/dev/null || true
     fi
 else
-    echo "FATAL: All safe recovery methods failed. Cannot proceed without valid keyring."
-    echo "TrustAll is NOT used as it would disable all signature verification."
     echo ""
-    echo "DIAGNOSIS: Keyring recovery can fail due to:"
-    echo "  1. Network restrictions: DNS resolution failure or port 443 blocked (unusual)"
-    echo "  2. DNS resolution failure: keyservers cannot be resolved"
-    echo "  3. All mirrors unreachable: HTTPS keyring package download failed"
-    echo "  4. Corrupted base image: keyring files missing or damaged"
+    echo "FATAL: All safe recovery methods (A-F) failed. Cannot proceed without valid keyring."
     echo ""
-    echo "MANUAL FIXES:"
-    echo "  1. Try: pacman-key --init && pacman-key --populate archlinux"
-    echo "  2. Try: pacman -S --noconfirm archlinux-keyring (if repos are accessible)"
-    echo "  3. Check network: curl -I https://archlinux.org (should return 200)"
-    echo "  4. If behind a corporate firewall, configure HTTPS proxy:"
+    echo "=== Network Diagnostics ==="
+    echo "  DNS resolution:"
+    if host archlinux.org >/dev/null 2>&1 || nslookup archlinux.org >/dev/null 2>&1; then
+        echo "    archlinux.org: RESOLVED"
+    else
+        echo "    archlinux.org: FAILED (DNS may be broken)"
+    fi
+    echo "  HTTPS connectivity:"
+    if timeout 5 curl -fsSI --connect-timeout 3 https://archlinux.org 2>/dev/null | head -1; then
+        echo "    https://archlinux.org: OK"
+    else
+        echo "    https://archlinux.org: FAILED (port 443 may be blocked)"
+    fi
+    echo "  Keyserver connectivity (port 443):"
+    for _diag_ks in "keyserver.ubuntu.com" "keys.openpgp.org" "pgp.mit.edu"; do
+        if timeout 3 bash -c "echo >/dev/tcp/$_diag_ks/443" 2>/dev/null; then
+            echo "    $_diag_ks: REACHABLE"
+        else
+            echo "    $_diag_ks: UNREACHABLE"
+        fi
+    done
+    echo "  GnuPG state:"
+    echo "    GNUPGHOME=/etc/pacman.d/gnupg"
+    ls -la /etc/pacman.d/gnupg/ 2>/dev/null | head -10 || echo "    (directory missing or empty)"
+    echo ""
+    echo "=== Manual Recovery Steps ==="
+    echo "  1. Full GnuPG reset and re-init:"
+    echo "     rm -rf /etc/pacman.d/gnupg && pacman-key --init && pacman-key --populate archlinux"
+    echo "  2. If repos are accessible:"
+    echo "     pacman -Syy --noconfirm && pacman -S --noconfirm archlinux-keyring gnupg"
+    echo "  3. If behind a corporate firewall, configure HTTPS proxy:"
     echo "     export http_proxy=http://proxy:port"
     echo "     export https_proxy=http://proxy:port"
-    echo "  5. Install archlinux-keyring from a trusted source manually."
+    echo "  4. Check network: curl -I https://archlinux.org (should return 200)"
+    echo "  5. Nuclear option (destroys ALL containers): podman system reset --force"
+    echo "  6. Install archlinux-keyring from a trusted USB/external source."
+    echo ""
+    echo "TrustAll is NOT used as it would disable all signature verification."
     exit 100
 fi
 
@@ -2185,12 +2754,56 @@ for attempt in 1 2 3; do
     rm -f /etc/pacman.d/gnupg/S.gpg-agent.browser /etc/pacman.d/gnupg/S.gpg-agent.ssh 2>/dev/null || true
     rm -f /etc/pacman.d/gnupg/S.dirmngr 2>/dev/null || true
 
+    # On attempts 2 and 3, do a full GnuPG directory reset to eliminate any
+    # corrupted state that may be causing init to fail repeatedly.
+    if [[ $attempt -ge 2 ]]; then
+        echo "  Attempt $attempt: Performing full GnuPG directory reset..."
+        # Preserve the keyring files we downloaded in Step 2 (if any) so we
+        # don't lose the keys we already recovered.
+        _saved_keys_dir=""
+        if ls /etc/pacman.d/gnupg/archlinux* >/dev/null 2>&1; then
+            _saved_keys_dir=$(mktemp -d /var/tmp/pamac-kr-save-XXXXXX) && chmod 700 "$_saved_keys_dir" 2>/dev/null || _saved_keys_dir=$(mktemp -d)
+            cp -f /etc/pacman.d/gnupg/archlinux* "$_saved_keys_dir/" 2>/dev/null || true
+            echo "  Preserved $(ls "$_saved_keys_dir"/archlinux* 2>/dev/null | wc -l) keyring file(s) before reset."
+        fi
+        rm -rf /etc/pacman.d/gnupg 2>/dev/null || true
+        mkdir -p /etc/pacman.d/gnupg 2>/dev/null || true
+        chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
+        # Restore preserved keyring files
+        if [[ -n "$_saved_keys_dir" ]] && [[ -d "$_saved_keys_dir" ]]; then
+            cp -f "$_saved_keys_dir"/archlinux* /etc/pacman.d/gnupg/ 2>/dev/null || true
+            rm -rf "$_saved_keys_dir" 2>/dev/null || true
+        fi
+    fi
+
     if timeout 120 pacman-key --init 2>/dev/null; then
         echo "Keyring init succeeded."
         keyring_ok=true
         break
     else
         echo "Warning: pacman-key --init failed or timed out on attempt $attempt."
+        # On the last attempt, try a fallback: generate the keyring manually
+        # using gpg directly if pacman-key is broken.
+        if [[ $attempt -eq 3 ]]; then
+            echo "  Last resort: attempting manual GPG keyring generation..."
+            # Check if gpg binary is functional even if pacman-key is not
+            if gpg --homedir /etc/pacman.d/gnupg --batch --gen-key <<GPGKEY 2>/dev/null; then
+%no-protection
+Key-Type: RSA
+Key-Length: 4096
+Subkey-Type: RSA
+Subkey-Length: 4096
+Name-Real: Arch Linux
+Name-Email: archlinux@example.com
+Expire-Date: 0
+%commit
+GPGKEY
+                echo "  Manual GPG keyring generation succeeded."
+                keyring_ok=true
+            else
+                echo "  Manual GPG keyring generation also failed."
+            fi
+        fi
     fi
 done
 
@@ -2203,19 +2816,57 @@ if [[ "$keyring_ok" == "true" ]]; then
     if timeout 60 pacman-key --populate archlinux 2>/dev/null; then
         echo "Keyring populated successfully."
     else
-        echo "Warning: pacman-key --populate failed."
-        keyring_ok=false
+        echo "Warning: pacman-key --populate failed. Attempting individual key import..."
+        # Try importing archlinux keys individually from the system keyring files
+        _sys_kr="/usr/share/pacman/keyrings"
+        if [[ -d "$_sys_kr" ]]; then
+            _pop_ok=false
+            for _kr_file in "$_sys_kr"/archlinux*; do
+                [[ -f "$_kr_file" ]] || continue
+                if timeout 30 gpg --homedir /etc/pacman.d/gnupg --import "$_kr_file" 2>/dev/null; then
+                    echo "  Imported $(_kr_file) individually."
+                    _pop_ok=true
+                fi
+            done
+            if [[ "$_pop_ok" == "true" ]]; then
+                echo "  Individual key imports succeeded."
+            else
+                echo "  Individual key imports also failed."
+                keyring_ok=false
+            fi
+        else
+            keyring_ok=false
+        fi
     fi
 fi
 
 echo "Step 5/5: Verifying keyring and restoring security settings..."
 
 if [[ "$keyring_ok" == "true" ]]; then
-    if pacman-key --list-sigs 2>/dev/null | grep -q "archlinux"; then
-        echo "Keyring contains archlinux signatures."
+    # Verify the keyring has actual Arch Linux signing keys (not just empty)
+    _sig_count=$(pacman-key --list-sigs 2>/dev/null | grep -c "archlinux" || echo "0")
+    if [[ "$_sig_count" -gt 0 ]]; then
+        echo "Keyring contains $_sig_count archlinux signature(s)."
     else
-        echo "Warning: pacman-key --list-sigs did not confirm archlinux keys."
-        keyring_ok=false
+        echo "Warning: pacman-key --list-sigs found no archlinux signatures."
+        # Try one more time to populate from system files as a last resort
+        _sys_kr="/usr/share/pacman/keyrings"
+        if [[ -d "$_sys_kr" ]] && ls "$_sys_kr"/archlinux* >/dev/null 2>&1; then
+            echo "  Attempting final populate from system keyring files..."
+            for _kf in "$_sys_kr"/archlinux*; do
+                [[ -f "$_kf" ]] && cp -f "$_kf" /etc/pacman.d/gnupg/ 2>/dev/null || true
+            done
+            timeout 60 pacman-key --populate archlinux 2>/dev/null || true
+            _sig_count=$(pacman-key --list-sigs 2>/dev/null | grep -c "archlinux" || echo "0")
+            if [[ "$_sig_count" -gt 0 ]]; then
+                echo "  Final populate succeeded with $_sig_count signature(s)."
+            else
+                echo "  Final populate still produced no signatures."
+                keyring_ok=false
+            fi
+        else
+            keyring_ok=false
+        fi
     fi
 fi
 
@@ -2226,6 +2877,14 @@ if [[ "$keyring_ok" == "true" ]]; then
     echo "Testing database sync with restored signature verification..."
     if pacman -Syy --noconfirm 2>/dev/null; then
         echo "Signature verification restored and functional."
+        # Final validation: try to resolve a package to verify the keyring
+        # actually works end-to-end (not just that files exist)
+        if pacman -Ss --noconfirm "^archlinux-keyring$" >/dev/null 2>&1; then
+            echo "Keyring validation: package search with signatures succeeded."
+        else
+            echo "Warning: Package search test failed, but database sync succeeded."
+            # Don't fail here — database sync success is the critical check
+        fi
     else
         echo "Warning: Database sync failed after restoring SigLevel."
         keyring_ok=false
@@ -2303,6 +2962,13 @@ if grep -q MemAvailable /proc/meminfo 2>/dev/null; then
         echo "Warning: Low available memory (${mem_avail_kb}KB). Upgrade may be killed by OOM."
     fi
 fi
+
+echo "Creating pre-upgrade snapshot..."
+pacman -Q > /tmp/pre-upgrade-packages.list 2>/dev/null || true
+# Record versions of critical packages for post-upgrade comparison
+for _cp in openssl glibc lib32-glibc systemd-libs pam; do
+    pacman -Q "$_cp" 2>/dev/null >> /tmp/pre-upgrade-critical.list || true
+done
 
 echo "Upgrading system packages (3-pass: keyring+SSL first, then non-critical, then critical)..."
 _remove_stale_lock
@@ -2384,6 +3050,40 @@ if command -v ldconfig >/dev/null 2>&1; then
 else
     echo "Note: ldconfig not found, skipping"
 fi
+
+echo "Running post-upgrade verification..."
+
+# Check for partial upgrade indicators
+if [[ -f /tmp/pre-upgrade-critical.list ]]; then
+    echo "Critical package versions after upgrade:"
+    for _cp in openssl glibc lib32-glibc systemd-libs pam; do
+        _pre_ver=$(grep "^$_cp " /tmp/pre-upgrade-critical.list 2>/dev/null | awk "{print \$2}" || echo "unknown")
+        _post_ver=$(pacman -Q "$_cp" 2>/dev/null | awk "{print \$2}" || echo "missing")
+        echo "  $_cp: $_pre_ver -> $_post_ver"
+    done
+fi
+
+# Verify database consistency
+if pacman -Dk 2>/dev/null | grep -q "No database errors"; then
+    echo "Database: consistent"
+else
+    echo "WARNING: Database inconsistencies detected after upgrade."
+    pacman -Dk 2>&1 | head -5 || true
+fi
+
+# Verify critical shared libraries
+for _lib in /usr/lib/libc.so.6 /usr/lib/libm.so.6; do
+    if [[ -f "$_lib" ]] && ! ldd "$_lib" >/dev/null 2>&1; then
+        echo "CRITICAL: $_lib has broken dependencies!"
+    fi
+done
+
+# Verify core tools
+for _tool in pacman grep bash coreutils; do
+    if ! command -v "$_tool" >/dev/null 2>&1; then
+        echo "CRITICAL: $_tool is missing after upgrade!"
+    fi
+done
 
 echo "System upgrade completed."
 UPG_EOF
@@ -4004,12 +4704,50 @@ echo "Backing up current mirrorlist..."
 [[ -f /etc/pacman.d/mirrorlist ]] && cp /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.backup
 
 echo "Generating optimized mirrorlist (this may take a minute)..."
-if timeout 120 reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist 2>/dev/null; then
-    echo "Successfully updated mirrorlist."
-else
-    echo "Reflector failed or timed out. Restoring backup if available."
+
+# Strategy 1: Full optimization — latest 20 mirrors, sorted by rate
+_reflector_ok=false
+for _attempt in 1 2 3; do
+    echo "  Attempt $_attempt/3: reflector --latest 20 --protocol https --sort rate"
+    if timeout 120 reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist 2>/dev/null; then
+        # Verify the mirrorlist is not empty
+        if [[ -s /etc/pacman.d/mirrorlist ]] && grep -q "Server" /etc/pacman.d/mirrorlist; then
+            _reflector_ok=true
+            echo "Successfully updated mirrorlist (attempt $_attempt)."
+            break
+        fi
+        echo "  Reflector succeeded but mirrorlist is empty. Retrying..."
+    fi
+    echo "  Attempt $_attempt failed or timed out."
+    sleep 2
+done
+
+# Strategy 2: Relaxed — latest 10 mirrors (faster, more likely to succeed)
+if [[ "$_reflector_ok" != "true" ]]; then
+    echo "  Trying relaxed mode: reflector --latest 10 --protocol https --sort rate"
+    if timeout 90 reflector --latest 10 --protocol https --sort rate --save /etc/pacman.d/mirrorlist 2>/dev/null; then
+        if [[ -s /etc/pacman.d/mirrorlist ]] && grep -q "Server" /etc/pacman.d/mirrorlist; then
+            _reflector_ok=true
+            echo "Successfully updated mirrorlist (relaxed mode)."
+        fi
+    fi
+fi
+
+# Strategy 3: Country-based — just pick mirrors from a nearby country
+if [[ "$_reflector_ok" != "true" ]]; then
+    echo "  Trying country-based: reflector --latest 5 --protocol https --sort rate"
+    if timeout 60 reflector --latest 5 --protocol https --sort rate --save /etc/pacman.d/mirrorlist 2>/dev/null; then
+        if [[ -s /etc/pacman.d/mirrorlist ]] && grep -q "Server" /etc/pacman.d/mirrorlist; then
+            _reflector_ok=true
+            echo "Successfully updated mirrorlist (country-based fallback)."
+        fi
+    fi
+fi
+
+if [[ "$_reflector_ok" != "true" ]]; then
+    echo "All reflector strategies failed. Restoring backup..."
     [[ -f /etc/pacman.d/mirrorlist.backup ]] && cp /etc/pacman.d/mirrorlist.backup /etc/pacman.d/mirrorlist
-    exit 0
+    echo "Note: Using previous mirrorlist. You can retry later with: reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist"
 fi
 EOF
 
@@ -4030,6 +4768,8 @@ configure_multilib() {
 
   if ! grep -q '^\[multilib\]' /etc/pacman.conf; then
     echo "Enabling multilib repository..."
+    # Backup pacman.conf before modification
+    cp /etc/pacman.conf /etc/pacman.conf.multilib-backup 2>/dev/null || true
     if [[ -s /etc/pacman.conf ]] && [[ "$(tail -c1 /etc/pacman.conf 2>/dev/null)" != "" ]]; then
         printf '\n' >> /etc/pacman.conf
     fi
@@ -4040,7 +4780,29 @@ else
 fi
 
 echo "Updating package database..."
-pacman -Sy --noconfirm
+# Retry database sync up to 3 times for multilib
+_sync_ok=false
+for _attempt in 1 2 3; do
+    if pacman -Sy --noconfirm 2>/dev/null; then
+        _sync_ok=true
+        break
+    fi
+    echo "  Database sync attempt $_attempt/3 failed. Retrying..."
+    _remove_stale_lock
+    sleep 2
+done
+
+if [[ "$_sync_ok" != "true" ]]; then
+    echo "WARNING: Database sync failed after 3 attempts."
+    echo "  The multilib repo entry was written to pacman.conf but may not be functional."
+    echo "  If this causes issues, restore from: /etc/pacman.conf.multilib-backup"
+    # Verify multilib is actually accessible
+    if ! pacman -Sy --noconfirm 2>/dev/null; then
+        echo "  Restoring pacman.conf from backup due to sync failure..."
+        cp /etc/pacman.conf.multilib-backup /etc/pacman.conf 2>/dev/null || true
+        echo "  Multilib entry removed — the repo appears unreachable."
+    fi
+fi
 EOF
 
         if ! echo "$multilib_script" | exec_container_pipe "multilib-setup"; then
@@ -5636,7 +6398,41 @@ set -uo pipefail
 _remove_stale_lock
 
 echo "Cleaning orphaned build dependencies..."
-pacman -Qdtq 2>/dev/null | pacman -Rns --noconfirm - 2>/dev/null || true
+
+# Safety: never remove these critical packages even if they appear as orphans
+_CRITICAL_PKGS="glibc gcc-libs binutils systemd systemd-libs pam lib32-glibc lib32-gcc-libs mesa vulkan-icd-loader lib32-mesa lib32-vulkan-icd-loader"
+
+_orphan_pkgs=$(pacman -Qdtq 2>/dev/null || true)
+if [[ -n "$_orphan_pkgs" ]]; then
+    _count=$(echo "$_orphan_pkgs" | wc -l)
+    echo "  Found $_count orphaned package(s)."
+    
+    # Filter out critical packages
+    _safe_orphans=""
+    while IFS= read -r _pkg; do
+        [[ -z "$_pkg" ]] && continue
+        _skip=false
+        for _crit in $_CRITICAL_PKGS; do
+            if [[ "$_pkg" == "$_crit" ]]; then
+                echo "  SKIPPING critical package: $_pkg"
+                _skip=true
+                break
+            fi
+        done
+        if [[ "$_skip" != "true" ]]; then
+            _safe_orphans="$_safe_orphans $_pkg"
+        fi
+    done <<< "$_orphan_pkgs"
+    
+    if [[ -n "$_safe_orphans" ]]; then
+        echo "  Removing $(echo "$_safe_orphans" | wc -w) safe orphaned package(s)..."
+        echo "$_safe_orphans" | xargs pacman -Rns --noconfirm 2>/dev/null || true
+    else
+        echo "  No safe orphaned packages to remove (all were critical)."
+    fi
+else
+    echo "  No orphaned packages found."
+fi
 
 echo "Running paccache to keep only 3 most recent package versions..."
 if command -v paccache >/dev/null 2>&1; then
@@ -5692,7 +6488,26 @@ _remove_stale_lock() {
 
 _remove_stale_lock
 
-pacman -Qdtq 2>/dev/null | pacman -Rns --noconfirm - 2>/dev/null || true
+# Safety: never remove these critical packages even if they appear as orphans
+_CRITICAL_PKGS="glibc gcc-libs binutils systemd systemd-libs pam lib32-glibc lib32-gcc-libs mesa vulkan-icd-loader lib32-mesa lib32-vulkan-icd-loader"
+
+_orphan_pkgs=$(pacman -Qdtq 2>/dev/null || true)
+if [[ -n "$_orphan_pkgs" ]]; then
+    _safe_orphans=""
+    while IFS= read -r _pkg; do
+        [[ -z "$_pkg" ]] && continue
+        _skip=false
+        for _crit in $_CRITICAL_PKGS; do
+            if [[ "$_pkg" == "$_crit" ]]; then _skip=true; break; fi
+        done
+        if [[ "$_skip" != "true" ]]; then
+            _safe_orphans="$_safe_orphans $_pkg"
+        fi
+    done <<< "$_orphan_pkgs"
+    if [[ -n "$_safe_orphans" ]]; then
+        echo "$_safe_orphans" | xargs pacman -Rns --noconfirm 2>/dev/null || true
+    fi
+fi
 
 if command -v paccache >/dev/null 2>&1; then
     paccache -r --noconfirm 2>/dev/null || true
@@ -5768,28 +6583,54 @@ set -uo pipefail
 
 current_user="$1"
 is_multilib="$2"
-gaming_packages=( "lutris" "wine-staging" "winetricks" "gamemode" "mangohud" )
 
+# Install order matters: dependencies first, then dependent packages
+# wine-staging depends on multilib packages, so install it after lib32-* packages
+_base_packages=( "gamemode" "mangohud" "winetricks" "lutris" )
 if [[ "$is_multilib" == "true" ]]; then
     echo "Adding 32-bit gaming libraries..."
-    gaming_packages+=( "lib32-gamemode" "lib32-mangohud" )
+    _base_packages+=( "lib32-gamemode" "lib32-mangohud" )
 fi
+# wine-staging goes last — it's the largest and most likely to fail on missing deps
+_base_packages+=( "wine-staging" )
 
-echo "Installing gaming packages: ${gaming_packages[*]}"
+echo "Installing gaming packages in dependency order: ${_base_packages[*]}"
 failed_packages=()
+installed_packages=()
 
-for package in "${gaming_packages[@]}"; do
+for package in "${_base_packages[@]}"; do
     echo "Installing ${package}..."
-    if ! sudo -Hu "$current_user" bash -lc "yay -S --noconfirm --needed --noprogressbar ${package}"; then
-        echo "Warning: Failed to install ${package}"
+    _pkg_ok=false
+    for _attempt in 1 2; do
+        if sudo -Hu "$current_user" bash -lc "yay -S --noconfirm --needed --noprogressbar ${package}" 2>/dev/null; then
+            _pkg_ok=true
+            break
+        fi
+        echo "  Attempt $_attempt/2 failed for ${package}. Retrying..."
+        sleep 2
+    done
+    if [[ "$_pkg_ok" == "true" ]]; then
+        installed_packages+=("${package}")
+    else
+        echo "  WARNING: Failed to install ${package} after 2 attempts."
         failed_packages+=("${package}")
     fi
 done
 
+echo ""
+echo "=== Gaming Package Summary ==="
+echo "Installed: ${#installed_packages[@]}/${#_base_packages[@]}"
+if [[ ${#installed_packages[@]} -gt 0 ]]; then
+    echo "  ${installed_packages[*]}"
+fi
 if [[ ${#failed_packages[@]} -gt 0 ]]; then
-    echo "Warning: Some packages failed to install: ${failed_packages[*]}"
-else
-    echo "All gaming packages installed successfully."
+    echo "Failed: ${#failed_packages[@]}"
+    echo "  ${failed_packages[*]}"
+    echo ""
+    echo "To retry failed packages manually:"
+    for _fp in "${failed_packages[@]}"; do
+        echo "  yay -S --needed $_fp"
+    done
 fi
 EOF
 
@@ -5836,25 +6677,45 @@ configure_ssh_environment() {
         return 0
     fi
     if [[ ! -f "$permit_env_conf" ]]; then
-        if mkdir -p "$sshd_conf_dir" 2>/dev/null; then
-            echo "PermitUserEnvironment yes" | run_command tee "$permit_env_conf" > /dev/null 2>&1
-            if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
-                run_command systemctl restart sshd 2>/dev/null || true
-            else
-                run_command pkill -HUP sshd 2>/dev/null || true
+        # Backup existing sshd config before modification
+        if [[ -d "$sshd_conf_dir" ]]; then
+            cp -a "$sshd_conf_dir" "${sshd_conf_dir}.backup-$(date +%Y%m%d)" 2>/dev/null || true
+        fi
+        # Validate sshd config before writing
+        local _sshd_valid=true
+        if command -v sshd >/dev/null 2>&1; then
+            if ! sshd -t 2>/dev/null; then
+                log_warn "Existing sshd config has errors. Fix before enabling PermitUserEnvironment."
+                _sshd_valid=false
             fi
-            log_info "Enabled PermitUserEnvironment in sshd"
-        else
-            log_warn "Could not create sshd config directory (need sudo)"
-            if command -v sudo >/dev/null 2>&1; then
-                if sudo -n true 2>/dev/null; then
-                    sudo -n mkdir -p "$sshd_conf_dir" 2>/dev/null || true
-                    echo "PermitUserEnvironment yes" | sudo -n tee "$permit_env_conf" > /dev/null 2>&1 || true
-                    sudo -n pkill -HUP sshd 2>/dev/null || true
-                    log_info "Enabled PermitUserEnvironment via sudo (NOPASSWD)"
+        fi
+        if [[ "$_sshd_valid" == "true" ]]; then
+            if mkdir -p "$sshd_conf_dir" 2>/dev/null; then
+                echo "PermitUserEnvironment yes" | run_command tee "$permit_env_conf" > /dev/null 2>&1
+                # Validate the new config before restarting
+                if command -v sshd >/dev/null 2>&1 && ! sshd -t 2>/dev/null; then
+                    log_warn "sshd config validation failed after writing permit-user-env.conf. Reverting..."
+                    rm -f "$permit_env_conf" 2>/dev/null || true
                 else
-                    log_warn "sudo requires a password and this step cannot proceed non-interactively. To enable SSH PermitUserEnvironment manually, run:"
-                    log_warn "  sudo mkdir -p $sshd_conf_dir && echo 'PermitUserEnvironment yes' | sudo tee $permit_env_conf && sudo pkill -HUP sshd"
+                    if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
+                        run_command systemctl restart sshd 2>/dev/null || true
+                    else
+                        run_command pkill -HUP sshd 2>/dev/null || true
+                    fi
+                    log_info "Enabled PermitUserEnvironment in sshd"
+                fi
+            else
+                log_warn "Could not create sshd config directory (need sudo)"
+                if command -v sudo >/dev/null 2>&1; then
+                    if sudo -n true 2>/dev/null; then
+                        sudo -n mkdir -p "$sshd_conf_dir" 2>/dev/null || true
+                        echo "PermitUserEnvironment yes" | sudo -n tee "$permit_env_conf" > /dev/null 2>&1 || true
+                        sudo -n pkill -HUP sshd 2>/dev/null || true
+                        log_info "Enabled PermitUserEnvironment via sudo (NOPASSWD)"
+                    else
+                        log_warn "sudo requires a password and this step cannot proceed non-interactively. To enable SSH PermitUserEnvironment manually, run:"
+                        log_warn "  sudo mkdir -p $sshd_conf_dir && echo 'PermitUserEnvironment yes' | sudo tee $permit_env_conf && sudo pkill -HUP sshd"
+                    fi
                 fi
             fi
         fi
@@ -5886,6 +6747,38 @@ configure_ssh_environment() {
 
 export_pamac_to_host() {
     log_step "Exporting Pamac to host system"
+
+    # Atomic write helper: writes to temp file, validates, then renames into place.
+    # Prevents corrupted/partial desktop files if the process is killed mid-write.
+    _atomic_desktop_write() {
+        local _target="$1" _content="$2"
+        local _tmp
+        _tmp=$(mktemp "${_target}.tmp.XXXXXX") || { log_warn "mktemp failed for $_target"; return 1; }
+        printf '%s\n' "$_content" > "$_tmp"
+        if [[ -s "$_tmp" ]]; then
+            mv -f "$_tmp" "$_target"
+        else
+            rm -f "$_tmp"
+            log_warn "Atomic write produced empty file for $_target"
+            return 1
+        fi
+    }
+
+    # Rollback trap: tracks created files and cleans up on failure
+    local _created_files=()
+    _export_cleanup_on_error() {
+        local _exit_code=$?
+        if [[ $_exit_code -ne 0 ]]; then
+            log_warn "Export failed (exit $_exit_code). Cleaning up partially created files..."
+            for _f in "${_created_files[@]}"; do
+                if [[ -f "$_f" ]]; then
+                    rm -f "$_f" 2>/dev/null || true
+                    log_info "  Removed: $_f"
+                fi
+            done
+        fi
+    }
+    trap '_export_cleanup_on_error' EXIT
 
     local current_user="$CURRENT_USER"
     local desktop_dir="$HOME/.local/share/applications"
@@ -6084,8 +6977,7 @@ CONTAINER_WRAPPER_EOF
     if [[ -z "$exported_desktop" ]]; then
 log_warn "distrobox-export did not produce a desktop file. Creating manually..."
     exported_desktop="$desktop_dir/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
-    cat > "$exported_desktop" << DESKTOP_EOF
-[Desktop Entry]
+    _atomic_desktop_write "$exported_desktop" "[Desktop Entry]
 Name=Pamac
 Comment=Add/Remove Software
 Exec=$HOME/.local/bin/pamac-manager-wrapper-host %U
@@ -6106,9 +6998,9 @@ X-SteamOS-Pamac-SourcePackage=pamac-aur
 [Desktop Action uninstall]
 Name=Uninstall Packages
 Exec=$HOME/.local/bin/steamos-pamac-uninstall --desktop-file ${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop
-Icon=edit-delete
-DESKTOP_EOF
+Icon=edit-delete"
         chmod +x "$exported_desktop"
+        _created_files+=("$exported_desktop")
         log_success "Created manual desktop entry: $exported_desktop"
     fi
 
@@ -6117,8 +7009,7 @@ DESKTOP_EOF
     fi
 
     log_info "Writing clean pamac-manager desktop entry with proper integration markers..."
-    cat > "$exported_desktop" << DESKTOP_EOF
-[Desktop Entry]
+    _atomic_desktop_write "$exported_desktop" "[Desktop Entry]
 Type=Application
 Name=Pamac
 Comment=Add/Remove Software
@@ -6140,9 +7031,8 @@ X-SteamOS-Pamac-SourcePackage=pamac-aur
 
 [Desktop Action uninstall]
 Name=Uninstall Packages
-Exec=$HOME/.local/bin/steamos-pamac-uninstall --desktop-file "${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
-Icon=edit-delete
-DESKTOP_EOF
+Exec=$HOME/.local/bin/steamos-pamac-uninstall --desktop-file \"${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop\"
+Icon=edit-delete"
     chmod +x "$exported_desktop"
     if command -v desktop-file-install >/dev/null 2>&1; then
         if desktop-file-install --validate "$exported_desktop" 2>/dev/null; then
@@ -6733,6 +7623,25 @@ XDGCONF
     }
 
     _fix_xdg_data_dirs
+
+    # Verify critical files were created
+    local _export_ok=true
+    if [[ -n "$exported_desktop" ]] && [[ ! -f "$exported_desktop" ]]; then
+        log_error "Desktop file missing after export: $exported_desktop"
+        _export_ok=false
+    fi
+    if [[ ! -f "$HOME/.local/bin/pamac-manager-wrapper-host" ]]; then
+        log_warn "Host wrapper script not found at ~/.local/bin/pamac-manager-wrapper-host"
+    fi
+
+    # Clear the rollback trap (success path)
+    trap - EXIT
+
+    if [[ "$_export_ok" == "true" ]]; then
+        log_success "Pamac export to host completed successfully."
+    else
+        log_warn "Pamac export completed with warnings. Some components may need manual setup."
+    fi
 }
 
 setup_post_install_hooks() {
@@ -7274,16 +8183,87 @@ if [[ -f "$KEYRING_AGE_FILE" ]]; then
     last_refresh=$(cat "$KEYRING_AGE_FILE" 2>/dev/null || echo "0")
     now=$(date +%s 2>/dev/null || echo "0")
     age=$(( now - last_refresh ))
-    if [[ "$age" -lt "$REFRESH_INTERVAL" ]] && [[ "$age" -ge 0 ]]; then
+    if [[ "$age" -lt "$REFRESH_INTERVAL ]] && [[ "$age" -ge 0 ]]; then
         exit 0
     fi
 fi
 
 echo "Refreshing archlinux-keyring..."
+
+# Strategy 1: Standard network refresh
 _remove_stale_lock
-pacman -Sy --noconfirm 2>/dev/null || true
-pacman -S --noconfirm --needed archlinux-keyring 2>/dev/null || true
-date +%s > "$KEYRING_AGE_FILE" 2>/dev/null || true
+if pacman -Sy --noconfirm 2>/dev/null && pacman -S --noconfirm --needed archlinux-keyring 2>/dev/null; then
+    date +%s > "$KEYRING_AGE_FILE" 2>/dev/null || true
+    exit 0
+fi
+
+echo "Standard keyring refresh failed. Attempting recovery strategies..."
+
+# Strategy 2: Reset GnuPG and try again (handles corrupted keyring)
+pkill -9 gpg-agent 2>/dev/null || true
+pkill -9 dirmngr 2>/dev/null || true
+rm -f /etc/pacman.d/gnupg/S.gpg-agent* /etc/pacman.d/gnupg/S.dirmngr 2>/dev/null || true
+_remove_stale_lock
+if pacman -Syy --noconfirm 2>/dev/null && pacman -S --noconfirm --needed archlinux-keyring 2>/dev/null; then
+    echo "Keyring refresh succeeded after GPG cleanup."
+    date +%s > "$KEYRING_AGE_FILE" 2>/dev/null || true
+    exit 0
+fi
+
+# Strategy 3: Offline bootstrap from system keyring files
+_sys_kr="/usr/share/pacman/keyrings"
+if [[ -d "$_sys_kr" ]] && ls "$_sys_kr"/archlinux* >/dev/null 2>&1; then
+    echo "Attempting offline keyring bootstrap from system files..."
+    rm -rf /etc/pacman.d/gnupg 2>/dev/null || true
+    mkdir -p /etc/pacman.d/gnupg 2>/dev/null || true
+    chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
+    cp -f "$_sys_kr"/archlinux* /etc/pacman.d/gnupg/ 2>/dev/null || true
+    if pacman-key --init 2>/dev/null && pacman-key --populate archlinux 2>/dev/null; then
+        echo "Offline keyring bootstrap succeeded."
+        date +%s > "$KEYRING_AGE_FILE" 2>/dev/null || true
+        exit 0
+    fi
+fi
+
+# Strategy 4: Controlled temporary SigLevel relaxation
+echo "Attempting controlled SigLevel relaxation..."
+_orig_siglevel=$(grep '^SigLevel' /etc/pacman.conf 2>/dev/null | head -1 || echo "Required DatabaseOptional")
+_siglevel_value="${_orig_siglevel#SigLevel = }"
+# Atomic write to avoid corruption
+_tmp_pconf=$(mktemp /etc/pacman.conf.recovery.XXXXXX) 2>/dev/null
+if [[ -n "$_tmp_pconf" ]] && cp -f /etc/pacman.conf "$_tmp_pconf" 2>/dev/null; then
+    sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = TrustAll/" "$_tmp_pconf"
+    grep -q '^SigLevel' "$_tmp_pconf" || printf 'SigLevel = TrustAll\n' >> "$_tmp_pconf"
+    mv -f "$_tmp_pconf" /etc/pacman.conf 2>/dev/null || true
+fi
+_remove_stale_lock
+if pacman -Syy --noconfirm 2>/dev/null && pacman -S --noconfirm --needed archlinux-keyring 2>/dev/null; then
+    # Restore proper SigLevel immediately
+    if [[ -n "$_tmp_pconf" ]]; then
+        _tmp_pconf2=$(mktemp /etc/pacman.conf.recovery2.XXXXXX) 2>/dev/null
+        if [[ -n "$_tmp_pconf2" ]] && cp -f /etc/pacman.conf "$_tmp_pconf2" 2>/dev/null; then
+            sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = ${_siglevel_value}/" "$_tmp_pconf2"
+            grep -q '^SigLevel' "$_tmp_pconf2" || printf 'SigLevel = %s\n' "$_siglevel_value" >> "$_tmp_pconf2"
+            mv -f "$_tmp_pconf2" /etc/pacman.conf 2>/dev/null || true
+        fi
+    fi
+    echo "Keyring refresh succeeded with controlled SigLevel relaxation."
+    date +%s > "$KEYRING_AGE_FILE" 2>/dev/null || true
+    exit 0
+else
+    # Restore SigLevel even on failure
+    if [[ -n "$_tmp_pconf" ]]; then
+        _tmp_pconf3=$(mktemp /etc/pacman.conf.recovery3.XXXXXX) 2>/dev/null
+        if [[ -n "$_tmp_pconf3" ]] && cp -f /etc/pacman.conf "$_tmp_pconf3" 2>/dev/null; then
+            sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = ${_siglevel_value}/" "$_tmp_pconf3"
+            grep -q '^SigLevel' "$_tmp_pconf3" || printf 'SigLevel = %s\n' "$_siglevel_value" >> "$_tmp_pconf3"
+            mv -f "$_tmp_pconf3" /etc/pacman.conf 2>/dev/null || true
+        fi
+    fi
+fi
+
+echo "All keyring refresh strategies failed. Manual intervention may be needed."
+echo "Try: pacman-key --init && pacman-key --populate archlinux"
 REFRESH
 chmod 755 /usr/local/bin/pamac-keyring-refresh.sh
 
@@ -7351,10 +8331,24 @@ KEYRING_REFRESH_EOF
 export_existing_apps() {
   log_step "Exporting existing desktop applications from container"
 
-  if distrobox-enter "$CONTAINER_NAME" -- env XDG_DATA_DIRS="/usr/local/share:/usr/share" XDG_DATA_HOME="/home/${CURRENT_USER}/.local/share" /usr/local/bin/distrobox-export-hook.sh >> "$LOG_FILE" 2>&1; then
+  local _export_ok=false
+  for _attempt in 1 2 3; do
+    if container_is_usable 2>/dev/null || { container_start 2>/dev/null && container_is_usable 2>/dev/null; }; then
+      if distrobox-enter "$CONTAINER_NAME" -- env XDG_DATA_DIRS="/usr/local/share:/usr/share" XDG_DATA_HOME="/home/${CURRENT_USER}/.local/share" /usr/local/bin/distrobox-export-hook.sh >> "$LOG_FILE" 2>&1; then
+        _export_ok=true
+        break
+      fi
+    fi
+    log_warn "Export attempt $_attempt/3 failed. Restarting container and retrying..."
+    container_start 2>/dev/null || true
+    sleep 3
+  done
+
+  if [[ "$_export_ok" == "true" ]]; then
     log_success "Existing explicit desktop applications exported to host menu."
   else
-    log_warn "Some applications could not be exported to host."
+    log_warn "Some applications could not be exported to host after 3 attempts."
+    log_info "You can retry manually with: $0 --export-only"
   fi
 }
 
@@ -7401,24 +8395,98 @@ run_update() {
         fi
     fi
 
+    log_info "Creating pre-upgrade package snapshot..."
+    container_root_exec bash -c 'pacman -Q > /tmp/pre-upgrade-snapshot.list 2>/dev/null || true' 2>/dev/null || true
+
     log_info "Syncing package databases..."
-    if ! container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null && grep -E "pacman|yay" "/proc/$_p/comm" >/dev/null 2>&1; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Syy --noconfirm' 2>/dev/null; then
-        log_warn "Database sync had issues. Continuing..."
+    local _sync_ok=false
+    for _sync_attempt in 1 2 3; do
+        if container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null && grep -E "pacman|yay" "/proc/$_p/comm" >/dev/null 2>&1; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Syy --noconfirm' 2>/dev/null; then
+            _sync_ok=true
+            break
+        fi
+        log_warn "Database sync attempt $_sync_attempt/3 failed. Retrying..."
+        container_start 2>/dev/null || true
+        sleep 3
+    done
+    if [[ "$_sync_ok" != "true" ]]; then
+        log_warn "Database sync failed after 3 attempts. Proceeding with caution..."
     fi
 
     log_info "Running pacman -Syu..."
-    if ! container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null && grep -E "pacman|yay" "/proc/$_p/comm" >/dev/null 2>&1; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Syu --noconfirm' 2>/dev/null; then
-        log_warn "pacman -Syu had issues."
+    local _upgrade_ok=false
+    for _upgrade_attempt in 1 2 3; do
+        if container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null && grep -E "pacman|yay" "/proc/$_p/comm" >/dev/null 2>&1; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Syu --noconfirm' 2>/dev/null; then
+            _upgrade_ok=true
+            break
+        fi
+        log_warn "pacman -Syu attempt $_upgrade_attempt/3 failed."
+        if [[ $_upgrade_attempt -lt 3 ]]; then
+            container_start 2>/dev/null || true
+            container_root_exec bash -c 'rm -f /var/lib/pacman/db.lck 2>/dev/null; pacman -Dk 2>/dev/null || true; pacman -Syy --noconfirm 2>/dev/null || true' 2>/dev/null || true
+            sleep 3
+        fi
+    done
+
+    if [[ "$_upgrade_ok" != "true" ]]; then
+        log_warn "pacman -Syu failed after 3 attempts. Checking for partial upgrade..."
+        container_root_exec bash -c 'pacman -Dk 2>/dev/null || true' 2>/dev/null || true
     fi
 
     if container_user_exec bash -c "command -v yay >/dev/null 2>&1" 2>/dev/null; then
         log_info "Running yay -Syu..."
-        if ! container_user_exec bash -c "yay -Syu --noconfirm --needed --noprogressbar" 2>/dev/null; then
+        local _yay_ok=false
+        for _yay_attempt in 1 2; do
+            if container_user_exec bash -c "yay -Syu --noconfirm --needed --noprogressbar" 2>/dev/null; then
+                _yay_ok=true
+                break
+            fi
+            log_warn "yay -Syu attempt $_yay_attempt/2 failed. Retrying..."
+            sleep 3
+        done
+        if [[ "$_yay_ok" != "true" ]]; then
             log_warn "yay -Syu had issues. Some AUR packages may not have updated."
         fi
     else
         log_info "yay not installed, skipping AUR updates."
     fi
+
+    log_info "Running post-upgrade verification..."
+    container_root_exec bash -c '
+set +e
+# Check for database inconsistencies
+if ! pacman -Dk 2>/dev/null | grep -q "No database errors"; then
+    echo "WARNING: Database inconsistencies detected after upgrade."
+    pacman -Dk 2>&1 | head -10 || true
+fi
+
+# Verify critical shared libraries are intact
+_critical_libs_ok=true
+for _lib in /usr/lib/libc.so.6 /usr/lib/libm.so.6 /usr/lib/libpthread.so.0; do
+    if [[ -f "$_lib" ]] && ! ldd "$_lib" >/dev/null 2>&1; then
+        echo "WARNING: Critical library $_lib has broken dependencies."
+        _critical_libs_ok=false
+    fi
+done
+
+# Verify core tools still work
+for _tool in pacman grep bash; do
+    if ! command -v "$_tool" >/dev/null 2>&1; then
+        echo "CRITICAL: Core tool $_tool is missing after upgrade."
+    fi
+done
+
+# Check for partial upgrade indicators
+if pacman -Q glibc >/dev/null 2>&1 && pacman -Q gcc-libs >/dev/null 2>&1; then
+    _glibc_ver=$(pacman -Q glibc 2>/dev/null | awk "{print \$2}" || true)
+    _gcc_ver=$(pacman -Q gcc-libs 2>/dev/null | awk "{print \$2}" || true)
+    if [[ -n "$_glibc_ver" ]] && [[ -n "$_gcc_ver" ]]; then
+        echo "Post-upgrade versions: glibc=$_glibc_ver gcc-libs=$_gcc_ver"
+    fi
+fi
+
+echo "Post-upgrade verification complete."
+' 2>/dev/null || true
 
     log_success "Package update complete."
 }

@@ -8001,22 +8001,6 @@ When = PostTransaction
 Exec = /usr/bin/rm -rf /var/lib/pacman/sync/download-*
 CLEANUP_HOOK
 
-# Hook to restart pamac-daemon after every transaction
-# (daemon caches DB state in memory; stale cache causes "corrupt database")
-cat > "$hook_dir/98-restart-pamac-daemon.hook" << 'DAEMON_HOOK'
-[Trigger]
-Operation = Install
-Operation = Upgrade
-Operation = Remove
-Type = Package
-Target = *
-
-[Action]
-Description = Restarting pamac-daemon for fresh database state...
-When = PostTransaction
-Exec = /bin/bash -c "pkill -x pamac-daemon 2>/dev/null; sleep 1; /usr/bin/pamac-daemon &"
-DAEMON_HOOK
-
 cat > "$hook_dir/99-distrobox-export.hook" << 'HOOKDEF'
 [Trigger]
 Operation = Install

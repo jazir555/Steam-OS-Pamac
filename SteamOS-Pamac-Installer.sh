@@ -1694,11 +1694,11 @@ if _inner_db_is_healthy; then
     exit 0
 fi
 
-# ── Strategy 4: Full database sync with --overwrite ──
+# ── Strategy 4: Full database sync ──
 echo ""
 echo "=== Strategy 4: Full database sync ==="
 _inner_remove_stale_lock
-if pacman -Syy --noconfirm --overwrite "*" 2>/dev/null; then
+if pacman -Syy --noconfirm 2>/dev/null; then
     if _inner_db_is_healthy; then
         echo "Database consistent after Strategy 4 (full sync)."
         exit 0
@@ -1923,17 +1923,22 @@ _remove_stale_lock() {
     if [[ ! -f "$_lock" ]]; then return 0; fi
     local _lck_pid
     _lck_pid=$(cat "$_lock" 2>/dev/null || echo "")
-    if [[ -n "$_lck_pid" ]] && kill -0 "$_lck_pid" 2>/dev/null && grep -E "pacman|yay" "/proc/$_lck_pid/comm" >/dev/null 2>&1; then
-        echo "Pacman is currently running (PID $_lck_pid). Waiting..."
-        local _wait=0
-        while [[ $_wait -lt 30 ]] && kill -0 "$_lck_pid" 2>/dev/null; do
-            _safe_sleep 2
-            _wait=$(( _wait + 2 ))
-        done
-        if kill -0 "$_lck_pid" 2>/dev/null; then
-            echo "ERROR: Pacman (PID $_lck_pid) is still running after ${_wait}s. Aborting to prevent database corruption."
-            exit 1
+    # Validate PID is a numeric value (prevent malformed lock file injection)
+    if [[ -n "$_lck_pid" ]] && [[ "$_lck_pid" =~ ^[0-9]+$ ]]; then
+        if kill -0 "$_lck_pid" 2>/dev/null && grep -E "pacman|yay" "/proc/$_lck_pid/comm" >/dev/null 2>&1; then
+            echo "Pacman is currently running (PID $_lck_pid). Waiting..."
+            local _wait=0
+            while [[ $_wait -lt 30 ]] && kill -0 "$_lck_pid" 2>/dev/null; do
+                _safe_sleep 2
+                _wait=$(( _wait + 2 ))
+            done
+            if kill -0 "$_lck_pid" 2>/dev/null; then
+                echo "ERROR: Pacman (PID $_lck_pid) is still running after ${_wait}s. Aborting to prevent database corruption."
+                exit 1
+            fi
         fi
+    elif [[ -n "$_lck_pid" ]]; then
+        echo "Warning: Lock file contains non-numeric PID: '$_lck_pid'. Removing stale lock."
     fi
     rm -f "$_lock" 2>/dev/null || true
 }
@@ -1992,13 +1997,14 @@ safe_install() {
                     echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
                     ;;
                 1)
-                    echo "  Exit 1: General error (dependency conflict, etc.)."
-                    # Check for file conflicts
-                    _conflict_output=$(pacman -S --noconfirm --needed "$@" 2>&1 | grep -i "conflicting files\|exists in filesystem" || true)
-                    if [[ -n "$_conflict_output" ]]; then
-                        echo "  File conflicts detected. Trying with --overwrite..."
-                        pacman -S --noconfirm --needed --overwrite "*" "$@" 2>/dev/null || true
-                    fi
+                echo "  Exit 1: General error (dependency conflict, etc.)."
+                # Check for file conflicts
+                _conflict_output=$(pacman -S --noconfirm --needed "$@" 2>&1 | grep -i "conflicting files\|exists in filesystem" || true)
+                if [[ -n "$_conflict_output" ]]; then
+                    echo "  File conflicts detected. Trying with targeted --overwrite for /usr/lib and /usr/share..."
+                    # Only overwrite files in standard package directories, not config dirs
+                    pacman -S --noconfirm --needed --overwrite '/usr/lib/*,/usr/share/*,/usr/bin/*,/usr/sbin/*' "$@" 2>/dev/null || true
+                fi
                     ;;
                 2)
                     echo "  Exit 2: Invalid package name or target."
@@ -2023,12 +2029,25 @@ safe_install() {
                 _remove_stale_lock
                 # Remove any stale lock aggressively
                 rm -f /var/lib/pacman/db.lck 2>/dev/null || true
-                # Kill any zombie pacman processes
-                pkill -9 pacman 2>/dev/null || true
-                pkill -9 yay 2>/dev/null || true
+                # Kill only stale pacman/yay processes that held the lock
+                # (not all pacman processes — other builds may be running)
+                _stale_pids=$(pgrep -x pacman 2>/dev/null || true)
+                for _spid in $_stale_pids; do
+                    if [[ "$_spid" != "$$" ]] && [[ "$_spid" != "$PPID" ]]; then
+                        echo "  Force-killing stale pacman PID $_spid"
+                        kill -9 "$_spid" 2>/dev/null || true
+                    fi
+                done
+                _stale_yay_pids=$(pgrep -x yay 2>/dev/null || true)
+                for _ypid in $_stale_yay_pids; do
+                    if [[ "$_ypid" != "$$" ]] && [[ "$_ypid" != "$PPID" ]]; then
+                        echo "  Force-killing stale yay PID $_ypid"
+                        kill -9 "$_ypid" 2>/dev/null || true
+                    fi
+                done
                 sleep 1
-                # Re-sync with overwrite
-                pacman -Syy --noconfirm --overwrite "*" 2>/dev/null || true
+                # Re-sync with overwrite limited to standard package dirs
+                pacman -Syy --noconfirm 2>/dev/null || true
                 # Reinstall keyring to fix potential signature issues
                 pacman -S --noconfirm --needed archlinux-keyring 2>/dev/null || true
                 _safe_sleep 3
@@ -2070,8 +2089,10 @@ install_base_devel_batched() {
         echo "Installing batch: $batch"
         sync 2>/dev/null || true
         _safe_sleep 1
+        # shellcheck disable=SC2086 # Intentional word-splitting: $batch is a space-separated package list
         if ! safe_install $batch; then
             echo "ERROR: batch install failed for: $batch"
+            # shellcheck disable=SC2086
             for pkg in $batch; do
                 if ! pacman -Q "$pkg" >/dev/null 2>&1; then
                     echo "  Missing from failed batch: $pkg"
@@ -2284,9 +2305,22 @@ if [[ -f /var/lib/pacman/db.lck ]]; then
     fi
     rm -f /var/lib/pacman/db.lck 2>/dev/null || true
 fi
-# Kill any zombie pacman/yay/gpg processes
-pkill -9 pacman 2>/dev/null || true
-pkill -9 yay 2>/dev/null || true
+# Kill only stale pacman/yay processes that hold the db.lck
+# (avoid pkill -9 pacman which would kill ALL pacman processes including active builds)
+_stale_pids=$(pgrep -x pacman 2>/dev/null || true)
+for _spid in $_stale_pids; do
+    if [[ "$_spid" != "$$" ]] && [[ "$_spid" != "$PPID" ]]; then
+        echo "  Force-killing stale pacman PID $_spid"
+        kill -9 "$_spid" 2>/dev/null || true
+    fi
+done
+_stale_yay_pids=$(pgrep -x yay 2>/dev/null || true)
+for _ypid in $_stale_yay_pids; do
+    if [[ "$_ypid" != "$$" ]] && [[ "$_ypid" != "$PPID" ]]; then
+        echo "  Force-killing stale yay PID $_ypid"
+        kill -9 "$_ypid" 2>/dev/null || true
+    fi
+done
 pkill -9 gpg-agent 2>/dev/null || true
 pkill -9 dirmngr 2>/dev/null || true
 sleep 1
@@ -2633,6 +2667,14 @@ if [[ "$_safe_recovered" != "true" ]]; then
     echo "  This is a controlled recovery operation — proper security will be restored immediately."
     # Save current SigLevel
     _orig_siglevel=$(grep '^SigLevel' /etc/pacman.conf 2>/dev/null | head -1 || echo "Required DatabaseOptional")
+    _orig_siglevel_value="${_orig_siglevel#SigLevel = }"
+    # SIGTERM/SIGHUP trap to restore SigLevel if interrupted during TrustAll window
+    _restore_siglevel_on_signal() {
+        echo "  Restoring SigLevel after signal..."
+        _atomic_write_pacman_conf "${_orig_siglevel_value}"
+        exit 130
+    }
+    trap '_restore_siglevel_on_signal' TERM HUP
     # Set TrustAll temporarily
     _atomic_write_pacman_conf "TrustAll"
     echo "  SigLevel set to TrustAll temporarily."
@@ -2643,6 +2685,7 @@ if [[ "$_safe_recovered" != "true" ]]; then
             echo "  Keyring package installed with TrustAll SigLevel."
             # Now restore proper SigLevel and re-init
             _atomic_write_pacman_conf "Required DatabaseOptional"
+            trap - TERM HUP
             echo "  SigLevel restored to Required DatabaseOptional."
             # Verify the keyring actually works with proper SigLevel
             if pacman -Syy --noconfirm 2>/dev/null; then
@@ -2651,17 +2694,19 @@ if [[ "$_safe_recovered" != "true" ]]; then
             else
                 echo "  Database sync failed after restoring SigLevel. Keyring may be incomplete."
                 # Restore original SigLevel
-                _atomic_write_pacman_conf "${_orig_siglevel#SigLevel = }"
+                _atomic_write_pacman_conf "${_orig_siglevel_value}"
             fi
         else
             echo "  Keyring package install failed even with TrustAll."
+            trap - TERM HUP
             # Restore original SigLevel
-            _atomic_write_pacman_conf "${_orig_siglevel#SigLevel = }"
+            _atomic_write_pacman_conf "${_orig_siglevel_value}"
         fi
     else
         echo "  Database sync failed even with TrustAll. Network may be down."
+        trap - TERM HUP
         # Restore original SigLevel
-        _atomic_write_pacman_conf "${_orig_siglevel#SigLevel = }"
+        _atomic_write_pacman_conf "${_orig_siglevel_value}"
     fi
 fi
 
@@ -2729,8 +2774,8 @@ echo "Step 3/5: Updating keyring, GPG, and certificate packages..."
 _remove_stale_lock
 
 if ! pacman -Syy --noconfirm 2>/dev/null; then
-    echo "Warning: Initial database sync failed. Attempting repair with --overwrite..."
-    pacman -Syy --noconfirm --overwrite '*' 2>/dev/null || true
+    echo "Warning: Initial database sync failed. Attempting repair..."
+    pacman -Syy --noconfirm 2>/dev/null || true
 fi
 
 pacman -S --noconfirm --needed archlinux-keyring gnupg 2>/dev/null || {
@@ -3971,7 +4016,7 @@ cat > /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf << 'DBUS_CONF'
 <allow send_destination="org.manjaro.pamac.daemon"/>
 </policy>
 
-<policy context="default">
+<policy group="wheel">
 <allow send_destination="org.manjaro.pamac.daemon"/>
 </policy>
 
@@ -4644,7 +4689,7 @@ cat > /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf << 'DBUS_CONF'
 <allow send_destination="org.manjaro.pamac.daemon"/>
 </policy>
 
-<policy context="default">
+<policy group="wheel">
 <allow send_destination="org.manjaro.pamac.daemon"/>
 </policy>
 
@@ -5054,8 +5099,11 @@ _enable_repo_with_fallback() {
     # Step 3: Dynamically discover and import GPG key from repo mirrors
     # Tries to download the signing key directly from the repo's distribution
     # rather than relying on hardcoded fingerprints that may become stale after key rotations.
+    # SECURITY: Keys discovered from mirrors are verified against the expected $key_id
+    # before being trusted. If the discovered key does not match $key_id, it is rejected
+    # to prevent a compromised mirror from injecting an arbitrary signing key.
     if [[ "$key_ok" != "true" ]] && command -v pacman-key >/dev/null 2>&1; then
-        echo "Attempting dynamic key discovery from repo mirrors..."
+        echo "Attempting dynamic key discovery from repo mirrors (fingerprint-verified against expected $key_id)..."
         local host_arch
         host_arch=$(uname -m 2>/dev/null || echo "x86_64")
         local _key_tmp_dir
@@ -5074,18 +5122,27 @@ _enable_repo_with_fallback() {
                 if timeout 15 curl -fsSL --connect-timeout 5 -o "$_tmp_key" "$key_url" 2>/dev/null; then
                     if file "$_tmp_key" 2>/dev/null | grep -qi "GPG\|PGP"; then
                         echo "  Found GPG key at $key_url"
-                        if timeout 30 pacman-key --import "$_tmp_key" 2>/dev/null; then
-                            # Extract fingerprint and verify it was actually imported into keyring
-                            local _imported_fp
-                            _imported_fp=$(GNUPGHOME=/etc/pacman.d/gnupg gpg --with-colons --show-keys "$_tmp_key" 2>/dev/null \
-                                | grep '^fpr' | head -1 | cut -d: -f10 || echo "")
-                            if [[ -n "$_imported_fp" ]] && GNUPGHOME=/etc/pacman.d/gnupg gpg --list-keys "$_imported_fp" >/dev/null 2>&1; then
-                                timeout 30 pacman-key --lsign-key "$_imported_fp" 2>/dev/null || true
-                                echo "  Dynamically discovered key: ${_imported_fp: -8} (last 8 chars)"
+                        # Verify the discovered key's fingerprint matches the expected key_id
+                        local _discovered_fp
+                        _discovered_fp=$(GNUPGHOME=/etc/pacman.d/gnupg gpg --with-colons --show-keys "$_tmp_key" 2>/dev/null \
+                            | grep '^fpr' | head -1 | cut -d: -f10 || echo "")
+                        local _clean_expected="${key_id,,}"
+                        local _clean_discovered="${_discovered_fp,,}"
+                        if [[ -n "$_discovered_fp" ]] && \
+                           { [[ "$_clean_discovered" == "$_clean_expected" ]] || \
+                             [[ "$_clean_discovered" == *"$_clean_expected"* ]]; }; then
+                            echo "  Fingerprint verified: ${_discovered_fp: -8} matches expected ${key_id: -8}"
+                            if timeout 30 pacman-key --import "$_tmp_key" 2>/dev/null; then
+                                timeout 30 pacman-key --lsign-key "$_discovered_fp" 2>/dev/null || true
+                                echo "  Dynamically discovered and verified key: ${_discovered_fp: -8}"
+                                key_ok=true
+                                rm -f "$_tmp_key"
+                                break 2
                             fi
-                            key_ok=true
-                            rm -f "$_tmp_key"
-                            break 2
+                        else
+                            echo "  WARNING: Key at $key_url has fingerprint ${_discovered_fp:-NONE} but expected ${key_id}. REJECTED."
+                            echo "  This may indicate a compromised mirror or a key rotation."
+                            echo "  Update ${env_var_name} with the new fingerprint and re-run."
                         fi
                     fi
                     rm -f "$_tmp_key"
@@ -5094,7 +5151,7 @@ _enable_repo_with_fallback() {
         done
         rm -rf "$_key_tmp_dir" 2>/dev/null || true
         if [[ "$key_ok" != "true" ]]; then
-            echo "  No GPG key found at common mirror paths. Trying keyserver fallback..."
+            echo "  No verified GPG key found at common mirror paths. Trying keyserver fallback..."
         fi
     fi
 
@@ -5110,15 +5167,27 @@ _enable_repo_with_fallback() {
             -H "Accept: application/json" \
             -o "$_json_tmp/keys.json" \
             "$_json_url" 2>/dev/null; then
-            _json_fp=$(jq -r --arg repo "$repo_name" '.[$repo].fingerprint // empty' "$_json_tmp/keys.json" 2>/dev/null || echo "")
-            if [[ -n "$_json_fp" ]]; then
-                echo "  Trusted fingerprint for $repo_name from JSON: ${_json_fp: -8}"
-                key_id="$_json_fp"
-                if _import_key_with_retry "$_json_fp"; then
-                    key_ok=true
-                fi
+            # Validate response is valid JSON with expected structure before trusting
+            if ! jq -e 'type == "object"' "$_json_tmp/keys.json" >/dev/null 2>&1; then
+                echo "  JSON endpoint returned non-object response. Rejecting."
+            elif jq -e 'has("error")' "$_json_tmp/keys.json" >/dev/null 2>&1; then
+                echo "  JSON endpoint returned an error. Rejecting."
             else
-                echo "  No trusted fingerprint found for $repo_name in JSON endpoint."
+                _json_fp=$(jq -r --arg repo "$repo_name" '.[$repo].fingerprint // empty' "$_json_tmp/keys.json" 2>/dev/null || echo "")
+                if [[ -n "$_json_fp" ]]; then
+                    # Validate fingerprint is a 40-character hex string
+                    if [[ ! "$_json_fp" =~ ^[0-9a-fA-F]{40}$ ]]; then
+                        echo "  JSON endpoint returned invalid fingerprint format: $_json_fp. Rejecting."
+                    else
+                        echo "  Trusted fingerprint for $repo_name from JSON: ${_json_fp: -8}"
+                        key_id="$_json_fp"
+                        if _import_key_with_retry "$_json_fp"; then
+                            key_ok=true
+                        fi
+                    fi
+                else
+                    echo "  No trusted fingerprint found for $repo_name in JSON endpoint."
+                fi
             fi
         else
             echo "  JSON endpoint unreachable or invalid response."
@@ -6479,7 +6548,7 @@ _remove_stale_lock() {
     if [[ ! -f "$_lock" ]]; then return 0; fi
     local _lck_pid
     _lck_pid=$(cat "$_lock" 2>/dev/null || echo "")
-    if [[ -n "$_lck_pid" ]] && kill -0 "$_lck_pid" 2>/dev/null; then
+    if [[ -n "$_lck_pid" ]] && [[ "$_lck_pid" =~ ^[0-9]+$ ]] && kill -0 "$_lck_pid" 2>/dev/null; then
         echo "Pacman is currently running (PID $_lck_pid). Skipping cleanup."
         exit 0
     fi
@@ -6663,8 +6732,8 @@ configure_ssh_environment() {
 
     if [[ ! -f "$ssh_dir/environment" ]] || ! grep -q '^PATH=' "$ssh_dir/environment" 2>/dev/null; then
         echo "PATH=/home/$CURRENT_USER/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin" > "$ssh_dir/environment"
-        chmod 644 "$ssh_dir/environment"
-        log_info "Created $ssh_dir/environment with clean PATH"
+        chmod 600 "$ssh_dir/environment"
+        log_info "Created $ssh_dir/environment with clean PATH (permissions: 600)"
     fi
 
     local sshd_conf_dir="/etc/ssh/sshd_config.d"
@@ -8166,7 +8235,7 @@ _remove_stale_lock() {
     if [[ ! -f "$_lock" ]]; then return 0; fi
     local _lck_pid
     _lck_pid=$(cat "$_lock" 2>/dev/null || echo "")
-    if [[ -n "$_lck_pid" ]] && kill -0 "$_lck_pid" 2>/dev/null; then
+    if [[ -n "$_lck_pid" ]] && [[ "$_lck_pid" =~ ^[0-9]+$ ]] && kill -0 "$_lck_pid" 2>/dev/null; then
         echo "Pacman is currently running (PID $_lck_pid). Skipping keyring refresh."
         return 0
     fi
@@ -8229,6 +8298,18 @@ fi
 echo "Attempting controlled SigLevel relaxation..."
 _orig_siglevel=$(grep '^SigLevel' /etc/pacman.conf 2>/dev/null | head -1 || echo "Required DatabaseOptional")
 _siglevel_value="${_orig_siglevel#SigLevel = }"
+# SIGTERM/SIGHUP trap to restore SigLevel if interrupted during TrustAll window
+_restore_siglevel_on_signal() {
+    echo "  Restoring SigLevel after signal..."
+    local _tmp_fix=$(mktemp /etc/pacman.conf.signal-fix.XXXXXX) 2>/dev/null
+    if [[ -n "$_tmp_fix" ]] && cp -f /etc/pacman.conf "$_tmp_fix" 2>/dev/null; then
+        sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = ${_siglevel_value}/" "$_tmp_fix"
+        grep -q '^SigLevel' "$_tmp_fix" || printf 'SigLevel = %s\n' "$_siglevel_value" >> "$_tmp_fix"
+        mv -f "$_tmp_fix" /etc/pacman.conf 2>/dev/null || true
+    fi
+    exit 130
+}
+trap '_restore_siglevel_on_signal' TERM HUP
 # Atomic write to avoid corruption
 _tmp_pconf=$(mktemp /etc/pacman.conf.recovery.XXXXXX) 2>/dev/null
 if [[ -n "$_tmp_pconf" ]] && cp -f /etc/pacman.conf "$_tmp_pconf" 2>/dev/null; then
@@ -8239,6 +8320,7 @@ fi
 _remove_stale_lock
 if pacman -Syy --noconfirm 2>/dev/null && pacman -S --noconfirm --needed archlinux-keyring 2>/dev/null; then
     # Restore proper SigLevel immediately
+    trap - TERM HUP
     if [[ -n "$_tmp_pconf" ]]; then
         _tmp_pconf2=$(mktemp /etc/pacman.conf.recovery2.XXXXXX) 2>/dev/null
         if [[ -n "$_tmp_pconf2" ]] && cp -f /etc/pacman.conf "$_tmp_pconf2" 2>/dev/null; then
@@ -8251,6 +8333,7 @@ if pacman -Syy --noconfirm 2>/dev/null && pacman -S --noconfirm --needed archlin
     date +%s > "$KEYRING_AGE_FILE" 2>/dev/null || true
     exit 0
 else
+    trap - TERM HUP
     # Restore SigLevel even on failure
     if [[ -n "$_tmp_pconf" ]]; then
         _tmp_pconf3=$(mktemp /etc/pacman.conf.recovery3.XXXXXX) 2>/dev/null

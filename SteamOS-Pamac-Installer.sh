@@ -166,14 +166,6 @@ container_runtime() {
     fi
 }
 
-
-# SECURITY: Running as host root significantly weakens container isolation.
-_SUDO_VERIFIED=""
-# sudo credentials can expire mid-run (timestamp_timeout). Cache the last-known
-# successful verification timestamp and re-check after SUDO_REVALIDATE_SECONDS
-# so a privileged call doesn't hang on a password prompt once creds lapse.
-_SUDO_VERIFIED_AT=0
-SUDO_REVALIDATE_SECONDS="${SUDO_REVALIDATE_SECONDS:-60}"
 container_runtime_privileged() {
     container_runtime "$@"
 }
@@ -914,7 +906,6 @@ repair_podman() {
     log_error "     Ensure /home is writable (it should be by default on Steam Deck)."
     log_error ""
     log_error "After fixing, try running this script again."
-    log_error "to run the container as host root, but this weakens security significantly."
     return 1
 }
 

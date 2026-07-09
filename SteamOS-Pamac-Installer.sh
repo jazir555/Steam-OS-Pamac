@@ -92,6 +92,7 @@ PIN_ALPM="${PIN_ALPM:-true}"
 readonly EXIT_USER_ABORT=130
 
 setup_colors() {
+    [[ -n "${GREEN:-}" ]] && return 0
     if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
         GREEN=$(tput setaf 2); readonly GREEN
         YELLOW=$(tput setaf 3); readonly YELLOW
@@ -262,6 +263,10 @@ container_root_exec() {
     if ! container_is_usable; then
       log_warn "Container not usable before root exec. Attempting anyway..."
     fi
+  fi
+  if command -v distrobox-enter >/dev/null 2>&1; then
+    distrobox-enter "$CONTAINER_NAME" --root -- "$@" 2>/dev/null && return 0
+    log_debug "distrobox-enter --root failed, falling back to direct container exec"
   fi
   container_runtime_privileged exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" "$@"
 }
@@ -1508,7 +1513,7 @@ repair_pacman_db() {
 set +e
 if [[ -f /var/lib/pacman/db.lck ]]; then
     _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo "")
-    if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null; then
+    if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null && grep -E "pacman|yay" "/proc/$_p/comm" >/dev/null 2>&1; then
         echo "Pacman running (PID $_p), waiting..."
         _w=0
         while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do
@@ -1589,7 +1594,7 @@ _remove_stale_lock() {
     if [[ ! -f "$_lock" ]]; then return 0; fi
     local _lck_pid
     _lck_pid=$(cat "$_lock" 2>/dev/null || echo "")
-    if [[ -n "$_lck_pid" ]] && kill -0 "$_lck_pid" 2>/dev/null; then
+    if [[ -n "$_lck_pid" ]] && kill -0 "$_lck_pid" 2>/dev/null && grep -E "pacman|yay" "/proc/$_lck_pid/comm" >/dev/null 2>&1; then
         echo "Pacman is currently running (PID $_lck_pid). Waiting..."
         local _wait=0
         while [[ $_wait -lt 30 ]] && kill -0 "$_lck_pid" 2>/dev/null; do
@@ -1873,7 +1878,7 @@ _exec_handle_result() {
                 done
             fi
         fi
-        container_root_exec bash -c "if [[ -f /var/lib/pacman/db.lck ]]; then _p=\$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ''); if [[ -n \$_p ]] && kill -0 \$_p 2>/dev/null; then echo \"Pacman running (PID \$_p), waiting...\"; _w=0; while [[ \$_w -lt 30 ]] && kill -0 \$_p 2>/dev/null; do sleep 2; _w=\$(( _w + 2 )); done; if kill -0 \$_p 2>/dev/null; then echo \"ERROR: Pacman (PID \$_p) still running after 30s. Aborting.\"; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pkill -9 gpg-agent 2>/dev/null || true" 2>/dev/null || true
+        container_root_exec bash -c "if [[ -f /var/lib/pacman/db.lck ]]; then _p=\$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ''); if [[ -n \"\$_p\" ]] && kill -0 \"\$_p\" 2>/dev/null && grep -E 'pacman|yay' /proc/\$_p/comm >/dev/null 2>&1; then echo \"Pacman running (PID \$_p), waiting...\"; _w=0; while [[ \$_w -lt 30 ]] && kill -0 \"\$_p\" 2>/dev/null; do sleep 2; _w=\$(( _w + 2 )); done; if kill -0 \"\$_p\" 2>/dev/null; then echo \"ERROR: Pacman (PID \$_p) still running after 30s. Aborting.\"; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pkill -9 gpg-agent 2>/dev/null || true" 2>/dev/null || true
         container_start 2>/dev/null || true
         repair_pacman_db
         return "$_rc"
@@ -2474,7 +2479,7 @@ DEV_EOF
     for _dep in git gcc go; do
         if ! container_root_exec bash -c "command -v $_dep >/dev/null 2>&1 || pacman -Q $_dep >/dev/null 2>&1" 2>/dev/null; then
             log_warn "Development dependency '$_dep' not found after install stage. Attempting recovery..."
-            container_root_exec bash -c "if [[ -f /var/lib/pacman/db.lck ]]; then _p=\$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ''); if [[ -n \$_p ]] && kill -0 \$_p 2>/dev/null; then echo \"Pacman running (PID \$_p), waiting...\"; _w=0; while [[ \$_w -lt 30 ]] && kill -0 \$_p 2>/dev/null; do sleep 2; _w=\$(( _w + 2 )); done; if kill -0 \$_p 2>/dev/null; then echo \"ERROR: Pacman (PID \$_p) still running after 30s. Aborting.\"; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -S --noconfirm --needed $_dep" 2>/dev/null || true
+            container_root_exec bash -c "if [[ -f /var/lib/pacman/db.lck ]]; then _p=\$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ''); if [[ -n \"\$_p\" ]] && kill -0 \"\$_p\" 2>/dev/null && grep -E 'pacman|yay' /proc/\$_p/comm >/dev/null 2>&1; then echo \"Pacman running (PID \$_p), waiting...\"; _w=0; while [[ \$_w -lt 30 ]] && kill -0 \"\$_p\" 2>/dev/null; do sleep 2; _w=\$(( _w + 2 )); done; if kill -0 \"\$_p\" 2>/dev/null; then echo \"ERROR: Pacman (PID \$_p) still running after 30s. Aborting.\"; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -S --noconfirm --needed $_dep" 2>/dev/null || true
         fi
     done
 
@@ -4449,7 +4454,7 @@ install_aur_helper() {
     fi
 
     log_info "Attempting to install yay from prebuilt repositories..."
-    if container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Sy --noconfirm 2>/dev/null; pacman -S --noconfirm --needed yay 2>/dev/null; command -v yay >/dev/null 2>&1 && echo __PREBUILT_OK__' 2>/dev/null | grep -q "__PREBUILT_OK__"; then
+    if container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null && grep -E "pacman|yay" "/proc/$_p/comm" >/dev/null 2>&1; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Sy --noconfirm 2>/dev/null; pacman -S --noconfirm --needed yay 2>/dev/null; command -v yay >/dev/null 2>&1 && echo __PREBUILT_OK__' 2>/dev/null | grep -q "__PREBUILT_OK__"; then
         log_success "AUR helper yay installed from prebuilt repository."
         return 0
     fi
@@ -4626,13 +4631,22 @@ sanitize_version_component() {
 }
 
 pacman_major=$(echo "$installed_pacman_ver" | sanitize_version_component)
-# For minor, strip epoch first, then get the second dot-separated component
-_pacman_minor_raw=$(echo "$installed_pacman_ver" | sed 's/^[^:]*://')
-_pacman_minor_raw=$(echo "$_pacman_minor_raw" | cut -d. -f2)
-pacman_minor=$(echo "$_pacman_minor_raw" | grep -oP '^[0-9]*' || echo "0")
+# Strip epoch first, then extract minor/patch only when dot delimiters exist
+# (avoids cut -d. -f2 returning the full string when there is no dot)
+_pacman_ver_stripped=$(echo "$installed_pacman_ver" | sed 's/^[^:]*://')
+if [[ "$_pacman_ver_stripped" == *.* ]]; then
+    _pacman_minor_raw=$(echo "$_pacman_ver_stripped" | cut -d. -f2)
+    pacman_minor=$(echo "$_pacman_minor_raw" | grep -oP '^[0-9]+' || echo "0")
+else
+    pacman_minor=0
+fi
 [[ -z "$pacman_minor" ]] && pacman_minor=0
-_pacman_patch_raw=$(echo "$installed_pacman_ver" | sed 's/^[^:]*://' | cut -d. -f3)
-pacman_patch=$(echo "$_pacman_patch_raw" | grep -oP '^[0-9]*' || echo "0")
+if [[ "$_pacman_ver_stripped" == *.*.* ]]; then
+    _pacman_patch_raw=$(echo "$_pacman_ver_stripped" | cut -d. -f3)
+    pacman_patch=$(echo "$_pacman_patch_raw" | grep -oP '^[0-9]+' || echo "0")
+else
+    pacman_patch=0
+fi
 [[ -z "$pacman_patch" ]] && pacman_patch=0
 echo "Parsed pacman version: major=$pacman_major minor=$pacman_minor patch=$pacman_patch (raw: $installed_pacman_ver)"
 
@@ -4777,11 +4791,19 @@ req_op=$(echo "$aur_pacman_dep" | grep -oP "[><=]+" | head -1 || echo "")
 echo "Required: pacman $req_op $req_version"
 
 req_major=$(echo "$req_version" | sanitize_version_component)
-_req_minor_raw=$(echo "$req_version" | cut -d. -f2)
-req_minor=$(echo "$_req_minor_raw" | grep -oP '^[0-9]*' || echo "0")
+if [[ "$req_version" == *.* ]]; then
+    _req_minor_raw=$(echo "$req_version" | cut -d. -f2)
+    req_minor=$(echo "$_req_minor_raw" | grep -oP '^[0-9]+' || echo "0")
+else
+    req_minor=0
+fi
 [[ -z "$req_minor" ]] && req_minor=0
-_req_patch_raw=$(echo "$req_version" | cut -d. -f3)
-req_patch=$(echo "$_req_patch_raw" | grep -oP '^[0-9]*' || echo "0")
+if [[ "$req_version" == *.*.* ]]; then
+    _req_patch_raw=$(echo "$req_version" | cut -d. -f3)
+    req_patch=$(echo "$_req_patch_raw" | grep -oP '^[0-9]+' || echo "0")
+else
+    req_patch=0
+fi
 [[ -z "$req_patch" ]] && req_patch=0
 
 version_meets_requirement() {
@@ -4882,11 +4904,20 @@ if [[ "$can_upgrade_pacman" == "true" ]]; then
             new_ver=$(pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
             echo "Upgraded pacman to: $new_ver"
             new_major=$(echo "$new_ver" | sanitize_version_component)
-            _new_minor_raw=$(echo "$new_ver" | sed 's/^[^:]*://' | cut -d. -f2)
-            new_minor=$(echo "$_new_minor_raw" | grep -oP '^[0-9]*' || echo "0")
+            _new_ver_stripped=$(echo "$new_ver" | sed 's/^[^:]*://')
+            if [[ "$_new_ver_stripped" == *.* ]]; then
+                _new_minor_raw=$(echo "$_new_ver_stripped" | cut -d. -f2)
+                new_minor=$(echo "$_new_minor_raw" | grep -oP '^[0-9]+' || echo "0")
+            else
+                new_minor=0
+            fi
             [[ -z "$new_minor" ]] && new_minor=0
-            _new_patch_raw=$(echo "$new_ver" | sed 's/^[^:]*://' | cut -d. -f3)
-            new_patch=$(echo "$_new_patch_raw" | grep -oP '^[0-9]*' || echo "0")
+            if [[ "$_new_ver_stripped" == *.*.* ]]; then
+                _new_patch_raw=$(echo "$_new_ver_stripped" | cut -d. -f3)
+                new_patch=$(echo "$_new_patch_raw" | grep -oP '^[0-9]+' || echo "0")
+            else
+                new_patch=0
+            fi
             [[ -z "$new_patch" ]] && new_patch=0
             if version_meets_requirement "$new_major" "$new_minor" "$req_op" "$req_major" "$req_minor" "$new_patch" "$req_patch"; then
                 echo "SUCCESS: Upgraded pacman $new_ver now satisfies $aur_pacman_dep"
@@ -4900,11 +4931,20 @@ if [[ "$can_upgrade_pacman" == "true" ]]; then
             new_ver=$(pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
             echo "After full upgrade, pacman version: $new_ver"
             new_major=$(echo "$new_ver" | sanitize_version_component)
-            _new_minor_raw2=$(echo "$new_ver" | sed 's/^[^:]*://' | cut -d. -f2)
-            new_minor=$(echo "$_new_minor_raw2" | grep -oP '^[0-9]*' || echo "0")
+            _new_ver_stripped2=$(echo "$new_ver" | sed 's/^[^:]*://')
+            if [[ "$_new_ver_stripped2" == *.* ]]; then
+                _new_minor_raw2=$(echo "$_new_ver_stripped2" | cut -d. -f2)
+                new_minor=$(echo "$_new_minor_raw2" | grep -oP '^[0-9]+' || echo "0")
+            else
+                new_minor=0
+            fi
             [[ -z "$new_minor" ]] && new_minor=0
-            _new_patch_raw2=$(echo "$new_ver" | sed 's/^[^:]*://' | cut -d. -f3)
-            new_patch=$(echo "$_new_patch_raw2" | grep -oP '^[0-9]*' || echo "0")
+            if [[ "$_new_ver_stripped2" == *.*.* ]]; then
+                _new_patch_raw2=$(echo "$_new_ver_stripped2" | cut -d. -f3)
+                new_patch=$(echo "$_new_patch_raw2" | grep -oP '^[0-9]+' || echo "0")
+            else
+                new_patch=0
+            fi
             [[ -z "$new_patch" ]] && new_patch=0
             if version_meets_requirement "$new_major" "$new_minor" "$req_op" "$req_major" "$req_minor" "$new_patch" "$req_patch"; then
                 echo "SUCCESS: Full upgrade brought pacman $new_ver which satisfies $aur_pacman_dep"
@@ -5108,7 +5148,7 @@ install_pamac() {
     fi
 
     log_info "Attempting to install pamac-aur from prebuilt repositories..."
-    if container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Sy --noconfirm 2>/dev/null; pacman -S --noconfirm --needed pamac-aur 2>/dev/null; command -v pamac-manager >/dev/null 2>&1 && command -v pamac >/dev/null 2>&1 && echo __PREBUILT_OK__' 2>/dev/null | grep -q "__PREBUILT_OK__"; then
+    if container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null && grep -E "pacman|yay" "/proc/$_p/comm" >/dev/null 2>&1; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Sy --noconfirm 2>/dev/null; pacman -S --noconfirm --needed pamac-aur 2>/dev/null; command -v pamac-manager >/dev/null 2>&1 && command -v pamac >/dev/null 2>&1 && echo __PREBUILT_OK__' 2>/dev/null | grep -q "__PREBUILT_OK__"; then
         log_success "Pamac installed from prebuilt repository."
         return 0
     fi
@@ -7312,12 +7352,12 @@ run_update() {
     fi
 
     log_info "Syncing package databases..."
-    if ! container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Syy --noconfirm' 2>/dev/null; then
+    if ! container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null && grep -E "pacman|yay" "/proc/$_p/comm" >/dev/null 2>&1; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Syy --noconfirm' 2>/dev/null; then
         log_warn "Database sync had issues. Continuing..."
     fi
 
     log_info "Running pacman -Syu..."
-    if ! container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Syu --noconfirm' 2>/dev/null; then
+    if ! container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null && grep -E "pacman|yay" "/proc/$_p/comm" >/dev/null 2>&1; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Syu --noconfirm' 2>/dev/null; then
         log_warn "pacman -Syu had issues."
     fi
 

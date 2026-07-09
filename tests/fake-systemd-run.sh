@@ -107,7 +107,21 @@ if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
     if ! id "$BUILD_USER" >/dev/null 2>&1; then
         # 'nobody' has no writable home and is not safe for AUR builds.
         # Match the installer: try an ad-hoc build user, then refuse if that fails.
-        _bl_tmp=$(mktemp -d /tmp/builduser-home-XXXXXX) || _bl_tmp=""
+        chmod +t /var/tmp 2>/dev/null || true
+        _bl_tmp=$(mktemp -d /var/tmp/builduser-home-XXXXXX) || _bl_tmp=""
+        if [[ -n "$_bl_tmp" ]]; then
+            # Validate: temp home must NOT be under /home (host mount overlap risk)
+            case "$_bl_tmp" in
+                /home/*)
+                    echo "systemd-run(fake): REFUSING temp home under /home (host mount overlap): $_bl_tmp" >&2
+                    rmdir "$_bl_tmp" 2>/dev/null || true
+                    _bl_tmp=""
+                    ;;
+                *)
+                    chmod 0700 "$_bl_tmp" 2>/dev/null || true
+                    ;;
+            esac
+        fi
         if [[ -n "$_bl_tmp" ]]; then
             BUILD_USER="_brecover$(date +%s | tail -c7)"
             if ! useradd -M -d "$_bl_tmp" -s /bin/bash "$BUILD_USER" 2>/dev/null; then

@@ -1977,29 +1977,30 @@ pkill -9 gpg-agent 2>/dev/null || true
 pkill -9 dirmngr 2>/dev/null || true
 _safe_sleep 1
 
-# Pre-flight: check which keyservers are reachable (TCP connect test, 3s timeout)
-echo "Pre-flight: testing keyserver reachability..."
+# Pre-flight: check which keyservers are reachable over port 443 (HTTPS).
+# Port 443 is universally allowed through firewalls (same as web browsing).
+# Port 11371 (HKPS) is frequently blocked on restrictive networks, so we
+# only use 443. The hkps:// URIs in GnuPG default to port 443.
+echo "Pre-flight: testing keyserver reachability (port 443 only)..."
 _KS_REACHABLE=()
 _KS_UNREACHABLE=()
 for _ks in "hkps://keyserver.ubuntu.com" "hkps://keys.openpgp.org" "hkps://pgp.mit.edu"; do
     _ks_host="${_ks#hkps://}"
     _ks_host="${_ks_host#https://}"
     _ks_host="${_ks_host#http://}"
-    # Try port 443 (HTTPS) first, then 11371 (HKPS)
-    if timeout 3 bash -c "echo >/dev/tcp/$_ks_host/443" 2>/dev/null || \
-       timeout 3 bash -c "echo >/dev/tcp/$_ks_host/11371" 2>/dev/null; then
-        echo "  $_ks: REACHABLE"
+    if timeout 3 bash -c "echo >/dev/tcp/$_ks_host/443" 2>/dev/null; then
+        echo "  $_ks: REACHABLE (port 443)"
         _KS_REACHABLE+=("$_ks")
     else
-        echo "  $_ks: UNREACHABLE (will skip)"
+        echo "  $_ks: UNREACHABLE on port 443 (will skip)"
         _KS_UNREACHABLE+=("$_ks")
     fi
 done
 
 if [[ ${#_KS_REACHABLE[@]} -eq 0 ]]; then
-    echo "  WARNING: No keyservers reachable. All keyserver methods will be skipped."
-    echo "  This may be due to firewall restrictions on ports 443/11371."
-    echo "  Falling back to direct HTTPS keyring download..."
+    echo "  WARNING: No keyservers reachable on port 443. All keyserver methods will be skipped."
+    echo "  This may indicate DNS issues or an unusual network configuration."
+    echo "  Falling back to WKD, direct HTTPS keyring download, and JSON endpoint..."
 fi
 
 for _ks in "${_KS_REACHABLE[@]}"; do
@@ -2088,7 +2089,7 @@ else
     echo "TrustAll is NOT used as it would disable all signature verification."
     echo ""
     echo "DIAGNOSIS: Keyring recovery can fail due to:"
-    echo "  1. Network restrictions: firewall blocking ports 443/11371 (HKPS protocol)"
+    echo "  1. Network restrictions: DNS resolution failure or port 443 blocked (unusual)"
     echo "  2. DNS resolution failure: keyservers cannot be resolved"
     echo "  3. All mirrors unreachable: HTTPS keyring package download failed"
     echo "  4. Corrupted base image: keyring files missing or damaged"
@@ -2537,6 +2538,9 @@ printf '%s\n' 'polkit.addRule(function(action, subject) {' \
 ' }' \
 '});' > "$polkit_dir/10-pamac-nopasswd.rules"
 echo "polkit passwordless rule created for pamac operations (explicit allowlist, local+active only)."
+echo "SECURITY: This rule grants passwordless package management to any local, active wheel-group"
+echo "          member. Safe on single-user devices (e.g. Steam Deck). On multi-user hosts,"
+echo "          consider restricting the subject check to a specific user or removing the rule."
 if ! id polkitd >/dev/null 2>&1; then
 useradd -r -d / -s /usr/bin/nologin polkitd 2>/dev/null || echo "Note: polkitd user creation failed"
 fi
@@ -3128,7 +3132,24 @@ _BL_TMP_HOME=""
 if ! id "$BUILD_USER" >/dev/null 2>&1; then
     if ! useradd -r -d /var/lib/builduser -s /usr/bin/nologin "$BUILD_USER" 2>/dev/null; then
         _warn_dsr "useradd -r failed — trying ad-hoc non-root build user as fallback"
+        # Ensure /var/tmp has the sticky bit so only directory owners can delete
+        # within it. /var/tmp is container-internal (not a host mount in Distrobox),
+        # so temporary homes placed here stay isolated from the host's /home.
+        chmod +t /var/tmp 2>/dev/null || true
         _bl_tmp=$(mktemp -d /var/tmp/builduser-home-XXXXXX) || _bl_tmp=""
+        if [[ -n "$_bl_tmp" ]]; then
+            # Validate: temp home must NOT be under /home (host mount overlap risk)
+            case "$_bl_tmp" in
+                /home/*)
+                    _warn_dsr "REFUSING temp home under /home (host mount overlap): $_bl_tmp"
+                    rmdir "$_bl_tmp" 2>/dev/null || true
+                    _bl_tmp=""
+                    ;;
+                *)
+                    chmod 0700 "$_bl_tmp" 2>/dev/null || true
+                    ;;
+            esac
+        fi
         if [[ -n "$_bl_tmp" ]]; then
             BUILD_USER="_brecover$(date +%s|tail -c7)"
             if ! useradd -M -d "$_bl_tmp" -s /bin/bash "$BUILD_USER" 2>/dev/null; then
@@ -3136,6 +3157,7 @@ if ! id "$BUILD_USER" >/dev/null 2>&1; then
                 BUILD_USER=""
             else
                 _BL_TMP_HOME="$_bl_tmp"
+                _log_dsr "Ad-hoc build user $_BL_TMP_HOME created (isolated from host mounts)"
             fi
         fi
         if [[ -z "$BUILD_USER" ]] || ! id "$BUILD_USER" >/dev/null 2>&1; then
@@ -3786,7 +3808,20 @@ _BL_TMP_HOME=""
 if ! id "$BUILD_USER" >/dev/null 2>&1; then
     if ! useradd -r -d /var/lib/builduser -s /usr/bin/nologin "$BUILD_USER" 2>/dev/null; then
         _warn_dsr "useradd -r failed — trying ad-hoc non-root build user as fallback"
+        chmod +t /var/tmp 2>/dev/null || true
         _bl_tmp=$(mktemp -d /var/tmp/builduser-home-XXXXXX) || _bl_tmp=""
+        if [[ -n "$_bl_tmp" ]]; then
+            case "$_bl_tmp" in
+                /home/*)
+                    _warn_dsr "REFUSING temp home under /home (host mount overlap): $_bl_tmp"
+                    rmdir "$_bl_tmp" 2>/dev/null || true
+                    _bl_tmp=""
+                    ;;
+                *)
+                    chmod 0700 "$_bl_tmp" 2>/dev/null || true
+                    ;;
+            esac
+        fi
         if [[ -n "$_bl_tmp" ]]; then
             BUILD_USER="_brecover$(date +%s|tail -c7)"
             if ! useradd -M -d "$_bl_tmp" -s /bin/bash "$BUILD_USER" 2>/dev/null; then
@@ -3794,6 +3829,7 @@ if ! id "$BUILD_USER" >/dev/null 2>&1; then
                 BUILD_USER=""
             else
                 _BL_TMP_HOME="$_bl_tmp"
+                _log_dsr "Ad-hoc build user $_BL_TMP_HOME created (isolated from host mounts)"
             fi
         fi
         if [[ -z "$BUILD_USER" ]] || ! id "$BUILD_USER" >/dev/null 2>&1; then
@@ -5236,14 +5272,18 @@ verify_pamac_libalpm_compat() {
         fi
     fi
 
-    # Check if pamac can at least print its version (basic smoke test)
-    if /usr/bin/pamac --version >/dev/null 2>&1; then
-        echo "  pamac --version: $(/usr/bin/pamac --version 2>&1 | head -1)"
+    # Check if pamac can at least print its version (basic smoke test).
+    # Wrap with timeout to protect against hangs from corrupted shared
+    # libraries or deadlocks in broken libalpm builds.
+    local _pamac_ver_rc=0
+    local _pamac_ver_out=""
+    _pamac_ver_out=$(timeout 5 /usr/bin/pamac --version 2>&1) || _pamac_ver_rc=$?
+    if [[ $_pamac_ver_rc -eq 0 ]]; then
+        echo "  pamac --version: $(echo "$_pamac_ver_out" | head -1)"
         echo "  Basic smoke test: PASSED"
     else
-        local _exit_code=$?
-        echo "  WARNING: pamac --version failed (exit $_exit_code)"
-        echo "  This may indicate a runtime library incompatibility."
+        echo "  WARNING: pamac --version failed (exit $_pamac_ver_rc, timeout 5s)"
+        echo "  This may indicate a runtime library incompatibility or a hang."
         _issues=$((_issues + 1))
     fi
 
@@ -5494,9 +5534,16 @@ else
     pacman -S --noconfirm --needed pacman-contrib 2>/dev/null && paccache -r --noconfirm 2>/dev/null || true
 fi
 
-echo "Removing uninstalled packages from yay cache..."
-if command -v yay >/dev/null 2>&1; then
-    yay -Sc --noconfirm 2>/dev/null || true
+# Prune downloaded .pkg.tar.zst archives from yay's AUR cache without
+# removing cloned source directories (needed for faster rebuilds).
+# This is deliberately more conservative than 'yay -Sc' because Distrobox
+# mounts the host's /home — a full 'yay -Sc' would destroy the host-side
+# build cache at ~/.cache/yay-${CONTAINER_NAME}.
+echo "Pruning .pkg.tar.zst archives from yay cache (preserving sources)..."
+_yay_cache="${XDG_CACHE_HOME:-$HOME/.cache}/yay"
+if [[ -d "$_yay_cache" ]]; then
+    find "$_yay_cache" -name '*.pkg.tar.zst' -delete 2>/dev/null || true
+    echo "  Cleaned yay package archives from $_yay_cache"
 fi
 
 echo "Cache cleanup complete."
@@ -5539,8 +5586,12 @@ if command -v paccache >/dev/null 2>&1; then
     paccache -r --noconfirm 2>/dev/null || true
 fi
 
-if command -v yay >/dev/null 2>&1; then
-    yay -Sc --noconfirm 2>/dev/null || true
+# Prune .pkg.tar.zst archives only — preserve AUR source directories for
+# faster rebuilds. Full 'yay -Sc' is avoided because Distrobox mounts the
+# host /home and would destroy the host-side build cache.
+_yay_cache="${XDG_CACHE_HOME:-$HOME/.cache}/yay"
+if [[ -d "$_yay_cache" ]]; then
+    find "$_yay_cache" -name '*.pkg.tar.zst' -delete 2>/dev/null || true
 fi
 CLEANUP
 chmod 755 /usr/local/bin/pamac-cache-cleanup.sh

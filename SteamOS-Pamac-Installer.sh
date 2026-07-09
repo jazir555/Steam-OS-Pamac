@@ -7961,6 +7961,13 @@ HOOKDEF
 #!/bin/bash
 set +e
 
+# distrobox-export refuses to run as root. Pacman hooks always run as root,
+# so skip export here — desktop file exports are handled by the installer
+# and host wrapper instead.
+if [[ "\$(id -u)" == "0" ]]; then
+    exit 0
+fi
+
 APP_DIR="/home/${current_user}/.local/share/applications"
 STATE_DIR="/home/${current_user}/.local/share/steamos-pamac/${container_name}"
 STATE_FILE="\$STATE_DIR/exported-apps.list"
@@ -8424,6 +8431,24 @@ fi
 HOOKSCRIPT
 
 chmod +x "/usr/local/bin/distrobox-export-hook.sh"
+
+# Create missing distrobox pre/post hook scripts (distrobox pacman hooks
+# reference these but they may not exist in the container).
+if [[ ! -f /etc/distrobox-pre-hook.sh ]]; then
+    cat > /etc/distrobox-pre-hook.sh << 'EOF'
+#!/bin/sh
+exit 0
+EOF
+    chmod +x /etc/distrobox-pre-hook.sh
+fi
+if [[ ! -f /etc/distrobox-post-hook.sh ]]; then
+    cat > /etc/distrobox-post-hook.sh << 'EOF'
+#!/bin/sh
+exit 0
+EOF
+    chmod +x /etc/distrobox-post-hook.sh
+fi
+
 echo "Post-install hook configured."
 HOOK_EOF
 

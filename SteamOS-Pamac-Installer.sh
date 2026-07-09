@@ -67,6 +67,7 @@ NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
 # --enable-ssh-env on a single-user trusted host (e.g. a personal Steam Deck).
 ENABLE_SSH_ENV="${ENABLE_SSH_ENV:-false}"
 UPLOAD_LOG="${UPLOAD_LOG:-false}"
+PIN_ALPM="${PIN_ALPM:-true}"
 
 # Exit code used when the user declines an interactive prompt (e.g. low battery).
 # 130 is the conventional shell exit for "terminated by SIGINT" — distinct from a
@@ -100,7 +101,7 @@ initialize_logging() {
         echo "User: $CURRENT_USER"
         echo "OS: $os_version"
         echo "Container: $CONTAINER_NAME"
-        echo "Features: MULTILIB=$ENABLE_MULTILIB GAMING=$ENABLE_GAMING_PACKAGES EXTRA_REPOS=$ENABLE_EXTRA_REPOS BUILD_CACHE=$ENABLE_BUILD_CACHE OPTIMIZE_MIRRORS=$OPTIMIZE_MIRRORS NON_INTERACTIVE=$NON_INTERACTIVE"
+        echo "Features: MULTILIB=$ENABLE_MULTILIB GAMING=$ENABLE_GAMING_PACKAGES EXTRA_REPOS=$ENABLE_EXTRA_REPOS BUILD_CACHE=$ENABLE_BUILD_CACHE OPTIMIZE_MIRRORS=$OPTIMIZE_MIRRORS NON_INTERACTIVE=$NON_INTERACTIVE PIN_ALPM=$PIN_ALPM"
         echo "=========================================="
     } > "$LOG_FILE"
 
@@ -1035,6 +1036,8 @@ OPTIONS:
   --status                  Check container health, Pamac installation, and export status
   --export-only              Re-export apps to host menu without running full setup
   --non-interactive          Skip all interactive prompts (safe for automation)
+  --disable-pin-alpm        Do NOT defer libalpm/pacman upgrade (risky on
+                             rolling release containers; not recommended)
   --enable-ssh-env           ENABLE SSH PermitUserEnvironment (INSECURE on multi-user hosts; opt-in only)
   --check                   Perform system checks and exit without installing
   --dry-run                 Show what would be done without making changes
@@ -1053,6 +1056,10 @@ ENVIRONMENT VARIABLES:
   PAMAC_VERSION            Specific pamac-aur version/commit to install (AUR fallback)
   NON_INTERACTIVE          Set to 'true' to skip all interactive prompts (safe for
                            background tools, automated installers, and cron jobs)
+  PIN_ALPM                 Set to 'false' to skip deferring libalpm/pacman upgrade.
+                           Default is 'true' — pacman/libalpm are upgraded after
+                           pamac-aur is built to prevent API breakage on rolling
+                           release containers.
   CHAOTIC_AUR_KEY_ID       Override the Chaotic-AUR signing key fingerprint
   ARCHLINUXCN_KEY_ID       Override the archlinuxcn signing key fingerprint
   ENDEAVOUROS_KEY_ID       Override the EndeavourOS signing key fingerprint
@@ -1103,6 +1110,7 @@ parse_arguments() {
             --update) UPDATE="true"; shift ;;
             --export-only) EXPORT_ONLY="true"; shift ;;
             --non-interactive) NON_INTERACTIVE="true"; shift ;;
+            --disable-pin-alpm) PIN_ALPM="false"; shift ;;
             --enable-ssh-env) ENABLE_SSH_ENV="true"; shift ;;
             --upload-log) UPLOAD_LOG="true"; shift ;;
             --dry-run) DRY_RUN="true"; shift ;;
@@ -2209,6 +2217,8 @@ KEYRING_EOF
     read -r -d '' upgrade_script <<'UPG_EOF' || true
 set -uo pipefail
 
+pin_alpm="${1:-false}"
+
 _remove_stale_lock
 
 echo "Syncing package databases..."
@@ -2262,6 +2272,10 @@ verify_core_tools || {
 
 echo "Pass 2: Upgrading remaining non-critical packages..."
 SKIP_PKGS=(systemd systemd-sysvcompat)
+if [[ "$pin_alpm" == "true" ]]; then
+    echo "PIN_ALPM active: deferring pacman/libalpm upgrade until after pamac-aur is built."
+    SKIP_PKGS+=(pacman libalpm lib32-libalpm)
+fi
 exclude_args=()
 for pkg in "${CRITICAL_PKGS[@]}" archlinux-keyring ca-certificates-mozilla "${SKIP_PKGS[@]}"; do
     exclude_args+=(--ignore "$pkg")
@@ -2323,7 +2337,7 @@ fi
 echo "System upgrade completed."
 UPG_EOF
 
-    if ! exec_container_script "$upgrade_script" "pacman-upgrade"; then
+    if ! exec_container_script "$upgrade_script" "pacman-upgrade" "$PIN_ALPM"; then
         log_warn "System upgrade had issues, continuing anyway..."
         if ! container_is_usable; then
             log_error "Container is not usable after upgrade attempt."
@@ -4816,7 +4830,7 @@ if ! git clone --depth=200 --single-branch "$_AUR_GIT_URL" "$_AUR_WORK" 2>/tmp/p
     exit 3
 fi
 
-_commits=$(git -C "$_AUR_WORK" log --format=%H -10 2>/dev/null || true)
+_commits=$(git -C "$_AUR_WORK" log --format=%H -50 2>/dev/null || true)
 if [[ -z "$_commits" ]]; then
     echo "WARN: git log returned no commits."
     rm -rf "$_AUR_WORK"
@@ -7455,6 +7469,40 @@ configure_multilib
 	fi
 
 	_ensure_healthy_or_recreate "after pamac install" || exit 1
+
+    if [[ "$PIN_ALPM" == "true" ]]; then
+        log_step "Upgrading deferred libalpm/pacman packages..."
+        local deferred_alpm_script
+        read -r -d '' deferred_alpm_script <<'ALPM_EOF' || true
+set -uo pipefail
+_remove_stale_lock
+echo "Upgrading pacman and libalpm (deferred by --pin-alpm)..."
+if pacman -Sy --noconfirm 2>/dev/null; then
+    if pacman -S --noconfirm --needed pacman libalpm 2>/dev/null; then
+        echo "pacman/libalpm upgraded successfully."
+        ldconfig 2>/dev/null || true
+        echo "Rebuilding pamac-aur against new libalpm..."
+        if command -v yay >/dev/null 2>&1; then
+            if sudo -Hu "$1" bash -lc "yay -S --noconfirm --rebuild --noprogressbar pamac-aur" 2>/dev/null; then
+                echo "pamac-aur rebuilt successfully against new libalpm."
+            else
+                echo "WARN: pamac-aur rebuild failed. It may still work with the old build."
+                echo "Try manually: yay -S --rebuild pamac-aur"
+            fi
+        else
+            echo "WARN: yay not found, cannot rebuild pamac-aur."
+        fi
+    else
+        echo "WARN: pacman/libalpm upgrade failed. Using whatever version is installed."
+    fi
+else
+    echo "WARN: Database sync failed before pacman/libalpm upgrade."
+fi
+ALPM_EOF
+        exec_container_script "$deferred_alpm_script" "deferred-alpm-upgrade" "$CURRENT_USER" || \
+            log_warn "Deferred libalpm upgrade had issues. pamac-aur may need manual rebuild."
+    fi
+
 ensure_critical_helpers
 
 setup_cache_cleanup

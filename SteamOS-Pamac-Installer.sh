@@ -7211,6 +7211,10 @@ fi
 # Clean stale pacman download dirs that cause "invalid database" errors
 rm -rf /var/lib/pacman/sync/download-* 2>/dev/null || true
 
+# Kill stale pamac-daemon so it picks up fresh database state
+pkill -x pamac-daemon 2>/dev/null || true
+sleep 1
+
 /usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true
 
 DESKTOP_FILE="__DESKTOP_PATH__"

@@ -93,14 +93,15 @@ readonly EXIT_USER_ABORT=130
 
 setup_colors() {
     if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
-        readonly GREEN=$(tput setaf 2)
-        readonly YELLOW=$(tput setaf 3)
-        readonly BLUE=$(tput setaf 4)
-        readonly RED=$(tput setaf 1)
-        readonly BOLD=$(tput bold)
-        readonly NC=$(tput sgr0)
+        GREEN=$(tput setaf 2); readonly GREEN
+        YELLOW=$(tput setaf 3); readonly YELLOW
+        BLUE=$(tput setaf 4); readonly BLUE
+        RED=$(tput setaf 1); readonly RED
+        BOLD=$(tput bold); readonly BOLD
+        NC=$(tput sgr0); readonly NC
     else
-        readonly GREEN='' YELLOW='' BLUE='' RED='' BOLD='' NC=''
+        GREEN=''; YELLOW=''; BLUE=''; RED=''; BOLD=''; NC=''
+        readonly GREEN YELLOW BLUE RED BOLD NC
     fi
 }
 
@@ -1204,8 +1205,9 @@ uninstall_setup() {
                 rm -f "$marked_df" 2>/dev/null || true
             done
             rm -f "$app_dir/${CONTAINER_NAME}.desktop" 2>/dev/null || true
-            command -v update-desktop-database >/dev/null 2>&1 && \
+            if command -v update-desktop-database >/dev/null 2>&1; then
                 update-desktop-database "$app_dir" 2>/dev/null || true
+            fi
         else
             log_warn "[DRY RUN] Would search for and delete .desktop files in $app_dir"
         fi
@@ -1225,14 +1227,17 @@ uninstall_setup() {
     [[ -f "$icon_svg" ]] && { log_info "Removing icon: $icon_svg"; [[ "$DRY_RUN" != "true" ]] && rm -f "$icon_svg"; }
     [[ -f "$icon_png" ]] && { log_info "Removing icon: $icon_png"; [[ "$DRY_RUN" != "true" ]] && rm -f "$icon_png"; }
 
-    command -v gtk-update-icon-cache >/dev/null 2>&1 && \
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
         gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" -f 2>/dev/null || true
+    fi
 
     log_success "Uninstallation completed."
 }
 
 _restore_errexit() {
-  [[ "${_SAVED_ERREXIT:-}" == "on" ]] && set -e || true
+  if [[ "${_SAVED_ERREXIT:-}" == "on" ]]; then
+    set -e
+  fi
   # Clear the RETURN trap so it does not fire spuriously in the caller.
   trap - RETURN
 }
@@ -1540,6 +1545,7 @@ fi
 ' 2>/dev/null || true
 }
 
+# shellcheck disable=SC2016,SC1078,SC1079
 _CONTAINER_PREAMBLE='_safe_sleep() {
 local _d="$1"
 # Sanitize argument to a positive INTEGER (default 1s) before passing to
@@ -1718,7 +1724,8 @@ exec_container_script() {
     _TEMP_FILES+=("$_script_file")
     printf '%s\n' "${_preamble}" > "$_script_file"
 
-    local _marker="PAMAC_SCRIPT_OK_$(head -c 16 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$_$(date +%s)")"
+    local _marker
+    _marker="PAMAC_SCRIPT_OK_$(head -c 16 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$_$(date +%s)")"
     # Marker race fix: install an EXIT trap BEFORE the script body so an early
     # `exit 0` mid-body still emits the marker. The trap only fires on a
     # successful (exit-code 0) exit so the existing "no marker => failure" proxy
@@ -1754,7 +1761,8 @@ exec_container_pipe() {
     shift
     local _rc=0
     local _script_file
-    local _marker="PAMAC_PIPE_OK_$(head -c 16 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$_$(date +%s)")"
+    local _marker
+    _marker="PAMAC_PIPE_OK_$(head -c 16 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$_$(date +%s)")"
     local _preamble="$_CONTAINER_PREAMBLE"
 
     _script_file=$(mktemp "${_SCRIPT_TMPDIR:-/tmp}/pamac-pipe-XXXXXXXX")
@@ -1865,7 +1873,7 @@ _exec_handle_result() {
                 done
             fi
         fi
-        container_root_exec bash -c "if [[ -f /var/lib/pacman/db.lck ]]; then _p=\$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ''); if [[ -n "\$_p" ]] && kill -0 "\$_p" 2>/dev/null; then echo \"Pacman running (PID \$_p), waiting...\"; _w=0; while [[ \$_w -lt 30 ]] && kill -0 "\$_p" 2>/dev/null; do sleep 2; _w=\$(( _w + 2 )); done; if kill -0 "\$_p" 2>/dev/null; then echo \"ERROR: Pacman (PID \$_p) still running after 30s. Aborting.\"; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pkill -9 gpg-agent 2>/dev/null || true" 2>/dev/null || true
+        container_root_exec bash -c "if [[ -f /var/lib/pacman/db.lck ]]; then _p=\$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ''); if [[ -n \$_p ]] && kill -0 \$_p 2>/dev/null; then echo \"Pacman running (PID \$_p), waiting...\"; _w=0; while [[ \$_w -lt 30 ]] && kill -0 \$_p 2>/dev/null; do sleep 2; _w=\$(( _w + 2 )); done; if kill -0 \$_p 2>/dev/null; then echo \"ERROR: Pacman (PID \$_p) still running after 30s. Aborting.\"; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pkill -9 gpg-agent 2>/dev/null || true" 2>/dev/null || true
         container_start 2>/dev/null || true
         repair_pacman_db
         return "$_rc"
@@ -2466,7 +2474,7 @@ DEV_EOF
     for _dep in git gcc go; do
         if ! container_root_exec bash -c "command -v $_dep >/dev/null 2>&1 || pacman -Q $_dep >/dev/null 2>&1" 2>/dev/null; then
             log_warn "Development dependency '$_dep' not found after install stage. Attempting recovery..."
-            container_root_exec bash -c "if [[ -f /var/lib/pacman/db.lck ]]; then _p=\$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ''); if [[ -n "\$_p" ]] && kill -0 "\$_p" 2>/dev/null; then echo \"Pacman running (PID \$_p), waiting...\"; _w=0; while [[ \$_w -lt 30 ]] && kill -0 "\$_p" 2>/dev/null; do sleep 2; _w=\$(( _w + 2 )); done; if kill -0 "\$_p" 2>/dev/null; then echo \"ERROR: Pacman (PID \$_p) still running after 30s. Aborting.\"; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -S --noconfirm --needed $_dep" 2>/dev/null || true
+            container_root_exec bash -c "if [[ -f /var/lib/pacman/db.lck ]]; then _p=\$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ''); if [[ -n \$_p ]] && kill -0 \$_p 2>/dev/null; then echo \"Pacman running (PID \$_p), waiting...\"; _w=0; while [[ \$_w -lt 30 ]] && kill -0 \$_p 2>/dev/null; do sleep 2; _w=\$(( _w + 2 )); done; if kill -0 \$_p 2>/dev/null; then echo \"ERROR: Pacman (PID \$_p) still running after 30s. Aborting.\"; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -S --noconfirm --needed $_dep" 2>/dev/null || true
         fi
     done
 
@@ -4992,7 +5000,8 @@ COMPAT_EOF
     _TEMP_FILES+=("$_compat_script_file")
     printf '%s\n' "${_preamble}${compat_script}" > "$_compat_script_file"
 
-    local _compat_marker="COMPAT_CHECK_$(head -c 8 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$")"
+    local _compat_marker
+    _compat_marker="COMPAT_CHECK_$(head -c 8 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$")"
     printf '\necho "%s"\n' "$_compat_marker" >> "$_compat_script_file"
 
     set +e
@@ -5893,8 +5902,9 @@ export_pamac_to_host() {
         log_info "Pamac icons not found in container. Using system default icon."
     fi
 
-    command -v gtk-update-icon-cache >/dev/null 2>&1 && \
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
         gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" -f 2>/dev/null || true
+    fi
 
     local _host_is_x11=false
     if [[ -n "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
@@ -6578,7 +6588,47 @@ log_info "Registered appstream handler as default for x-scheme-handler/appstream
 rm -f "$HOME/.local/share/plasma/kickeractions/steamos-pamac-uninstall.desktop" 2>/dev/null || true
 
     if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
-        log_info "Add '$bin_dir' to your PATH to use the CLI wrapper directly."
+        log_warn "'$bin_dir' is NOT in your PATH. CLI wrapper pamac-${CONTAINER_NAME} may not be found."
+        local _profile_line="export PATH=\"\$HOME/.local/bin:\$PATH\""
+        local _profile_updated=false
+        local _already_configured=false
+        for _rc_file in "$HOME/.bashrc" "$HOME/.zshrc"; do
+            if [[ -f "$_rc_file" ]]; then
+                if grep -qF '.local/bin' "$_rc_file" 2>/dev/null; then
+                    _already_configured=true
+                else
+                    if [[ "$DRY_RUN" != "true" ]]; then
+                        printf '\n%s\n' "$_profile_line" >> "$_rc_file" 2>/dev/null || true
+                        if grep -qF '.local/bin' "$_rc_file" 2>/dev/null; then
+                            log_info "Added ~/.local/bin to PATH in $_rc_file"
+                            _profile_updated=true
+                        fi
+                    else
+                        log_info "[DRY RUN] Would add ~/.local/bin to PATH in $_rc_file"
+                        _profile_updated=true
+                    fi
+                fi
+            fi
+        done
+        if [[ "$_profile_updated" != "true" && "$_already_configured" != "true" ]]; then
+            local _target_rc="$HOME/.bashrc"
+            if [[ ! -f "$HOME/.bashrc" && ! -f "$HOME/.zshrc" ]]; then
+                if [[ "$DRY_RUN" != "true" ]]; then
+                    printf '%s\n' "# SteamOS-Pamac: added ~/.local/bin to PATH" "$_profile_line" > "$_target_rc" 2>/dev/null || true
+                    if [[ -f "$_target_rc" ]]; then
+                        log_info "Created $_target_rc with ~/.local/bin in PATH"
+                        _profile_updated=true
+                    fi
+                else
+                    log_info "[DRY RUN] Would create $_target_rc with ~/.local/bin in PATH"
+                    _profile_updated=true
+                fi
+            fi
+        fi
+        if [[ "$_profile_updated" != "true" && "$_already_configured" != "true" ]]; then
+            log_warn "Could not automatically add ~/.local/bin to PATH. Please run manually:"
+            log_warn "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc && source ~/.bashrc"
+        fi
     fi
 
     _fix_xdg_data_dirs() {
@@ -6778,10 +6828,25 @@ PAMAC_DESKTOP
   # Use Python for robust INI/desktop-file parsing instead of fragile awk passes.
   # This correctly handles: multi-line values, upstream [Desktop Action] sections,
   # re-entry into action sections, and preserves all non-owned lines.
-  # Pre-flight: verify Python 3 + configparser are available; fall back to
-  # a sed-based path if not, so builds don't break inside minimal containers.
-  if ! python3 -c "import configparser" >/dev/null 2>&1; then
-    echo "WARN: Python 3 or configparser unavailable — using sed fallback for desktop annotation." >&2
+  # Pre-flight: verify Python 3 executable is reachable before testing modules,
+  # so builds don't break inside minimal containers with broken interpreters.
+  _python3_ok=false
+  if command -v python3 >/dev/null 2>&1; then
+    if python3 -c "import configparser" >/dev/null 2>&1; then
+      _python3_ok=true
+    fi
+  fi
+  if [[ "\$_python3_ok" != "true" ]]; then
+    echo "Python 3 or configparser missing — attempting to install python..." >&2
+    if command -v pacman >/dev/null 2>&1; then
+      pacman -S --noconfirm --needed python python-configparser >/dev/null 2>&1 || true
+    fi
+    if command -v python3 >/dev/null 2>&1 && python3 -c "import configparser" >/dev/null 2>&1; then
+      _python3_ok=true
+    fi
+  fi
+  if [[ "\$_python3_ok" != "true" ]]; then
+    echo "WARN: Python 3 still unavailable after install attempt — using sed fallback for desktop annotation." >&2
     sed -i \
       -e '/^X-SteamOS-Pamac-/d' \
       -e '/^Actions=.*uninstall/d' \

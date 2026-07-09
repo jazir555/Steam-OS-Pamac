@@ -3570,6 +3570,17 @@ fi
 _refresh_pacman_databases &
 _ensure_keyring
 
+# Clean stale pacman lock file
+if [[ -f /var/lib/pacman/db.lck ]]; then
+    _lck_pid=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo "")
+    if [[ -n "$_lck_pid" ]] && [[ "$_lck_pid" =~ ^[0-9]+$ ]] && kill -0 "$_lck_pid" 2>/dev/null; then
+        log_bootstrap "Pacman is running (PID $_lck_pid). Waiting for lock..."
+    else
+        log_bootstrap "Removing stale pacman lock file."
+        rm -f /var/lib/pacman/db.lck 2>/dev/null || true
+    fi
+fi
+
 if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
 log_bootstrap "systemd detected, starting services via systemctl"
 systemctl start polkit 2>/dev/null || true
@@ -4286,6 +4297,17 @@ pacman-key --init 2>/dev/null && pacman-key --populate archlinux 2>/dev/null || 
 
 _refresh_pacman_databases &
 _ensure_keyring
+
+# Clean stale pacman lock file
+if [[ -f /var/lib/pacman/db.lck ]]; then
+    _lck_pid=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo "")
+    if [[ -n "$_lck_pid" ]] && [[ "$_lck_pid" =~ ^[0-9]+$ ]] && kill -0 "$_lck_pid" 2>/dev/null; then
+        log_bootstrap "Pacman is running (PID $_lck_pid). Waiting for lock..."
+    else
+        log_bootstrap "Removing stale pacman lock file."
+        rm -f /var/lib/pacman/db.lck 2>/dev/null || true
+    fi
+fi
 
 if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
 log_bootstrap "systemd detected, starting services via systemctl"
@@ -6952,7 +6974,18 @@ configure_ssh_environment() {
                     log_warn "sshd config validation failed after writing permit-user-env.conf. Reverting..."
                     rm -f "$permit_env_conf" 2>/dev/null || true
                 else
-                    if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
+# Clean stale pacman lock file (from interrupted previous transactions)
+if [[ -f /var/lib/pacman/db.lck ]]; then
+    _lck_pid=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo "")
+    if [[ -n "$_lck_pid" ]] && [[ "$_lck_pid" =~ ^[0-9]+$ ]] && kill -0 "$_lck_pid" 2>/dev/null; then
+        log_bootstrap "Pacman is running (PID $_lck_pid). Waiting for lock..."
+    else
+        log_bootstrap "Removing stale pacman lock file."
+        rm -f /var/lib/pacman/db.lck 2>/dev/null || true
+    fi
+fi
+
+if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
                         run_command systemctl restart sshd 2>/dev/null || true
                     else
                         run_command pkill -HUP sshd 2>/dev/null || true

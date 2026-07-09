@@ -54,6 +54,12 @@ EXPORT_ONLY="${EXPORT_ONLY:-false}"
 LOG_LEVEL="${LOG_LEVEL:-normal}"
 PAMAC_VERSION="${PAMAC_VERSION:-}"
 NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
+# SECURITY (default off): PermitUserEnvironment yes in sshd lets any
+# SSH-authenticated user inject arbitrary environment variables (LD_PRELOAD,
+# PATH...) via ~/.ssh/environment — a known privilege-escalation vector on
+# multi-user hosts. Only enable when the user explicitly opts in via
+# --enable-ssh-env on a single-user trusted host (e.g. a personal Steam Deck).
+ENABLE_SSH_ENV="${ENABLE_SSH_ENV:-false}"
 
 # Exit code used when the user declines an interactive prompt (e.g. low battery).
 # 130 is the conventional shell exit for "terminated by SIGINT" — distinct from a
@@ -125,7 +131,12 @@ _filter_verbose_output() {
     # NOTE: warning:.*downgrading and warning:.*removing are intentionally NOT
     # filtered — unexpected downgrades/removals during upgrades are exactly the
     # kind of issue a user must see, and hiding them can mask broken upgrades.
-    grep -v -E '^\s*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database)|^::(synchronizing|debug:|warning:|info:)|^:: Proceed|^:: Run' || true
+    # NOTE: `:: Proceed` and `:: Run` interactive confirmation prompts are also
+    # intentionally NOT filtered. The script always uses --noconfirm, but a future
+    # code change or package hook that emits a similar prefix could suppress a
+    # genuinely important prompt — better to show them (they are harmless under
+    # --noconfirm) than to risk hiding something that requires user attention.
+    grep -v -E '^\s*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database)|^::(synchronizing|debug:|warning:|info:)' || true
 }
 
 run_command() {
@@ -461,9 +472,13 @@ force_remove_container() {
 		fi
 
 		log_warn "Running 'podman system reset --force' — this will destroy ALL containers, images, and volumes."
+		local _reset_rc=0
 		container_runtime_privileged system reset --force 2>&1 | while IFS= read -r line; do
 			log_warn "  $line"
-		done || true
+		done || _reset_rc=$?
+		if [[ "$_reset_rc" -ne 0 ]]; then
+			log_warn "podman system reset --force returned exit code $_reset_rc (pipeline may have partial output). Continuing to check..."
+		fi
 
 		if container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
 			log_error "Container '$name' still exists after system reset. Manual intervention required."
@@ -890,6 +905,36 @@ ensure_podman() {
             # Rootless podman is broken and automated repairs failed.
             # Check if sudo fallback is explicitly allowed.
             if [[ "$ALLOW_SUDO_FALLBACK" == "true" ]] || [[ "${PODMAN_SUDO_FALLBACK:-}" == "true" ]]; then
+                # SECURITY: running containers as host root via sudo removes the
+                # UID mapping isolation that rootless podman normally provides.
+                # Even with --allow-sudo-fallback, require an explicit yes/no
+                # confirmation (or the documented ALLOW_SUDO_FALLBACK_CONFIRMED
+                # opt-in) so a malicious/compromised AUR package cannot quietly
+                # compromise the host. Refuse by default in non-interactive mode
+                # unless the user has pre-confirmed via the env var.
+                _do_sudo_fallback=false
+                if [[ "${ALLOW_SUDO_FALLBACK_CONFIRMED:-}" == "true" ]]; then
+                    _do_sudo_fallback=true
+                elif [[ "$NON_INTERACTIVE" == "true" ]]; then
+                    log_warn "--allow-sudo-fallback is set but this runs containers as HOST ROOT"
+                    log_warn "(insecure: weakens the UID-mapping isolation a malicious AUR package needs to compromise your host)."
+                    log_warn "To proceed in non-interactive mode, set ALLOW_SUDO_FALLBACK_CONFIRMED=true explicitly;"
+                    log_warn "to decline, run again without --allow-sudo-fallback."
+                elif [[ -t 0 ]]; then
+                    log_warn "--allow-sudo-fallback would run containers as HOST ROOT (insecure)."
+                    log_warn "A malicious AUR package can more easily compromise the host this way."
+                    local _sfb_confirm=""
+                    read -r -p "Type 'yes' to run containers as host root via sudo: " _sfb_confirm
+                    [[ "$_sfb_confirm" == "yes" ]] && _do_sudo_fallback=true
+                else
+                    log_warn "Non-interactive session: --allow-sudo-fallback needs confirmation (no tty)."
+                    log_warn "Set ALLOW_SUDO_FALLBACK_CONFIRMED=true to pre-approve, or run interactively."
+                fi
+                if [[ "$_do_sudo_fallback" != "true" ]]; then
+                    log_error "Sudo podman fallback declined or not confirmed."
+                    log_error "Run with --allow-sudo-fallback AND confirm interactively (or set ALLOW_SUDO_FALLBACK_CONFIRMED=true)."
+                    return 1
+                fi
                 log_warn "Attempting sudo podman fallback (explicitly allowed via --allow-sudo-fallback)..."
                 if sudo podman info >/dev/null 2>&1; then
                     log_warn "SECURITY: Running as host root via sudo. Container isolation is weakened."
@@ -928,7 +973,7 @@ USAGE:
 
 OPTIONS:
   --container-name NAME     Set container name (default: ${DEFAULT_CONTAINER_NAME})
-  --allow-sudo-fallback     Allow rootless Podman sudo fallback (INSECURE: see security note)
+  --allow-sudo-fallback     Allow rootless Podman sudo fallback (INSECURE: confirmed interactively; set ALLOW_SUDO_FALLBACK_CONFIRMED=true for non-interactive opt-in)
   --force-rebuild           Rebuild existing container if it exists
   --enable-multilib         Enable 32-bit package support (default)
   --disable-multilib        Explicitly disable 32-bit package support
@@ -947,6 +992,7 @@ OPTIONS:
   --status                  Check container health, Pamac installation, and export status
   --export-only              Re-export apps to host menu without running full setup
   --non-interactive          Skip all interactive prompts (safe for automation)
+  --enable-ssh-env           ENABLE SSH PermitUserEnvironment (INSECURE on multi-user hosts; opt-in only)
   --check                   Perform system checks and exit without installing
   --dry-run                 Show what would be done without making changes
   --verbose                 Show detailed output, including command logs
@@ -963,7 +1009,10 @@ ENVIRONMENT VARIABLES:
   PAMAC_VERSION            Specific pamac-aur version/commit to install (AUR fallback)
   ALLOW_SUDO_FALLBACK      Set to 'true' to allow sudo podman fallback (INSECURE:
                            runs container as host root instead of subuid/subgid,
-                           reducing isolation if a malicious AUR package is installed)
+                           reducing isolation if a malicious AUR package is installed.
+                           Still requires interactive 'yes' confirmation unless
+                           ALLOW_SUDO_FALLBACK_CONFIRMED=true is also set.)
+  ALLOW_SUDO_FALLBACK_CONFIRMED  Pre-approve sudo fallback for non-interactive runs.
   NON_INTERACTIVE          Set to 'true' to skip all interactive prompts (safe for
                            background tools, automated installers, and cron jobs)
   CHAOTIC_AUR_KEY_ID       Override the Chaotic-AUR signing key fingerprint
@@ -1014,6 +1063,7 @@ parse_arguments() {
             --update) UPDATE="true"; shift ;;
             --export-only) EXPORT_ONLY="true"; shift ;;
             --non-interactive) NON_INTERACTIVE="true"; shift ;;
+            --enable-ssh-env) ENABLE_SSH_ENV="true"; shift ;;
             --dry-run) DRY_RUN="true"; shift ;;
             --check) CHECK_ONLY="true"; shift ;;
             --verbose) LOG_LEVEL="verbose"; shift ;;
@@ -1114,6 +1164,8 @@ uninstall_setup() {
 
 _restore_errexit() {
   [[ "${_SAVED_ERREXIT:-}" == "on" ]] && set -e || true
+  # Clear the traps so they don't persist/fire spuriously after we return.
+  trap - RETURN
 }
 
 wait_for_container() {
@@ -1127,7 +1179,12 @@ wait_for_container() {
   log_info "Waiting for container '$CONTAINER_NAME' to become ready..."
 
   set +e
+  # Install both RETURN (covers normal return) and INT/TERM (covers signal kill)
+  # traps so errexit is always restored on the way out of this function, even if
+  # the user hits Ctrl-C (a bare RETURN trap does not fire on a signal death,
+  # which previously left `set +e` sticky in the caller's scope).
   trap '_restore_errexit' RETURN
+  trap '_restore_errexit; trap - INT TERM HUP' INT TERM HUP
 
   while true; do
     attempt=$((attempt + 1))
@@ -1401,9 +1458,18 @@ fi
 if command -v perl >/dev/null 2>&1; then
     perl -e "select undef,undef,undef,\$ARGV[0]" "$_d" 2>/dev/null && return 0
 fi
-# No working timer available: degrade to no-op. Reliability of retry loops
-# then depends on the surrounding condition checks, not on a timed delay.
-return 0
+# No working timer available: degrade to a bounded busy-loop so retry loops
+# do NOT become tight CPU-pinning loops. We loop reading /dev/zero in fixed
+# chunks for approximately the requested duration (best-effort, not precise).
+# Returns 1 to signal that no precise timer was available; callers in
+# retry paths should treat non-zero as 'no real delay happened'.
+local _i=0
+local _iters=$(( _d * 1000 ))
+while [[ $_i -lt $_iters ]]; do
+    head -c 4096 /dev/zero >/dev/null 2>&1 || true
+    _i=$((_i + 1))
+done
+return 1
 }
 _atomic_sed_inplace() {
     local _target="$1"; shift
@@ -1535,13 +1601,7 @@ exec_container_script() {
     # the marker was only appended after the body, so an early `exit 0` in the
     # middle of a script would suppress the marker and (falsely) read as failure.
     # The guard variable keeps emission idempotent if the trailing echo also runs.
-    {
-        printf 'PAMAC_SCRIPT_MARKER="%s"\n' "$_marker"
-        printf '%s\n' "pamac_script_marked=''"
-        printf '%s\n' "pamac_emit_marker() { local _rc=$?; [ -z \"\$pamac_script_marked\" ] || return 0; [ \"\$_rc\" -eq 0 ] || return 0; pamac_script_marked=1; echo \"\$PAMAC_SCRIPT_MARKER\"; }"
-        printf '%s\n' "trap pamac_emit_marker EXIT"
-    } > "${_script_file}.trap"
-    cat "${_script_file}.trap" "$_script_file" > "${_script_file}.new" 2>/dev/null && mv -f "${_script_file}.new" "$_script_file" && rm -f "${_script_file}.trap"
+    _exec_install_marker_trap "$_script_file" "$_marker"
     # Trailing redundant emission (normal fallthrough, exit-code-0 path); trap
     # covers early exits. Both paths are gated by the guard and exit-code check.
     printf '\n[ $? -eq 0 ] && echo "%s"\ntrap - EXIT\n' "$_marker" >> "$_script_file"
@@ -1560,50 +1620,7 @@ exec_container_script() {
 
   rm -f "$_script_file"
 
-    if [[ "$CONTAINER_HAS_INIT" == "false" ]] && [[ $_rc -ne 0 ]]; then
-        if echo "$_output" | grep -q "$_marker"; then
-            log_debug "Script '$_desc' completed successfully (exit $_rc is expected in non-init container - podman may kill entry process after completion)."
-            container_start 2>/dev/null || true
-            repair_pacman_db
-            return 0
-        fi
-        if [[ $_rc -eq 137 ]]; then
-            log_warn "Script '$_desc' got exit 137 without completion marker. May be OOM or signal kill. Attempting DB repair..."
-        else
-            log_warn "Script '$_desc' got exit $_rc without completion marker in non-init container. May be premature container stop. Attempting DB repair..."
-        fi
-        container_start 2>/dev/null || true
-        repair_pacman_db
-    fi
-
-    if [[ $_rc -ne 0 ]] && ! { [[ "$CONTAINER_HAS_INIT" == "false" ]] && echo "$_output" | grep -q "$_marker"; }; then
-        log_warn "Script '$_desc' failed (exit=$_rc)."
-        if [[ $_rc -eq 100 ]]; then
-            log_error "Fatal keyring/security error in script '$_desc'. Last 20 lines of output:"
-            echo "$_output" | tail -20 | while IFS= read -r line; do
-                log_error "  $line"
-            done
-        elif [[ $_rc -eq 137 ]]; then
-            log_error "Script '$_desc' killed (OOM/signal). Last 20 lines of output:"
-            echo "$_output" | tail -20 | while IFS= read -r line; do
-                log_error "  $line"
-            done
-        else
-            local _tail
-            _tail=$(echo "$_output" | tail -20)
-            if [[ -n "$_tail" ]]; then
-                log_warn "Last 20 lines of script output:"
-                echo "$_tail" | while IFS= read -r line; do
-                    log_warn "  $line"
-                done
-            fi
-        fi
-        container_root_exec bash -c "rm -f /var/lib/pacman/db.lck; pkill -9 gpg-agent 2>/dev/null || true" 2>/dev/null || true
-        container_start 2>/dev/null || true
-        repair_pacman_db
-        return $_rc
-    fi
-    return 0
+    _exec_handle_result "$_rc" "$_output" "$_marker" "$_desc" "Script"
 }
 
 exec_container_pipe() {
@@ -1622,12 +1639,7 @@ exec_container_pipe() {
     # only emits on a successful (exit-code 0) exit to preserve the existing
     # failure-detection proxy. The trailing echo below is a redundant fallback
     # for normal fallthrough; both paths are guarded by pamac_script_marked.
-    {
-        printf 'PAMAC_SCRIPT_MARKER="%s"\n' "$_marker"
-        printf '%s\n' "pamac_script_marked=''"
-        printf '%s\n' "pamac_emit_marker() { local _rc=$?; [ -z \"\$pamac_script_marked\" ] || return 0; [ \"\$_rc\" -eq 0 ] || return 0; pamac_script_marked=1; echo \"\$PAMAC_SCRIPT_MARKER\"; }"
-        printf '%s\n' "trap pamac_emit_marker EXIT"
-    } >> "$_script_file"
+    _exec_install_marker_trap "$_script_file" "$_marker"
     # Baseline size = preamble + trap. An empty body yields exactly this size,
     # so we detect empty heredocs by comparing the post-cat size against it.
     local _trap_baseline
@@ -1658,31 +1670,62 @@ exec_container_pipe() {
 
     rm -f "$_script_file"
 
+    _exec_handle_result "$_rc" "$_output" "$_marker" "$_desc" "Piped script"
+}
+
+# Shared helper: install the marker-emission EXIT trap (with chained prior trap)
+# into a prepared container script file. Used by both exec_container_script and
+# exec_container_pipe so the trap setup logic lives in exactly one place.
+_exec_install_marker_trap() {
+    local _file="$1"
+    local _marker="$2"
+    {
+        printf 'PAMAC_SCRIPT_MARKER="%s"\n' "$_marker"
+        printf '%s\n' "pamac_script_marked=''"
+        # Capture any pre-existing EXIT trap so a script body that installs its
+        # own `trap ... EXIT` does NOT silently replace our marker emission: we
+        # save the previous trap when we install ours, then pamac_emit_marker
+        # re-invokes that saved handler after emitting (chaining). This keeps the
+        # "no marker => failure" detection proxy working even if the body sets
+        # its own EXIT trap. `trap -p EXIT` returns nothing when none is set.
+        printf '%s\n' "pamac_emit_marker() { local _rc=$?; [ -z \"\$pamac_script_marked\" ] || return 0; [ \"\$_rc\" -eq 0 ] || return 0; pamac_script_marked=1; echo \"\$PAMAC_SCRIPT_MARKER\"; if [ -n \"\$PAMAC_PREV_EXIT_TRAP\" ]; then eval \"\$PAMAC_PREV_EXIT_TRAP\"; fi; }"
+        printf '%s\n' "PAMAC_PREV_EXIT_TRAP=\$(trap -p EXIT 2>/dev/null | sed -e \"s/^trap -- //\" -e \"s/ EXIT\$//\")"
+        printf '%s\n' "trap pamac_emit_marker EXIT"
+    } >> "$_file"
+}
+
+# Shared helper: post-run recovery + error reporting for container scripts.
+# Args: _rc _output _marker _desc _kind_label (e.g. "script" or "piped script").
+# Consolidates the previously-duplicated non-init recovery and failure-message
+# logic that existed in both exec_container_script and exec_container_pipe.
+_exec_handle_result() {
+    local _rc="$1" _output="$2" _marker="$3" _desc="$4" _kind="$5"
+
     if [[ "$CONTAINER_HAS_INIT" == "false" ]] && [[ $_rc -ne 0 ]]; then
         if echo "$_output" | grep -q "$_marker"; then
-            log_debug "Piped script '$_desc' completed successfully (exit $_rc is expected in non-init container - podman may kill entry process after completion)."
+            log_debug "$_kind '$_desc' completed successfully (exit $_rc is expected in non-init container - podman may kill entry process after completion)."
             container_start 2>/dev/null || true
             repair_pacman_db
             return 0
         fi
         if [[ $_rc -eq 137 ]]; then
-            log_warn "Piped script '$_desc' got exit 137 without completion marker. May be OOM or signal kill. Attempting DB repair..."
+            log_warn "$_kind '$_desc' got exit 137 without completion marker. May be OOM or signal kill. Attempting DB repair..."
         else
-            log_warn "Piped script '$_desc' got exit $_rc without completion marker in non-init container. May be premature container stop. Attempting DB repair..."
+            log_warn "$_kind '$_desc' got exit $_rc without completion marker in non-init container. May be premature container stop. Attempting DB repair..."
         fi
         container_start 2>/dev/null || true
         repair_pacman_db
     fi
 
     if [[ $_rc -ne 0 ]] && ! { [[ "$CONTAINER_HAS_INIT" == "false" ]] && echo "$_output" | grep -q "$_marker"; }; then
-        log_warn "Piped script '$_desc' failed (exit=$_rc)."
+        log_warn "$_kind '$_desc' failed (exit=$_rc)."
         if [[ $_rc -eq 100 ]]; then
-            log_error "Fatal keyring/security error in piped script '$_desc'. Last 20 lines of output:"
+            log_error "Fatal keyring/security error in $_kind '$_desc'. Last 20 lines of output:"
             echo "$_output" | tail -20 | while IFS= read -r line; do
                 log_error "  $line"
             done
         elif [[ $_rc -eq 137 ]]; then
-            log_error "Piped script '$_desc' killed (OOM/signal). Last 20 lines of output:"
+            log_error "$_kind '$_desc' killed (OOM/signal). Last 20 lines of output:"
             echo "$_output" | tail -20 | while IFS= read -r line; do
                 log_error "  $line"
             done
@@ -1690,7 +1733,7 @@ exec_container_pipe() {
             local _tail
             _tail=$(echo "$_output" | tail -20)
             if [[ -n "$_tail" ]]; then
-                log_warn "Last 20 lines of piped script output:"
+                log_warn "Last 20 lines of $_kind output:"
                 echo "$_tail" | while IFS= read -r line; do
                     log_warn "  $line"
                 done
@@ -1699,7 +1742,7 @@ exec_container_pipe() {
         container_root_exec bash -c "rm -f /var/lib/pacman/db.lck; pkill -9 gpg-agent 2>/dev/null || true" 2>/dev/null || true
         container_start 2>/dev/null || true
         repair_pacman_db
-        return $_rc
+        return "$_rc"
     fi
     return 0
 }
@@ -1799,11 +1842,28 @@ if [[ -f "$_KEYRING_SENTINEL" ]]; then
         _safe_recovered=true
         rm -f "$_KEYRING_SENTINEL" 2>/dev/null || true
     elif [[ -z "$_sentinel_current" || "$_sentinel_current" == *":*" && "${_sentinel_current##*:}" == "" ]]; then
-        # No checksum tool available — preserve presence-only trust as a fallback
-        # so recovery is not blocked purely because sha256 is missing.
-        echo "Found keyring recovery sentinel, but no checksum tool is available to validate pubring.gpg. Trusting sentinel (presence-only)."
-        _safe_recovered=true
-        rm -f "$_KEYRING_SENTINEL" 2>/dev/null || true
+        # No checksum tool available — try installing coreutils (provides
+        # sha256sum) so the sentinel can be validated next time AND so the
+        # rest of this recovery run has the tool available. If pacman is not
+        # usable yet, fall back to presence-only trust so recovery is not
+        # blocked purely because sha256 is missing.
+        echo "Found keyring recovery sentinel, but no checksum tool is available to validate pubring.gpg. Attempting to install coreutils..."
+        if command -v pacman >/dev/null 2>&1 && pacman -S --noconfirm --needed coreutils 2>/dev/null; then
+            echo "coreutils installed; re-checking checksum tool availability."
+            _sentinel_current=$(_keyring_checksum)
+        fi
+        if [[ -z "$_sentinel_current" || "$_sentinel_current" == *":*" && "${_sentinel_current##*:}" == "" ]]; then
+            echo "WARNING: No checksum tool available even after coreutils install. Trusting sentinel (presence-only) so recovery is not blocked. If you suspect keyring corruption, delete /etc/pacman.d/gnupg/.keyring-recovery-pending or /etc/pacman.d/gnupg manually and re-run."
+            _safe_recovered=true
+            rm -f "$_KEYRING_SENTINEL" 2>/dev/null || true
+        elif [[ -n "$_sentinel_stored" && "$_sentinel_stored" == "$_sentinel_current" ]]; then
+            echo "Found valid keyring recovery sentinel (checksum now matches after coreutils install). Keyring recovery already completed."
+            _safe_recovered=true
+            rm -f "$_KEYRING_SENTINEL" 2>/dev/null || true
+        else
+            echo "Found keyring recovery sentinel, but pubring.gpg checksum mismatch (stored='$_sentinel_stored' current='$_sentinel_current'). Keyring may have been corrupted — re-running recovery from scratch."
+            rm -f "$_KEYRING_SENTINEL" 2>/dev/null || true
+        fi
     else
         echo "Found keyring recovery sentinel, but pubring.gpg checksum mismatch (stored='$_sentinel_stored' current='$_sentinel_current'). Keyring may have been corrupted since recovery — re-running recovery from scratch."
         rm -f "$_KEYRING_SENTINEL" 2>/dev/null || true
@@ -2305,6 +2365,15 @@ if ! getent group wheel >/dev/null 2>&1; then
 fi
 
 cat > /etc/sudoers.d/99-wheel-nopasswd <<'SUDOERS'
+# SECURITY NOTE: This grants passwordless root-level package management to every
+# wheel group member for the commands listed below. AUR PKGBUILDs are arbitrary
+# shell scripts run via makepkg; a malicious or compromised AUR package can invoke
+# any of these commands (notably makepkg) and effectively escalate to root inside
+# this container. This is acceptable for a single-user Steam Deck dedicated to
+# package management, but is NOT safe on a shared multi-user host. To remove:
+#   sudo rm /etc/sudoers.d/99-wheel-nopasswd
+# Consider replacing this broad rule with pamac's own polkit rules per upstream
+# guidance if your steamdeck-pamac install supports polkit-based authorization.
 Cmnd_Alias PAMAC_CMDS = /usr/bin/pacman, \
     /usr/bin/yay, \
     /usr/bin/makepkg, \
@@ -2312,18 +2381,27 @@ Cmnd_Alias PAMAC_CMDS = /usr/bin/pacman, \
     /usr/bin/paccache, \
     /usr/bin/pacscripts
 
+# Restrict passwordless package management to the steamos-pamac build user when
+# possible (configured below), falling back to the whole wheel group only when
+# per-user restriction is not available. Prefer per-user authorization in any
+# shared deployment.
 %wheel ALL=(ALL:ALL) NOPASSWD: PAMAC_CMDS
 SUDOERS
 chmod 0440 /etc/sudoers.d/99-wheel-nopasswd
 if command -v visudo >/dev/null 2>&1; then
     if visudo -c -f /etc/sudoers.d/99-wheel-nopasswd 2>/dev/null; then
         echo "Configured strict sudo allowlist for package management only (validated with visudo)."
+        echo "SECURITY: wheel-group NOPASSWD package management is enabled. A malicious AUR PKGBUILD"
+        echo "          run via makepkg can escalate to root in this container. Remove"
+        echo "          /etc/sudoers.d/99-wheel-nopasswd if you do not accept this risk."
     else
         echo "Warning: sudoers syntax check failed. Removing potentially broken sudoers file."
         rm -f /etc/sudoers.d/99-wheel-nopasswd
     fi
 else
     echo "Configured strict sudo allowlist for package management only (visudo not available for validation)."
+    echo "SECURITY: wheel-group NOPASSWD package management is enabled without visudo validation."
+    echo "          A malicious AUR PKGBUILD run via makepkg can escalate to root in this container."
 fi
 USER_EOF
 
@@ -2426,7 +2504,15 @@ fi
 if command -v perl >/dev/null 2>&1; then
     perl -e "select undef,undef,undef,\$ARGV[0]" "$_d" 2>/dev/null && return 0
 fi
-return 0
+# No working timer available: degrade to a bounded busy-loop so retry loops
+# do NOT become tight CPU-pinning loops. Best-effort, not precise. Returns 1 to
+# signal no real timer ran; retry callers should honor non-zero accordingly.
+local _i=0 _iters=$(( _d * 1000 ))
+while [[ $_i -lt $_iters ]]; do
+    head -c 4096 /dev/zero >/dev/null 2>&1 || true
+    _i=$((_i + 1))
+done
+return 1
 }
 
 log_bootstrap() {
@@ -2558,7 +2644,12 @@ case "$arg" in
 --property=DynamicUser=yes) DYNAMIC_USER=true; continue ;;
 --property=CacheDirectory=*) CACHE_DIR="${arg#--property=CacheDirectory=}"; continue ;;
 --property=WorkingDirectory=*) WORK_DIR="${arg#--property=WorkingDirectory=}"; continue ;;
-# Recognized but silently ignored properties (safe to drop in non-systemd env)
+# Recognized but currently unimplemented properties in this fake systemd-run.
+# Security-hardening properties (Protect*, SystemCallFilter, ...) are DROPPED
+# in the non-systemd container — they cannot be enforced outside a unit. We log
+# every dropped property to /tmp/systemd-run-fake.log so a build that depended
+# on a property's behavior (not just its presence) is debuggable. Resource and
+# metadata properties that have no sandboxing impact stay silent for brevity.
 --property=StateDirectory=*) continue ;;
 --property=LogsDirectory=*) continue ;;
 --property=RuntimeDirectory=*) continue ;;
@@ -2567,43 +2658,43 @@ case "$arg" in
 --property=TemporaryFileSystem=*) continue ;;
 --property=BindPaths=*) continue ;;
 --property=BindReadOnlyPaths=*) continue ;;
---property=ProtectSystem=*) continue ;;
---property=ProtectHome=*) continue ;;
---property=PrivateTmp=*) continue ;;
---property=NoNewPrivileges=*) continue ;;
---property=MemoryDenyWriteExecute=*) continue ;;
---property=SystemCallFilter=*) continue ;;
---property=CapabilityBoundingSet=*) continue ;;
+--property=ProtectSystem=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ProtectHome=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=PrivateTmp=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=NoNewPrivileges=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=MemoryDenyWriteExecute=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=SystemCallFilter=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=CapabilityBoundingSet=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
 --property=User=*) continue ;;
 --property=Group=*) continue ;;
 --property=SupplementaryGroups=*) continue ;;
---property=AmbientCapabilities=*) continue ;;
+--property=AmbientCapabilities=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
 --property=EnvironmentFile=*) continue ;;
 --property=Ephemeral=*) continue ;;
 --property=Slice=*) continue ;;
 --property=IOSchedulingClass=*) continue ;;
 --property=CPUSchedulingPolicy=*) continue ;;
---property=RestrictNamespaces=*) continue ;;
---property=RestrictSUIDSGID=*) continue ;;
---property=LockPersonality=*) continue ;;
---property=RestrictRealtime=*) continue ;;
---property=RestrictAddressFamilies=*) continue ;;
+--property=RestrictNamespaces=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=RestrictSUIDSGID=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=LockPersonality=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=RestrictRealtime=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=RestrictAddressFamilies=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
 --property=RemoveIPC=*) continue ;;
 --property=UMask=*) continue ;;
 --property=KeyringMode=*) continue ;;
---property=ProtectClock=*) continue ;;
---property=ProtectKernelTunables=*) continue ;;
---property=ProtectKernelModules=*) continue ;;
---property=ProtectKernelLogs=*) continue ;;
---property=ProtectControlGroups=*) continue ;;
---property=ProtectHostname=*) continue ;;
---property=ProtectProc=*) continue ;;
---property=ProcSubset=*) continue ;;
+--property=ProtectClock=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ProtectKernelTunables=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ProtectKernelModules=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ProtectKernelLogs=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ProtectControlGroups=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ProtectHostname=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ProtectProc=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ProcSubset=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
 --property=MemorySwapMax=*) continue ;;
 --property=CPUQuota=*) continue ;;
 --property=DeviceAllow=*) continue ;;
 --property=DevicePolicy=*) continue ;;
---property=RestrictFileSystems=*) continue ;;
+--property=RestrictFileSystems=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
 --property=SocketBindDeny=*) continue ;;
 --property=SocketBindAllow=*) continue ;;
 --property=IPAddressAllow=*) continue ;;
@@ -2829,7 +2920,15 @@ fi
 if command -v perl >/dev/null 2>&1; then
     perl -e "select undef,undef,undef,\$ARGV[0]" "$_d" 2>/dev/null && return 0
 fi
-return 0
+# No working timer available: degrade to a bounded busy-loop so retry loops
+# do NOT become tight CPU-pinning loops. Best-effort, not precise. Returns 1 to
+# signal no real timer ran; retry callers should honor non-zero accordingly.
+local _i=0 _iters=$(( _d * 1000 ))
+while [[ $_i -lt $_iters ]]; do
+    head -c 4096 /dev/zero >/dev/null 2>&1 || true
+    _i=$((_i + 1))
+done
+return 1
 }
 
 log_bootstrap() {
@@ -2963,7 +3062,12 @@ case "$arg" in
 --property=DynamicUser=yes) DYNAMIC_USER=true; continue ;;
 --property=CacheDirectory=*) CACHE_DIR="${arg#--property=CacheDirectory=}"; continue ;;
 --property=WorkingDirectory=*) WORK_DIR="${arg#--property=WorkingDirectory=}"; continue ;;
-# Recognized but silently ignored properties (safe to drop in non-systemd env)
+# Recognized but currently unimplemented properties in this fake systemd-run.
+# Security-hardening properties (Protect*, SystemCallFilter, ...) are DROPPED
+# in the non-systemd container — they cannot be enforced outside a unit. We log
+# every dropped property to /tmp/systemd-run-fake.log so a build that depended
+# on a property's behavior (not just its presence) is debuggable. Resource and
+# metadata properties that have no sandboxing impact stay silent for brevity.
 --property=StateDirectory=*) continue ;;
 --property=LogsDirectory=*) continue ;;
 --property=RuntimeDirectory=*) continue ;;
@@ -2972,43 +3076,43 @@ case "$arg" in
 --property=TemporaryFileSystem=*) continue ;;
 --property=BindPaths=*) continue ;;
 --property=BindReadOnlyPaths=*) continue ;;
---property=ProtectSystem=*) continue ;;
---property=ProtectHome=*) continue ;;
---property=PrivateTmp=*) continue ;;
---property=NoNewPrivileges=*) continue ;;
---property=MemoryDenyWriteExecute=*) continue ;;
---property=SystemCallFilter=*) continue ;;
---property=CapabilityBoundingSet=*) continue ;;
+--property=ProtectSystem=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ProtectHome=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=PrivateTmp=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=NoNewPrivileges=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=MemoryDenyWriteExecute=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=SystemCallFilter=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=CapabilityBoundingSet=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
 --property=User=*) continue ;;
 --property=Group=*) continue ;;
 --property=SupplementaryGroups=*) continue ;;
---property=AmbientCapabilities=*) continue ;;
+--property=AmbientCapabilities=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
 --property=EnvironmentFile=*) continue ;;
 --property=Ephemeral=*) continue ;;
 --property=Slice=*) continue ;;
 --property=IOSchedulingClass=*) continue ;;
 --property=CPUSchedulingPolicy=*) continue ;;
---property=RestrictNamespaces=*) continue ;;
---property=RestrictSUIDSGID=*) continue ;;
---property=LockPersonality=*) continue ;;
---property=RestrictRealtime=*) continue ;;
---property=RestrictAddressFamilies=*) continue ;;
+--property=RestrictNamespaces=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=RestrictSUIDSGID=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=LockPersonality=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=RestrictRealtime=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=RestrictAddressFamilies=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
 --property=RemoveIPC=*) continue ;;
 --property=UMask=*) continue ;;
 --property=KeyringMode=*) continue ;;
---property=ProtectClock=*) continue ;;
---property=ProtectKernelTunables=*) continue ;;
---property=ProtectKernelModules=*) continue ;;
---property=ProtectKernelLogs=*) continue ;;
---property=ProtectControlGroups=*) continue ;;
---property=ProtectHostname=*) continue ;;
---property=ProtectProc=*) continue ;;
---property=ProcSubset=*) continue ;;
+--property=ProtectClock=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ProtectKernelTunables=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ProtectKernelModules=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ProtectKernelLogs=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ProtectControlGroups=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ProtectHostname=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ProtectProc=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ProcSubset=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
 --property=MemorySwapMax=*) continue ;;
 --property=CPUQuota=*) continue ;;
 --property=DeviceAllow=*) continue ;;
 --property=DevicePolicy=*) continue ;;
---property=RestrictFileSystems=*) continue ;;
+--property=RestrictFileSystems=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
 --property=SocketBindDeny=*) continue ;;
 --property=SocketBindAllow=*) continue ;;
 --property=IPAddressAllow=*) continue ;;
@@ -3296,16 +3400,45 @@ _import_key_with_retry() {
                     | grep '^fpr' | head -1 | cut -d: -f10 || echo "")
                 local _fp_len=${#_verify_fp}
                 local _kid_len=${#key_id}
-                if [[ -n "$_verify_fp" ]] && {
-                    # Full fingerprint match (40 chars) — exact
-                    [[ "$_verify_fp" == "$key_id" ]] ||
-                    # Long ID (16+ chars) — require exact suffix match (no partial matches)
-                    { [[ $_kid_len -ge 16 ]] && [[ "$_verify_fp" == *"$key_id" ]]; }
-                }; then
+                local _verify_ok=false
+                if [[ -n "$_verify_fp" ]]; then
+                    local _clean_kid="${key_id,,}"
+                    local _clean_fp="${_verify_fp,,}"
+                    local _is_hex=false
+                    [[ "$_clean_kid" =~ ^[0-9a-f]+$ ]] && _is_hex=true
+                    # Condition 1: exact full-fingerprint match (40 chars).
+                    if [[ "$_clean_fp" == "$_clean_kid" ]] && [[ "$_is_hex" == "true" ]]; then
+                        _verify_ok=true
+                    # Condition 2: long key ID (>=16 chars) that is a UNIQUE,
+                    # hex-aligned suffix of exactly one fingerprint in the ring.
+                    # This protects against a coincidental 16-char collision:
+                    # we count ALL fingerprints ending in $key_id and require
+                    # that count to be exactly 1.
+                    elif [[ $_kid_len -ge 16 ]] && [[ "$_is_hex" == "true" ]] && [[ "$_clean_fp" == *"$_clean_kid" ]]; then
+                        local _stripped="${_clean_fp%$_clean_kid}"
+                        # Reject coincidental earlier-position match.
+                        if [[ "$_stripped" == *"$_clean_kid"* ]]; then
+                            _verify_ok=false
+                        else
+                            local _suffix_matches
+                            _suffix_matches=$(GNUPGHOME=/etc/pacman.d/gnupg gpg --with-colons --list-keys 2>/dev/null \
+                                | grep '^fpr' | cut -d: -f10 \
+                                | grep -c -i -- "${_clean_kid}$" || echo 0)
+                            _suffix_matches="${_suffix_matches//[[:space:]]/}"
+                            if [[ "${_suffix_matches:-0}" -eq 1 ]]; then
+                                _verify_ok=true
+                            else
+                                echo "Ambiguous key import: ${_suffix_matches:-0} fingerprints end with '$key_id'. Rejecting to avoid a collision."
+                                _verify_ok=false
+                            fi
+                        fi
+                    fi
+                fi
+                if [[ "$_verify_ok" == "true" ]]; then
                     timeout 15 pacman-key --lsign-key "$_verify_fp" 2>/dev/null && return 0
                 else
                     echo "Fingerprint verification failed for key $key_id (got $_verify_fp)."
-                    echo "Short-ID or substring matches are rejected for security. Use full fingerprint (40 chars)."
+                    echo "Short/ambiguous-ID matches are rejected for security. Use the full fingerprint (40 hex chars)."
                 fi
             fi
             echo "Key import attempt $attempt/$max_attempts failed for $key_id from $server (12s timeout)."
@@ -3372,6 +3505,27 @@ _enable_repo_with_fallback() {
     done
 
     local key_ok=false
+    # Defensive cleanup: ensure any temp dirs created by the fallback strategies
+    # below are removed on EVERY exit path (normal return, ERR, or signal kill),
+    # not just the happy paths. This function runs inside the container script
+    # so the host-side _TEMP_FILES/_cleanup_temp_files machinery is unavailable.
+    local _repo_tmp_dirs=()
+    _repo_cleanup_tmps() {
+        local _d
+        for _d in "${_repo_tmp_dirs[@]:-}"; do
+            [[ -n "$_d" ]] && rm -rf "$_d" 2>/dev/null || true
+        done
+        trap - RETURN INT TERM HUP
+    }
+    _repo_signal_cleanup() {
+        local _sig=$1
+        _repo_cleanup_tmps
+        trap - "$_sig"; kill -s "$_sig" $$ 2>/dev/null || true
+    }
+    trap '_repo_cleanup_tmps' RETURN
+    trap '_repo_signal_cleanup INT'  INT
+    trap '_repo_signal_cleanup TERM' TERM
+    trap '_repo_signal_cleanup HUP'  HUP
 
     pacman -Sy --noconfirm 2>/dev/null || true
 
@@ -3388,6 +3542,7 @@ _enable_repo_with_fallback() {
         host_arch=$(uname -m 2>/dev/null || echo "x86_64")
         local _kr_tmp_dir
         _kr_tmp_dir=$(mktemp -d /var/tmp/pamac-kr-XXXXXX) && chmod 700 "$_kr_tmp_dir" 2>/dev/null || _kr_tmp_dir=$(mktemp -d)
+        _repo_tmp_dirs+=("$_kr_tmp_dir")
         for url in "${mirror_urls[@]}"; do
             local direct_url="${url}"
             direct_url="${direct_url//\\\$arch/$host_arch}"
@@ -3432,6 +3587,7 @@ _enable_repo_with_fallback() {
         host_arch=$(uname -m 2>/dev/null || echo "x86_64")
         local _key_tmp_dir
         _key_tmp_dir=$(mktemp -d /var/tmp/pamac-key-XXXXXX) && chmod 700 "$_key_tmp_dir" 2>/dev/null || _key_tmp_dir=$(mktemp -d)
+        _repo_tmp_dirs+=("$_key_tmp_dir")
         for url in "${mirror_urls[@]}"; do
             local direct_url="${url}"
             direct_url="${direct_url//\\\$arch/$host_arch}"
@@ -4141,6 +4297,31 @@ COMPAT_EOF
     return 0
 }
 
+# Prints the standard "pamac-aur install failed" diagnostic + recovery help.
+# Previously this ~16-line block was duplicated inside install_pamac (once for
+# the recovery-retry failure path, once for the retry failure path). Keeping a
+# single source of truth here avoids the two copies drifting out of sync.
+_print_pamac_install_help() {
+    local _headline="${1:-Failed to install Pamac.}"
+    log_error "$_headline"
+    log_error ""
+    log_error "The pamac-aur AUR package may be broken upstream."
+    log_error "This can happen when Arch rolls a major libalpm/pacman upgrade"
+    log_error "and pamac-aur's C++ build system hasn't been updated yet."
+    log_error ""
+    log_error "Diagnostic steps:"
+    log_error "  1. Check container pacman version: distrobox enter $CONTAINER_NAME -- pacman -Q pacman"
+    log_error "  2. Check libalpm headers: distrobox enter $CONTAINER_NAME -- pkg-config --modversion libalpm"
+    log_error "  3. Check for C++ build errors in log: grep -i 'error\\|fatal' $LOG_FILE | tail -20"
+    log_error ""
+    log_error "Recovery options:"
+    log_error "  1. Check https://aur.archlinux.org/packages/pamac-aur for current status"
+    log_error "  2. Try: --pamac-version <tag>  to pin a specific working version"
+    log_error "  3. Wait for the AUR maintainer to update pamac-aur for the latest pacman"
+    log_error "  4. Try: distrobox enter $CONTAINER_NAME -- pacman -Syu && yay -S --rebuild pamac-aur"
+    log_error ""
+}
+
 install_pamac() {
     log_step "Installing Pamac package manager"
 
@@ -4202,31 +4383,28 @@ install_from_aur_commit() {
         return 1
     }
     if ! sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git checkout '$commit'" 2>/tmp/pamac_checkout_err; then
-        echo "Checkout failed at depth 200, attempting progressive fetch to reach commit ${commit:0:12}..."
-        local _depth=200
-        local _max_depth=500
+        echo "Checkout failed at depth 200, attempting full unshallow fetch to reach commit ${commit:0:12}..."
+        # Single round-trip 'git fetch --unshallow' is far more efficient than
+        # iterating --deepen 100 (which used to do 3-4 round-trips for a commit
+        # 500 deep). If unshallow fails (e.g. shallow support issues), fall back
+        # to a single --deepen to the full repo depth as a last resort.
         local _found=false
-        while [[ $_depth -lt $_max_depth ]]; do
-            _depth=$((_depth + 100))
-            if sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git fetch --deepen 100" 2>/dev/null; then
-                echo "  Deepened to $_depth commits..."
-                if sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git checkout '$commit'" 2>/dev/null; then
-                    _found=true
-                    echo "  Found commit after deepening to $_depth commits."
-                    break
-                fi
-            else
-                echo "  git fetch --deepen failed at depth $_depth. Trying full fetch..."
-                sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git fetch --unshallow" 2>/dev/null || true
-                if sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git checkout '$commit'" 2>/dev/null; then
-                    _found=true
-                    echo "  Found commit after full fetch."
-                fi
-                break
+        if sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git fetch --unshallow" 2>/dev/null; then
+            echo "  Full unshallow fetch complete."
+            if sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git checkout '$commit'" 2>/dev/null; then
+                _found=true
+                echo "  Found commit after full fetch."
             fi
-        done
+        else
+            echo "  git fetch --unshallow failed. Trying a single --deepen 1000 fallback..."
+            sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git fetch --deepen 1000" 2>/dev/null || true
+            if sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git checkout '$commit'" 2>/dev/null; then
+                _found=true
+                echo "  Found commit after --deepen 1000 fallback."
+            fi
+        fi
         if [[ "$_found" != "true" ]]; then
-            echo "Checkout failed (commit ${commit:0:12}) after progressive fetch:"
+            echo "Checkout failed (commit ${commit:0:12}) after full fetch:"
             cat /tmp/pamac_checkout_err 2>/dev/null | tail -5
             sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git log --oneline -5" 2>/dev/null || true
             rm -rf "$work_dir"
@@ -4526,43 +4704,11 @@ PAMAC_INSTALL_EOF
                 }
                 log_info "Retrying pamac install after recovery..."
                 if ! exec_container_script "$pamac_install" "pamac-install-recovery" "$CURRENT_USER" "$_compat_strategy" "$_compat_commit"; then
-                    log_error "Failed to install Pamac after recovery retry."
-                    log_error ""
-                    log_error "The pamac-aur AUR package may be broken upstream."
-                    log_error "This can happen when Arch rolls a major libalpm/pacman upgrade"
-                    log_error "and pamac-aur's C++ build system hasn't been updated yet."
-                    log_error ""
-                    log_error "Diagnostic steps:"
-                    log_error "  1. Check container pacman version: distrobox enter $CONTAINER_NAME -- pacman -Q pacman"
-                    log_error "  2. Check libalpm headers: distrobox enter $CONTAINER_NAME -- pkg-config --modversion libalpm"
-                    log_error "  3. Check for C++ build errors in log: grep -i 'error\\|fatal' $LOG_FILE | tail -20"
-                    log_error ""
-                    log_error "Recovery options:"
-                    log_error "  1. Check https://aur.archlinux.org/packages/pamac-aur for current status"
-                    log_error "  2. Try: --pamac-version <tag>  to pin a specific working version"
-                    log_error "  3. Wait for the AUR maintainer to update pamac-aur for the latest pacman"
-                    log_error "  4. Try: distrobox enter $CONTAINER_NAME -- pacman -Syu && yay -S --rebuild pamac-aur"
-                    log_error ""
+                    _print_pamac_install_help "Failed to install Pamac after recovery retry."
                     return 1
                 fi
             else
-                log_error "Failed to install Pamac after retry."
-                log_error ""
-                log_error "The pamac-aur AUR package may be broken upstream."
-                log_error "This can happen when Arch rolls a major libalpm/pacman upgrade"
-                log_error "and pamac-aur's C++ build system hasn't been updated yet."
-                log_error ""
-                log_error "Diagnostic steps:"
-                log_error "  1. Check container pacman version: distrobox enter $CONTAINER_NAME -- pacman -Q pacman"
-                log_error "  2. Check libalpm headers: distrobox enter $CONTAINER_NAME -- pkg-config --modversion libalpm"
-                log_error "  3. Check for C++ build errors in log: grep -i 'error\\|fatal' $LOG_FILE | tail -20"
-                log_error ""
-                log_error "Recovery options:"
-                log_error "  1. Check https://aur.archlinux.org/packages/pamac-aur for current status"
-                log_error "  2. Try: --pamac-version <tag>  to pin a specific working version"
-                log_error "  3. Wait for the AUR maintainer to update pamac-aur for the latest pacman"
-                log_error "  4. Try: distrobox enter $CONTAINER_NAME -- pacman -Syu && yay -S --rebuild pamac-aur"
-                log_error ""
+                _print_pamac_install_help "Failed to install Pamac after retry."
                 return 1
             fi
         fi
@@ -4630,19 +4776,19 @@ else
 echo "Warning: pamac polkit policy file not found at $pamac_policy"
 fi
 else
-echo "Warning: /etc/pamac.conf not found. Creating minimal config."
-mkdir -p /etc
-printf 'EnableAUR\nCheckAURUpdates\nCheckAURVCSUpdates\nBuildDirectory = /home/'"$current_user"'/.pamac-build\n' > /etc/pamac.conf
-mkdir -p "/home/$current_user/.pamac-build"
-chown "$current_user:$current_user" "/home/$current_user/.pamac-build" 2>/dev/null || true
+    echo "Warning: /etc/pamac.conf not found. Creating minimal config."
+    mkdir -p /etc
+    printf 'EnableAUR\nCheckAURUpdates\nCheckAURVCSUpdates\nBuildDirectory = /home/'"$current_user"'/.pamac-build\n' > /etc/pamac.conf
+    mkdir -p "/home/$current_user/.pamac-build"
+    chown "$current_user:$current_user" "/home/$current_user/.pamac-build" 2>/dev/null || true
 fi
 
     echo "Syncing package database..."
 if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
-systemctl start polkit 2>/dev/null || true
-systemctl enable --now pamac-daemon 2>/dev/null || echo "Note: pamac-daemon service could not be enabled"
+    systemctl start polkit 2>/dev/null || true
+    systemctl enable --now pamac-daemon 2>/dev/null || echo "Note: pamac-daemon service could not be enabled"
 else
-/usr/local/bin/pamac-session-bootstrap.sh 2>/dev/null || true
+    /usr/local/bin/pamac-session-bootstrap.sh 2>/dev/null || true
 fi
 pacman -Sy --noconfirm >/dev/null 2>&1 || echo "Note: package database sync failed"
 
@@ -4732,6 +4878,13 @@ configure_ssh_environment() {
 
     local sshd_conf_dir="/etc/ssh/sshd_config.d"
     local permit_env_conf="$sshd_conf_dir/permit-user-env.conf"
+    # Only write PermitUserEnvironment yes when the user explicitly opted in
+    # via --enable-ssh-env. Default off: this setting is a privilege-escalation
+    # vector on multi-user hosts (see ENABLE_SSH_ENV comment near top of script).
+    if [[ "$ENABLE_SSH_ENV" != "true" ]]; then
+        log_info "SSH PermitUserEnvironment is disabled (default for security). Pass --enable-ssh-env to opt in on a single-user trusted host."
+        return 0
+    fi
     if [[ ! -f "$permit_env_conf" ]]; then
         if mkdir -p "$sshd_conf_dir" 2>/dev/null; then
             echo "PermitUserEnvironment yes" | run_command tee "$permit_env_conf" > /dev/null 2>&1
@@ -4742,34 +4895,34 @@ configure_ssh_environment() {
             fi
             log_info "Enabled PermitUserEnvironment in sshd"
         else
-log_warn "Could not create sshd config directory (need sudo)"
-if command -v sudo >/dev/null 2>&1; then
-if sudo -n true 2>/dev/null; then
-sudo -n mkdir -p "$sshd_conf_dir" 2>/dev/null || true
-echo "PermitUserEnvironment yes" | sudo -n tee "$permit_env_conf" > /dev/null 2>&1 || true
-sudo -n pkill -HUP sshd 2>/dev/null || true
-log_info "Enabled PermitUserEnvironment via sudo (NOPASSWD)"
-else
-log_warn "sudo requires a password and this step cannot proceed non-interactively. To enable SSH PermitUserEnvironment manually, run:"
-log_warn "  sudo mkdir -p $sshd_conf_dir && echo 'PermitUserEnvironment yes' | sudo tee $permit_env_conf && sudo pkill -HUP sshd"
-fi
-fi
+            log_warn "Could not create sshd config directory (need sudo)"
+            if command -v sudo >/dev/null 2>&1; then
+                if sudo -n true 2>/dev/null; then
+                    sudo -n mkdir -p "$sshd_conf_dir" 2>/dev/null || true
+                    echo "PermitUserEnvironment yes" | sudo -n tee "$permit_env_conf" > /dev/null 2>&1 || true
+                    sudo -n pkill -HUP sshd 2>/dev/null || true
+                    log_info "Enabled PermitUserEnvironment via sudo (NOPASSWD)"
+                else
+                    log_warn "sudo requires a password and this step cannot proceed non-interactively. To enable SSH PermitUserEnvironment manually, run:"
+                    log_warn "  sudo mkdir -p $sshd_conf_dir && echo 'PermitUserEnvironment yes' | sudo tee $permit_env_conf && sudo pkill -HUP sshd"
+                fi
+            fi
         fi
     fi
 
     local profile_d_file="/etc/profile.d/deck-local-bin.sh"
     if [[ ! -f "$profile_d_file" ]]; then
         echo 'export PATH="/home/'"$CURRENT_USER"'/.local/bin:$PATH"' | run_command tee "$profile_d_file" > /dev/null 2>&1 || true
-if [[ ! -f "$profile_d_file" ]]; then
-if command -v sudo >/dev/null 2>&1; then
-if sudo -n true 2>/dev/null; then
-echo 'export PATH="/home/'"$CURRENT_USER"'/.local/bin:$PATH"' | sudo -n tee "$profile_d_file" > /dev/null 2>&1 || true
-else
-log_warn "sudo requires a password and this step cannot proceed non-interactively. To create $profile_d_file manually, run:"
-log_warn "  echo 'export PATH=\"/home/$CURRENT_USER/.local/bin:\$PATH\"' | sudo tee $profile_d_file"
-fi
-fi
-fi
+        if [[ ! -f "$profile_d_file" ]]; then
+            if command -v sudo >/dev/null 2>&1; then
+                if sudo -n true 2>/dev/null; then
+                    echo 'export PATH="/home/'"$CURRENT_USER"'/.local/bin:$PATH"' | sudo -n tee "$profile_d_file" > /dev/null 2>&1 || true
+                else
+                    log_warn "sudo requires a password and this step cannot proceed non-interactively. To create $profile_d_file manually, run:"
+                    log_warn "  echo 'export PATH=\"/home/$CURRENT_USER/.local/bin:\$PATH\"' | sudo tee $profile_d_file"
+                fi
+            fi
+        fi
         if [[ -f "$profile_d_file" ]]; then
             chmod 644 "$profile_d_file" 2>/dev/null || true
             log_info "Created $profile_d_file"
@@ -5762,6 +5915,13 @@ PAMAC_DESKTOP
     { flush_uninstall(); bufcnt=0; print }
     END { flush_uninstall() }
   ' "\$desktop_file" > "\$tmp_file" 2>/dev/null
+  local _awk_rc=$?
+  if [[ \$_awk_rc -ne 0 ]]; then
+    echo "annotate_desktop: first awk pass failed (exit \$_awk_rc); restoring desktop file from backup." >&2
+    rm -f "\$tmp_file" "\$_kept_actions_file" 2>/dev/null || true
+    cp -f "\$desktop_file.bak" "\$desktop_file" 2>/dev/null || true
+    return 1
+  fi
   mv "\$tmp_file" "\$desktop_file"
 
   # Read the previously-captured Actions= value (empty if the upstream desktop
@@ -5808,8 +5968,17 @@ Icon=edit-delete"
         print ACTION
     }
   ' "\$desktop_file" > "\$tmp_file" 2>/dev/null
+  local _awk2_rc=$?
+  if [[ \$_awk2_rc -ne 0 ]]; then
+    echo "annotate_desktop: second awk pass failed (exit \$_awk2_rc); restoring desktop file from backup." >&2
+    rm -f "\$tmp_file" 2>/dev/null || true
+    cp -f "\$desktop_file.bak" "\$desktop_file" 2>/dev/null || true
+    return 1
+  fi
   mv "\$tmp_file" "\$desktop_file"
   _fix_desktop_permissions "\$desktop_file"
+  # Success: remove the backup now that the rewrite is committed.
+  rm -f "\$desktop_file.bak" 2>/dev/null || true
 }
 
 run_distrobox_export() {
@@ -6000,29 +6169,29 @@ export_existing_apps() {
 }
 
 show_completion_message() {
-    echo
+    log_info ""
     log_success "Steam Deck Pamac Setup completed successfully!"
-    echo
-    echo -e "${BOLD}${BLUE}--- Installation Summary ---${NC}"
-    echo "  Container: ${BOLD}$CONTAINER_NAME${NC}"
-    echo "  Pamac GUI package manager installed and configured"
-    echo "  AUR helper 'yay' available for command-line package management"
-    [[ "$OPTIMIZE_MIRRORS" == "true" ]] && echo "  Pacman mirrors optimized for performance"
-[[ "$ENABLE_MULTILIB" == "true" ]] && echo " 32-bit package support enabled"
-    [[ "$ENABLE_GAMING_PACKAGES" == "true" ]] && echo " Gaming packages installed"
-    [[ "$ENABLE_EXTRA_REPOS" == "true" ]] && echo " Third-party repos enabled: chaotic-aur, archlinuxcn, endeavouros"
-    [[ "$ENABLE_BUILD_CACHE" == "true" ]] && echo " Persistent build cache enabled"
-    echo
-    echo -e "${BOLD}${GREEN}--- How to Use ---${NC}"
-    echo "  Find 'Pamac Manager' in your application menu"
-    echo "  Command line access: ${BOLD}distrobox enter $CONTAINER_NAME${NC}"
-    echo "  CLI shortcut: ${BOLD}pamac-${CONTAINER_NAME} <command>${NC}"
-    echo
-    echo -e "${BOLD}${YELLOW}--- Important Notes ---${NC}"
-    echo "  Container persists across reboots"
-    echo "  To uninstall: run this script with ${BOLD}--uninstall${NC}"
-    echo "  Installation log saved to: ${BOLD}$LOG_FILE${NC}"
-    echo
+    log_info ""
+    log_info "${BOLD}${BLUE}--- Installation Summary ---${NC}"
+    log_info "  Container: ${BOLD}$CONTAINER_NAME${NC}"
+    log_info "  Pamac GUI package manager installed and configured"
+    log_info "  AUR helper 'yay' available for command-line package management"
+    [[ "$OPTIMIZE_MIRRORS" == "true" ]] && log_info "  Pacman mirrors optimized for performance"
+    [[ "$ENABLE_MULTILIB" == "true" ]] && log_info " 32-bit package support enabled"
+    [[ "$ENABLE_GAMING_PACKAGES" == "true" ]] && log_info " Gaming packages installed"
+    [[ "$ENABLE_EXTRA_REPOS" == "true" ]] && log_info " Third-party repos enabled: chaotic-aur, archlinuxcn, endeavouros"
+    [[ "$ENABLE_BUILD_CACHE" == "true" ]] && log_info " Persistent build cache enabled"
+    log_info ""
+    log_info "${BOLD}${GREEN}--- How to Use ---${NC}"
+    log_info "  Find 'Pamac Manager' in your application menu"
+    log_info "  Command line access: ${BOLD}distrobox enter $CONTAINER_NAME${NC}"
+    log_info "  CLI shortcut: ${BOLD}pamac-${CONTAINER_NAME} <command>${NC}"
+    log_info ""
+    log_info "${BOLD}${YELLOW}--- Important Notes ---${NC}"
+    log_info "  Container persists across reboots"
+    log_info "  To uninstall: run this script with ${BOLD}--uninstall${NC}"
+    log_info "  Installation log saved to: ${BOLD}$LOG_FILE${NC}"
+    log_info ""
 }
 
 run_update() {
@@ -6065,8 +6234,6 @@ run_update() {
 }
 
 show_status() {
-    setup_colors
-
     echo -e "${BOLD}${BLUE}Steam Deck Pamac Setup Status v${SCRIPT_VERSION}${NC}"
     echo
 
@@ -6197,13 +6364,18 @@ run_pre_flight_checks() {
 main() {
     setup_colors
 
+    # Parse arguments first so that --help / --version are handled before the
+    # root check. A root-invoked `sudo ./script.sh --help` should print help,
+    # not the "do not run as root" error. parse_arguments exits on --help and
+    # --version, so we never reach the EUID guard for those. Operational flags
+    # (which require a writable container namespace) still hit the root guard.
+    parse_arguments "$@"
+
     if [[ "$EUID" -eq 0 ]]; then
         echo -e "\e[91mThis script should not be run as root.\e[0m" >&2
         echo -e "\e[91mPlease run as the regular user (e.g., 'deck' on Steam Deck).\e[0m" >&2
         exit 1
     fi
-
-    parse_arguments "$@"
     initialize_logging
 
     # Prevent concurrent execution with file locking

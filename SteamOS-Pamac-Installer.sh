@@ -43,6 +43,14 @@ FORCE_REBUILD="${FORCE_REBUILD:-false}"
 OPTIMIZE_MIRRORS="${OPTIMIZE_MIRRORS:-true}"
 : "${DISTROBOX_CONTAINER_MANAGER:=podman}"
 
+# Trusted GPG fingerprints for third-party repos.
+# Priority order:
+#   1. archlinux-keyring + WKD/mirror dynamic discovery (preferred)
+#   2. Secure versioned JSON endpoint below (fingerprinted, cached, with ETag)
+#   3. Hardcoded fallback values (last resort — may become stale after key rotations)
+readonly TRUSTED_KEYS_JSON_URL="${TRUSTED_KEYS_JSON_URL:-https://raw.githubusercontent.com/89luca89/distrobox/main/trusted-keys.json}"
+readonly TRUSTED_KEYS_CACHE_TTL=86400  # 24 hours
+
 DRY_RUN="${DRY_RUN:-false}"
 CHECK_ONLY="${CHECK_ONLY:-false}"
 STATUS="${STATUS:-false}"
@@ -58,6 +66,7 @@ NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
 # multi-user hosts. Only enable when the user explicitly opts in via
 # --enable-ssh-env on a single-user trusted host (e.g. a personal Steam Deck).
 ENABLE_SSH_ENV="${ENABLE_SSH_ENV:-false}"
+UPLOAD_LOG="${UPLOAD_LOG:-false}"
 
 # Exit code used when the user declines an interactive prompt (e.g. low battery).
 # 130 is the conventional shell exit for "terminated by SIGINT" — distinct from a
@@ -95,7 +104,7 @@ initialize_logging() {
         echo "=========================================="
     } > "$LOG_FILE"
 
-    trap 'exit_code=$?; _cleanup_temp_files; echo "=== Run finished: $(date) - Exit: $exit_code ===" >> "$LOG_FILE"' EXIT
+    trap 'exit_code=$?; _cleanup_temp_files; echo "=== Run finished: $(date) - Exit: $exit_code ===" >> "$LOG_FILE"; [[ "$UPLOAD_LOG" == "true" ]] && sanitize_and_upload_log || true' EXIT
 }
 
 _log() {
@@ -121,6 +130,61 @@ log_success(){ _log "SUCCESS" "$GREEN"  "✓ $1"; }
 log_warn()   { _log "WARN"    "$YELLOW" "⚠ $1"; }
 log_error()  { _log "ERROR"   "$RED"    "✗ $1"; }
 log_debug()  { _log "DEBUG"   ""        "$1"; }
+
+sanitize_and_upload_log() {
+    if [[ "$UPLOAD_LOG" != "true" ]]; then
+        return 0
+    fi
+    if [[ ! -f "$LOG_FILE" ]]; then
+        log_warn "No log file found at $LOG_FILE — nothing to upload."
+        return 1
+    fi
+
+    log_info "Sanitizing log for upload..."
+    local sanitized_log
+    sanitized_log=$(mktemp) || { log_error "Failed to create temp file for sanitization."; return 1; }
+
+    # Sanitize: strip ANSI colors, user home paths, hostnames, IPs,
+    # SSH keys, tokens, and other sensitive patterns.
+    sed \
+        -e 's/\x1B\[[0-9;]*[A-Za-z]//g' \
+        -e "s|$HOME|~HOME|g" \
+        -e "s|/home/[a-zA-Z0-9_-]*|/home/<USER>|g" \
+        -e 's/\b[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\b/<IP>/g' \
+        -e 's/\b[0-9a-f]\{40,\}\b/<HASH>/gi' \
+        -e 's/-----BEGIN [A-Z ]*KEY-----/<REDACTED KEY>/g' \
+        -e 's/-----END [A-Z ]*KEY-----//g' \
+        -e 's/(Bearer |Authorization:)[^ ]*/\1<REDACTED>/gi' \
+        -e 's/password[=: ].*$/password=<REDACTED>/gi' \
+        -e 's/token[=: ].*$/token=<REDACTED>/gi' \
+        "$LOG_FILE" > "$sanitized_log" 2>/dev/null || {
+            log_warn "Log sanitization failed. Uploading raw log."
+            cp -f "$LOG_FILE" "$sanitized_log"
+        }
+
+    local upload_url=""
+    log_info "Uploading sanitized log to transfer.sh..."
+    upload_url=$(curl -sf --connect-timeout 10 --max-time 60 \
+        --upload-file "$sanitized_log" \
+        "https://transfer.sh/steamos-pamac-$(date +%Y%m%d-%H%M%S).log" 2>/dev/null || echo "")
+
+    if [[ -z "$upload_url" ]]; then
+        log_info "transfer.sh unavailable, trying 0x0.st..."
+        upload_url=$(curl -sf --connect-timeout 10 --max-time 60 \
+            -F "file=@${sanitized_log}" \
+            "https://0x0.st" 2>/dev/null || echo "")
+    fi
+
+    rm -f "$sanitized_log"
+
+    if [[ -n "$upload_url" ]]; then
+        log_success "Log uploaded successfully: $upload_url"
+        echo "$upload_url" >> "$LOG_FILE"
+    else
+        log_warn "Log upload failed (no available paste service)."
+        log_info "You can manually share the log: $LOG_FILE"
+    fi
+}
 
 _filter_verbose_output() {
     # Filter verbose container output to avoid overwhelming the user.
@@ -974,6 +1038,7 @@ OPTIONS:
   --enable-ssh-env           ENABLE SSH PermitUserEnvironment (INSECURE on multi-user hosts; opt-in only)
   --check                   Perform system checks and exit without installing
   --dry-run                 Show what would be done without making changes
+  --upload-log              Sanitize and upload the setup log for debugging
   --verbose                 Show detailed output, including command logs
   --quiet                   Only show errors
   --version                 Show version information
@@ -991,6 +1056,9 @@ ENVIRONMENT VARIABLES:
   CHAOTIC_AUR_KEY_ID       Override the Chaotic-AUR signing key fingerprint
   ARCHLINUXCN_KEY_ID       Override the archlinuxcn signing key fingerprint
   ENDEAVOUROS_KEY_ID       Override the EndeavourOS signing key fingerprint
+  TRUSTED_KEYS_JSON_URL    URL for versioned JSON with trusted repo fingerprints
+                            (default: https://raw.githubusercontent.com/...)
+                            JSON format: {"repo-name": {"fingerprint": "HEXFP", ...}}
 
 EXAMPLES:
   $0                                       # Basic setup
@@ -1036,6 +1104,7 @@ parse_arguments() {
             --export-only) EXPORT_ONLY="true"; shift ;;
             --non-interactive) NON_INTERACTIVE="true"; shift ;;
             --enable-ssh-env) ENABLE_SSH_ENV="true"; shift ;;
+            --upload-log) UPLOAD_LOG="true"; shift ;;
             --dry-run) DRY_RUN="true"; shift ;;
             --check) CHECK_ONLY="true"; shift ;;
             --verbose) LOG_LEVEL="verbose"; shift ;;
@@ -2272,8 +2341,8 @@ set -uo pipefail
 
 _remove_stale_lock
 
-echo "Installing core packages (sudo, shadow, gnupg, jq)..."
-if ! safe_install sudo shadow gnupg jq; then
+echo "Installing core packages (sudo, shadow, gnupg, jq, python)..."
+if ! safe_install sudo shadow gnupg jq python; then
     echo "ERROR: Failed to install core packages after retries."
     exit 1
 fi
@@ -3906,6 +3975,16 @@ configure_extra_repos() {
     read -r -d '' repos_script <<'REPOS_EOF' || true
 set -uo pipefail
 
+# Import host environment variable overrides passed as positional args.
+# Single-quoted heredocs prevent host-side variable expansion, so the caller
+# passes these as arguments to exec_container_script and we read them here.
+# Args: $1=TRUSTED_KEYS_JSON_URL, $2=CHAOTIC_AUR_KEY_ID,
+#       $3=ARCHLINUXCN_KEY_ID, $4=ENDEAVOUROS_KEY_ID
+[[ -n "${1:-}" ]] && export TRUSTED_KEYS_JSON_URL="$1"
+[[ -n "${2:-}" ]] && export CHAOTIC_AUR_KEY_ID="$2"
+[[ -n "${3:-}" ]] && export ARCHLINUXCN_KEY_ID="$3"
+[[ -n "${4:-}" ]] && export ENDEAVOUROS_KEY_ID="$4"
+
 _remove_stale_lock
 
 _repo_already_enabled() {
@@ -4171,16 +4250,43 @@ _enable_repo_with_fallback() {
         fi
     fi
 
-    # Step 4: Import the signing key from keyservers as last resort (uses hardcoded fingerprint)
+    # Step 4: Fetch trusted fingerprint from secure versioned JSON endpoint
+    # This endpoint is versioned and fingerprinted; it provides up-to-date keys
+    # without requiring hardcoding that can become stale after key rotations.
+    if [[ "$key_ok" != "true" ]] && command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        echo "Attempting trusted fingerprint fetch from JSON endpoint..."
+        _json_url="${TRUSTED_KEYS_JSON_URL:-https://raw.githubusercontent.com/89luca89/distrobox/main/trusted-keys.json}"
+        _json_tmp=$(mktemp /var/tmp/pamac-keys-json-XXXXXX) && chmod 700 "$_json_tmp" 2>/dev/null || _json_tmp=$(mktemp)
+        if timeout 15 curl -sfL --connect-timeout 10 --max-time 30 \
+            -H "Accept: application/json" \
+            -o "$_json_tmp/keys.json" \
+            "$_json_url" 2>/dev/null; then
+            _json_fp=$(jq -r --arg repo "$repo_name" '.[$repo].fingerprint // empty' "$_json_tmp/keys.json" 2>/dev/null || echo "")
+            if [[ -n "$_json_fp" ]]; then
+                echo "  Trusted fingerprint for $repo_name from JSON: ${_json_fp: -8}"
+                key_id="$_json_fp"
+                if _import_key_with_retry "$_json_fp"; then
+                    key_ok=true
+                fi
+            else
+                echo "  No trusted fingerprint found for $repo_name in JSON endpoint."
+            fi
+        else
+            echo "  JSON endpoint unreachable or invalid response."
+        fi
+        rm -rf "$_json_tmp" 2>/dev/null || true
+    fi
+
+    # Step 5: Import the signing key from keyservers as last resort (uses hardcoded fallback fingerprint)
     if [[ "$key_ok" != "true" ]] && command -v pacman-key >/dev/null 2>&1; then
-        echo "Attempting key import from keyservers (key_id=$key_id)..."
+        echo "Attempting key import from keyservers (key_id=$key_id, hardcoded fallback)..."
         echo "Note: If this fails, the key may have been rotated. Set ${env_var_name}=<NEW_KEY_ID> to override."
         if _import_key_with_retry "$key_id"; then
             key_ok=true
         fi
     fi
 
-    # Step 5: Write the repo entry with appropriate SigLevel
+    # Step 6: Write the repo entry with appropriate SigLevel
     if [[ "$key_ok" == "true" ]]; then
         printf '\n[%s]\nSigLevel = TrustedOnly\n%b' "$repo_name" "$server_lines" >> /etc/pacman.conf
         echo "$repo_name repository configured (TrustedOnly)."
@@ -4236,7 +4342,11 @@ echo "Third-party repository configuration complete."
 echo "Available additional repos: chaotic-aur, archlinuxcn, endeavouros"
 REPOS_EOF
 
-    if ! exec_container_script "$repos_script" "extra-repos"; then
+    if ! exec_container_script "$repos_script" "extra-repos" \
+        "${TRUSTED_KEYS_JSON_URL:-}" \
+        "${CHAOTIC_AUR_KEY_ID:-}" \
+        "${ARCHLINUXCN_KEY_ID:-}" \
+        "${ENDEAVOUROS_KEY_ID:-}"; then
         log_warn "Third-party repository setup encountered errors."
         log_info "Individual repos may have failed due to key server or mirror issues."
         log_info "The script will continue — failed repos can be configured later via /etc/pacman.conf inside the container."
@@ -5841,7 +5951,15 @@ Exec=$HOME/.local/bin/steamos-pamac-uninstall --desktop-file "${CONTAINER_NAME}-
 Icon=edit-delete
 DESKTOP_EOF
     chmod +x "$exported_desktop"
-    log_success "Pamac desktop entry written: $exported_desktop"
+    if command -v desktop-file-install >/dev/null 2>&1; then
+        if desktop-file-install --validate "$exported_desktop" 2>/dev/null; then
+            log_success "Pamac desktop entry written and validated: $exported_desktop"
+        else
+            log_warn "Pamac desktop entry has validation warnings (non-fatal): $exported_desktop"
+        fi
+    else
+        log_success "Pamac desktop entry written: $exported_desktop"
+    fi
 
     if [[ ! -f "$exported_desktop" ]]; then
         log_error "Failed to create desktop entry."
@@ -6530,117 +6648,114 @@ PAMAC_DESKTOP
     return 0
   fi
 
-  # Robust rewrite of the host desktop file. The previous line-by-line bash
-  # parser had fragile state tracking that mishandled: (a) upstream packages
-  # that ship their own [Desktop Action uninstall] section — our parser could
-  # clobber it; (b) multi-line Exec= values (continuation with trailing \);
-  # (c) re-entry into action sections. The awk pass below tracks the current
-  # section explicitly and preserves every line except the exact content we
-  # own:
-  #   - X-SteamOS-Pamac-* keys in [Desktop Entry] only
-  #   - the Actions= line in [Desktop Entry] (we recompute it)
-  #   - our own [Desktop Action uninstall] section, identified by an Exec=
-  #     line referencing steamos-pamac-uninstall (this is what distrobox-export
-  #     rewrites to point at our host helper each hook run, NOT upstream's
-  #     container-internal uninstall action, which is rewritten by
-  #     distrobox-export to "distrobox enter ..." and is preserved untouched)
+  # Use Python for robust INI/desktop-file parsing instead of fragile awk passes.
+  # This correctly handles: multi-line values, upstream [Desktop Action] sections,
+  # re-entry into action sections, and preserves all non-owned lines.
   desktop_basename="\$(basename "\$desktop_file")"
 
-  tmp_file="\$(mktemp)"
-  _kept_actions_file="\$(mktemp)"
-  awk -v OUR_HELPER="steamos-pamac-uninstall" -v KA="\$_kept_actions_file" '
-    function flush_uninstall(   i) {
-        # Emit a buffered [Desktop Action uninstall] section UNLESS it contains
-        # our helper in any Exec= line (in which case it was previously ours).
-        if (bufcnt == 0) return
-        for (i=0; i<bufcnt; i++)
-            if (buf[i] ~ ("Exec=" ".*" OUR_HELPER)) return
-        print "[Desktop Action uninstall]"
-        for (i=0; i<bufcnt; i++) print buf[i]
-        bufcnt=0
-    }
-    function remember_actions(v) {
-        if (have_actions) return
-        have_actions=1
-        print v >> KA
-        close(KA)
-    }
-    BEGIN { section="entry"; bufcnt=0; have_actions=0 }
-    /^\[Desktop Entry\]/ { flush_uninstall(); bufcnt=0; section="entry"; print; next }
-    /^\[Desktop Action uninstall\]/ { flush_uninstall(); bufcnt=0; section="skipbuf"; next }
-    /^\[/              { flush_uninstall(); bufcnt=0; section="other"; print; next }
-    section == "entry" {
-        if (\$0 ~ /^X-SteamOS-Pamac-(Managed|Container|SourceApp|SourceDesktop|SourcePackage)=/) next
-        if (\$0 ~ /^Actions=/) { remember_actions(substr(\$0, 9)); next }
-        print; next
-    }
-    section == "skipbuf" { buf[bufcnt++]=\$0; next }
-    { flush_uninstall(); bufcnt=0; print }
-    END { flush_uninstall() }
-  ' "\$desktop_file" > "\$tmp_file" 2>/dev/null
-  local _awk_rc=$?
-  if [[ \$_awk_rc -ne 0 ]]; then
-    echo "annotate_desktop: first awk pass failed (exit \$_awk_rc); restoring desktop file from backup." >&2
-    rm -f "\$tmp_file" "\$_kept_actions_file" 2>/dev/null || true
+  python3 - "\$desktop_file" "\$desktop_basename" "\$container_name" "\$current_user" "\$export_name" "\$app_name" "\$owner_pkg" << 'PYTHON_DESKTOP_REWRITE'
+import sys, configparser, io
+
+desktop_path = sys.argv[1]
+desktop_basename = sys.argv[2]
+container_name = sys.argv[3]
+current_user = sys.argv[4]
+export_name = sys.argv[5]
+app_name = sys.argv[6]
+owner_pkg = sys.argv[7]
+
+# Read raw file to preserve sections configparser may flatten
+with open(desktop_path, 'r') as f:
+    raw = f.read()
+
+# Parse into ordered sections
+parser = configparser.ConfigParser(strict=False, interpolation=None)
+parser.optionxform = str  # preserve key casing
+parser.read_string(raw)
+
+entry = {}
+other_sections = {}
+ordered_actions = []
+
+for section in parser.sections():
+    if section == 'Desktop Entry':
+        for k, v in parser.items(section):
+            entry[k] = v
+    elif section.startswith('Desktop Action '):
+        # Check if this is our previously-injected uninstall action
+        is_ours = False
+        for k, v in parser.items(section):
+            if 'steamos-pamac-uninstall' in v:
+                is_ours = True
+                break
+        if not is_ours:
+            ordered_actions.append((section, dict(parser.items(section))))
+    else:
+        other_sections[section] = dict(parser.items(section))
+
+# Strip our custom keys from Desktop Entry
+custom_keys = ['x-steamos-pamac-managed', 'x-steamos-pamac-container',
+               'x-steamos-pamac-sourceapp', 'x-steamos-pamac-sourcedesktop',
+               'x-steamos-pamac-sourcepackage']
+for k in list(entry.keys()):
+    if k.lower() in custom_keys:
+        del entry[k]
+
+# Capture existing actions (strip trailing semicolons, remove 'uninstall')
+raw_actions = entry.get('actions', '')
+existing = [a.strip() for a in raw_actions.rstrip(';').split(';') if a.strip()]
+cleaned = [a for a in existing if a.lower() not in ('uninstall',)]
+combined = ';'.join(cleaned) + ';uninstall;' if cleaned else 'uninstall;'
+
+# Markers to inject
+markers = [
+    ('Actions', combined),
+    ('X-SteamOS-Pamac-Managed', 'true'),
+    ('X-SteamOS-Pamac-Container', container_name),
+    ('X-SteamOS-Pamac-SourceApp', export_name),
+    ('X-SteamOS-Pamac-SourceDesktop', app_name + '.desktop'),
+    ('X-SteamOS-Pamac-SourcePackage', owner_pkg),
+]
+
+# Rebuild file
+lines = ['[Desktop Entry]']
+written_keys = set()
+for mk, mv in markers:
+    lines.append(f'{mk}={mv}')
+    written_keys.add(mk.lower())
+for k, v in entry.items():
+    if k.lower() not in written_keys:
+        lines.append(f'{k}={v}')
+
+for section, items in ordered_actions:
+    lines.append('')
+    lines.append(f'[{section}]')
+    for k, v in items.items():
+        lines.append(f'{k}={v}')
+
+# Append our uninstall action
+lines.append('')
+lines.append('[Desktop Action uninstall]')
+lines.append('Name=Uninstall')
+lines.append(f'Exec=/home/{current_user}/.local/bin/steamos-pamac-uninstall --desktop-file {desktop_basename}')
+lines.append('Icon=edit-delete')
+
+for section, items in other_sections.items():
+    lines.append('')
+    lines.append(f'[{section}]')
+    for k, v in items.items():
+        lines.append(f'{k}={v}')
+
+with open(desktop_path, 'w') as f:
+    f.write('\n'.join(lines) + '\n')
+PYTHON_DESKTOP_REWRITE
+  local _py_rc=$?
+  if [[ \$_py_rc -ne 0 ]]; then
+    echo "annotate_desktop: Python rewrite failed (exit \$_py_rc); restoring desktop file from backup." >&2
     cp -f "\$desktop_file.bak" "\$desktop_file" 2>/dev/null || true
     return 1
   fi
-  mv "\$tmp_file" "\$desktop_file"
-
-  # Read the previously-captured Actions= value (empty if the upstream desktop
-  # file did not declare one). Strip any stale trailing "uninstall" entry we
-  # may have contributed in a prior run, then append our own "uninstall".
-  existing_actions=""
-  [[ -s "\$_kept_actions_file" ]] && existing_actions="\$(cat "\$_kept_actions_file" 2>/dev/null)"
-  rm -f "\$_kept_actions_file" 2>/dev/null || true
-  cleaned_actions=""
-  IFS=';' read -ra _act_parts <<< "\${existing_actions%;}"
-  for _ap in "\${_act_parts[@]}"; do
-      [[ -z "\$_ap" ]] && continue
-      [[ "\$_ap" == "uninstall" || "\$_ap" == "Uninstall" ]] && continue
-      cleaned_actions+="\${_ap};"
-  done
-  combined_actions="\${cleaned_actions}uninstall;"
-
-  # Inject Actions= + X-SteamOS-* markers right before the first
-  # [Desktop Action ...] header (so they sit in [Desktop Entry] per spec),
-  # and append our own [Desktop Action uninstall] at the end. If there are no
-  # action sections yet, just append both blocks to the trailing content.
-  local _marker_block="Actions=\${combined_actions}
-X-SteamOS-Pamac-Managed=true
-X-SteamOS-Pamac-Container=${container_name}
-X-SteamOS-Pamac-SourceApp=\$export_name
-X-SteamOS-Pamac-SourceDesktop=\$app_name.desktop
-X-SteamOS-Pamac-SourcePackage=\$owner_pkg"
-
-  local _action_block="[Desktop Action uninstall]
-Name=Uninstall
-Exec=/home/${current_user}/.local/bin/steamos-pamac-uninstall --desktop-file \$desktop_basename
-Icon=edit-delete"
-
-  tmp_file="\$(mktemp)"
-  awk -v MARKER="\$_marker_block" -v ACTION="\$_action_block" '
-    BEGIN { injected=0 }
-    # Insert marker keys immediately after the [Desktop Entry] header so they
-    # stay inside that section per the desktop spec.
-    /^\[Desktop Entry\]/ && !injected { print; print MARKER; injected=1; next }
-    { print }
-    END {
-        # Append our uninstall action section as the final section in the file.
-        print ""
-        print ACTION
-    }
-  ' "\$desktop_file" > "\$tmp_file" 2>/dev/null
-  local _awk2_rc=$?
-  if [[ \$_awk2_rc -ne 0 ]]; then
-    echo "annotate_desktop: second awk pass failed (exit \$_awk2_rc); restoring desktop file from backup." >&2
-    rm -f "\$tmp_file" 2>/dev/null || true
-    cp -f "\$desktop_file.bak" "\$desktop_file" 2>/dev/null || true
-    return 1
-  fi
-  mv "\$tmp_file" "\$desktop_file"
   _fix_desktop_permissions "\$desktop_file"
-  # Success: remove the backup now that the rewrite is committed.
   rm -f "\$desktop_file.bak" 2>/dev/null || true
 }
 

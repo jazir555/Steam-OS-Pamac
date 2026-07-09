@@ -1496,7 +1496,22 @@ repair_pacman_db() {
     log_info "Checking and repairing pacman database (if needed)..."
     container_root_exec bash -c '
 set +e
-_remove_stale_lock
+if [[ -f /var/lib/pacman/db.lck ]]; then
+    _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo "")
+    if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null; then
+        echo "Pacman running (PID $_p), waiting..."
+        _w=0
+        while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do
+            sleep 2
+            _w=$(( _w + 2 ))
+        done
+        if kill -0 "$_p" 2>/dev/null; then
+            echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting repair."
+            exit 1
+        fi
+    fi
+    rm -f /var/lib/pacman/db.lck
+fi
 
 if ! pacman -Dk 2>/dev/null; then
     echo "Pacman DB inconsistencies detected. Attempting repair..."
@@ -1567,7 +1582,7 @@ _remove_stale_lock() {
         done
         if kill -0 "$_lck_pid" 2>/dev/null; then
             echo "ERROR: Pacman (PID $_lck_pid) is still running after ${_wait}s. Aborting to prevent database corruption."
-            return 1
+            exit 1
         fi
     fi
     rm -f "$_lock" 2>/dev/null || true
@@ -1691,18 +1706,18 @@ exec_container_script() {
 
     _script_file=$(mktemp --tmpdir pamac-script-XXXXXXXX)
     _TEMP_FILES+=("$_script_file")
-    printf '%s\n' "${_preamble}${_script}" > "$_script_file"
+    printf '%s\n' "${_preamble}" > "$_script_file"
 
     local _marker="PAMAC_SCRIPT_OK_$(head -c 16 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$_$(date +%s)")"
-    # Marker race fix: prepend an EXIT trap that emits the marker exactly once
-    # ONLY when the script exits successfully (code 0), regardless of where that
-    # exit occurs (mid-body `exit 0`, a returned-from function, or normal
-    # fallthrough to the end). The trap intentionally stays silent on non-zero
-    # exits so the existing "no marker => failure" proxy still works. Previously
-    # the marker was only appended after the body, so an early `exit 0` in the
-    # middle of a script would suppress the marker and (falsely) read as failure.
-    # The guard variable keeps emission idempotent if the trailing echo also runs.
+    # Marker race fix: install an EXIT trap BEFORE the script body so an early
+    # `exit 0` mid-body still emits the marker. The trap only fires on a
+    # successful (exit-code 0) exit so the existing "no marker => failure" proxy
+    # still works. The guard variable keeps emission idempotent if the trailing
+    # echo also runs.
     _exec_install_marker_trap "$_script_file" "$_marker"
+    # Now append the script body AFTER the trap so it is registered before
+    # any commands in the body execute (including mid-body `exit 0`).
+    printf '%s\n' "${_script}" >> "$_script_file"
     # Trailing redundant emission (normal fallthrough, exit-code-0 path); trap
     # covers early exits. Both paths are gated by the guard and exit-code check.
     printf '\n[ $? -eq 0 ] && echo "%s"\ntrap - EXIT\n' "$_marker" >> "$_script_file"

@@ -2273,8 +2273,7 @@ verify_core_tools || {
 echo "Pass 2: Upgrading remaining non-critical packages..."
 SKIP_PKGS=(systemd systemd-sysvcompat)
 if [[ "$pin_alpm" == "true" ]]; then
-    echo "PIN_ALPM active: deferring pacman/libalpm upgrade until after pamac-aur is built."
-    SKIP_PKGS+=(pacman libalpm lib32-libalpm)
+    echo "PIN_ALPM active: pacman/libalpm upgraded upfront; pamac-aur compat handled via ensure_pamac_aur_compat."
 fi
 exclude_args=()
 for pkg in "${CRITICAL_PKGS[@]}" archlinux-keyring ca-certificates-mozilla "${SKIP_PKGS[@]}"; do
@@ -4270,7 +4269,8 @@ _enable_repo_with_fallback() {
     if [[ "$key_ok" != "true" ]] && command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
         echo "Attempting trusted fingerprint fetch from JSON endpoint..."
         _json_url="${TRUSTED_KEYS_JSON_URL:-https://raw.githubusercontent.com/89luca89/distrobox/main/trusted-keys.json}"
-        _json_tmp=$(mktemp /var/tmp/pamac-keys-json-XXXXXX) && chmod 700 "$_json_tmp" 2>/dev/null || _json_tmp=$(mktemp)
+        _json_tmp=$(mktemp -d /var/tmp/pamac-keys-json-XXXXXX) && chmod 700 "$_json_tmp" 2>/dev/null || _json_tmp=$(mktemp -d)
+        _repo_tmp_dirs+=("$_json_tmp")
         if timeout 15 curl -sfL --connect-timeout 10 --max-time 30 \
             -H "Accept: application/json" \
             -o "$_json_tmp/keys.json" \
@@ -6704,6 +6704,8 @@ for section in parser.sections():
                 break
         if not is_ours:
             ordered_actions.append((section, dict(parser.items(section))))
+    else:
+        other_sections[section] = dict(parser.items(section))
 
 # Strip our custom keys from Desktop Entry
 custom_keys = ['x-steamos-pamac-managed', 'x-steamos-pamac-container',
@@ -7471,36 +7473,8 @@ configure_multilib
 	_ensure_healthy_or_recreate "after pamac install" || exit 1
 
     if [[ "$PIN_ALPM" == "true" ]]; then
-        log_step "Upgrading deferred libalpm/pacman packages..."
-        local deferred_alpm_script
-        read -r -d '' deferred_alpm_script <<'ALPM_EOF' || true
-set -uo pipefail
-_remove_stale_lock
-echo "Upgrading pacman and libalpm (deferred by --pin-alpm)..."
-if pacman -Sy --noconfirm 2>/dev/null; then
-    if pacman -S --noconfirm --needed pacman libalpm 2>/dev/null; then
-        echo "pacman/libalpm upgraded successfully."
-        ldconfig 2>/dev/null || true
-        echo "Rebuilding pamac-aur against new libalpm..."
-        if command -v yay >/dev/null 2>&1; then
-            if sudo -Hu "$1" bash -lc "yay -S --noconfirm --rebuild --noprogressbar pamac-aur" 2>/dev/null; then
-                echo "pamac-aur rebuilt successfully against new libalpm."
-            else
-                echo "WARN: pamac-aur rebuild failed. It may still work with the old build."
-                echo "Try manually: yay -S --rebuild pamac-aur"
-            fi
-        else
-            echo "WARN: yay not found, cannot rebuild pamac-aur."
-        fi
-    else
-        echo "WARN: pacman/libalpm upgrade failed. Using whatever version is installed."
-    fi
-else
-    echo "WARN: Database sync failed before pacman/libalpm upgrade."
-fi
-ALPM_EOF
-        exec_container_script "$deferred_alpm_script" "deferred-alpm-upgrade" "$CURRENT_USER" || \
-            log_warn "Deferred libalpm upgrade had issues. pamac-aur may need manual rebuild."
+        log_info "libalpm/pacman upgraded upfront during system upgrade."
+        log_info "pamac-aur compatibility handled by ensure_pamac_aur_compat during install."
     fi
 
 ensure_critical_helpers

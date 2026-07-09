@@ -16,7 +16,7 @@ trap '_err_trap $LINENO "$BASH_COMMAND"' ERR
 #   <<'EOF'  — no host variable expansion; content runs inside container
 #   <<EOF    — host variables expand at write-time; use \$ for literal $
 
-readonly SCRIPT_VERSION="5.2.1"
+readonly SCRIPT_VERSION="5.3.0"
 readonly DEFAULT_CONTAINER_NAME="arch-pamac"
 readonly LOG_FILE="$HOME/distrobox-pamac-setup.log"
 readonly REQUIRED_TOOLS=("distrobox")
@@ -695,7 +695,71 @@ check_system_requirements() {
         log_info "Not running on SteamOS. Script will adapt automatically."
     fi
 
+    check_kernel_glibc_compat
+
     [[ "$all_ok" == "true" ]]
+}
+
+check_kernel_glibc_compat() {
+    local host_kernel
+    host_kernel=$(uname -r 2>/dev/null || echo "")
+    if [[ -z "$host_kernel" ]]; then
+        log_warn "Could not determine host kernel version."
+        return 0
+    fi
+
+    local kernel_major kernel_minor
+    kernel_major=$(echo "$host_kernel" | cut -d. -f1)
+    kernel_minor=$(echo "$host_kernel" | cut -d. -f2)
+
+    if [[ -z "$kernel_major" || -z "$kernel_minor" ]]; then
+        log_warn "Could not parse host kernel version: $host_kernel"
+        return 0
+    fi
+
+    log_info "Host kernel: $host_kernel (${kernel_major}.${kernel_minor})"
+
+    # Known glibc minimum kernel requirements (approximate, based on Arch changelogs):
+    # glibc 2.38+ may require kernel >= 5.10 (for some features)
+    # glibc 2.39+ may require kernel >= 5.15 (some reports)
+    # glibc 2.40+ may require kernel >= 6.1 (verified minimum for recent Arch)
+    # SteamOS 3.x ships kernel ~6.1 on the Steam Deck.
+    local min_warn_major=6
+    local min_warn_minor=1
+    local min_crit_major=5
+    local min_crit_minor=10
+
+    local kernel_too_old=false
+    local kernel_warn=false
+
+    if [[ "$kernel_major" -lt "$min_crit_major" ]] || \
+       { [[ "$kernel_major" -eq "$min_crit_major" ]] && [[ "$kernel_minor" -lt "$min_crit_minor" ]]; }; then
+        kernel_too_old=true
+    elif [[ "$kernel_major" -lt "$min_warn_major" ]] || \
+         { [[ "$kernel_major" -eq "$min_warn_major" ]] && [[ "$kernel_minor" -lt "$min_warn_minor" ]]; }; then
+        kernel_warn=true
+    fi
+
+    if [[ "$kernel_too_old" == "true" ]]; then
+        log_warn "Host kernel ${kernel_major}.${kernel_minor} is older than the minimum"
+        log_warn "recommended kernel (~${min_crit_major}.${min_crit_minor}) for current"
+        log_warn "Arch Linux glibc packages. When Arch updates glibc to require a"
+        log_warn "newer kernel, binaries inside the container may segfault with"
+        log_warn "'FATAL: kernel too old'."
+        log_warn ""
+        log_warn "Mitigation options:"
+        log_warn "  1. Pin the container image to an older Arch snapshot:"
+        log_warn "     ARCHLINUX_IMAGE=archlinux:base-20240101 $0"
+        log_warn "  2. Update your host kernel if possible."
+        log_warn "  3. Accept the risk if your Arch packages are currently working."
+    elif [[ "$kernel_warn" == "true" ]]; then
+        log_info "Host kernel ${kernel_major}.${kernel_minor} is close to the minimum"
+        log_info "recommended for current Arch Linux glibc. Monitor Arch news for"
+        log_info "glibc kernel requirement changes. If issues arise, consider:"
+        log_info "  ARCHLINUX_IMAGE=archlinux:base-20240101 $0"
+    else
+        log_success "Host kernel ${kernel_major}.${kernel_minor} meets glibc requirements."
+    fi
 }
 
 repair_podman() {
@@ -1432,7 +1496,7 @@ repair_pacman_db() {
     log_info "Checking and repairing pacman database (if needed)..."
     container_root_exec bash -c '
 set +e
-rm -f /var/lib/pacman/db.lck
+_remove_stale_lock
 
 if ! pacman -Dk 2>/dev/null; then
     echo "Pacman DB inconsistencies detected. Attempting repair..."
@@ -1489,6 +1553,25 @@ while (( SECONDS - _start < _target )); do
 done
 return 1
 }
+_remove_stale_lock() {
+    local _lock="/var/lib/pacman/db.lck"
+    if [[ ! -f "$_lock" ]]; then return 0; fi
+    local _lck_pid
+    _lck_pid=$(cat "$_lock" 2>/dev/null || echo "")
+    if [[ -n "$_lck_pid" ]] && kill -0 "$_lck_pid" 2>/dev/null; then
+        echo "Pacman is currently running (PID $_lck_pid). Waiting..."
+        local _wait=0
+        while [[ $_wait -lt 30 ]] && kill -0 "$_lck_pid" 2>/dev/null; do
+            _safe_sleep 2
+            _wait=$(( _wait + 2 ))
+        done
+        if kill -0 "$_lck_pid" 2>/dev/null; then
+            echo "ERROR: Pacman (PID $_lck_pid) is still running after ${_wait}s. Aborting to prevent database corruption."
+            return 1
+        fi
+    fi
+    rm -f "$_lock" 2>/dev/null || true
+}
 _atomic_sed_inplace() {
     local _target="$1"; shift
     local _tmp; _tmp=$(mktemp "${_target}.atomic.XXXXXX") || { echo "FATAL: mktemp failed for atomic sed on $_target"; return 1; }
@@ -1524,7 +1607,7 @@ _set_makepkg_jobs() {
 safe_install() {
     local attempt=0 max_attempts=3 rc=0
     while [[ $attempt -lt $max_attempts ]]; do
-        rm -f /var/lib/pacman/db.lck
+        _remove_stale_lock
         if pacman -S --noconfirm --needed "$@"; then
             ldconfig 2>/dev/null || true
             return 0
@@ -1757,7 +1840,7 @@ _exec_handle_result() {
                 done
             fi
         fi
-        container_root_exec bash -c "rm -f /var/lib/pacman/db.lck; pkill -9 gpg-agent 2>/dev/null || true" 2>/dev/null || true
+        container_root_exec bash -c "if [[ -f /var/lib/pacman/db.lck ]]; then _p=\$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ''); if [[ -n "\$_p" ]] && kill -0 "\$_p" 2>/dev/null; then echo \"Pacman running (PID \$_p), waiting...\"; _w=0; while [[ \$_w -lt 30 ]] && kill -0 "\$_p" 2>/dev/null; do sleep 2; _w=\$(( _w + 2 )); done; if kill -0 "\$_p" 2>/dev/null; then echo \"ERROR: Pacman (PID \$_p) still running after 30s. Aborting.\"; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pkill -9 gpg-agent 2>/dev/null || true" 2>/dev/null || true
         container_start 2>/dev/null || true
         repair_pacman_db
         return "$_rc"
@@ -1775,7 +1858,7 @@ configure_container_base() {
     read -r -d '' keyring_script <<'KEYRING_EOF' || true
 set -uo pipefail
 
-rm -f /var/lib/pacman/db.lck
+_remove_stale_lock
 
 # Atomic pacman.conf writer: avoids sed -i which is non-atomic and can corrupt
 # the file if the process is killed mid-write (power loss, SIGKILL).
@@ -1975,7 +2058,7 @@ fi
 # Method C: Try standard database sync (works if keys are only slightly stale)
 if [[ "$_safe_recovered" != "true" ]]; then
     echo "Method C: Attempting standard database sync and keyring update..."
-    rm -f /var/lib/pacman/db.lck
+    _remove_stale_lock
     if pacman -Syy --noconfirm 2>/dev/null; then
         if pacman -S --noconfirm --needed archlinux-keyring gnupg 2>/dev/null; then
             echo "Standard sync and keyring update succeeded."
@@ -2022,7 +2105,7 @@ else
 fi
 
 echo "Step 3/5: Updating keyring, GPG, and certificate packages..."
-rm -f /var/lib/pacman/db.lck
+_remove_stale_lock
 
 if ! pacman -Syy --noconfirm 2>/dev/null; then
     echo "Warning: Initial database sync failed. Attempting repair with --overwrite..."
@@ -2134,7 +2217,7 @@ KEYRING_EOF
     read -r -d '' upgrade_script <<'UPG_EOF' || true
 set -uo pipefail
 
-rm -f /var/lib/pacman/db.lck
+_remove_stale_lock
 
 echo "Syncing package databases..."
 pacman -Syy --noconfirm 2>/dev/null || echo "Note: database sync had issues but continuing"
@@ -2168,7 +2251,7 @@ if grep -q MemAvailable /proc/meminfo 2>/dev/null; then
 fi
 
 echo "Upgrading system packages (3-pass: keyring+SSL first, then non-critical, then critical)..."
-rm -f /var/lib/pacman/db.lck
+_remove_stale_lock
 
 CRITICAL_PKGS=(openssl glibc lib32-glibc systemd-libs pam)
 upgrade_ok=true
@@ -2204,7 +2287,7 @@ verify_core_tools || {
 echo "Pass 3: Upgrading critical packages (openssl, glibc, systemd)..."
 for pkg in "${CRITICAL_PKGS[@]}"; do
     if pacman -Q "$pkg" >/dev/null 2>&1; then
-        rm -f /var/lib/pacman/db.lck
+        _remove_stale_lock
         echo "Upgrading $pkg..."
         if pacman -S --noconfirm --needed "$pkg" 2>/dev/null; then
             echo "$pkg upgraded."
@@ -2264,7 +2347,7 @@ UPG_EOF
     read -r -d '' core_script <<'CORE_EOF' || true
 set -uo pipefail
 
-rm -f /var/lib/pacman/db.lck
+_remove_stale_lock
 
 echo "Installing core packages (sudo, shadow, gnupg, jq)..."
 if ! safe_install sudo shadow gnupg jq; then
@@ -2292,7 +2375,7 @@ CORE_EOF
     read -r -d '' dev_script <<'DEV_EOF' || true
 set -uo pipefail
 
-rm -f /var/lib/pacman/db.lck
+_remove_stale_lock
 
 check_mem() {
     local min_kb="${1:-262144}"
@@ -2352,7 +2435,7 @@ DEV_EOF
     for _dep in git gcc go; do
         if ! container_root_exec bash -c "command -v $_dep >/dev/null 2>&1 || pacman -Q $_dep >/dev/null 2>&1" 2>/dev/null; then
             log_warn "Development dependency '$_dep' not found after install stage. Attempting recovery..."
-            container_root_exec bash -c "rm -f /var/lib/pacman/db.lck; pacman -S --noconfirm --needed $_dep" 2>/dev/null || true
+            container_root_exec bash -c "if [[ -f /var/lib/pacman/db.lck ]]; then _p=\$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ''); if [[ -n "\$_p" ]] && kill -0 "\$_p" 2>/dev/null; then echo \"Pacman running (PID \$_p), waiting...\"; _w=0; while [[ \$_w -lt 30 ]] && kill -0 "\$_p" 2>/dev/null; do sleep 2; _w=\$(( _w + 2 )); done; if kill -0 "\$_p" 2>/dev/null; then echo \"ERROR: Pacman (PID \$_p) still running after 30s. Aborting.\"; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -S --noconfirm --needed $_dep" 2>/dev/null || true
         fi
     done
 
@@ -2455,6 +2538,48 @@ fi
 else
 echo "Warning: could not install polkit. pamac GUI may prompt for password."
 fi
+
+echo "Installing polkit authentication agent..."
+if pacman -S --noconfirm --needed lxqt-policykit 2>/dev/null; then
+    echo "lxqt-policykit authentication agent installed."
+elif pacman -S --noconfirm --needed polkit-gnome 2>/dev/null; then
+    echo "polkit-gnome authentication agent installed."
+else
+    echo "Note: No polkit GUI agent available. Password prompts may not display."
+fi
+
+cat > /usr/local/bin/steamos-polkit-agent.sh << 'AGENT'
+#!/bin/bash
+set +e
+# Find and launch the first available polkit authentication agent.
+# This is needed because GUI authentication dialogs from inside a distrobox
+# container often fail to route back to the host's Wayland session.
+# Having an agent running inside the container ensures password prompts work.
+if command -v lxqt-policykit-agent >/dev/null 2>&1; then
+    exec lxqt-policykit-agent
+elif command -v polkit-gnome-authentication-agent-1 >/dev/null 2>&1; then
+    exec polkit-gnome-authentication-agent-1
+elif command -v cinnamon-polkit-agent >/dev/null 2>&1; then
+    exec cinnamon-polkit-agent
+elif command -v xfce-polkit >/dev/null 2>&1; then
+    exec xfce-polkit
+elif command -v polkit-agent-helper-1 >/dev/null 2>&1; then
+    exec polkit-agent-helper-1
+fi
+AGENT
+chmod 755 /usr/local/bin/steamos-polkit-agent.sh
+
+cat > /usr/local/bin/steamos-polkit-agent-wrapper.sh << 'WRAPPER'
+#!/bin/bash
+set +e
+# Wrapper to start the polkit agent if not already running.
+# Checks for an existing agent process before spawning a new one.
+if pgrep -x "lxqt-policykit-agent\|polkit-gnome-authentication-agent-1\|cinnamon-polkit-agent\|xfce-polkit" >/dev/null 2>&1; then
+    exit 0
+fi
+/usr/local/bin/steamos-polkit-agent.sh &
+WRAPPER
+chmod 755 /usr/local/bin/steamos-polkit-agent-wrapper.sh
 
 echo "Setting up D-Bus..."
 if command -v dbus-daemon >/dev/null 2>&1; then
@@ -2579,6 +2704,12 @@ if [[ -x /usr/lib/polkit-1/polkitd ]]; then
 fi
 }
 
+start_polkit_agent() {
+if [[ -x /usr/local/bin/steamos-polkit-agent-wrapper.sh ]]; then
+/usr/local/bin/steamos-polkit-agent-wrapper.sh &
+fi
+}
+
 start_pamac_daemon() {
 /usr/bin/pamac-daemon &
 }
@@ -2593,6 +2724,7 @@ ensure_service "dbus-daemon" "dbus-daemon" start_dbus
 ensure_service "polkitd" "polkitd" start_polkitd
 ensure_service "pamac-daemon" "pamac-daemon" start_pamac_daemon
 fi
+/usr/local/bin/steamos-polkit-agent-wrapper.sh 2>/dev/null &
 BOOTSTRAP
 chmod +x /usr/local/bin/pamac-session-bootstrap.sh
 echo "Bootstrap helper installed."
@@ -3228,6 +3360,12 @@ if [[ -x /usr/lib/polkit-1/polkitd ]]; then
 fi
 }
 
+start_polkit_agent() {
+if [[ -x /usr/local/bin/steamos-polkit-agent-wrapper.sh ]]; then
+/usr/local/bin/steamos-polkit-agent-wrapper.sh &
+fi
+}
+
 start_pamac_daemon() {
 /usr/bin/pamac-daemon &
 }
@@ -3242,6 +3380,7 @@ ensure_service "dbus-daemon" "dbus-daemon" start_dbus
 ensure_service "polkitd" "polkitd" start_polkitd
 ensure_service "pamac-daemon" "pamac-daemon" start_pamac_daemon
 fi
+/usr/local/bin/steamos-polkit-agent-wrapper.sh 2>/dev/null &
 BOOTSTRAP
 chmod +x /usr/local/bin/pamac-session-bootstrap.sh
 repaired=$((repaired + 1))
@@ -3775,7 +3914,7 @@ optimize_pacman_mirrors() {
   read -r -d '' mirror_script << 'EOF' || true
   set -uo pipefail
 
-  rm -f /var/lib/pacman/db.lck
+  _remove_stale_lock
 
   echo "Installing reflector..."
 if ! pacman -S --noconfirm --needed reflector; then
@@ -3809,7 +3948,7 @@ configure_multilib() {
   read -r -d '' multilib_script << 'EOF' || true
   set -uo pipefail
 
-  rm -f /var/lib/pacman/db.lck
+  _remove_stale_lock
 
   if ! grep -q '^\[multilib\]' /etc/pacman.conf; then
     echo "Enabling multilib repository..."
@@ -3844,7 +3983,7 @@ configure_extra_repos() {
     read -r -d '' repos_script <<'REPOS_EOF' || true
 set -uo pipefail
 
-rm -f /var/lib/pacman/db.lck
+_remove_stale_lock
 
 _repo_already_enabled() {
     grep -q "^\[$1\]" /etc/pacman.conf
@@ -4190,7 +4329,7 @@ install_aur_helper() {
     fi
 
     log_info "Attempting to install yay from prebuilt repositories..."
-    if container_root_exec bash -c 'rm -f /var/lib/pacman/db.lck; pacman -Sy --noconfirm 2>/dev/null; pacman -S --noconfirm --needed yay 2>/dev/null; command -v yay >/dev/null 2>&1 && echo __PREBUILT_OK__' 2>/dev/null | grep -q "__PREBUILT_OK__"; then
+    if container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Sy --noconfirm 2>/dev/null; pacman -S --noconfirm --needed yay 2>/dev/null; command -v yay >/dev/null 2>&1 && echo __PREBUILT_OK__' 2>/dev/null | grep -q "__PREBUILT_OK__"; then
         log_success "AUR helper yay installed from prebuilt repository."
         return 0
     fi
@@ -4201,7 +4340,7 @@ install_aur_helper() {
 	read -r -d '' verify_script <<'VERIFY_EOF' || true
 set -uo pipefail
 
-rm -f /var/lib/pacman/db.lck
+_remove_stale_lock
 
 _missing=""
 command -v git >/dev/null 2>&1 || _missing="$_missing git"
@@ -4260,7 +4399,7 @@ set -uo pipefail
 
 current_user="$1"
 
-rm -f /var/lib/pacman/db.lck
+_remove_stale_lock
 
 echo "Cloning and building yay from AUR..."
 _YAY_WORK=$(mktemp -d /var/tmp/pamac-yay-XXXXXX) && chmod 700 "$_YAY_WORK" 2>/dev/null || _YAY_WORK=$(mktemp -d)
@@ -4376,7 +4515,7 @@ echo "Parsed pacman version: major=$pacman_major minor=$pacman_minor (raw: $inst
 
 if [[ -n "$pamac_version_pin" && "$pamac_version_pin" != "latest" ]]; then
     echo "User specified --pamac-version=$pamac_version_pin. Attempting direct install..."
-    rm -f /var/lib/pacman/db.lck
+    _remove_stale_lock
     if sudo -Hu "$current_user" bash -lc "yay -S --noconfirm --noprogressbar --clone --noedit 'pamac-aur=$pamac_version_pin'" 2>&1; then
         echo "SUCCESS: pamac-aur $pamac_version_pin installed via --pamac-version."
         exit 0
@@ -4590,10 +4729,10 @@ fi
 if [[ "$can_upgrade_pacman" == "true" ]]; then
     echo ">>> Strategy A: Container pacman is TOO OLD (have $installed_pacman_ver, need $req_op $req_version)"
     echo ">>> Attempting to upgrade pacman inside the container to satisfy pamac-aur..."
-    rm -f /var/lib/pacman/db.lck
+    _remove_stale_lock
     if pacman -Sy --noconfirm 2>&1 | tail -5; then
         echo "Database synced. Upgrading pacman and dependencies..."
-        rm -f /var/lib/pacman/db.lck
+        _remove_stale_lock
         if pacman -S --noconfirm --needed pacman 2>&1 | tail -10; then
             new_ver=$(pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
             echo "Upgraded pacman to: $new_ver"
@@ -4608,7 +4747,7 @@ if [[ "$can_upgrade_pacman" == "true" ]]; then
             fi
             echo "WARNING: Upgraded pacman $new_ver still does not satisfy $aur_pacman_dep"
             echo "Attempting full system upgrade to pull in all dependencies..."
-            rm -f /var/lib/pacman/db.lck
+            _remove_stale_lock
             pacman -Syu --noconfirm 2>&1 | tail -20 || true
             new_ver=$(pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
             echo "After full upgrade, pacman version: $new_ver"
@@ -4815,7 +4954,7 @@ install_pamac() {
     fi
 
     log_info "Attempting to install pamac-aur from prebuilt repositories..."
-    if container_root_exec bash -c 'rm -f /var/lib/pacman/db.lck; pacman -Sy --noconfirm 2>/dev/null; pacman -S --noconfirm --needed pamac-aur 2>/dev/null; command -v pamac-manager >/dev/null 2>&1 && command -v pamac >/dev/null 2>&1 && echo __PREBUILT_OK__' 2>/dev/null | grep -q "__PREBUILT_OK__"; then
+    if container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Sy --noconfirm 2>/dev/null; pacman -S --noconfirm --needed pamac-aur 2>/dev/null; command -v pamac-manager >/dev/null 2>&1 && command -v pamac >/dev/null 2>&1 && echo __PREBUILT_OK__' 2>/dev/null | grep -q "__PREBUILT_OK__"; then
         log_success "Pamac installed from prebuilt repository."
         return 0
     fi
@@ -4845,7 +4984,7 @@ current_user="$1"
 compat_strategy="${2:-try_latest}"
 compat_commit="${3:-}"
 
-rm -f /var/lib/pacman/db.lck
+_remove_stale_lock
 
 echo "Installing pamac-aur (strategy: $compat_strategy)..."
 pamac_installed=false
@@ -4919,7 +5058,7 @@ install_from_yay() {
         echo "yay install attempt $attempt/3 failed. Retrying in 5 seconds..."
         _safe_sleep 5
         sudo -Hu "$current_user" bash -lc "yay -Y --gendb" 2>/dev/null || true
-        rm -f /var/lib/pacman/db.lck
+        _remove_stale_lock
     done
     return 1
 }
@@ -4943,7 +5082,7 @@ validate_pamac_build_deps() {
             echo "  WARNING: libalpm development headers not found via pkg-config."
             echo "  This may cause build failures if the libalpm API has changed."
             echo "  Installing pacman and libalpm development files..."
-            rm -f /var/lib/pacman/db.lck
+            _remove_stale_lock
             pacman -S --noconfirm --needed pacman 2>/dev/null || true
             if ! pkg-config --exists libalpm 2>/dev/null; then
                 _missing="$_missing libalpm-dev"
@@ -4972,7 +5111,7 @@ validate_pamac_build_deps() {
         echo "FATAL: Missing critical build dependencies:$_missing"
         echo "These are required to compile pamac-aur from source."
         echo "Attempting to install missing dependencies..."
-        rm -f /var/lib/pacman/db.lck
+        _remove_stale_lock
         pacman -Sy --noconfirm 2>/dev/null || true
         for pkg in $_missing; do
             case "$pkg" in
@@ -5145,7 +5284,7 @@ fi
 
 if ! command -v pamac >/dev/null 2>&1; then
     echo "pamac CLI not found after install. Retrying without --needed..."
-    rm -f /var/lib/pacman/db.lck
+    _remove_stale_lock
     _set_makepkg_jobs
     local _jobs
     _jobs=$(_calc_makepkg_jobs)
@@ -5286,6 +5425,123 @@ fi
 PAMAC_CFG_EOF
 
     exec_container_script "$pamac_cfg" "pamac-config" "$CURRENT_USER" || log_warn "Pamac configuration had minor issues."
+}
+
+setup_cache_cleanup() {
+    log_step "Setting up build cache cleanup"
+
+    local cache_script
+    read -r -d '' cache_script <<'CACHE_EOF' || true
+set -uo pipefail
+
+_remove_stale_lock
+
+echo "Cleaning orphaned build dependencies..."
+pacman -Qdtq 2>/dev/null | pacman -Rns --noconfirm - 2>/dev/null || true
+
+echo "Running paccache to keep only 3 most recent package versions..."
+if command -v paccache >/dev/null 2>&1; then
+    paccache -r --noconfirm 2>/dev/null || true
+else
+    echo "paccache not found. Installing pacman-contrib..."
+    pacman -S --noconfirm --needed pacman-contrib 2>/dev/null && paccache -r --noconfirm 2>/dev/null || true
+fi
+
+echo "Removing uninstalled packages from yay cache..."
+if command -v yay >/dev/null 2>&1; then
+    yay -Sc --noconfirm 2>/dev/null || true
+fi
+
+echo "Cache cleanup complete."
+CACHE_EOF
+
+    if ! exec_container_script "$cache_script" "cache-cleanup"; then
+        log_warn "Initial cache cleanup had issues. Continuing..."
+    fi
+
+    log_info "Installing weekly cache cleanup timer..."
+    local timer_script
+    read -r -d '' timer_script <<'TIMER_EOF' || true
+set -uo pipefail
+
+_remove_stale_lock
+
+mkdir -p /etc/pacman.d
+
+cat > /usr/local/bin/pamac-cache-cleanup.sh << 'CLEANUP'
+#!/bin/bash
+set +e
+
+_remove_stale_lock() {
+    local _lock="/var/lib/pacman/db.lck"
+    if [[ ! -f "$_lock" ]]; then return 0; fi
+    local _lck_pid
+    _lck_pid=$(cat "$_lock" 2>/dev/null || echo "")
+    if [[ -n "$_lck_pid" ]] && kill -0 "$_lck_pid" 2>/dev/null; then
+        echo "Pacman is currently running (PID $_lck_pid). Skipping cleanup."
+        exit 0
+    fi
+    rm -f "$_lock" 2>/dev/null || true
+}
+
+_remove_stale_lock
+
+pacman -Qdtq 2>/dev/null | pacman -Rns --noconfirm - 2>/dev/null || true
+
+if command -v paccache >/dev/null 2>&1; then
+    paccache -r --noconfirm 2>/dev/null || true
+fi
+
+if command -v yay >/dev/null 2>&1; then
+    yay -Sc --noconfirm 2>/dev/null || true
+fi
+CLEANUP
+chmod 755 /usr/local/bin/pamac-cache-cleanup.sh
+
+mkdir -p /etc/systemd/system
+cat > /etc/systemd/system/pamac-cache-cleanup.service << 'SVC'
+[Unit]
+Description=Weekly Pamac build cache cleanup
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pamac-cache-cleanup.sh
+Nice=19
+IOSchedulingClass=idle
+SVC
+
+cat > /etc/systemd/system/pamac-cache-cleanup.timer << 'TIMER'
+[Unit]
+Description=Weekly Pamac cache cleanup timer
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable --now pamac-cache-cleanup.timer 2>/dev/null || \
+        echo "Note: systemd timer setup failed (no systemd in container)"
+else
+    echo "Note: systemd not available, skipping timer setup. Manual cleanup: pamac-cache-cleanup.sh"
+fi
+
+echo "Cache cleanup timer installed."
+TIMER_EOF
+
+    if ! exec_container_script "$timer_script" "cache-timer-setup"; then
+        log_warn "Cache cleanup timer setup had issues. Continuing..."
+    fi
+
+    if [[ "$ENABLE_BUILD_CACHE" == "true" ]]; then
+        log_info "Host build cache: $HOME/.cache/yay-${CONTAINER_NAME}"
+        log_info "The container runs paccache weekly to prevent unbounded growth."
+    fi
 }
 
 install_gaming_packages() {
@@ -5850,7 +6106,7 @@ fi
  fi
  local remove_output
  remove_output=\$("\$CONTAINER_MANAGER" exec -u 0 "\$CONTAINER_NAME" bash -c "
-rm -f /var/lib/pacman/db.lck 2>/dev/null
+if [[ -f /var/lib/pacman/db.lck ]]; then _p=\$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ''); if [[ -n \"\$_p\" ]] && kill -0 \"\$_p\" 2>/dev/null; then echo \"Pacman running (PID \$_p), waiting...\"; _w=0; while [[ \$_w -lt 30 ]] && kill -0 \"\$_p\" 2>/dev/null; do sleep 2; _w=\$(( _w + 2 )); done; if kill -0 \"\$_p\" 2>/dev/null; then echo \"ERROR: Pacman (PID \$_p) still running after 30s. Aborting.\"; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi
 pacman -Rns --noconfirm \"\$pkg\" 2>&1
 " </dev/null 2>&1)
 local rc=\$?
@@ -6642,6 +6898,118 @@ HOOK_EOF
     fi
 }
 
+setup_keyring_refresh() {
+    log_step "Setting up keyring refresh for Pamac GUI updates"
+
+    local keyring_script
+    read -r -d '' keyring_script <<'KEYRING_REFRESH_EOF' || true
+set -uo pipefail
+
+_remove_stale_lock
+
+# Create a wrapper that refreshes the archlinux-keyring before any pacman
+# transaction. This solves the "catch-22" where a stale keyring inside the
+# container cannot validate new keyring packages.
+cat > /usr/local/bin/pamac-keyring-refresh.sh << 'REFRESH'
+#!/bin/bash
+set +e
+
+_remove_stale_lock() {
+    local _lock="/var/lib/pacman/db.lck"
+    if [[ ! -f "$_lock" ]]; then return 0; fi
+    local _lck_pid
+    _lck_pid=$(cat "$_lock" 2>/dev/null || echo "")
+    if [[ -n "$_lck_pid" ]] && kill -0 "$_lck_pid" 2>/dev/null; then
+        echo "Pacman is currently running (PID $_lck_pid). Skipping keyring refresh."
+        return 0
+    fi
+    rm -f "$_lock" 2>/dev/null || true
+}
+
+_remove_stale_lock
+
+# Only refresh if the keyring is older than 7 days
+KEYRING_AGE_FILE="/var/cache/pamac-keyring-last-refresh"
+REFRESH_INTERVAL=604800  # 7 days in seconds
+
+if [[ -f "$KEYRING_AGE_FILE" ]]; then
+    last_refresh=$(cat "$KEYRING_AGE_FILE" 2>/dev/null || echo "0")
+    now=$(date +%s 2>/dev/null || echo "0")
+    age=$(( now - last_refresh ))
+    if [[ "$age" -lt "$REFRESH_INTERVAL" ]] && [[ "$age" -ge 0 ]]; then
+        exit 0
+    fi
+fi
+
+echo "Refreshing archlinux-keyring..."
+_remove_stale_lock
+pacman -Sy --noconfirm 2>/dev/null || true
+pacman -S --noconfirm --needed archlinux-keyring 2>/dev/null || true
+date +%s > "$KEYRING_AGE_FILE" 2>/dev/null || true
+REFRESH
+chmod 755 /usr/local/bin/pamac-keyring-refresh.sh
+
+# Create a pacman hook that refreshes the keyring before package operations
+hook_dir="/etc/pacman.d/hooks"
+mkdir -p "$hook_dir"
+cat > "$hook_dir/00-keyring-refresh.hook" << 'HOOK'
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Refreshing archlinux-keyring before transaction...
+When = PreTransaction
+Exec = /usr/local/bin/pamac-keyring-refresh.sh
+Depends = archlinux-keyring
+HOOK
+
+# Create a systemd timer for periodic keyring refresh (in case Pamac GUI
+# is used without going through pacman hooks)
+mkdir -p /etc/systemd/system
+cat > /etc/systemd/system/pamac-keyring-refresh.service << 'SVC'
+[Unit]
+Description=Periodic archlinux-keyring refresh for Pamac
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pamac-keyring-refresh.sh
+Nice=19
+IOSchedulingClass=idle
+SVC
+
+cat > /etc/systemd/system/pamac-keyring-refresh.timer << 'TIMER'
+[Unit]
+Description=Weekly archlinux-keyring refresh timer
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable --now pamac-keyring-refresh.timer 2>/dev/null || \
+        echo "Note: systemd timer setup failed (no systemd in container)"
+else
+    echo "Note: systemd not available, skipping timer. The pacman hook handles keyring refresh."
+fi
+
+echo "Keyring refresh wrapper installed."
+KEYRING_REFRESH_EOF
+
+    if ! exec_container_script "$keyring_script" "keyring-refresh-setup"; then
+        log_warn "Keyring refresh setup had issues. Continuing..."
+    fi
+}
+
 export_existing_apps() {
   log_step "Exporting existing desktop applications from container"
 
@@ -6696,12 +7064,12 @@ run_update() {
     fi
 
     log_info "Syncing package databases..."
-    if ! container_root_exec bash -c 'rm -f /var/lib/pacman/db.lck; pacman -Syy --noconfirm' 2>/dev/null; then
+    if ! container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Syy --noconfirm' 2>/dev/null; then
         log_warn "Database sync had issues. Continuing..."
     fi
 
     log_info "Running pacman -Syu..."
-    if ! container_root_exec bash -c 'rm -f /var/lib/pacman/db.lck; pacman -Syu --noconfirm' 2>/dev/null; then
+    if ! container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Syu --noconfirm' 2>/dev/null; then
         log_warn "pacman -Syu had issues."
     fi
 
@@ -7053,11 +7421,14 @@ configure_multilib
 	_ensure_healthy_or_recreate "after pamac install" || exit 1
 ensure_critical_helpers
 
+setup_cache_cleanup
+
 install_gaming_packages
 
     export_pamac_to_host
 
     setup_post_install_hooks
+    setup_keyring_refresh
     export_existing_apps
 
     configure_ssh_environment

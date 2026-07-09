@@ -160,7 +160,7 @@ test_install() {
     fi
 
     log_test "Verifying sudo configuration..."
-    if podman exec -i -u 0 "$CONTAINER_NAME" test -f /etc/sudoers.d/99-wheel-nopasswd 2>/dev/null; then
+    if podman exec -i -u 0 "$CONTAINER_NAME" test -f /etc/sudoers.d/99-pamac-nopasswd 2>/dev/null; then
         pass "Passwordless sudo configured"
     else
         fail "Passwordless sudo not configured"

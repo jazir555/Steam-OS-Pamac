@@ -4,6 +4,7 @@ set -euo pipefail
 set -E
 
 # ERR trap for better error tracing in deeply nested calls (subshells, pipes, sub-functions)
+# shellcheck disable=SC2064 # $LINENO/$BASH_COMMAND MUST expand at trap execution, not definition
 _err_trap() {
     local _exit_code=$?
     local _line=$1
@@ -83,6 +84,7 @@ NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
 # multi-user hosts. Only enable when the user explicitly opts in via
 # --enable-ssh-env on a single-user trusted host (e.g. a personal Steam Deck).
 ENABLE_SSH_ENV="${ENABLE_SSH_ENV:-false}"
+ALLOW_WHEEL_NOPASSWD="${ALLOW_WHEEL_NOPASSWD:-false}"
 UPLOAD_LOG="${UPLOAD_LOG:-false}"
 PIN_ALPM="${PIN_ALPM:-true}"
 
@@ -127,6 +129,7 @@ initialize_logging() {
     # Initialize the global temp directory now that logging is available.
     _init_script_tmpdir
 
+    # shellcheck disable=SC2064 # $exit_code/$date MUST expand at trap execution, not definition
     trap 'exit_code=$?; _cleanup_temp_files; echo "=== Run finished: $(date) - Exit: $exit_code ===" >> "$LOG_FILE"; [[ "$UPLOAD_LOG" == "true" ]] && sanitize_and_upload_log || true' EXIT
 }
 
@@ -435,11 +438,13 @@ _ensure_healthy_or_recreate() {
         unset _CREATE_RECREATION_GUARD
         if ! create_container; then
             _CREATE_RECREATION_GUARD="$saved_guard"
+            _RECREATE_COUNT=0
             log_error "Failed to recreate container after '$desc' recovery."
             return 1
         fi
         _CREATE_RECREATION_GUARD="$saved_guard"
         if ! container_is_usable; then
+            _RECREATE_COUNT=0
             log_error "Container recreated but not usable after '$desc' recovery."
             return 1
         fi
@@ -1065,6 +1070,9 @@ OPTIONS:
   --disable-pin-alpm        Do NOT defer libalpm/pacman upgrade (risky on
                              rolling release containers; not recommended)
   --enable-ssh-env           ENABLE SSH PermitUserEnvironment (INSECURE on multi-user hosts; opt-in only)
+  --allow-wheel-nopasswd     Grant NOPASSWD to entire wheel group instead of
+                             just the current user (INSECURE on multi-user
+                             hosts; auto-enabled on Steam Deck)
   --check                   Perform system checks and exit without installing
   --dry-run                 Show what would be done without making changes
   --upload-log              Sanitize and upload the setup log for debugging
@@ -1138,6 +1146,7 @@ parse_arguments() {
             --non-interactive) NON_INTERACTIVE="true"; shift ;;
             --disable-pin-alpm) PIN_ALPM="false"; shift ;;
             --enable-ssh-env) ENABLE_SSH_ENV="true"; shift ;;
+            --allow-wheel-nopasswd) ALLOW_WHEEL_NOPASSWD="true"; shift ;;
             --upload-log) UPLOAD_LOG="true"; shift ;;
             --dry-run) DRY_RUN="true"; shift ;;
             --check) CHECK_ONLY="true"; shift ;;
@@ -1469,6 +1478,7 @@ create_container() {
     force_remove_container "$CONTAINER_NAME"
     sleep 2
     if ! run_command distrobox create "${create_args[@]}"; then
+      unset _CREATE_RECREATION_GUARD
       log_error "Failed to create Distrobox container after retry."
       return 1
     fi
@@ -1486,22 +1496,26 @@ create_container() {
     sleep 2
     if run_command distrobox create "${create_args[@]}"; then
       container_start
-      wait_for_container || return 1
+      wait_for_container || { unset _CREATE_RECREATION_GUARD; return 1; }
     else
+      unset _CREATE_RECREATION_GUARD
       log_error "Failed to recreate container after removal."
       return 1
     fi
   elif [[ "$wait_result" -eq 3 ]]; then
+    unset _CREATE_RECREATION_GUARD
     log_error "wait_for_container returned 3: force_remove_container already failed internally. Container likely still stuck."
     log_info "Recreation attempt skipped — prior removal failure makes recreation unlikely to succeed."
     return 1
   elif [[ "$wait_result" -ne 0 ]]; then
+    unset _CREATE_RECREATION_GUARD
     return 1
   fi
 
   if container_root_exec bash -c "echo ready" 2>/dev/null | grep -q "ready"; then
     log_success "Container is functional and ready."
   else
+    unset _CREATE_RECREATION_GUARD
     log_error "Container created but is not functional."
     return 1
     fi
@@ -1582,10 +1596,9 @@ local _start=\$SECONDS
 while (( SECONDS - _start < _target )); do
     # Use read -t to yield CPU instead of busy-pinning a core to 100%.
     # This prevents battery drain on handheld devices when sleep is broken.
-    # Note: /dev/null redirect is intentionally omitted — reading from /dev/null
-    # returns immediately on EOF and does NOT sleep. Without it, read blocks on
-    # stdin until the timeout expires, yielding the CPU for ~1 second per iteration.
-    read -t 1 _dummy 2>/dev/null || true
+    # Redirect stdin from /dev/null so read always times out after ~1s
+    # regardless of the callers stdin state (terminal, pipe, or closed fd).
+    read -t 1 _dummy </dev/null 2>/dev/null || true
 done
 return 1
 }
@@ -2509,44 +2522,73 @@ if ! getent group wheel >/dev/null 2>&1; then
     groupadd wheel || echo "Warning: groupadd wheel failed"
 fi
 
-cat > /etc/sudoers.d/99-wheel-nopasswd <<'SUDOERS'
-# SECURITY NOTE: This grants passwordless root-level package management to every
-# wheel group member for the commands listed below. AUR PKGBUILDs are arbitrary
-# shell scripts run via makepkg; a malicious or compromised AUR package can invoke
-# any of these commands (notably makepkg) and effectively escalate to root inside
-# this container. This is acceptable for a single-user Steam Deck dedicated to
-# package management, but is NOT safe on a shared multi-user host. To remove:
-#   sudo rm /etc/sudoers.d/99-wheel-nopasswd
-# Consider replacing this broad rule with pamac's own polkit rules per upstream
-# guidance if your steamdeck-pamac install supports polkit-based authorization.
-Cmnd_Alias PAMAC_CMDS = /usr/bin/pacman, \
-    /usr/bin/yay, \
-    /usr/bin/makepkg, \
-    /usr/bin/pacman-key, \
-    /usr/bin/paccache, \
+# Security: Determine sudoers scope.
+# Default: per-user NOPASSWD (limits AUR escalation to one user).
+# Steam Deck: auto-upgrade to wheel group (single-user device).
+# Explicit: --allow-wheel-nopasswd flag overrides to wheel group.
+_use_wheel_group=false
+if [[ "$ALLOW_WHEEL_NOPASSWD" == "true" ]]; then
+    echo "SECURITY: --allow-wheel-nopasswd specified. Granting NOPASSWD to entire wheel group."
+    _use_wheel_group=true
+elif grep -q "ID=steamos" /etc/os-release 2>/dev/null; then
+    echo "SteamOS detected — using wheel-group NOPASSWD (single-user device)."
+    _use_wheel_group=true
+else
+    echo "Multi-user system detected — restricting NOPASSWD to user '$current_user' only."
+fi
+
+cat > /etc/sudoers.d/99-pamac-nopasswd <<SUDOERS
+# SECURITY NOTE: AUR PKGBUILDs are arbitrary shell scripts run via makepkg; a
+# malicious or compromised AUR package can invoke the commands below and
+# effectively escalate to root inside this container.
+#
+# Scope: $(if [[ "\$_use_wheel_group" == "true" ]]; then echo "wheel group (all members)"; else echo "user $current_user only"; fi)
+# To remove: sudo rm /etc/sudoers.d/99-pamac-nopasswd
+# To widen:   re-run with --allow-wheel-nopasswd
+
+Cmnd_Alias PAMAC_CMDS = /usr/bin/pacman, \\
+    /usr/bin/yay, \\
+    /usr/bin/makepkg, \\
+    /usr/bin/pacman-key, \\
+    /usr/bin/paccache, \\
     /usr/bin/pacscripts
 
-# Restrict passwordless package management to the steamos-pamac build user when
-# possible (configured below), falling back to the whole wheel group only when
-# per-user restriction is not available. Prefer per-user authorization in any
-# shared deployment.
-%wheel ALL=(ALL:ALL) NOPASSWD: PAMAC_CMDS
+$(if [[ "\$_use_wheel_group" == "true" ]]; then
+    echo "%wheel ALL=(ALL:ALL) NOPASSWD: PAMAC_CMDS"
+else
+    echo "$current_user ALL=(ALL:ALL) NOPASSWD: PAMAC_CMDS"
+fi)
 SUDOERS
-chmod 0440 /etc/sudoers.d/99-wheel-nopasswd
+chmod 0440 /etc/sudoers.d/99-pamac-nopasswd
+
+# Reduce sudo timestamp cache to zero so privileges are not retained between
+# operations. Each sudo invocation requires a fresh (passwordless) auth check.
+cat > /etc/sudoers.d/98-pamac-timeout <<'TIMEOUT_SUDOERS'
+# Reset sudo timestamp after each Pamac operation to minimize escalation window.
+Defaults timestamp_timeout=0
+TIMEOUT_SUDOERS
+chmod 0440 /etc/sudoers.d/98-pamac-timeout
+
 if command -v visudo >/dev/null 2>&1; then
-    if visudo -c -f /etc/sudoers.d/99-wheel-nopasswd 2>/dev/null; then
-        echo "Configured strict sudo allowlist for package management only (validated with visudo)."
-        echo "SECURITY: wheel-group NOPASSWD package management is enabled. A malicious AUR PKGBUILD"
-        echo "          run via makepkg can escalate to root in this container. Remove"
-        echo "          /etc/sudoers.d/99-wheel-nopasswd if you do not accept this risk."
+    if visudo -c -f /etc/sudoers.d/99-pamac-nopasswd 2>/dev/null && \
+       visudo -c -f /etc/sudoers.d/98-pamac-timeout 2>/dev/null; then
+        echo "Sudoers configured and validated (visudo)."
     else
-        echo "Warning: sudoers syntax check failed. Removing potentially broken sudoers file."
-        rm -f /etc/sudoers.d/99-wheel-nopasswd
+        echo "Warning: sudoers syntax check failed. Removing potentially broken sudoers files."
+        rm -f /etc/sudoers.d/99-pamac-nopasswd /etc/sudoers.d/98-pamac-timeout
     fi
 else
-    echo "Configured strict sudo allowlist for package management only (visudo not available for validation)."
-    echo "SECURITY: wheel-group NOPASSWD package management is enabled without visudo validation."
-    echo "          A malicious AUR PKGBUILD run via makepkg can escalate to root in this container."
+    echo "Sudoers configured (visudo not available for validation)."
+fi
+
+if [[ "\$_use_wheel_group" == "true" ]]; then
+    echo "SECURITY: wheel-group NOPASSWD package management is enabled."
+    echo "          A malicious AUR PKGBUILD run via makepkg can escalate to root."
+    echo "          Remove /etc/sudoers.d/99-pamac-nopasswd if you do not accept this risk."
+else
+    echo "SECURITY: Per-user NOPASSWD package management is enabled for '$current_user'."
+    echo "          Only this user can run package commands without password."
+    echo "          A malicious AUR PKGBUILD can still escalate as '$current_user' inside the container."
 fi
 USER_EOF
 
@@ -2671,8 +2713,9 @@ local _target=$(( _d + 0 ))
 local _start=$SECONDS
 while (( SECONDS - _start < _target )); do
     local _dummy
-    # read -t blocks on stdin until timeout, yielding CPU (no /dev/null redirect)
-    read -t 1 _dummy 2>/dev/null || true
+    # Redirect from /dev/null so read always times out after ~1s regardless of
+    # the caller's stdin state (terminal, pipe, or closed fd).
+    read -t 1 _dummy </dev/null 2>/dev/null || true
 done
 return 1
 }
@@ -3340,8 +3383,9 @@ local _target=$(( _d + 0 ))
 local _start=$SECONDS
 while (( SECONDS - _start < _target )); do
     local _dummy
-    # read -t blocks on stdin until timeout, yielding CPU (no /dev/null redirect)
-    read -t 1 _dummy 2>/dev/null || true
+    # Redirect from /dev/null so read always times out after ~1s regardless of
+    # the caller's stdin state (terminal, pipe, or closed fd).
+    read -t 1 _dummy </dev/null 2>/dev/null || true
 done
 return 1
 }
@@ -4322,8 +4366,11 @@ _enable_repo_with_fallback() {
 
     # Step 5: Import the signing key from keyservers as last resort (uses hardcoded fallback fingerprint)
     if [[ "$key_ok" != "true" ]] && command -v pacman-key >/dev/null 2>&1; then
-        echo "Attempting key import from keyservers (key_id=$key_id, hardcoded fallback)..."
-        echo "Note: If this fails, the key may have been rotated. Set ${env_var_name}=<NEW_KEY_ID> to override."
+        echo "WARNING: Using hardcoded fallback fingerprint for $repo_name (key_id=$key_id)."
+        echo "  This fingerprint may be STALE after key rotations. If key import fails,"
+        echo "  set ${env_var_name}=<NEW_FULL_FINGERPRINT> (40 hex chars) before re-running."
+        echo "  Verify current fingerprint at: https://archlinux.org/packages/?repo=$repo_name"
+        echo "  or check the upstream keyring package for the latest signing key."
         if _import_key_with_retry "$key_id"; then
             key_ok=true
         fi
@@ -4349,7 +4396,8 @@ _enable_repo_with_fallback \
     "https://cdn-mirror.chaotic.cx/chaotic-aur/\$arch" \
     "https://geo-mirror.chaotic.cx/chaotic-aur/\$arch" \
     "https://mirror.chaotic.cx/chaotic-aur/\$arch"
-echo "Note: Set CHAOTIC_AUR_KEY_ID=<FINGERPRINT> to override the default signing key."
+echo "Note: Fallback fingerprint 30565AC3868033CA may be stale after key rotation."
+echo "  Override with: CHAOTIC_AUR_KEY_ID=<FULL_FINGERPRINT>  (40 hex chars)"
 
 echo "=== Configuring archlinuxcn repository ==="
 _enable_repo_with_fallback \
@@ -4357,7 +4405,8 @@ _enable_repo_with_fallback \
     "https://repo.archlinuxcn.org/\$arch" \
     "https://mirrors.tuna.tsinghua.edu.cn/archlinuxcn/\$arch" \
     "https://mirror.sjtu.edu.cn/archlinuxcn/\$arch"
-echo "Note: Set ARCHLINUXCN_KEY_ID=<FINGERPRINT> to override the default signing key."
+echo "Note: Fallback fingerprint 11C2E2D1D43CF75C may be stale after key rotation."
+echo "  Override with: ARCHLINUXCN_KEY_ID=<FULL_FINGERPRINT>  (40 hex chars)"
 
 echo "=== Configuring endeavouros repository ==="
 _enable_repo_with_fallback \
@@ -4365,7 +4414,8 @@ _enable_repo_with_fallback \
     "https://mirror.freedif.org/EndeavourOS/repo/\$repo/\$arch" \
     "https://mirror.endeavouros.com/EndeavourOS/repo/\$repo/\$arch" \
     "https://mirror.enderunix.org/endeavouros/repo/\$repo/\$arch"
-echo "Note: Set ENDEAVOUROS_KEY_ID=<FINGERPRINT> to override the default signing key."
+echo "Note: Fallback fingerprint F52611D11AFD4556 may be stale after key rotation."
+echo "  Override with: ENDEAVOUROS_KEY_ID=<FULL_FINGERPRINT>  (40 hex chars)"
 
 echo "=== Configuring mesa-git repository (disabled by default - can break GPU drivers) ==="
 if ! _repo_already_enabled "mesa-git"; then

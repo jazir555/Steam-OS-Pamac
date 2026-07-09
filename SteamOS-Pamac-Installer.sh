@@ -2586,47 +2586,12 @@ else
 echo "Warning: could not install polkit. pamac GUI may prompt for password."
 fi
 
-echo "Installing polkit authentication agent..."
-if pacman -S --noconfirm --needed lxqt-policykit 2>/dev/null; then
-    echo "lxqt-policykit authentication agent installed."
-elif pacman -S --noconfirm --needed polkit-gnome 2>/dev/null; then
-    echo "polkit-gnome authentication agent installed."
-else
-    echo "Note: No polkit GUI agent available. Password prompts may not display."
-fi
-
-cat > /usr/local/bin/steamos-polkit-agent.sh << 'AGENT'
-#!/bin/bash
-set +e
-# Find and launch the first available polkit authentication agent.
-# This is needed because GUI authentication dialogs from inside a distrobox
-# container often fail to route back to the host's Wayland session.
-# Having an agent running inside the container ensures password prompts work.
-if command -v lxqt-policykit-agent >/dev/null 2>&1; then
-    exec lxqt-policykit-agent
-elif command -v polkit-gnome-authentication-agent-1 >/dev/null 2>&1; then
-    exec polkit-gnome-authentication-agent-1
-elif command -v cinnamon-polkit-agent >/dev/null 2>&1; then
-    exec cinnamon-polkit-agent
-elif command -v xfce-polkit >/dev/null 2>&1; then
-    exec xfce-polkit
-elif command -v polkit-agent-helper-1 >/dev/null 2>&1; then
-    exec polkit-agent-helper-1
-fi
-AGENT
-chmod 755 /usr/local/bin/steamos-polkit-agent.sh
-
-cat > /usr/local/bin/steamos-polkit-agent-wrapper.sh << 'WRAPPER'
-#!/bin/bash
-set +e
-# Wrapper to start the polkit agent if not already running.
-# Checks for an existing agent process before spawning a new one.
-if pgrep -x "lxqt-policykit-agent\|polkit-gnome-authentication-agent-1\|cinnamon-polkit-agent\|xfce-polkit" >/dev/null 2>&1; then
-    exit 0
-fi
-/usr/local/bin/steamos-polkit-agent.sh &
-WRAPPER
-chmod 755 /usr/local/bin/steamos-polkit-agent-wrapper.sh
+# Note: No polkit authentication agent is installed inside the container.
+# The 10-pamac-nopasswd.rules file above grants passwordless access for
+# Pamac operations, so the agent is never triggered. If a user removes
+# the rules, the agent cannot project authentication dialogs from inside
+# a Distrobox container to the host's Wayland session — the GUI would
+# appear to hang. Use CLI (pacman/yay) as a fallback in that case.
 
 echo "Setting up D-Bus..."
 if command -v dbus-daemon >/dev/null 2>&1; then
@@ -2753,12 +2718,6 @@ if [[ -x /usr/lib/polkit-1/polkitd ]]; then
 fi
 }
 
-start_polkit_agent() {
-if [[ -x /usr/local/bin/steamos-polkit-agent-wrapper.sh ]]; then
-/usr/local/bin/steamos-polkit-agent-wrapper.sh &
-fi
-}
-
 start_pamac_daemon() {
 /usr/bin/pamac-daemon &
 }
@@ -2773,7 +2732,6 @@ ensure_service "dbus-daemon" "dbus-daemon" start_dbus
 ensure_service "polkitd" "polkitd" start_polkitd
 ensure_service "pamac-daemon" "pamac-daemon" start_pamac_daemon
 fi
-/usr/local/bin/steamos-polkit-agent-wrapper.sh 2>/dev/null &
 BOOTSTRAP
 chmod +x /usr/local/bin/pamac-session-bootstrap.sh
 echo "Bootstrap helper installed."
@@ -3429,12 +3387,6 @@ if [[ -x /usr/lib/polkit-1/polkitd ]]; then
 fi
 }
 
-start_polkit_agent() {
-if [[ -x /usr/local/bin/steamos-polkit-agent-wrapper.sh ]]; then
-/usr/local/bin/steamos-polkit-agent-wrapper.sh &
-fi
-}
-
 start_pamac_daemon() {
 /usr/bin/pamac-daemon &
 }
@@ -3449,7 +3401,6 @@ ensure_service "dbus-daemon" "dbus-daemon" start_dbus
 ensure_service "polkitd" "polkitd" start_polkitd
 ensure_service "pamac-daemon" "pamac-daemon" start_pamac_daemon
 fi
-/usr/local/bin/steamos-polkit-agent-wrapper.sh 2>/dev/null &
 BOOTSTRAP
 chmod +x /usr/local/bin/pamac-session-bootstrap.sh
 repaired=$((repaired + 1))
@@ -5997,36 +5948,51 @@ XDOTOOL_WRAPPER
 
     log_info "Creating pamac-manager launch wrapper inside container..."
     local _desktop_path="/home/${CURRENT_USER}/.local/share/applications/${CONTAINER_NAME}-org.manjaro.pamac.manager.desktop"
+
+    # Detect the actual StartupWMClass from the container's installed desktop file.
+    # GTK3/GTK4 apps may use reverse-DNS (org.manjaro.pamac.manager) or the binary
+    # name (pamac-manager). Hardcoding the wrong value breaks taskbar grouping.
+    local _detected_wmclass="pamac-manager"
+    _detected_wmclass=$(container_root_exec bash -c "grep -E '^StartupWMClass=' /usr/share/applications/org.manjaro.pamac.manager.desktop 2>/dev/null | head -1 | cut -d= -f2" 2>/dev/null || echo "")
+    if [[ -z "$_detected_wmclass" ]]; then
+        _detected_wmclass="pamac-manager"
+    fi
+    log_info "Detected StartupWMClass for pamac: $_detected_wmclass"
+
     local _wrapper_content
-    read -r -d '' _wrapper_content <<'CONTAINER_WRAPPER_EOF'
+    read -r -d '' _wrapper_content <<CONTAINER_WRAPPER_EOF
 #!/bin/bash
 set +e
 
 /usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true
 
-export DISPLAY=${DISPLAY:-:0}
+export DISPLAY=\${DISPLAY:-:0}
 DESKTOP_FILE="__DESKTOP_PATH__"
 
-pamac-manager "$@" &
-PAMAC_PID=$!
+pamac-manager "\$@" &
+PAMAC_PID=\$!
 
-# On X11 only, make a single best-effort attempt to set the desktop file hint
-# after a brief delay. This avoids the brittle 30-second polling loop that
-# depends on xdotool/wlrctl/hyprctl — tools that are increasingly restricted
-# by Wayland compositors for security reasons.
-if [[ -z "${WAYLAND_DISPLAY:-}" ]] && command -v xprop >/dev/null 2>&1 && command -v xdotool >/dev/null 2>&1 && command -v xwininfo >/dev/null 2>&1; then
-    sleep 3
-    for wid in $(xdotool search --class "pamac-manager" 2>/dev/null | head -5); do
-        width=$(xwininfo -id "$wid" 2>/dev/null | awk '/Width:/{print $NF}')
-        if [[ -n "$width" ]] && [[ "$width" -gt 1 ]]; then
-            xprop -id "$wid" -f _KDE_NET_WM_DESKTOP_FILE 8u \
-                -set _KDE_NET_WM_DESKTOP_FILE "$DESKTOP_FILE" 2>/dev/null
-            break
-        fi
+# On X11 only, poll for the window to appear (up to 15s) then set the desktop
+# file hint. The polling replaces the old fixed \`sleep 3\` which was unreliable
+# under heavy load (compiling, downloading) where Pamac could take longer to
+# draw its initial window.
+if [[ -z "\${WAYLAND_DISPLAY:-}" ]] && command -v xprop >/dev/null 2>&1 && command -v xdotool >/dev/null 2>&1 && command -v xwininfo >/dev/null 2>&1; then
+    _xdotool_wait=0
+    while [[ \$_xdotool_wait -lt 15 ]]; do
+        for wid in \$(xdotool search --class "${_detected_wmclass}" 2>/dev/null | head -5); do
+            width=\$(xwininfo -id "\$wid" 2>/dev/null | awk '/Width:/{print \$NF}')
+            if [[ -n "\$width" ]] && [[ "\$width" -gt 1 ]]; then
+                xprop -id "\$wid" -f _KDE_NET_WM_DESKTOP_FILE 8u \\
+                    -set _KDE_NET_WM_DESKTOP_FILE "\$DESKTOP_FILE" 2>/dev/null
+                break 2
+            fi
+        done
+        sleep 1
+        _xdotool_wait=\$(( _xdotool_wait + 1 ))
     done
 fi
 
-wait "$PAMAC_PID" 2>/dev/null
+wait "\$PAMAC_PID" 2>/dev/null
 CONTAINER_WRAPPER_EOF
     _wrapper_content="${_wrapper_content/__DESKTOP_PATH__/$_desktop_path}"
     printf '%s\n' "$_wrapper_content" | container_root_exec bash -c 'cat > /usr/local/bin/pamac-manager-wrapper'
@@ -6079,7 +6045,7 @@ Type=Application
 Categories=System;PackageManager;Settings;
 Keywords=package;manager;software;arch;aur;
 StartupNotify=false
-StartupWMClass=pamac-manager
+StartupWMClass=${_detected_wmclass}
 Actions=uninstall;
 X-SteamOS-Pamac-Managed=true
 X-SteamOS-Pamac-Container=${CONTAINER_NAME}
@@ -6112,7 +6078,7 @@ Terminal=false
 Categories=System;PackageManager;Settings;
 Keywords=package;manager;software;arch;aur;
 StartupNotify=false
-StartupWMClass=pamac-manager
+StartupWMClass=${_detected_wmclass}
 NoDisplay=false
 DBusActivatable=false
 Actions=uninstall;
@@ -6195,33 +6161,32 @@ if [[ -d "\$HOME/.local/bin" ]]; then
     export PATH="\$HOME/.local/bin:\$PATH"
 fi
 
-# Compositor window matching is handled by StartupWMClass=pamac-manager in the
+# Compositor window matching is handled by StartupWMClass in the
 # .desktop file (set in annotate_desktop). No activation token or window-property
 # injection is needed for modern KDE Plasma (5.27+) and GNOME (42+).
-# Generating a unique XDG_ACTIVATION_TOKEN per launch would be the correct
-# protocol usage if we ever needed focus-stealing prevention, but the static
-# value previously exported here was both predictable (insecure as a token)
-# and unused for desktop-file association.
 
 # Launch Pamac in the background via distrobox
 distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper "\$@" &
 LAUNCHER_PID=\$!
 
-# On X11 only: make a single best-effort attempt to set the _KDE_NET_WM_DESKTOP_FILE
-# property after a brief delay. This is a legacy fallback — modern KDE Plasma (5.27+)
-# and GNOME (42+) use StartupWMClass for window matching instead.
-# We avoid the old 30-second polling loop with xdotool/wlrctl/hyprctl because those
-# tools are increasingly restricted by Wayland compositors and are unreliable.
+# On X11 only: poll for the window to appear (up to 15s) then set the desktop
+# file hint. The polling replaces the old fixed \`sleep 3\` which was unreliable
+# under heavy load (compiling, downloading) where Pamac could take longer to
+# draw its initial window.
 if [[ "\$IS_WAYLAND" == "false" ]] && command -v xprop >/dev/null 2>&1 && command -v xdotool >/dev/null 2>&1 && command -v xwininfo >/dev/null 2>&1; then
-    sleep 3
-    for wid in \$(xdotool search --class "pamac-manager" 2>/dev/null | head -5); do
-        width=\$(xwininfo -id "\$wid" 2>/dev/null | awk -F': ' '/Width:/{print \$2}')
-        if [[ -n "\$width" ]] && [[ "\$width" -gt 1 ]]; then
-            XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xprop -id "\$wid" \
-                -f _KDE_NET_WM_DESKTOP_FILE 8u \
-                -set _KDE_NET_WM_DESKTOP_FILE "\$DESKTOP_FILE" 2>/dev/null
-            break
-        fi
+    _xdotool_wait=0
+    while [[ \$_xdotool_wait -lt 15 ]]; do
+        for wid in \$(xdotool search --class "${_detected_wmclass}" 2>/dev/null | head -5); do
+            width=\$(xwininfo -id "\$wid" 2>/dev/null | awk '/Width:/{print \$NF}')
+            if [[ -n "\$width" ]] && [[ "\$width" -gt 1 ]]; then
+                XAUTHORITY="\$XAUTHORITY" DISPLAY="\$DISPLAY" xprop -id "\$wid" \\
+                    -f _KDE_NET_WM_DESKTOP_FILE 8u \\
+                    -set _KDE_NET_WM_DESKTOP_FILE "\$DESKTOP_FILE" 2>/dev/null
+                break 2
+            fi
+        done
+        sleep 1
+        _xdotool_wait=\$(( _xdotool_wait + 1 ))
     done
 fi
 
@@ -6840,6 +6805,10 @@ annotate_desktop() {
     cp -f "\$desktop_file" "\$desktop_file.bak" 2>/dev/null || true
 
 if [[ "\$app_name" == "org.manjaro.pamac.manager" ]]; then
+            # Detect actual WMClass from the container's installed desktop file.
+            # GTK3/GTK4 apps may use reverse-DNS or binary name for Wayland app_id.
+            _detected_wm=\$(grep -E '^StartupWMClass=' /usr/share/applications/org.manjaro.pamac.manager.desktop 2>/dev/null | head -1 | cut -d= -f2)
+            [[ -z "\$_detected_wm" ]] && _detected_wm="pamac-manager"
             cat > "\$desktop_file" << PAMAC_DESKTOP
 [Desktop Entry]
 Type=Application
@@ -6851,7 +6820,7 @@ Terminal=false
 Categories=System;PackageManager;Settings;
 Keywords=package;manager;software;arch;aur;
 StartupNotify=false
-StartupWMClass=pamac-manager
+StartupWMClass=\${_detected_wm}
 NoDisplay=false
 DBusActivatable=false
 Actions=uninstall;
@@ -6891,18 +6860,44 @@ PAMAC_DESKTOP
     fi
   fi
   if [[ "\$_python3_ok" != "true" ]]; then
-    echo "WARN: Python 3 still unavailable after install attempt — using sed fallback for desktop annotation." >&2
-    sed -i \
-      -e '/^X-SteamOS-Pamac-/d' \
-      -e '/^Actions=.*uninstall/d' \
-      -e "\$a\\
-Actions=uninstall;\\
-X-SteamOS-Pamac-Managed=true\\
-X-SteamOS-Pamac-Container=${container_name}\\
-X-SteamOS-Pamac-SourceApp=${export_name}\\
-X-SteamOS-Pamac-SourceDesktop=${app_name}.desktop\\
-X-SteamOS-Pamac-SourcePackage=${owner_pkg}" \
-      "\$desktop_file"
+    echo "WARN: Python 3 still unavailable after install attempt — using awk fallback for desktop annotation." >&2
+    # Use awk instead of sed to properly handle multi-section .desktop files.
+    # sed's \$a appends to the END of the file, which corrupts files that have
+    # [Desktop Action ...] sections after [Desktop Entry]. awk targets the
+    # boundary between [Desktop Entry] and the next section.
+    awk -v container="${container_name}" -v user="${current_user}" \
+        -v export_name="${export_name}" -v app_name="${app_name}" \
+        -v owner_pkg="${owner_pkg}" '
+    BEGIN { in_entry=0; inserted=0; saw_next_section=0 }
+    /^\[Desktop Entry\]/ { in_entry=1; print; next }
+    /^\[/ && in_entry && !saw_next_section {
+        # First section after [Desktop Entry] — insert markers here
+        saw_next_section=1
+        if (!inserted) {
+            print "Actions=uninstall;"
+            print "X-SteamOS-Pamac-Managed=true"
+            print "X-SteamOS-Pamac-Container=" container
+            print "X-SteamOS-Pamac-SourceApp=" export_name
+            print "X-SteamOS-Pamac-SourceDesktop=" app_name ".desktop"
+            print "X-SteamOS-Pamac-SourcePackage=" owner_pkg
+            inserted=1
+        }
+        print; next
+    }
+    /^Actions=.*uninstall/ { next }
+    /^X-SteamOS-Pamac-/ { next }
+    END {
+        if (!inserted) {
+            print "Actions=uninstall;"
+            print "X-SteamOS-Pamac-Managed=true"
+            print "X-SteamOS-Pamac-Container=" container
+            print "X-SteamOS-Pamac-SourceApp=" export_name
+            print "X-SteamOS-Pamac-SourceDesktop=" app_name ".desktop"
+            print "X-SteamOS-Pamac-SourcePackage=" owner_pkg
+        }
+    }
+    { print }
+    ' "\$desktop_file" > "\${desktop_file}.tmp" && mv -f "\${desktop_file}.tmp" "\$desktop_file"
     _fix_desktop_permissions "\$desktop_file"
     return 0
   fi

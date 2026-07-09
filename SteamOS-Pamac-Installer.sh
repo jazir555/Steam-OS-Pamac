@@ -7423,6 +7423,10 @@ fi
 # .desktop file (set in annotate_desktop). No activation token or window-property
 # injection is needed for modern KDE Plasma (5.27+) and GNOME (42+).
 
+# Clean stale pacman download dirs before entering container
+# (these cause "invalid or corrupted database" errors)
+${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" rm -rf /var/lib/pacman/sync/download-* 2>/dev/null || true
+
 # Launch Pamac in the background via distrobox
 # distrobox 1.8.x does not support --env; pass env via prefix instead
 DBUS_SESSION_BUS_ADDRESS="\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/\$(id -u)/bus}" \

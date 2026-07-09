@@ -6371,6 +6371,8 @@ update-desktop-database "\$APP_DIR" 2>/dev/null || true
 fi
 if command -v kbuildsycoca6 >/dev/null 2>&1; then
 DISPLAY="\${DISPLAY:-:0}" kbuildsycoca6 --noincremental 2>/dev/null || true
+elif command -v kbuildsycoca5 >/dev/null 2>&1; then
+DISPLAY="\${DISPLAY:-:0}" kbuildsycoca5 --noincremental 2>/dev/null || true
 fi
 if command -v qdbus6 >/dev/null 2>&1; then
 qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.refreshCurrentShell 2>/dev/null || true
@@ -6708,6 +6710,9 @@ XDGCONF
 
         if command -v kbuildsycoca6 >/dev/null 2>&1; then
             XDG_DATA_DIRS="$new_xdg" kbuildsycoca6 --noincremental 2>/dev/null || true
+            log_info "KDE service cache rebuilt with corrected XDG_DATA_DIRS"
+        elif command -v kbuildsycoca5 >/dev/null 2>&1; then
+            XDG_DATA_DIRS="$new_xdg" kbuildsycoca5 --noincremental 2>/dev/null || true
             log_info "KDE service cache rebuilt with corrected XDG_DATA_DIRS"
         fi
     }

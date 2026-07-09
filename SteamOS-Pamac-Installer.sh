@@ -41,8 +41,6 @@ ENABLE_GAMING_PACKAGES="${ENABLE_GAMING_PACKAGES:-false}"
 ENABLE_EXTRA_REPOS="${ENABLE_EXTRA_REPOS:-true}"
 FORCE_REBUILD="${FORCE_REBUILD:-false}"
 OPTIMIZE_MIRRORS="${OPTIMIZE_MIRRORS:-true}"
-ALLOW_SUDO_FALLBACK="${ALLOW_SUDO_FALLBACK:-false}"
-
 : "${DISTROBOX_CONTAINER_MANAGER:=podman}"
 
 DRY_RUN="${DRY_RUN:-false}"
@@ -178,36 +176,7 @@ _SUDO_VERIFIED=""
 _SUDO_VERIFIED_AT=0
 SUDO_REVALIDATE_SECONDS="${SUDO_REVALIDATE_SECONDS:-60}"
 container_runtime_privileged() {
-    local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
-    if [[ "${PODMAN_SUDO_FALLBACK:-}" == "true" ]]; then
-        # Defense-in-depth: refuse if explicit opt-in wasn't given
-        if [[ "$ALLOW_SUDO_FALLBACK" != "true" ]]; then
-            log_error "PODMAN_SUDO_FALLBACK is set but --allow-sudo-fallback was not passed. Refusing sudo."
-            container_runtime "$@"
-            return $?
-        fi
-        # Re-verify sudo -n periodically instead of trusting a single early check.
-        # If sudo timestamps are still valid, sudo -n true is effectively free.
-        local _now=$SECONDS
-        if [[ "$_SUDO_VERIFIED" != "ok" ]] || (( _now - _SUDO_VERIFIED_AT >= SUDO_REVALIDATE_SECONDS )); then
-            if sudo -n true 2>/dev/null; then
-                _SUDO_VERIFIED="ok"
-                _SUDO_VERIFIED_AT=$_now
-            else
-                log_warn "sudo -n true failed (password may be required or creds expired). Falling back to rootless podman."
-                unset PODMAN_SUDO_FALLBACK
-                container_runtime "$@"
-                return $?
-            fi
-        fi
-        if [[ "$mgr" == "docker" ]]; then
-            sudo -n docker "$@"
-        else
-            sudo -n podman "$@"
-        fi
-    else
-        container_runtime "$@"
-    fi
+    container_runtime "$@"
 }
 
 container_root_exec() {
@@ -1000,13 +969,6 @@ ensure_podman() {
                     return 1
                 fi
                 log_warn "Attempting sudo podman fallback (explicitly allowed via --allow-sudo-fallback)..."
-                if sudo podman info >/dev/null 2>&1; then
-                    log_warn "SECURITY: Running as host root via sudo. Container isolation is weakened."
-                    log_warn "A malicious AUR package could more easily compromise your host system."
-                    export PODMAN_SUDO_FALLBACK=true
-                    export DISTROBOX_CONTAINER_MANAGER=podman
-                    return 0
-                fi
                 log_error "Even sudo podman is not functional."
             fi
             if command -v docker >/dev/null 2>&1; then
@@ -1101,7 +1063,6 @@ parse_arguments() {
                 CONTAINER_NAME="$2"
                 shift 2
                 ;;
-            --allow-sudo-fallback) ALLOW_SUDO_FALLBACK="true"; shift ;;
             --force-rebuild) FORCE_REBUILD="true"; shift ;;
             --enable-multilib) ENABLE_MULTILIB="true"; shift ;;
             --disable-multilib) ENABLE_MULTILIB="false"; shift ;;

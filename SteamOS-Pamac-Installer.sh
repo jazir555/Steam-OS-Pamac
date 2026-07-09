@@ -3362,6 +3362,8 @@ printf '%s\n' 'polkit.addRule(function(action, subject) {' \
 '   return polkit.Result.YES;' \
 ' }' \
 '});' > "$polkit_dir/10-pamac-nopasswd.rules"
+# polkitd drops privileges to uid 966 (polkitd) — it needs read access to rules
+chmod 755 /etc/polkit-1 /etc/polkit-1/rules.d 2>/dev/null || true
 echo "polkit passwordless rule created for pamac operations (explicit allowlist, local+active only)."
 echo "SECURITY: This rule grants passwordless package management to any local, active wheel-group"
 echo "          member. Safe on single-user devices (e.g. Steam Deck). On multi-user hosts,"

@@ -4727,6 +4727,23 @@ repaired=$((repaired + 1))
 echo "D-Bus service file fixed for non-systemd."
 fi
 
+# Fix PolicyKit1 D-Bus service file (keep User=root, remove SystemdService)
+_pkit_svc="/usr/share/dbus-1/system-services/org.freedesktop.PolicyKit1.service"
+if [[ -f "$_pkit_svc" ]] && grep -q "SystemdService" "$_pkit_svc" 2>/dev/null; then
+cat > "$_pkit_svc" << 'PKIT_SVC_FIX'
+[D-BUS Service]
+Name=org.freedesktop.PolicyKit1
+Exec=/usr/lib/polkit-1/polkitd --no-debug
+User=root
+PKIT_SVC_FIX
+repaired=$((repaired + 1))
+echo "PolicyKit1 D-Bus service file fixed for non-systemd."
+fi
+
+# Ensure /var/lib/polkit-1 exists
+mkdir -p /var/lib/polkit-1 2>/dev/null || true
+chmod 755 /var/lib/polkit-1 2>/dev/null || true
+
 # Ensure system bus daemon is running
 if ! dbus-send --system --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
 mkdir -p /run/dbus
@@ -6491,6 +6508,22 @@ Exec=/usr/bin/pamac-daemon
 DBUS_SVC_FIX
     echo "Fixed D-Bus service file for non-systemd container."
 fi
+
+# Fix PolicyKit1 D-Bus service file (keep User=root for activation, remove SystemdService)
+_pkit_svc="/usr/share/dbus-1/system-services/org.freedesktop.PolicyKit1.service"
+if [[ -f "$_pkit_svc" ]] && grep -q "SystemdService" "$_pkit_svc" 2>/dev/null; then
+    cat > "$_pkit_svc" << 'PKIT_SVC_FIX'
+[D-BUS Service]
+Name=org.freedesktop.PolicyKit1
+Exec=/usr/lib/polkit-1/polkitd --no-debug
+User=root
+PKIT_SVC_FIX
+    echo "Fixed PolicyKit1 D-Bus service file for non-systemd container."
+fi
+
+# Ensure /var/lib/polkit-1 exists (polkitd authority database)
+mkdir -p /var/lib/polkit-1
+chmod 755 /var/lib/polkit-1
 
 # Ensure system bus daemon is running (distrobox doesn't have systemd)
 if ! dbus-send --system --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1; then

@@ -166,9 +166,8 @@ container_runtime() {
     fi
 }
 
-# Use sudo only for privileged operations (create, rm, system) when rootless is broken.
+
 # SECURITY: Running as host root significantly weakens container isolation.
-# PODMAN_SUDO_FALLBACK is only set by ensure_podman() when --allow-sudo-fallback is passed.
 _SUDO_VERIFIED=""
 # sudo credentials can expire mid-run (timestamp_timeout). Cache the last-known
 # successful verification timestamp and re-check after SUDO_REVALIDATE_SECONDS
@@ -915,7 +914,6 @@ repair_podman() {
     log_error "     Ensure /home is writable (it should be by default on Steam Deck)."
     log_error ""
     log_error "After fixing, try running this script again."
-    log_error "As a LAST RESORT (INSECURE), you may use --allow-sudo-fallback"
     log_error "to run the container as host root, but this weakens security significantly."
     return 1
 }
@@ -937,47 +935,12 @@ ensure_podman() {
         if ! repair_podman; then
             # Rootless podman is broken and automated repairs failed.
             # Check if sudo fallback is explicitly allowed.
-            if [[ "$ALLOW_SUDO_FALLBACK" == "true" ]] || [[ "${PODMAN_SUDO_FALLBACK:-}" == "true" ]]; then
-                # SECURITY: running containers as host root via sudo removes the
-                # UID mapping isolation that rootless podman normally provides.
-                # Even with --allow-sudo-fallback, require an explicit yes/no
-                # confirmation (or the documented ALLOW_SUDO_FALLBACK_CONFIRMED
-                # opt-in) so a malicious/compromised AUR package cannot quietly
-                # compromise the host. Refuse by default in non-interactive mode
-                # unless the user has pre-confirmed via the env var.
-                _do_sudo_fallback=false
-                if [[ "${ALLOW_SUDO_FALLBACK_CONFIRMED:-}" == "true" ]]; then
-                    _do_sudo_fallback=true
-                elif [[ "$NON_INTERACTIVE" == "true" ]]; then
-                    log_warn "--allow-sudo-fallback is set but this runs containers as HOST ROOT"
-                    log_warn "(insecure: weakens the UID-mapping isolation a malicious AUR package needs to compromise your host)."
-                    log_warn "To proceed in non-interactive mode, set ALLOW_SUDO_FALLBACK_CONFIRMED=true explicitly;"
-                    log_warn "to decline, run again without --allow-sudo-fallback."
-                elif [[ -t 0 ]]; then
-                    log_warn "--allow-sudo-fallback would run containers as HOST ROOT (insecure)."
-                    log_warn "A malicious AUR package can more easily compromise the host this way."
-                    local _sfb_confirm=""
-                    read -r -p "Type 'yes' to run containers as host root via sudo: " _sfb_confirm
-                    [[ "$_sfb_confirm" == "yes" ]] && _do_sudo_fallback=true
-                else
-                    log_warn "Non-interactive session: --allow-sudo-fallback needs confirmation (no tty)."
-                    log_warn "Set ALLOW_SUDO_FALLBACK_CONFIRMED=true to pre-approve, or run interactively."
-                fi
-                if [[ "$_do_sudo_fallback" != "true" ]]; then
-                    log_error "Sudo podman fallback declined or not confirmed."
-                    log_error "Run with --allow-sudo-fallback AND confirm interactively (or set ALLOW_SUDO_FALLBACK_CONFIRMED=true)."
-                    return 1
-                fi
-                log_warn "Attempting sudo podman fallback (explicitly allowed via --allow-sudo-fallback)..."
-                log_error "Even sudo podman is not functional."
-            fi
             if command -v docker >/dev/null 2>&1; then
                 log_warn "Podman repair failed. Falling back to docker."
                 export DISTROBOX_CONTAINER_MANAGER=docker
                 return 0
             fi
             log_error "No working container runtime available. Install podman or docker."
-            log_error "Run with --allow-sudo-fallback to try sudo podman (INSECURE)."
             return 1
         fi
         export DISTROBOX_CONTAINER_MANAGER=podman
@@ -999,7 +962,6 @@ USAGE:
 
 OPTIONS:
   --container-name NAME     Set container name (default: ${DEFAULT_CONTAINER_NAME})
-  --allow-sudo-fallback     Allow rootless Podman sudo fallback (INSECURE: confirmed interactively; set ALLOW_SUDO_FALLBACK_CONFIRMED=true for non-interactive opt-in)
   --force-rebuild           Rebuild existing container if it exists
   --enable-multilib         Enable 32-bit package support (default)
   --disable-multilib        Explicitly disable 32-bit package support
@@ -1033,12 +995,6 @@ ENVIRONMENT VARIABLES:
   FORCE_REBUILD            Set to 'true' to force-rebuild existing container
   ENABLE_GAMING_PACKAGES   Set to 'true' to install gaming packages
   PAMAC_VERSION            Specific pamac-aur version/commit to install (AUR fallback)
-  ALLOW_SUDO_FALLBACK      Set to 'true' to allow sudo podman fallback (INSECURE:
-                           runs container as host root instead of subuid/subgid,
-                           reducing isolation if a malicious AUR package is installed.
-                           Still requires interactive 'yes' confirmation unless
-                           ALLOW_SUDO_FALLBACK_CONFIRMED=true is also set.)
-  ALLOW_SUDO_FALLBACK_CONFIRMED  Pre-approve sudo fallback for non-interactive runs.
   NON_INTERACTIVE          Set to 'true' to skip all interactive prompts (safe for
                            background tools, automated installers, and cron jobs)
   CHAOTIC_AUR_KEY_ID       Override the Chaotic-AUR signing key fingerprint

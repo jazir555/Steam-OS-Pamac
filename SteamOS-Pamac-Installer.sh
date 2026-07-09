@@ -1164,8 +1164,19 @@ uninstall_setup() {
 
 _restore_errexit() {
   [[ "${_SAVED_ERREXIT:-}" == "on" ]] && set -e || true
-  # Clear the traps so they don't persist/fire spuriously after we return.
+  # Clear the RETURN trap so it does not fire spuriously in the caller.
   trap - RETURN
+}
+
+# Signal handler: restore errexit, clear the signal trap, and re-raise the
+# identical signal so the script terminates rather than resuming the loop.
+# Without this, a SIGINT/TERM/HUP fires the trap, bash resumes at the next
+# command in the while loop, and the user must hit Ctrl-C a second time.
+_restore_and_die() {
+    local _sig=$1
+    _restore_errexit
+    trap - "$_sig"
+    kill -s "$_sig" $$ 2>/dev/null || exit 130
 }
 
 wait_for_container() {
@@ -1184,7 +1195,9 @@ wait_for_container() {
   # the user hits Ctrl-C (a bare RETURN trap does not fire on a signal death,
   # which previously left `set +e` sticky in the caller's scope).
   trap '_restore_errexit' RETURN
-  trap '_restore_errexit; trap - INT TERM HUP' INT TERM HUP
+  trap '_restore_and_die INT'  INT
+  trap '_restore_and_die TERM' TERM
+  trap '_restore_and_die HUP'  HUP
 
   while true; do
     attempt=$((attempt + 1))

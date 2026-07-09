@@ -24,13 +24,30 @@ CONTAINER_HAS_INIT="unknown"
 
 readonly ARCHLINUX_IMAGE="${ARCHLINUX_IMAGE:-archlinux:latest}"
 
-# Track temp files for cleanup on interrupt
-_TEMP_FILES=()
+# Global temp directory for all script temp files. Using a single directory
+# instead of tracking individual files in an array avoids race conditions where
+# temp files created inside subshells or piped commands never propagate back to
+# the parent shell's _TEMP_FILES array and thus leak on cleanup.
+_SCRIPT_TMPDIR=""
+_init_script_tmpdir() {
+    _SCRIPT_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/steamos-pamac-XXXXXX") || {
+        log_warn "Failed to create global temp directory."
+        _SCRIPT_TMPDIR=""
+    }
+}
 _cleanup_temp_files() {
+    # Remove tracked individual files (legacy path)
     for f in "${_TEMP_FILES[@]}"; do
         rm -f "$f" 2>/dev/null || true
     done
+    # Remove the global temp directory tree (primary cleanup)
+    if [[ -n "${_SCRIPT_TMPDIR:-}" && -d "$_SCRIPT_TMPDIR" ]]; then
+        rm -rf "$_SCRIPT_TMPDIR" 2>/dev/null || true
+    fi
 }
+# Track individual temp files for backward compatibility with code that
+# references _TEMP_FILES directly. New code should use _SCRIPT_TMPDIR.
+_TEMP_FILES=()
 CONTAINER_NAME="${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}"
 
 CURRENT_USER=$(whoami)
@@ -105,6 +122,9 @@ initialize_logging() {
         echo "=========================================="
     } > "$LOG_FILE"
 
+    # Initialize the global temp directory now that logging is available.
+    _init_script_tmpdir
+
     trap 'exit_code=$?; _cleanup_temp_files; echo "=== Run finished: $(date) - Exit: $exit_code ===" >> "$LOG_FILE"; [[ "$UPLOAD_LOG" == "true" ]] && sanitize_and_upload_log || true' EXIT
 }
 
@@ -143,7 +163,7 @@ sanitize_and_upload_log() {
 
     log_info "Sanitizing log for upload..."
     local sanitized_log
-    sanitized_log=$(mktemp) || { log_error "Failed to create temp file for sanitization."; return 1; }
+    sanitized_log=$(mktemp "${_SCRIPT_TMPDIR:-/tmp}/pamac-sanitized-XXXXXXXX") || { log_error "Failed to create temp file for sanitization."; return 1; }
 
     # Sanitize: strip ANSI colors, user home paths, hostnames, IPs,
     # SSH keys, tokens, and other sensitive patterns.
@@ -1549,7 +1569,12 @@ local _target=\$(( _d + 0 ))
 [[ \$_target -lt 1 ]] && _target=1
 local _start=\$SECONDS
 while (( SECONDS - _start < _target )); do
-    :
+    # Use read -t to yield CPU instead of busy-pinning a core to 100%.
+    # This prevents battery drain on handheld devices when sleep is broken.
+    # Note: /dev/null redirect is intentionally omitted — reading from /dev/null
+    # returns immediately on EOF and does NOT sleep. Without it, read blocks on
+    # stdin until the timeout expires, yielding the CPU for ~1 second per iteration.
+    read -t 1 _dummy 2>/dev/null || true
 done
 return 1
 }
@@ -1689,7 +1714,7 @@ exec_container_script() {
     local _script_file
     local _preamble="$_CONTAINER_PREAMBLE"
 
-    _script_file=$(mktemp --tmpdir pamac-script-XXXXXXXX)
+    _script_file=$(mktemp "${_SCRIPT_TMPDIR:-/tmp}/pamac-script-XXXXXXXX")
     _TEMP_FILES+=("$_script_file")
     printf '%s\n' "${_preamble}" > "$_script_file"
 
@@ -1732,7 +1757,7 @@ exec_container_pipe() {
     local _marker="PAMAC_PIPE_OK_$(head -c 16 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$_$(date +%s)")"
     local _preamble="$_CONTAINER_PREAMBLE"
 
-    _script_file=$(mktemp --tmpdir pamac-pipe-XXXXXXXX)
+    _script_file=$(mktemp "${_SCRIPT_TMPDIR:-/tmp}/pamac-pipe-XXXXXXXX")
     _TEMP_FILES+=("$_script_file")
     printf '%s' "$_preamble" > "$_script_file"
     # Marker race fix (see exec_container_script): install an EXIT trap BEFORE
@@ -2667,7 +2692,9 @@ local _target=$(( _d + 0 ))
 [[ $_target -lt 1 ]] && _target=1
 local _start=$SECONDS
 while (( SECONDS - _start < _target )); do
-    :
+    local _dummy
+    # read -t blocks on stdin until timeout, yielding CPU (no /dev/null redirect)
+    read -t 1 _dummy 2>/dev/null || true
 done
 return 1
 }
@@ -3341,7 +3368,9 @@ local _target=$(( _d + 0 ))
 [[ $_target -lt 1 ]] && _target=1
 local _start=$SECONDS
 while (( SECONDS - _start < _target )); do
-    :
+    local _dummy
+    # read -t blocks on stdin until timeout, yielding CPU (no /dev/null redirect)
+    read -t 1 _dummy 2>/dev/null || true
 done
 return 1
 }
@@ -4594,7 +4623,10 @@ _pacman_minor_raw=$(echo "$installed_pacman_ver" | sed 's/^[^:]*://')
 _pacman_minor_raw=$(echo "$_pacman_minor_raw" | cut -d. -f2)
 pacman_minor=$(echo "$_pacman_minor_raw" | grep -oP '^[0-9]*' || echo "0")
 [[ -z "$pacman_minor" ]] && pacman_minor=0
-echo "Parsed pacman version: major=$pacman_major minor=$pacman_minor (raw: $installed_pacman_ver)"
+_pacman_patch_raw=$(echo "$installed_pacman_ver" | sed 's/^[^:]*://' | cut -d. -f3)
+pacman_patch=$(echo "$_pacman_patch_raw" | grep -oP '^[0-9]*' || echo "0")
+[[ -z "$pacman_patch" ]] && pacman_patch=0
+echo "Parsed pacman version: major=$pacman_major minor=$pacman_minor patch=$pacman_patch (raw: $installed_pacman_ver)"
 
 if [[ -n "$pamac_version_pin" && "$pamac_version_pin" != "latest" ]]; then
     echo "User specified --pamac-version=$pamac_version_pin. Attempting direct install..."
@@ -4637,26 +4669,35 @@ _fetch_aur_pkgbuild() {
     local _rpc_url="https://aur.archlinux.org/rpc/v5/info/pamac-aur"
     local _rpc_resp
     _rpc_resp=$(curl -sf --connect-timeout 10 --max-time 30 "$_rpc_url" 2>/dev/null || echo "")
-    if [[ -n "$_rpc_resp" ]] && echo "$_rpc_resp" | grep -q '"resultcount":1'; then
-        local _deps_formatted _makedeps_formatted
-        _deps_formatted=$(echo "$_rpc_resp" | jq -r '.results[0].Depends // [] | join("\n")' 2>/dev/null || echo "")
-        _makedeps_formatted=$(echo "$_rpc_resp" | jq -r '.results[0].MakeDepends // [] | join("\n")' 2>/dev/null || echo "")
-        if [[ -n "$_deps_formatted" ]]; then
-            echo "depends=($_deps_formatted)"
-        fi
-        if [[ -n "$_makedeps_formatted" ]]; then
-            echo "makedepends=($_makedeps_formatted)"
-        fi
-        if [[ -n "$_deps_formatted" || -n "$_makedeps_formatted" ]]; then
-            echo "# Generated from AUR RPC v5 API"
-            return 0
+    if [[ -n "$_rpc_resp" ]]; then
+        # Validate JSON response structure with jq (avoids regex fragility on
+        # future API field renames or reordering).
+        local _resultcount
+        _resultcount=$(echo "$_rpc_resp" | jq -r '.resultcount // empty' 2>/dev/null || echo "")
+        if [[ "$_resultcount" == "1" ]]; then
+            local _deps_formatted _makedeps_formatted
+            _deps_formatted=$(echo "$_rpc_resp" | jq -r '.results[0].Depends // [] | join("\n")' 2>/dev/null || echo "")
+            _makedeps_formatted=$(echo "$_rpc_resp" | jq -r '.results[0].MakeDepends // [] | join("\n")' 2>/dev/null || echo "")
+            if [[ -n "$_deps_formatted" ]]; then
+                echo "depends=($_deps_formatted)"
+            fi
+            if [[ -n "$_makedeps_formatted" ]]; then
+                echo "makedepends=($_makedeps_formatted)"
+            fi
+            if [[ -n "$_deps_formatted" || -n "$_makedeps_formatted" ]]; then
+                echo "# Generated from AUR RPC v5 API"
+                return 0
+            fi
+        elif [[ -n "$_resultcount" ]]; then
+            echo "# WARN: AUR RPC returned resultcount=$_resultcount (expected 1)" >&2
         fi
     fi
 
     # Method 2: CGIT web endpoint (may be rate-limited by Cloudflare)
+    # Validate response is an actual PKGBUILD (not an HTML error page).
     fetched=$(curl -sf --connect-timeout 10 --max-time 30 \
         "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=pamac-aur" 2>/dev/null || echo "")
-    if [[ -n "$fetched" ]]; then
+    if [[ -n "$fetched" ]] && echo "$fetched" | grep -q "^pkgname="; then
         echo "$fetched"
         return 0
     fi
@@ -4731,15 +4772,22 @@ req_major=$(echo "$req_version" | sanitize_version_component)
 _req_minor_raw=$(echo "$req_version" | cut -d. -f2)
 req_minor=$(echo "$_req_minor_raw" | grep -oP '^[0-9]*' || echo "0")
 [[ -z "$req_minor" ]] && req_minor=0
+_req_patch_raw=$(echo "$req_version" | cut -d. -f3)
+req_patch=$(echo "$_req_patch_raw" | grep -oP '^[0-9]*' || echo "0")
+[[ -z "$req_patch" ]] && req_patch=0
 
 version_meets_requirement() {
     local cur_major="$1" cur_minor="$2" op="$3" rq_major="$4" rq_minor="${5:-0}"
+    local cur_patch="${6:-0}" rq_patch="${7:-0}"
 
     # Use vercmp when available (standard Arch Linux utility that correctly handles
     # epochs like "6:5.2.0", pre-release suffixes like "rc", and package revisions)
     if command -v vercmp >/dev/null 2>&1; then
-        local cur_full="${cur_major}.${cur_minor}"
-        local rq_full="${rq_major}.${rq_minor}"
+        local cur_full="${cur_major}.${cur_minor}.${cur_patch}"
+        local rq_full="${rq_major}.${rq_minor}.${rq_patch}"
+        # Strip trailing .0 components for cleaner comparison (vercmp handles them)
+        cur_full="${cur_full%.0}"
+        rq_full="${rq_full%.0}"
         local cmp_result
         cmp_result=$(vercmp "$cur_full" "$rq_full" 2>/dev/null || echo "")
         if [[ -n "$cmp_result" && "$cmp_result" =~ ^-?[0-9]+$ ]]; then
@@ -4758,26 +4806,31 @@ version_meets_requirement() {
         fi
     fi
 
-    # Fallback: manual major.minor comparison (when vercmp is unavailable)
+    # Fallback: manual major.minor.patch comparison (when vercmp is unavailable)
+    # Compares major, then minor, then patch to handle three-component versions.
     case "$op" in
         ">="|"="|"==")
             if [[ "$cur_major" -gt "$rq_major" ]]; then return 0; fi
-            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -ge "$rq_minor" ]]; then return 0; fi
+            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -gt "$rq_minor" ]]; then return 0; fi
+            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -eq "$rq_minor" && "$cur_patch" -ge "$rq_patch" ]]; then return 0; fi
             return 1
             ;;
         ">")
             if [[ "$cur_major" -gt "$rq_major" ]]; then return 0; fi
             if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -gt "$rq_minor" ]]; then return 0; fi
+            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -eq "$rq_minor" && "$cur_patch" -gt "$rq_patch" ]]; then return 0; fi
             return 1
             ;;
         "<=")
             if [[ "$cur_major" -lt "$rq_major" ]]; then return 0; fi
-            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -le "$rq_minor" ]]; then return 0; fi
+            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -lt "$rq_minor" ]]; then return 0; fi
+            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -eq "$rq_minor" && "$cur_patch" -le "$rq_patch" ]]; then return 0; fi
             return 1
             ;;
         "<")
             if [[ "$cur_major" -lt "$rq_major" ]]; then return 0; fi
             if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -lt "$rq_minor" ]]; then return 0; fi
+            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -eq "$rq_minor" && "$cur_patch" -lt "$rq_patch" ]]; then return 0; fi
             return 1
             ;;
         *)
@@ -4786,7 +4839,7 @@ version_meets_requirement() {
     esac
 }
 
-if version_meets_requirement "$pacman_major" "$pacman_minor" "$req_op" "$req_major" "$req_minor"; then
+if version_meets_requirement "$pacman_major" "$pacman_minor" "$req_op" "$req_major" "$req_minor" "$pacman_patch" "$req_patch"; then
     echo "PASS: pacman $installed_pacman_ver satisfies requirement $aur_pacman_dep"
     exit 0
 fi
@@ -4802,9 +4855,10 @@ if command -v vercmp >/dev/null 2>&1; then
         can_upgrade_pacman=true
     fi
 else
-    # Fallback: manual major.minor comparison
+    # Fallback: manual major.minor.patch comparison
     if [[ "$req_major" -gt "$pacman_major" ]] || \
-       { [[ "$req_major" -eq "$pacman_major" ]] && [[ "$req_minor" -gt "$pacman_minor" ]]; }; then
+       { [[ "$req_major" -eq "$pacman_major" ]] && [[ "$req_minor" -gt "$pacman_minor" ]]; } || \
+       { [[ "$req_major" -eq "$pacman_major" ]] && [[ "$req_minor" -eq "$pacman_minor" ]] && [[ "$req_patch" -gt "$pacman_patch" ]]; }; then
         can_upgrade_pacman=true
     fi
 fi
@@ -4823,7 +4877,10 @@ if [[ "$can_upgrade_pacman" == "true" ]]; then
             _new_minor_raw=$(echo "$new_ver" | sed 's/^[^:]*://' | cut -d. -f2)
             new_minor=$(echo "$_new_minor_raw" | grep -oP '^[0-9]*' || echo "0")
             [[ -z "$new_minor" ]] && new_minor=0
-            if version_meets_requirement "$new_major" "$new_minor" "$req_op" "$req_major" "$req_minor"; then
+            _new_patch_raw=$(echo "$new_ver" | sed 's/^[^:]*://' | cut -d. -f3)
+            new_patch=$(echo "$_new_patch_raw" | grep -oP '^[0-9]*' || echo "0")
+            [[ -z "$new_patch" ]] && new_patch=0
+            if version_meets_requirement "$new_major" "$new_minor" "$req_op" "$req_major" "$req_minor" "$new_patch" "$req_patch"; then
                 echo "SUCCESS: Upgraded pacman $new_ver now satisfies $aur_pacman_dep"
                 ldconfig 2>/dev/null || true
                 exit 0
@@ -4838,7 +4895,10 @@ if [[ "$can_upgrade_pacman" == "true" ]]; then
             _new_minor_raw2=$(echo "$new_ver" | sed 's/^[^:]*://' | cut -d. -f2)
             new_minor=$(echo "$_new_minor_raw2" | grep -oP '^[0-9]*' || echo "0")
             [[ -z "$new_minor" ]] && new_minor=0
-            if version_meets_requirement "$new_major" "$new_minor" "$req_op" "$req_major" "$req_minor"; then
+            _new_patch_raw2=$(echo "$new_ver" | sed 's/^[^:]*://' | cut -d. -f3)
+            new_patch=$(echo "$_new_patch_raw2" | grep -oP '^[0-9]*' || echo "0")
+            [[ -z "$new_patch" ]] && new_patch=0
+            if version_meets_requirement "$new_major" "$new_minor" "$req_op" "$req_major" "$req_minor" "$new_patch" "$req_patch"; then
                 echo "SUCCESS: Full upgrade brought pacman $new_ver which satisfies $aur_pacman_dep"
                 ldconfig 2>/dev/null || true
                 exit 0
@@ -4900,11 +4960,13 @@ for try_commit in $_commits; do
     old_req_ver=$(echo "$old_dep" | grep -oP "[0-9.]+" | head -1 || echo "")
     old_req_major=$(echo "$old_req_ver" | grep -oP '^[0-9]+' || echo "0")
     old_req_minor=$(echo "$old_req_ver" | cut -d. -f2 | grep -oP '^[0-9]*' || echo "0")
+    old_req_patch=$(echo "$old_req_ver" | cut -d. -f3 | grep -oP '^[0-9]*' || echo "0")
     [[ -z "$old_req_major" ]] && old_req_major=0
     [[ -z "$old_req_minor" ]] && old_req_minor=0
+    [[ -z "$old_req_patch" ]] && old_req_patch=0
     old_req_op=$(echo "$old_dep" | grep -oP "[><=]+" | head -1 || echo "")
 
-    if version_meets_requirement "$pacman_major" "$pacman_minor" "$old_req_op" "$old_req_major" "$old_req_minor"; then
+    if version_meets_requirement "$pacman_major" "$pacman_minor" "$old_req_op" "$old_req_major" "$old_req_minor" "$pacman_patch" "$old_req_patch"; then
         echo "  -> Compatible: requires pacman $old_dep (have $installed_pacman_ver)"
         rm -rf "$_AUR_WORK"
         echo "FOUND_COMPATIBLE_COMMIT=$try_commit"
@@ -4926,7 +4988,7 @@ COMPAT_EOF
     local _preamble="$_CONTAINER_PREAMBLE"
 
     local _compat_script_file
-    _compat_script_file=$(mktemp --tmpdir pamac-compat-XXXXXXXX)
+    _compat_script_file=$(mktemp "${_SCRIPT_TMPDIR:-/tmp}/pamac-compat-XXXXXXXX")
     _TEMP_FILES+=("$_compat_script_file")
     printf '%s\n' "${_preamble}${compat_script}" > "$_compat_script_file"
 
@@ -6716,6 +6778,24 @@ PAMAC_DESKTOP
   # Use Python for robust INI/desktop-file parsing instead of fragile awk passes.
   # This correctly handles: multi-line values, upstream [Desktop Action] sections,
   # re-entry into action sections, and preserves all non-owned lines.
+  # Pre-flight: verify Python 3 + configparser are available; fall back to
+  # a sed-based path if not, so builds don't break inside minimal containers.
+  if ! python3 -c "import configparser" >/dev/null 2>&1; then
+    echo "WARN: Python 3 or configparser unavailable — using sed fallback for desktop annotation." >&2
+    sed -i \
+      -e '/^X-SteamOS-Pamac-/d' \
+      -e '/^Actions=.*uninstall/d' \
+      -e "\$a\\
+Actions=uninstall;\\
+X-SteamOS-Pamac-Managed=true\\
+X-SteamOS-Pamac-Container=${container_name}\\
+X-SteamOS-Pamac-SourceApp=${export_name}\\
+X-SteamOS-Pamac-SourceDesktop=${app_name}.desktop\\
+X-SteamOS-Pamac-SourcePackage=${owner_pkg}" \
+      "\$desktop_file"
+    _fix_desktop_permissions "\$desktop_file"
+    return 0
+  fi
   desktop_basename="\$(basename "\$desktop_file")"
 
   python3 - "\$desktop_file" "\$desktop_basename" "${container_name}" "${current_user}" "\$export_name" "\$app_name" "\$owner_pkg" << 'PYTHON_DESKTOP_REWRITE'

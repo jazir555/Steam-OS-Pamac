@@ -1,0 +1,79 @@
+#!/bin/bash
+export HOME="/home/deck"
+export DISPLAY=${DISPLAY:-:0}
+
+if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+    _uid=$(id -u)
+    if [[ -S "/run/user/$_uid/bus" ]]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$_uid/bus"
+    fi
+fi
+
+IS_WAYLAND=false
+if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    IS_WAYLAND=true
+fi
+
+if [[ "$IS_WAYLAND" == "false" ]]; then
+    if [[ -n "${XAUTH:-}" && -f "$XAUTH" ]]; then
+        export XAUTHORITY="$XAUTH"
+    elif [[ -f "$HOME/.Xauthority" ]]; then
+        export XAUTHORITY="$HOME/.Xauthority"
+    else
+        newest_xauth=$(ls -t /run/user/$(id -u)/xauth_* 2>/dev/null | head -1)
+        if [[ -n "$newest_xauth" && -f "$newest_xauth" ]]; then
+            export XAUTHORITY="$newest_xauth"
+        fi
+    fi
+fi
+
+DESKTOP_FILE="$HOME/.local/share/applications/arch-pamac-org.manjaro.pamac.manager.desktop"
+
+if [[ -d "$HOME/.local/bin" ]]; then
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+
+# Ensure host polkitd is running (handles auth for all containers on shared bus)
+if ! pgrep -x polkitd >/dev/null 2>&1; then
+    systemctl --user start polkit 2>/dev/null || true
+fi
+
+# Ensure container pamac-daemon is running
+if ! podman exec arch-pamac pgrep -x pamac-daemon >/dev/null 2>&1; then
+    podman exec arch-pamac /usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true
+    # Wait for daemon to appear on D-Bus
+    _wait=0
+    while [[ $_wait -lt 10 ]]; do
+        if podman exec arch-pamac busctl --system list 2>/dev/null | grep -q "org.manjaro.pamac.daemon"; then
+            break
+        fi
+        sleep 1
+        _wait=$(( _wait + 1 ))
+    done
+fi
+
+# Clean stale pacman download dirs before entering container
+podman exec arch-pamac rm -rf /var/lib/pacman/sync/download-* 2>/dev/null || true
+
+DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" \
+distrobox enter arch-pamac -- pamac-manager-wrapper "$@" &
+LAUNCHER_PID=$!
+
+if [[ "$IS_WAYLAND" == "false" ]] && command -v xprop >/dev/null 2>&1 && command -v xdotool >/dev/null 2>&1 && command -v xwininfo >/dev/null 2>&1; then
+    _xdotool_wait=0
+    while [[ $_xdotool_wait -lt 15 ]]; do
+        for wid in $(xdotool search --class "pamac-manager" 2>/dev/null | head -5); do
+            width=$(xwininfo -id "$wid" 2>/dev/null | awk '/Width:/{print $NF}')
+            if [[ -n "$width" ]] && [[ "$width" -gt 1 ]]; then
+                XAUTHORITY="$XAUTHORITY" DISPLAY="$DISPLAY" xprop -id "$wid" \
+                    -f _KDE_NET_WM_DESKTOP_FILE 8u \
+                    -set _KDE_NET_WM_DESKTOP_FILE "$DESKTOP_FILE" 2>/dev/null
+                break 2
+            fi
+        done
+        sleep 1
+        _xdotool_wait=$(( _xdotool_wait + 1 ))
+    done
+fi
+
+wait "$LAUNCHER_PID" 2>/dev/null

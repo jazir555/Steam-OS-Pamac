@@ -1,0 +1,48 @@
+#!/bin/bash
+set +e
+
+export DISPLAY=${DISPLAY:-:0}
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+
+if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+    if [[ -S "$XDG_RUNTIME_DIR/bus" ]]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+    else
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+    fi
+fi
+
+rm -rf /var/lib/pacman/sync/download-* 2>/dev/null || true
+
+if ! pgrep -x pamac-daemon >/dev/null 2>&1; then
+    /usr/local/bin/pamac-session-bootstrap.sh 2>&1 || true
+fi
+
+rm -f /var/lib/pacman/db.lck 2>/dev/null || true
+
+DESKTOP_FILE="/home/deck/.local/share/applications/arch-pamac-org.manjaro.pamac.manager.desktop"
+
+CRASH_LOG="/var/log/pamac-manager-crash.log"
+rm -f /tmp/pamac-debug-trans.log
+echo "=== Launch at $(date) ===" >> "$CRASH_LOG" 2>/dev/null
+pamac-manager "$@" 2>>"$CRASH_LOG" 1>>"$CRASH_LOG" &
+PAMAC_PID=$!
+
+if [[ -z "${WAYLAND_DISPLAY:-}" ]] && command -v xprop >/dev/null 2>&1 && command -v xdotool >/dev/null 2>&1 && command -v xwininfo >/dev/null 2>&1; then
+    _xdotool_wait=0
+    while [[ $_xdotool_wait -lt 15 ]]; do
+        for wid in $(xdotool search --class "pamac-manager" 2>/dev/null | head -5); do
+            width=$(xwininfo -id "$wid" 2>/dev/null | awk '/Width:/{print $NF}')
+            if [[ -n "$width" ]] && [[ "$width" -gt 1 ]]; then
+                xprop -id "$wid" -f _KDE_NET_WM_DESKTOP_FILE 8u \
+                    -set _KDE_NET_WM_DESKTOP_FILE "$DESKTOP_FILE" 2>/dev/null
+                break 2
+            fi
+        done
+        sleep 1
+        _xdotool_wait=$(( _xdotool_wait + 1 ))
+    done
+fi
+
+wait "$PAMAC_PID" 2>/dev/null
+echo "=== Exit at $(date) code=$? ===" >> "$CRASH_LOG" 2>/dev/null

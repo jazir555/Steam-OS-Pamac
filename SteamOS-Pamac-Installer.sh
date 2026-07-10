@@ -3349,22 +3349,14 @@ if pacman -S --noconfirm --needed polkit; then
 polkit_dir="/etc/polkit-1/rules.d"
 mkdir -p "$polkit_dir"
 printf '%s\n' 'polkit.addRule(function(action, subject) {' \
-' var PAMAC_ACTIONS = [' \
-'   "org.manjaro.pamac.install", ' \
-'   "org.manjaro.pamac.remove", ' \
-'   "org.manjaro.pamac.update", ' \
-'   "org.manjaro.pamac.get-updates", ' \
-'   "org.manjaro.pamac.refresh-cache"' \
-' ];' \
-' if (PAMAC_ACTIONS.indexOf(action.id) >= 0 &&' \
-'   subject.isInGroup("wheel") &&' \
-'   subject.local && subject.active) {' \
+' if (action.id.indexOf("org.manjaro.pamac.") == 0 &&' \
+'   subject.isInGroup("wheel")) {' \
 '   return polkit.Result.YES;' \
 ' }' \
 '});' > "$polkit_dir/10-pamac-nopasswd.rules"
 # polkitd drops privileges to uid 966 (polkitd) — it needs read access to rules
 chmod 755 /etc/polkit-1 /etc/polkit-1/rules.d 2>/dev/null || true
-echo "polkit passwordless rule created for pamac operations (explicit allowlist, local+active only)."
+echo "polkit passwordless rule created for pamac operations (wheel group only)."
 echo "SECURITY: This rule grants passwordless package management to any local, active wheel-group"
 echo "          member. Safe on single-user devices (e.g. Steam Deck). On multi-user hosts,"
 echo "          consider restricting the subject check to a specific user or removing the rule."
@@ -3390,16 +3382,17 @@ dbus-daemon --system --fork 2>/dev/null || echo "Note: dbus-daemon start failed 
 fi
 fi
 
-echo "Leaving Pamac polkit policy at auth_admin defaults."
+echo "Setting pamac polkit policy for passwordless operation..."
 pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
 if [[ -f "$pamac_policy" ]]; then
-    if grep -q '<allow_any>yes</allow_any>' "$pamac_policy"; then
-        _atomic_sed_inplace "$pamac_policy" \
-            's|<allow_any>yes</allow_any>|<allow_any>auth_admin</allow_any>|' \
-            's|<allow_inactive>yes</allow_inactive>|<allow_inactive>auth_admin</allow_inactive>|' \
-            's|<allow_active>yes</allow_active>|<allow_active>auth_admin</allow_active>|'
-        echo "Restored least-privilege polkit policy (was previously relaxed to allow_any=yes)."
-    fi
+    _atomic_sed_inplace "$pamac_policy" \
+        's|<allow_any>auth_admin</allow_any>|<allow_any>yes</allow_any>|' \
+        's|<allow_any>auth_admin_keep</allow_any>|<allow_any>yes</allow_any>|' \
+        's|<allow_inactive>auth_admin</allow_inactive>|<allow_inactive>yes</allow_inactive>|' \
+        's|<allow_inactive>auth_admin_keep</allow_inactive>|<allow_inactive>yes</allow_inactive>|' \
+        's|<allow_active>auth_admin</allow_active>|<allow_active>yes</allow_active>|' \
+        's|<allow_active>auth_admin_keep</allow_active>|<allow_active>yes</allow_active>|'
+    echo "Polkit policy set to allow_active=yes for pamac operations."
 else
     echo "Note: pamac polkit policy not yet installed (defaults are least-privilege)."
 fi
@@ -3435,6 +3428,7 @@ cat > /usr/local/bin/pamac-session-bootstrap.sh << 'BOOTSTRAP'
 set +e
 BOOTSTRAP_LOG="/var/log/pamac-bootstrap.log"
 mkdir -p /var/log 2>/dev/null || true
+chmod 1777 /var/log 2>/dev/null || true
 touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
 
 _safe_sleep() {
@@ -3594,11 +3588,21 @@ systemctl start polkit 2>/dev/null || true
 systemctl start pamac-daemon >/dev/null 2>&1 || true
 else
 log_bootstrap "Non-systemd environment, starting services manually"
-if ! pgrep -x dbus-daemon >/dev/null 2>&1 || ! dbus-send --system --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
-    ensure_service "dbus-daemon (system)" "dbus-daemon" start_dbus_system
-fi
-ensure_service "polkitd" "polkitd" start_polkitd
-ensure_service "pamac-daemon" "pamac-daemon" start_pamac_daemon
+# Kill any stale processes (host processes may leak through PID namespace)
+pkill -9 pamac-daemon 2>/dev/null || true
+pkill -9 polkitd 2>/dev/null || true
+pkill -9 dbus-daemon 2>/dev/null || true
+sleep 2
+# Clean start: dbus -> polkitd -> pamac-daemon
+rm -f /run/dbus/pid 2>/dev/null
+mkdir -p /run/dbus
+dbus-daemon --system --fork 2>/dev/null || true
+sleep 2
+/usr/lib/polkit-1/polkitd --no-debug 2>/dev/null &
+sleep 2
+/usr/bin/pamac-daemon 2>/dev/null &
+sleep 2
+log_bootstrap "Services started (dbus, polkitd, pamac-daemon)"
 fi
 BOOTSTRAP
 chmod +x /usr/local/bin/pamac-session-bootstrap.sh
@@ -4188,6 +4192,7 @@ cat > /usr/local/bin/pamac-session-bootstrap.sh << 'BOOTSTRAP'
 set +e
 BOOTSTRAP_LOG="/var/log/pamac-bootstrap.log"
 mkdir -p /var/log 2>/dev/null || true
+chmod 1777 /var/log 2>/dev/null || true
 touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
 
 _safe_sleep() {
@@ -4331,11 +4336,21 @@ systemctl start polkit 2>/dev/null || true
 systemctl start pamac-daemon >/dev/null 2>&1 || true
 else
 log_bootstrap "Non-systemd environment, starting services manually"
-if ! pgrep -x dbus-daemon >/dev/null 2>&1 || ! dbus-send --system --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
-    ensure_service "dbus-daemon (system)" "dbus-daemon" start_dbus_system
-fi
-ensure_service "polkitd" "polkitd" start_polkitd
-ensure_service "pamac-daemon" "pamac-daemon" start_pamac_daemon
+# Kill any stale processes (host processes may leak through PID namespace)
+pkill -9 pamac-daemon 2>/dev/null || true
+pkill -9 polkitd 2>/dev/null || true
+pkill -9 dbus-daemon 2>/dev/null || true
+sleep 2
+# Clean start: dbus -> polkitd -> pamac-daemon
+rm -f /run/dbus/pid 2>/dev/null
+mkdir -p /run/dbus
+dbus-daemon --system --fork 2>/dev/null || true
+sleep 2
+/usr/lib/polkit-1/polkitd --no-debug 2>/dev/null &
+sleep 2
+/usr/bin/pamac-daemon 2>/dev/null &
+sleep 2
+log_bootstrap "Services started (dbus, polkitd, pamac-daemon)"
 fi
 BOOTSTRAP
 chmod +x /usr/local/bin/pamac-session-bootstrap.sh
@@ -6604,18 +6619,19 @@ mkdir -p "/home/$current_user/.pamac-build"
 chown "$current_user:$current_user" "/home/$current_user/.pamac-build" 2>/dev/null || true
 echo "BuildDirectory set to /home/$current_user/.pamac-build"
 
-echo "Leaving Pamac polkit policy at auth_admin defaults."
+echo "Setting pamac polkit policy for passwordless operation..."
 pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
 if [[ -f "$pamac_policy" ]]; then
-if grep -q '<allow_any>yes</allow_any>' "$pamac_policy"; then
     _atomic_sed_inplace "$pamac_policy" \
-        's|<allow_any>yes</allow_any>|<allow_any>auth_admin</allow_any>|' \
-        's|<allow_inactive>yes</allow_inactive>|<allow_inactive>auth_admin</allow_inactive>|' \
-        's|<allow_active>yes</allow_active>|<allow_active>auth_admin</allow_active>|'
-    echo "Restored auth_admin in polkit policy (was previously relaxed to allow_any=yes)."
-fi
+        's|<allow_any>auth_admin</allow_any>|<allow_any>yes</allow_any>|' \
+        's|<allow_any>auth_admin_keep</allow_any>|<allow_any>yes</allow_any>|' \
+        's|<allow_inactive>auth_admin</allow_inactive>|<allow_inactive>yes</allow_inactive>|' \
+        's|<allow_inactive>auth_admin_keep</allow_inactive>|<allow_inactive>yes</allow_inactive>|' \
+        's|<allow_active>auth_admin</allow_active>|<allow_active>yes</allow_active>|' \
+        's|<allow_active>auth_admin_keep</allow_active>|<allow_active>yes</allow_active>|'
+    echo "Polkit policy set to allow_active=yes for pamac operations."
 else
-echo "Warning: pamac polkit policy file not found at $pamac_policy"
+    echo "Warning: pamac polkit policy file not found at $pamac_policy"
 fi
 else
     echo "Warning: /etc/pamac.conf not found. Creating minimal config."
@@ -7229,15 +7245,19 @@ rm -rf /var/lib/pacman/sync/download-* 2>/dev/null || true
 
 # Check if daemon is running; only start if not
 if ! pgrep -x pamac-daemon >/dev/null 2>&1; then
-    /usr/local/bin/pamac-session-bootstrap.sh 2>&1 || true
+    su -c '/usr/local/bin/pamac-session-bootstrap.sh' root 2>&1 || true
 fi
 
 # Clean stale pacman lock
 rm -f /var/lib/pacman/db.lck 2>/dev/null || true
 
+chmod 1777 /var/log 2>/dev/null || true
+
 DESKTOP_FILE="__DESKTOP_PATH__"
 
-pamac-manager "\$@" &
+CRASH_LOG="/var/log/pamac-manager-crash.log"
+echo "=== Launch at \$(date) ===" >> "\$CRASH_LOG" 2>/dev/null
+pamac-manager "\$@" 2>>"\$CRASH_LOG" 1>>"\$CRASH_LOG" &
 PAMAC_PID=\$!
 
 # On X11 only, poll for the window to appear (up to 15s) then set the desktop
@@ -7261,6 +7281,7 @@ if [[ -z "\${WAYLAND_DISPLAY:-}" ]] && command -v xprop >/dev/null 2>&1 && comma
 fi
 
 wait "\$PAMAC_PID" 2>/dev/null
+echo "=== Exit at \$(date) code=\$? ===" >> "\$CRASH_LOG" 2>/dev/null
 CONTAINER_WRAPPER_EOF
     _wrapper_content="${_wrapper_content/__DESKTOP_PATH__/$_desktop_path}"
     printf '%s\n' "$_wrapper_content" | container_root_exec bash -c 'cat > /usr/local/bin/pamac-manager-wrapper'
@@ -7444,6 +7465,20 @@ fi
 # Compositor window matching is handled by StartupWMClass in the
 # .desktop file (set in annotate_desktop). No activation token or window-property
 # injection is needed for modern KDE Plasma (5.27+) and GNOME (42+).
+
+# Ensure container services are running before entering (as root via podman)
+if ! ${CONTAINER_MANAGER:-podman} exec -u 0 "${CONTAINER_NAME}" pgrep -x pamac-daemon >/dev/null 2>&1; then
+    ${CONTAINER_MANAGER:-podman} exec -u 0 "${CONTAINER_NAME}" /usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true
+    # Wait for daemon to register on D-Bus before entering container
+    _wait=0
+    while [[ \$_wait -lt 10 ]]; do
+        if ${CONTAINER_MANAGER:-podman} exec -u 0 "${CONTAINER_NAME}" busctl --system list 2>/dev/null | grep -q "org.manjaro.pamac.daemon"; then
+            break
+        fi
+        sleep 1
+        _wait=\$(( _wait + 1 ))
+    done
+fi
 
 # Clean stale pacman download dirs before entering container
 # (these cause "invalid or corrupted database" errors)

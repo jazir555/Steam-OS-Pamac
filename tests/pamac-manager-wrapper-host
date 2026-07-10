@@ -52,15 +52,37 @@ podman exec arch-pamac rm -rf /var/lib/pacman/sync/download-* 2>/dev/null || tru
 
 # Ensure desktop files are exported from container to host
 # This runs on the HOST as deck user. We copy .desktop files directly
-# from the container and patch the Exec line to use distrobox-enter.
+# from the container, patch Exec, and annotate with pamac markers + uninstall action.
 _export_dir="$HOME/.local/share/applications"
 for _desktop in $(podman exec arch-pamac bash -c "pacman -Qeq | while read p; do pacman -Qql \$p 2>/dev/null; done" 2>/dev/null | grep '\.desktop$'); do
     _base=$(basename "$_desktop")
     _host_file="$_export_dir/arch-pamac-$_base"
     if [[ ! -f "$_host_file" ]]; then
         podman cp "arch-pamac:$_desktop" "$_host_file" 2>/dev/null || continue
-        # Patch Exec to use distrobox-enter
-        sed -i 's|^Exec=.*|Exec=distrobox-enter -n arch-pamac -- '"$(basename "$_desktop" .desktop)"' %f|' "$_host_file"
+        _pkg_name=$(basename "$_desktop" .desktop)
+        _app_exec=$(grep '^Exec=' "$_host_file" 2>/dev/null | head -1 | sed 's/^Exec=//' | sed 's/ .*//')
+        # Special case: pamac-manager gets wrapper-host and rename
+        if [[ "$_pkg_name" == "org.manjaro.pamac.manager" ]]; then
+            sed -i 's|^Name=.*|Name=Pamac|' "$_host_file"
+            sed -i "s|^Exec=.*|Exec=$HOME/.local/bin/pamac-manager-wrapper-host %U|" "$_host_file"
+        else
+            sed -i "s|^Exec=.*|Exec=distrobox-enter -n arch-pamac -- $_app_exec %f|" "$_host_file"
+        fi
+        # Add pamac markers and uninstall action
+        if ! grep -q '^Actions=uninstall;' "$_host_file"; then
+            sed -i '/^StartupWMClass=/a Actions=uninstall;' "$_host_file" 2>/dev/null
+            sed -i '/^StartupWMClass=/a X-SteamOS-Pamac-Managed=true' "$_host_file" 2>/dev/null
+            sed -i '/^StartupWMClass=/a X-SteamOS-Pamac-Container=arch-pamac' "$_host_file" 2>/dev/null
+            sed -i "/^StartupWMClass=/a X-SteamOS-Pamac-SourceDesktop=$_base" "$_host_file" 2>/dev/null
+            sed -i "/^StartupWMClass=/a X-SteamOS-Pamac-SourcePackage=$_pkg_name" "$_host_file" 2>/dev/null
+            cat >> "$_host_file" << ACTION_EOF
+
+[Desktop Action uninstall]
+Name=Uninstall $_pkg_name
+Exec=$HOME/.local/bin/steamos-pamac-uninstall --desktop-file arch-pamac-$_base
+Icon=edit-delete
+ACTION_EOF
+        fi
         chmod 644 "$_host_file" 2>/dev/null
     fi
 done

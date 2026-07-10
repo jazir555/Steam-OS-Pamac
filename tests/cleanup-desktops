@@ -1,0 +1,21 @@
+#!/bin/bash
+# Only remove stale desktop files that were exported by distrobox-export
+# (have X-SteamOS-Pamac-SourceDesktop marker) and whose source package
+# is no longer installed in the container.
+for user_dir in /home/*/; do
+    app_dir="${user_dir}.local/share/applications"
+    [ -d "$app_dir" ] || continue
+    for f in "$app_dir"/arch-pamac-*.desktop; do
+        [ -f "$f" ] || continue
+        # Only clean files with the pamac export marker
+        if ! grep -q '^X-SteamOS-Pamac-SourceDesktop=' "$f" 2>/dev/null; then
+            continue
+        fi
+        pkg_name=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$f" 2>/dev/null | cut -d= -f2)
+        if [ -n "$pkg_name" ]; then
+            if ! podman exec arch-pamac pacman -Qi "$pkg_name" >/dev/null 2>&1; then
+                rm -f "$f"
+            fi
+        fi
+    done
+done

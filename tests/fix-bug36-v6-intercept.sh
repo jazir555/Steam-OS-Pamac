@@ -104,8 +104,9 @@ if [[ -n "$FOUND_DESKTOP" ]]; then
     disown
     exit 0
 else
-    log_msg "No pamac-managed app found for component: $COMPONENT_ID, passing to Discover"
-    exec plasma-discover "$@"
+    log_msg "No pamac-managed app found for component: $COMPONENT_ID, opening in Pamac"
+    _pkg_name="$(echo "$COMPONENT_ID" | sed 's/\.desktop$//')"
+    exec pamac-manager --details="$_pkg_name" 2>/dev/null || exec plasma-discover "$@"
 fi
 HANDLER_EOF
 chmod +x "$BIN_DIR/steamos-pamac-appstream-handler"

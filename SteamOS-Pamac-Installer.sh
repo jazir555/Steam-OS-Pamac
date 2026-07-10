@@ -7933,8 +7933,22 @@ log_msg "Uninstall launched in background (nohup)"
 fi
 exit 0
 else
-log_msg "No pamac-managed app found for component: \$COMPONENT_ID, passing to Discover"
-exec plasma-discover "\$@"
+# Check if this is a Flatpak app — if so, let Discover handle it
+if flatpak list --app --columns=application 2>/dev/null | grep -q "^\$COMPONENT_ID\$"; then
+    log_msg "No pamac-managed app found for component: \$COMPONENT_ID (Flatpak), passing to Discover"
+    exec plasma-discover "\$@"
+else
+    # System/pacman app — open in Pamac so user can uninstall from there
+    log_msg "No pamac-managed app found for component: \$COMPONENT_ID (pacman), opening in Pamac"
+    _pkg_name="\$(echo "\$COMPONENT_ID" | sed 's/\.desktop$//')"
+    if [[ -x "\$HOME/.local/bin/pamac-manager-wrapper-host" ]]; then
+        "\$HOME/.local/bin/pamac-manager-wrapper-host" --details="\$_pkg_name" &
+    elif command -v distrobox >/dev/null 2>&1; then
+        distrobox enter arch-pamac -- pamac-manager --details="\$_pkg_name" &
+    else
+        exec plasma-discover "\$@"
+    fi
+fi
 fi
 APPSTREAM_EOF
 chmod +x "$appstream_handler"
@@ -8143,6 +8157,42 @@ else
 fi
 ORPHAN_CLEANUP
 chmod +x /usr/local/bin/cleanup-orphans
+
+# Hook to clean stale .desktop files when packages are removed
+cat > "$hook_dir/99-cleanup-desktops.hook" << 'DESKTOP_HOOK'
+[Trigger]
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Cleaning stale desktop entries...
+When = PostTransaction
+Exec = /usr/local/bin/cleanup-desktops
+DESKTOP_HOOK
+
+cat > /usr/local/bin/cleanup-desktops << 'CLEANUP_DESKTOP'
+#!/bin/bash
+# Only remove stale desktop files exported by distrobox-export whose
+# source package is no longer installed in the container.
+for user_dir in /home/*/; do
+    app_dir="${user_dir}.local/share/applications"
+    [ -d "$app_dir" ] || continue
+    for f in "$app_dir"/arch-pamac-*.desktop; do
+        [ -f "$f" ] || continue
+        if ! grep -q '^X-SteamOS-Pamac-SourceDesktop=' "$f" 2>/dev/null; then
+            continue
+        fi
+        pkg_name=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$f" 2>/dev/null | cut -d= -f2)
+        if [ -n "$pkg_name" ]; then
+            if ! podman exec arch-pamac pacman -Qi "$pkg_name" >/dev/null 2>&1; then
+                rm -f "$f"
+            fi
+        fi
+    done
+done
+CLEANUP_DESKTOP
+chmod +x /usr/local/bin/cleanup-desktops
 
 cat > "$hook_dir/99-distrobox-export.hook" << 'HOOKDEF'
 [Trigger]
@@ -8812,6 +8862,42 @@ Description = Cleaning stale pacman download directories...
 When = PostTransaction
 Exec = /usr/bin/rm -rf /var/lib/pacman/sync/download-*
 CLEANUP_HOOK
+fi
+
+# Hook to clean stale .desktop files when packages are removed
+if [[ ! -f "$hook_dir/99-cleanup-desktops.hook" ]]; then
+cat > "$hook_dir/99-cleanup-desktops.hook" << 'DESKTOP_HOOK'
+[Trigger]
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Cleaning stale desktop entries...
+When = PostTransaction
+Exec = /usr/local/bin/cleanup-desktops
+DESKTOP_HOOK
+
+cat > /usr/local/bin/cleanup-desktops << 'CLEANUP_DESKTOP'
+#!/bin/bash
+for user_dir in /home/*/; do
+    app_dir="${user_dir}.local/share/applications"
+    [ -d "$app_dir" ] || continue
+    for f in "$app_dir"/arch-pamac-*.desktop; do
+        [ -f "$f" ] || continue
+        if ! grep -q '^X-SteamOS-Pamac-SourceDesktop=' "$f" 2>/dev/null; then
+            continue
+        fi
+        pkg_name=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$f" 2>/dev/null | cut -d= -f2)
+        if [ -n "$pkg_name" ]; then
+            if ! podman exec arch-pamac pacman -Qi "$pkg_name" >/dev/null 2>&1; then
+                rm -f "$f"
+            fi
+        fi
+    done
+done
+CLEANUP_DESKTOP
+chmod +x /usr/local/bin/cleanup-desktops
 fi
 
 cat > "$hook_dir/00-keyring-refresh.hook" << 'HOOK'

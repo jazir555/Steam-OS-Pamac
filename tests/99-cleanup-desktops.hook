@@ -1,0 +1,9 @@
+[Trigger]
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Cleaning stale desktop entries...
+When = PostTransaction
+Exec = /usr/local/bin/cleanup-desktops

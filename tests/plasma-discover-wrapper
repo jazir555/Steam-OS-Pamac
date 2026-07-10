@@ -1,0 +1,36 @@
+#!/bin/bash
+# Wrapper for plasma-discover that intercepts uninstall requests
+# and routes pamac-managed apps to pamac-manager instead of Discover.
+set +e
+
+CONTAINER_NAME="arch-pamac"
+
+# Check if this is an uninstall request
+if [[ "$*" == *"--mode=Uninstall"* ]] || [[ "$*" == *"uninstall"* ]]; then
+    # Extract the app ID
+    APP_ID=""
+    for arg in "$@"; do
+        case "$arg" in
+            --appid=*) APP_ID="${arg#--appid=}" ;;
+            --id=*) APP_ID="${arg#--id=}" ;;
+        esac
+    done
+    
+    if [[ -n "$APP_ID" ]]; then
+        # Check if this app was installed via pacman inside the container
+        if podman exec -u 0 "$CONTAINER_NAME" pacman -Qi "$APP_ID" >/dev/null 2>&1 || \
+           podman exec -u 0 "$CONTAINER_NAME" pacman -Qs "$APP_ID" >/dev/null 2>&1; then
+            # Route to Pamac
+            distrobox enter "$CONTAINER_NAME" -- pamac-manager --details="$APP_ID" 2>/dev/null &
+            exit 0
+        fi
+    fi
+fi
+
+# For everything else, pass through to real Discover
+REAL_DISCOVER="/usr/lib/org.kde.discover.backup"
+if [[ -x "$REAL_DISCOVER" ]]; then
+    exec "$REAL_DISCOVER" "$@"
+else
+    exec /usr/bin/plasma-discover.real "$@"
+fi

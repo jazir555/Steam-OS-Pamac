@@ -7939,15 +7939,19 @@ if flatpak list --app --columns=application 2>/dev/null | grep -q "^\$COMPONENT_
     exec plasma-discover "\$@"
 else
     # System/pacman app — open in Pamac so user can uninstall from there
-    log_msg "No pamac-managed app found for component: \$COMPONENT_ID (pacman), opening in Pamac"
+    # System/pacman app — uninstall directly via container
+    log_msg "No pamac-managed app found for component: \$COMPONENT_ID (pacman), uninstalling directly"
     _pkg_name="\$(echo "\$COMPONENT_ID" | sed 's/\.desktop$//')"
-    if [[ -x "\$HOME/.local/bin/pamac-manager-wrapper-host" ]]; then
-        "\$HOME/.local/bin/pamac-manager-wrapper-host" --details="\$_pkg_name" &
-    elif command -v distrobox >/dev/null 2>&1; then
-        distrobox enter arch-pamac -- pamac-manager --details="\$_pkg_name" &
-    else
-        exec plasma-discover "\$@"
+    if command -v kdialog >/dev/null 2>&1; then
+        CONFIRM=\$(kdialog --yesno "Remove \$_pkg_name? This was installed via Pamac." --title "Uninstall" 2>/dev/null)
+        if [[ \$? -ne 0 ]]; then
+            log_msg "User cancelled uninstall"
+            exit 0
+        fi
     fi
+    nohup bash -c "podman exec -u 0 arch-pamac bash -c 'rm -f /var/lib/pacman/db.lck; pacman -Rns --noconfirm \$_pkg_name' 2>&1 && notify-send -i edit-delete 'Uninstalled' '\$_pkg_name has been removed.' 2>/dev/null || notify-send -i dialog-error 'Uninstall Failed' 'Could not remove \$_pkg_name' 2>/dev/null" &>/dev/null &
+    disown
+    exit 0
 fi
 fi
 APPSTREAM_EOF

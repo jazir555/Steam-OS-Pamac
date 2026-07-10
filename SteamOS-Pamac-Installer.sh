@@ -19,7 +19,11 @@ trap '_err_trap $LINENO "$BASH_COMMAND"' ERR
 
 readonly SCRIPT_VERSION="5.3.0"
 readonly DEFAULT_CONTAINER_NAME="arch-pamac"
-readonly LOG_FILE="$HOME/distrobox-pamac-setup.log"
+# Default log file (used until CONTAINER_NAME is known). init_log_file() in
+# main reassigns it to a per-container path so concurrent runs with different
+# --container-name values don't overwrite each other's logs. Not declared
+# readonly here so the per-container override can take effect.
+LOG_FILE="$HOME/distrobox-pamac-setup.log"
 readonly REQUIRED_TOOLS=("distrobox")
 CONTAINER_HAS_INIT="unknown"
 
@@ -141,7 +145,11 @@ _log() {
     local plain_message
     plain_message=$(printf '%s' "$message" | sed 's/\x1B\[[0-9;]*[A-Za-z]//g') || plain_message="$message"
 
-    echo "[$timestamp] $level: $plain_message" >> "$LOG_FILE"
+    # Guard against an empty LOG_FILE (early bootstrap, before main finalizes
+    # the per-container path) so logging never trips set -e with `>> ""`.
+    if [[ -n "${LOG_FILE:-}" ]]; then
+        echo "[$timestamp] $level: $plain_message" >> "$LOG_FILE"
+    fi
 
     case "$LOG_LEVEL" in
         "quiet") if [[ "$level" == "ERROR" ]]; then printf '%b\n' "${color}${message}${NC}"; fi ;;
@@ -256,6 +264,14 @@ container_runtime() {
     fi
 }
 
+# container_runtime_privileged is intentionally a thin pass-through to
+# container_runtime (no sudo / no --privileged flag). Rootless podman already
+# runs the user's own containers; on Steam Deck the user owns the podman socket.
+# The name documents the *caller's intent* (these ops reach the container's
+# root namespace) rather than adding host escalation. Do NOT add sudo here —
+# that would make repair_podman retry loops escalate to host root, which the
+# script deliberately avoids (rootless-by-design). See also SECURITY notes
+# around ALLOW_WHEEL_NOPASSWD.
 container_runtime_privileged() {
     container_runtime "$@"
 }
@@ -482,65 +498,73 @@ force_remove_container() {
     container_runtime_privileged rm -f --time 0 "$name" 2>/dev/null || true
   fi
 
-	if container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
-		log_warn "podman rm -f --time 0 still failed for '$name'. The container engine may be corrupted."
-		log_warn ""
-		log_warn "IMPORTANT: A full 'podman system reset --force' would destroy ALL containers,"
-		log_warn "images, and volumes — not just this one. This script will NOT do that"
-		log_warn "automatically because it can destroy other distroboxes and podman workloads."
-		log_warn ""
+  if container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
+    log_warn "podman rm -f --time 0 still failed for '$name'. The container engine may be corrupted."
+    log_warn ""
+    log_warn "IMPORTANT: A full 'podman system reset --force' would destroy ALL containers,"
+    log_warn "images, and volumes — not just this one. This script will NOT do that"
+    log_warn "automatically because it can destroy other distroboxes and podman workloads."
+    log_warn ""
 
-		local other_containers
-		other_containers=$(container_runtime_privileged ps -a --format '{{.Names}}' 2>/dev/null | grep -v "^${name}$" || true)
-		if [[ -n "$other_containers" ]]; then
-			log_warn "Other containers that would be destroyed by 'podman system reset':"
-			while IFS= read -r oc; do
-				log_warn "  - $oc"
-			done <<< "$other_containers"
-			log_warn ""
-		fi
+    local other_containers
+    other_containers=$(container_runtime_privileged ps -a --format '{{.Names}}' 2>/dev/null | grep -v "^${name}$" || true)
+    if [[ -n "$other_containers" ]]; then
+      log_warn "Other containers that would be destroyed by 'podman system reset':"
+      while IFS= read -r oc; do
+        log_warn "  - $oc"
+      done <<< "$other_containers"
+      log_warn ""
+    fi
 
-		log_warn "Manual recovery options (in order of safety):"
-		log_warn "  1. podman rm -f --time 0 '$name'  (immediate SIGKILL, no grace period)"
-		log_warn "  2. podman stop '$name' && podman rm '$name'  (stop then remove)"
-		log_warn "  3. systemctl --user restart podman  (restart the engine)"
-		log_warn "  4. podman system reset --force     (DESTRUCTIVE: removes ALL containers)"
+    log_warn "Manual recovery options (in order of safety):"
+    log_warn "  1. podman rm -f --time 0 '$name'  (immediate SIGKILL, no grace period)"
+    log_warn "  2. podman stop '$name' && podman rm '$name'  (stop then remove)"
+    log_warn "  3. systemctl --user restart podman  (restart the engine)"
+    log_warn "  4. podman system reset --force     (DESTRUCTIVE: removes ALL containers)"
 
-		if [[ "$NON_INTERACTIVE" == "true" ]]; then
-			log_warn "Non-interactive mode (--non-interactive) — skipping podman system reset to avoid data loss."
-			log_info "Run this script without --non-interactive to approve, or try: podman system reset --force"
-			return
-		fi
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+      log_warn "Non-interactive mode (--non-interactive) — skipping podman system reset to avoid data loss."
+      log_info "Run this script without --non-interactive to approve, or try: podman system reset --force"
+      return
+    fi
 
-		if [[ -t 0 ]]; then
-			echo -ne "${RED}${BOLD}Type 'reset' to run 'podman system reset --force' (destroys ALL containers), or anything else to skip: ${NC}" >&2
-			local cleanup_confirm
-			read -r cleanup_confirm
-			if [[ "$cleanup_confirm" != "reset" ]]; then
-				log_warn "User declined podman system reset. Skipping."
-				log_info "Try manually: podman rm -f '$name' or podman system reset --force"
-				return
-			fi
-		else
-			log_warn "Non-interactive session — skipping podman system reset to avoid data loss."
-			log_info "Run this script interactively to approve, or try: podman system reset --force"
-			return
-		fi
+    if [[ -t 0 ]]; then
+      echo -ne "${RED}${BOLD}Type 'reset' to run 'podman system reset --force' (destroys ALL containers), or anything else to skip: ${NC}" >&2
+      local cleanup_confirm
+      read -r cleanup_confirm
+      if [[ "$cleanup_confirm" != "reset" ]]; then
+        log_warn "User declined podman system reset. Skipping."
+        log_info "Try manually: podman rm -f '$name' or podman system reset --force"
+        return
+      fi
+    else
+      log_warn "Non-interactive session — skipping podman system reset to avoid data loss."
+      log_info "Run this script interactively to approve, or try: podman system reset --force"
+      return
+    fi
 
-		log_warn "Running 'podman system reset --force' — this will destroy ALL containers, images, and volumes."
-		local _reset_rc=0
-		container_runtime_privileged system reset --force 2>&1 | while IFS= read -r line; do
-			log_warn "  $line"
-		done || _reset_rc=$?
-		if [[ "$_reset_rc" -ne 0 ]]; then
-			log_warn "podman system reset --force returned exit code $_reset_rc (pipeline may have partial output). Continuing to check..."
-		fi
+    log_warn "Running 'podman system reset --force' — this will destroy ALL containers, images, and volumes."
+    # Capture the reset's own output+exit, then stream lines to the log.
+    # The previous form piped into `| while read` and grabbed `$?` from the
+    # while loop (always 0 under pipefail because the consumer succeeds),
+    # masking a real reset failure. Capture-first makes the reset exit code
+    # available via PIPESTATUS[0] / the command-substitution rc.
+    local _reset_output _reset_rc=0
+    _reset_output=$(container_runtime_privileged system reset --force 2>&1) || _reset_rc=$?
+    if [[ -n "$_reset_output" ]]; then
+      while IFS= read -r line; do
+        log_warn "  $line"
+      done <<< "$_reset_output"
+    fi
+    if [[ "$_reset_rc" -ne 0 ]]; then
+      log_warn "podman system reset --force returned exit code $_reset_rc (reset itself failed). Continuing to check..."
+    fi
 
-		if container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
-			log_error "Container '$name' still exists after system reset. Manual intervention required."
-			log_info "Try: sudo podman rm -f '$name' or reboot the system."
-			return 1
-		fi
+    if container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
+      log_error "Container '$name' still exists after system reset. Manual intervention required."
+      log_info "Try: sudo podman rm -f '$name' or reboot the system."
+      return 1
+    fi
   fi
 
   if container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
@@ -564,6 +588,15 @@ validate_container_name() {
 }
 
 check_memory_ok() {
+    # $1 min_avail_kb  : soft warning threshold in KiB (default 524288 = 512 MiB).
+    #                    Below this we warn but proceed (heavy ops like AUR
+    #                    builds may still complete if swap is available).
+    # $2 desc          : human label for which operation is being checked.
+    # $3 critical_kb   : hard abort threshold in KiB (default 262144 = 256 MiB).
+    #                    Below this we abort to avoid OOM-killing pacman/yay and
+    #                    corrupting the container's pacman database mid-write.
+    # Magic numbers are KiB (not bytes): /proc/meminfo reports MemAvailable in
+    # KiB, so the units here let the comparisons stay integer-arithmetic.
     local min_avail_kb="${1:-524288}"
     local desc="${2:-operation}"
     local critical_kb="${3:-262144}"
@@ -964,9 +997,9 @@ repair_podman() {
         skip_reset=true
     fi
     if [[ "$skip_reset" != "true" ]]; then
-        local reset_output
+        local reset_output rc=0
         reset_output=$(container_runtime_privileged system reset --force 2>&1) && rc=0 || rc=$?
-        log_debug "podman system reset: $reset_output"
+        log_debug "podman system reset (exit $rc): $reset_output"
     fi
 
     if [[ "$skip_reset" != "true" ]] && podman info >/dev/null 2>&1; then
@@ -1122,10 +1155,10 @@ parse_arguments() {
             --force-rebuild) FORCE_REBUILD="true"; shift ;;
             --enable-multilib) ENABLE_MULTILIB="true"; shift ;;
             --disable-multilib) ENABLE_MULTILIB="false"; shift ;;
---enable-gaming) ENABLE_GAMING_PACKAGES="true"; shift ;;
-        --disable-gaming) ENABLE_GAMING_PACKAGES="false"; shift ;;
-        --enable-extra-repos) ENABLE_EXTRA_REPOS="true"; shift ;;
-        --disable-extra-repos) ENABLE_EXTRA_REPOS="false"; shift ;;
+            --enable-gaming) ENABLE_GAMING_PACKAGES="true"; shift ;;
+            --disable-gaming) ENABLE_GAMING_PACKAGES="false"; shift ;;
+            --enable-extra-repos) ENABLE_EXTRA_REPOS="true"; shift ;;
+            --disable-extra-repos) ENABLE_EXTRA_REPOS="false"; shift ;;
             --enable-build-cache) ENABLE_BUILD_CACHE="true"; shift ;;
             --disable-build-cache) ENABLE_BUILD_CACHE="false"; shift ;;
             --optimize-mirrors) OPTIMIZE_MIRRORS="true"; shift ;;
@@ -1486,6 +1519,14 @@ create_container() {
     log_error "Container creation already attempted recreation internally - refusing nested retry."
     return 1
   fi
+  # Recursion lock: create_container may be reached from
+  # _ensure_healthy_or_recreate (which temporarily unsets this guard, calls
+  # create_container, then restores). create_container itself never calls
+  # back into _ensure_healthy_or_recreate, so recursion is single-level. We
+  # set the guard here and clear it on EVERY return path (success and
+  # failure) below; the prior code forgot to unset on the success path,
+  # leaving the lock set permanently and blocking any later legitimate
+  # (re)creation.
   _CREATE_RECREATION_GUARD=1
 
   if ! run_command distrobox create "${create_args[@]}"; then
@@ -1533,7 +1574,10 @@ create_container() {
     unset _CREATE_RECREATION_GUARD
     log_error "Container created but is not functional."
     return 1
-    fi
+  fi
+  # Success path: clear the recursion lock so a later (re)creation isn't
+  # falsely rejected as nested recursion.
+  unset _CREATE_RECREATION_GUARD
 }
 
 repair_pacman_db() {
@@ -3385,14 +3429,18 @@ fi
 echo "Setting pamac polkit policy for passwordless operation..."
 pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
 if [[ -f "$pamac_policy" ]]; then
+    # Blanket-set allow_any / allow_active / allow_inactive to "yes" across
+    # EVERY <action> in the policy, regardless of the upstream default value.
+    # The host root is read-only (SteamOS immutable) so these in-container
+    # rules/policy are the ONLY authority: the container runs its own private
+    # system bus + polkitd (not the host's). Any remaining auth_admin* value
+    # would trigger a password prompt with no polkit-agent inside the
+    # container to handle it, freezing the GUI. Safe on a single-user Deck.
     _atomic_sed_inplace "$pamac_policy" \
-        's|<allow_any>auth_admin</allow_any>|<allow_any>yes</allow_any>|' \
-        's|<allow_any>auth_admin_keep</allow_any>|<allow_any>yes</allow_any>|' \
-        's|<allow_inactive>auth_admin</allow_inactive>|<allow_inactive>yes</allow_inactive>|' \
-        's|<allow_inactive>auth_admin_keep</allow_inactive>|<allow_inactive>yes</allow_inactive>|' \
-        's|<allow_active>auth_admin</allow_active>|<allow_active>yes</allow_active>|' \
-        's|<allow_active>auth_admin_keep</allow_active>|<allow_active>yes</allow_active>|'
-    echo "Polkit policy set to allow_active=yes for pamac operations."
+        's|<allow_any>[^<]*</allow_any>|<allow_any>yes</allow_any>|g' \
+        's|<allow_active>[^<]*</allow_active>|<allow_active>yes</allow_active>|g' \
+        's|<allow_inactive>[^<]*</allow_inactive>|<allow_inactive>yes</allow_inactive>|g'
+    echo "Polkit policy set to allow_any=allow_active=allow_inactive=yes for ALL pamac actions."
 else
     echo "Note: pamac polkit policy not yet installed (defaults are least-privilege)."
 fi
@@ -6652,14 +6700,15 @@ echo "BuildDirectory set to /home/$current_user/.pamac-build"
 echo "Setting pamac polkit policy for passwordless operation..."
 pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
 if [[ -f "$pamac_policy" ]]; then
+    # Blanket-set allow_* to "yes" across every <action> (host root is
+    # read-only; container's own system bus + polkitd is the only authority,
+    # so these in-container values must be authoritative — see comment in
+    # the stage-6a block).
     _atomic_sed_inplace "$pamac_policy" \
-        's|<allow_any>auth_admin</allow_any>|<allow_any>yes</allow_any>|' \
-        's|<allow_any>auth_admin_keep</allow_any>|<allow_any>yes</allow_any>|' \
-        's|<allow_inactive>auth_admin</allow_inactive>|<allow_inactive>yes</allow_inactive>|' \
-        's|<allow_inactive>auth_admin_keep</allow_inactive>|<allow_inactive>yes</allow_inactive>|' \
-        's|<allow_active>auth_admin</allow_active>|<allow_active>yes</allow_active>|' \
-        's|<allow_active>auth_admin_keep</allow_active>|<allow_active>yes</allow_active>|'
-    echo "Polkit policy set to allow_active=yes for pamac operations."
+        's|<allow_any>[^<]*</allow_any>|<allow_any>yes</allow_any>|g' \
+        's|<allow_active>[^<]*</allow_active>|<allow_active>yes</allow_active>|g' \
+        's|<allow_inactive>[^<]*</allow_inactive>|<allow_inactive>yes</allow_inactive>|g'
+    echo "Polkit policy set to allow_any=allow_active=allow_inactive=yes for ALL pamac actions."
 else
     echo "Warning: pamac polkit policy file not found at $pamac_policy"
 fi
@@ -7557,13 +7606,23 @@ for _desktop in \$(${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" bash -c
 
 [Desktop Action uninstall]
 Name=Uninstall \$_pkg_name
-Exec=bash -c 'podman exec -u 0 arch-pamac pacman -R --noconfirm \$_pkg_name 2>/dev/null && rm -f \$_host_file && touch \$(dirname \$_host_file) && notify-send -i edit-delete "Uninstalled" "\$_pkg_name removed" 2>/dev/null'
+Exec=bash -c '${CONTAINER_MANAGER:-podman} exec -u 0 ${CONTAINER_NAME} pacman -R --noconfirm \$_pkg_name 2>/dev/null && rm -f \$_host_file && touch \$(dirname \$_host_file) && notify-send -i edit-delete "Uninstalled" "\$_pkg_name removed" 2>/dev/null'
 Icon=edit-delete
 ACTION_EOF
         fi
         chmod 644 "\$_host_file" 2>/dev/null
     fi
 done
+
+# Re-suppress the KDE Discover notifier on every launch: the autostart unit is
+# masked (set during install) but a surviving notifier process keeps the KDE
+# built-in "Uninstall or Manage Add-Ons" context-menu entry alive. Kill it
+# best-effort and bump the applications dir mtime so Kicker drops the entry.
+if command -v pkill >/dev/null 2>&1; then
+    pkill -9 -f "discover.notifier" 2>/dev/null || true
+    pkill -9 -f "DiscoverNotifier" 2>/dev/null || true
+fi
+touch "\$HOME/.local/share/applications" 2>/dev/null || true
 
 # Launch Pamac in the background via distrobox
 # distrobox 1.8.x does not support --env; pass env via prefix instead
@@ -7733,20 +7792,22 @@ mv "\$tmp_list" "\$STATE_DIR/exported-apps.list" 2>/dev/null || true
 _log "Updated exported-apps.list (removed entries for \$pkg)"
 fi
 
+# Touch the applications dir mtime so KDE's KDirWatch picks up the deletion
+# and refreshes the start menu without the 5-10s lag. We deliberately do NOT
+# call kbuildsycoca6 or qdbus refreshCurrentShell here — both crash plasmashell
+# under the SteamOS/distrobox split-bus configuration. Note: the SYSTEM bus is
+# the container's own private bus (own dbus-daemon + polkitd), NOT shared with
+# the host — verified empirically (container socket inode differs from host's,
+# container polkitd owns org.freedesktop.PolicyKit1 on it). Only the SESSION
+# bus (KDE/GUI) is shared with the host. This is what lets the host stay 100%
+# read-only (no /etc/polkit-1, no /usr/share/polkit-1 on host) while pamac auth
+# resolves entirely inside the container.
+touch "\$APP_DIR" 2>/dev/null || _log "touch \$APP_DIR failed"
+_log "Applications dir mtime bumped for KDE menu refresh"
+
 if command -v update-desktop-database >/dev/null 2>&1; then
 update-desktop-database "\$APP_DIR" 2>/dev/null || true
 fi
-if command -v kbuildsycoca6 >/dev/null 2>&1; then
-DISPLAY="\${DISPLAY:-:0}" kbuildsycoca6 --noincremental 2>/dev/null || true
-elif command -v kbuildsycoca5 >/dev/null 2>&1; then
-DISPLAY="\${DISPLAY:-:0}" kbuildsycoca5 --noincremental 2>/dev/null || true
-fi
-if command -v qdbus6 >/dev/null 2>&1; then
-qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.refreshCurrentShell 2>/dev/null || true
-elif command -v qdbus >/dev/null 2>&1; then
-qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.refreshCurrentShell 2>/dev/null || true
-fi
-_log "Plasma menu refresh triggered"
 
 if command -v notify-send >/dev/null 2>&1; then
 notify-send -i edit-delete "Uninstalled" "\$pkg has been removed successfully." 2>/dev/null || true
@@ -7986,9 +8047,9 @@ if command -v kdialog >/dev/null 2>&1; then
         exit 0
     fi
 fi
-nohup bash -c "podman exec -u 0 arch-pamac bash -c 'rm -f /var/lib/pacman/db.lck; pacman -R --noconfirm \$_pkg_name' 2>&1 && notify-send -i edit-delete 'Uninstalled' '\$_pkg_name has been removed.' 2>/dev/null || notify-send -i dialog-error 'Uninstall Failed' 'Could not remove \$_pkg_name' 2>/dev/null" &>/dev/null &
-disown
-exit 0
+    nohup bash -c "podman exec -u 0 arch-pamac bash -c 'rm -f /var/lib/pacman/db.lck; pacman -R --noconfirm \$_pkg_name' 2>&1 && rm -f \$HOME/.local/share/applications/arch-pamac-\$_pkg_name.desktop && touch \$HOME/.local/share/applications && notify-send -i edit-delete 'Uninstalled' '\$_pkg_name has been removed.' 2>/dev/null || notify-send -i dialog-error 'Uninstall Failed' 'Could not remove \$_pkg_name' 2>/dev/null" &>/dev/null &
+    disown
+    exit 0
 fi
 APPSTREAM_EOF
 chmod +x "$appstream_handler"
@@ -8101,6 +8162,26 @@ XDGCONF
     }
 
     _fix_xdg_data_dirs
+
+    # Suppress the KDE Discover notifier so the built-in "Uninstall or Manage
+    # Add-Ons" context-menu entry stops competing with Pamac's own annotation.
+    # Masking the autostart unit prevents new launches, but an already-running
+    # notifier survives (e.g. PID kept alive across a re-export). Kill it so
+    # the stale entry disappears immediately, then bump the applications dir
+    # mtime so Kicker refreshes without a full plasmashell restart.
+    _suppress_discover_notifier() {
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl --user mask app-org.kde.discover.notifier@autostart.service 2>/dev/null || true
+        fi
+        # Kill any running DiscoverNotifier (by process name, not cached PID)
+        if command -v pkill >/dev/null 2>&1; then
+            pkill -9 -f "discover.notifier" 2>/dev/null || true
+            pkill -9 -f "DiscoverNotifier" 2>/dev/null || true
+        fi
+        touch "$HOME/.local/share/applications" 2>/dev/null || true
+        log_info "DiscoverNotifier masked and running instance killed"
+    }
+    _suppress_discover_notifier
 
     # Verify critical files were created
     local _export_ok=true
@@ -8375,7 +8456,7 @@ X-SteamOS-Pamac-SourcePackage=pamac-aur
 
 [Desktop Action uninstall]
 Name=Uninstall Packages
-Exec=/home/${current_user}/.local/bin/steamos-pamac-uninstall --desktop-file ${container_name}-org.manjaro.pamac.manager.desktop
+Exec=bash -c 'podman exec -u 0 ${container_name} pacman -R --noconfirm pamac-aur 2>/dev/null && rm -f /home/${current_user}/.local/share/applications/${container_name}-org.manjaro.pamac.manager.desktop && touch /home/${current_user}/.local/share/applications && notify-send -i edit-delete "Uninstalled" "pamac-aur removed" 2>/dev/null'
 Icon=edit-delete
 PAMAC_DESKTOP
     _fix_desktop_permissions "\$desktop_file"
@@ -8411,8 +8492,14 @@ PAMAC_DESKTOP
     awk -v container="${container_name}" -v user="${current_user}" \
         -v export_name="${export_name}" -v app_name="${app_name}" \
         -v owner_pkg="${owner_pkg}" '
-    BEGIN { in_entry=0; inserted=0; saw_next_section=0 }
+    BEGIN { in_entry=0; inserted=0; saw_next_section=0; in_uninstall=0 }
     /^\[Desktop Entry\]/ { in_entry=1; print; next }
+    # Strip any pre-existing [Desktop Action uninstall] section FIRST so the
+    # direct one-liner appended in END is the only uninstall action — no stale
+    # helper-based Exec survives re-annotation.
+    /^\[Desktop Action uninstall\]/ { in_uninstall=1; next }
+    in_uninstall && /^\[/ { in_uninstall=0 }
+    in_uninstall { next }
     /^\[/ && in_entry && !saw_next_section {
         # First section after [Desktop Entry] — insert markers here
         saw_next_section=1
@@ -8438,6 +8525,16 @@ PAMAC_DESKTOP
             print "X-SteamOS-Pamac-SourceDesktop=" app_name ".desktop"
             print "X-SteamOS-Pamac-SourcePackage=" owner_pkg
         }
+        # Always append a fresh direct uninstall action (no helper, no
+        # kbuildsycoca6/qdbus crash source; touch dir for fast KDE refresh).
+        print ""
+        print "[Desktop Action uninstall]"
+        print "Name=Uninstall " owner_pkg
+        _desktop_bn=app_name ".desktop"
+        _host_file="/home/" user "/.local/share/applications/" container "-" _desktop_bn
+        _apps_dir="/home/" user "/.local/share/applications"
+        printf "Exec=bash -c 'podman exec -u 0 %s pacman -R --noconfirm %s 2>/dev/null && rm -f %s && touch %s && notify-send -i edit-delete \"Uninstalled\" \"%s removed\" 2>/dev/null'\n", container, owner_pkg, _host_file, _apps_dir, owner_pkg
+        print "Icon=edit-delete"
     }
     { print }
     ' "\$desktop_file" > "\${desktop_file}.tmp" && mv -f "\${desktop_file}.tmp" "\$desktop_file"
@@ -8526,11 +8623,18 @@ for section, items in ordered_actions:
     for k, v in items.items():
         lines.append(f'{k}={v}')
 
-# Append our uninstall action
+# Append our uninstall action.
+# Use the direct podman-exec one-liner (matches tests/distrobox-export-hook.sh):
+# no intermediate helper, no kbuildsycoca6/qdbus crash source, and the
+# `touch $(dirname ...)` forces KDE's KDirWatch to refresh within ~1s instead
+# of the 5-10s start-menu lag. The host desktop path is resolved here (Python
+# f-string) so the written desktop file contains a fully-qualified literal.
+_host_desktop_path = f'/home/{current_user}/.local/share/applications/{desktop_basename}'
+_apps_dir = f'/home/{current_user}/.local/share/applications'
 lines.append('')
 lines.append('[Desktop Action uninstall]')
-lines.append('Name=Uninstall')
-lines.append(f'Exec=/home/{current_user}/.local/bin/steamos-pamac-uninstall --desktop-file {desktop_basename}')
+lines.append(f'Name=Uninstall {owner_pkg}')
+lines.append(f"Exec=bash -c 'podman exec -u 0 {container_name} pacman -R --noconfirm {owner_pkg} 2>/dev/null && rm -f {_host_desktop_path} && touch {_apps_dir} && notify-send -i edit-delete \"Uninstalled\" \"{owner_pkg} removed\" 2>/dev/null'")
 lines.append('Icon=edit-delete')
 
 for section, items in other_sections.items():
@@ -9298,6 +9402,11 @@ main() {
     # --version, so we never reach the EUID guard for those. Operational flags
     # (which require a writable container namespace) still hit the root guard.
     parse_arguments "$@"
+
+    # Finalize the per-container log path now that CONTAINER_NAME is resolved.
+    # Without this, runs with different --container-name overwrite one shared
+    # log (issue: log-file collision across container names).
+    LOG_FILE="$HOME/distrobox-pamac-setup-${CONTAINER_NAME}.log"
 
     if [[ "$EUID" -eq 0 ]]; then
         echo -e "\e[91mThis script should not be run as root.\e[0m" >&2

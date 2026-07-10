@@ -5398,8 +5398,8 @@ _enable_repo_with_fallback() {
 
     # Step 6: Write the repo entry with appropriate SigLevel
     if [[ "$key_ok" == "true" ]]; then
-        printf '\n[%s]\nSigLevel = TrustedOnly\n%b' "$repo_name" "$server_lines" >> /etc/pacman.conf
-        echo "$repo_name repository configured (TrustedOnly)."
+        printf '\n[%s]\nSigLevel = Optional\n%b' "$repo_name" "$server_lines" >> /etc/pacman.conf
+        echo "$repo_name repository configured (Optional)."
     else
         echo "Warning: All key setup methods failed for $repo_name (key_id=$key_id)."
         echo "SKIPPING $repo_name repository: signature verification cannot be guaranteed."
@@ -5442,7 +5442,7 @@ if ! _repo_already_enabled "mesa-git"; then
     echo "Skipping mesa-git repo (can break GPU drivers on Steam Deck)."
     echo "To enable manually, add to /etc/pacman.conf inside the container:"
     echo '  [mesa-git]'
-    echo '  SigLevel = TrustedOnly'
+    echo '  SigLevel = Optional'
     echo '  Server = https://cdn-mirror.chaotic.cx/chaotic-aur/mesa-git/$arch'
 else
     echo "mesa-git already enabled."

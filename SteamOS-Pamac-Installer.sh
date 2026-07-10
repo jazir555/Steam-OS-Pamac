@@ -7645,7 +7645,7 @@ fi
 exit 1
 fi
 
- _log "Removing \$pkg via pacman -Rns (as root, no D-Bus needed)..."
+ _log "Removing \$pkg via pacman -R (as root, no D-Bus needed)..."
  if ! echo "\$pkg" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9._+-]*$'; then
  _log "Error: Invalid package name format: '\$pkg'"
  echo "Error: Invalid package name: '\$pkg'" >&2
@@ -7654,7 +7654,7 @@ fi
  local remove_output
  remove_output=\$("\$CONTAINER_MANAGER" exec -u 0 "\$CONTAINER_NAME" bash -c "
 if [[ -f /var/lib/pacman/db.lck ]]; then _p=\$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ''); if [[ -n \"\$_p\" ]] && kill -0 \"\$_p\" 2>/dev/null; then echo \"Pacman running (PID \$_p), waiting...\"; _w=0; while [[ \$_w -lt 30 ]] && kill -0 \"\$_p\" 2>/dev/null; do sleep 2; _w=\$(( _w + 2 )); done; if kill -0 \"\$_p\" 2>/dev/null; then echo \"ERROR: Pacman (PID \$_p) still running after 30s. Aborting.\"; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi
-pacman -Rns --noconfirm \"\$pkg\" 2>&1
+pacman -R --noconfirm \"\$pkg\" 2>&1
 " </dev/null 2>&1)
 local rc=\$?
 _log "pacman -Rns exit code: \$rc"
@@ -7949,7 +7949,7 @@ else
             exit 0
         fi
     fi
-    nohup bash -c "podman exec -u 0 arch-pamac bash -c 'rm -f /var/lib/pacman/db.lck; pacman -Rns --noconfirm \$_pkg_name' 2>&1 && notify-send -i edit-delete 'Uninstalled' '\$_pkg_name has been removed.' 2>/dev/null || notify-send -i dialog-error 'Uninstall Failed' 'Could not remove \$_pkg_name' 2>/dev/null" &>/dev/null &
+    nohup bash -c "podman exec -u 0 arch-pamac bash -c 'rm -f /var/lib/pacman/db.lck; pacman -R --noconfirm \$_pkg_name' 2>&1 && notify-send -i edit-delete 'Uninstalled' '\$_pkg_name has been removed.' 2>/dev/null || notify-send -i dialog-error 'Uninstall Failed' 'Could not remove \$_pkg_name' 2>/dev/null" &>/dev/null &
     disown
     exit 0
 fi
@@ -8216,9 +8216,9 @@ HOOKDEF
 set +e
 
 # distrobox-export refuses to run as root. Pacman hooks always run as root,
-# so skip export here — desktop file exports are handled by the installer
-# and host wrapper instead.
+# so re-exec as the container user to handle desktop file exports.
 if [[ "\$(id -u)" == "0" ]]; then
+    su -s /bin/bash ${current_user} -c "PATH=/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin /usr/local/bin/distrobox-export-hook.sh" 2>/dev/null || true
     exit 0
 fi
 

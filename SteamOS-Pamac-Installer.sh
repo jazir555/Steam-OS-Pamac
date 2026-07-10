@@ -2194,8 +2194,13 @@ exec_container_script() {
   set +e
   local _output=""
   if [[ "$LOG_LEVEL" == "verbose" ]]; then
-    _output=$(container_root_exec bash -s "$@" < "$_script_file" 2>&1 | tee -a "$LOG_FILE" | _filter_verbose_output)
-    _rc=${PIPESTATUS[0]}
+    # Capture output+exit FIRST, then stream filtered lines to the user.
+    # The prior pipe `... | tee | _filter_verbose_output` ran inside $(...),
+    # making PIPESTATUS[0] point to the command-substitution exit (always 0)
+    # instead of container_root_exec's exit — effectively masking terminal
+    # failures. Now the exit code is captured directly from the assignment.
+    _output=$(container_root_exec bash -s "$@" < "$_script_file" 2>&1); _rc=$?
+    tee -a "$LOG_FILE" <<< "$_output" | _filter_verbose_output || true
   else
     _output=$(container_root_exec bash -s "$@" < "$_script_file" 2>&1)
     _rc=$?
@@ -2245,12 +2250,16 @@ exec_container_pipe() {
     set +e
     local _output=""
     if [[ "$LOG_LEVEL" == "verbose" ]]; then
-        _output=$(container_root_exec bash -s "$@" < "$_script_file" 2>&1 | tee -a "$LOG_FILE" | _filter_verbose_output)
-        _rc=${PIPESTATUS[0]}
+      # Same fix as exec_container_script: capture output+exit directly so
+      # container_root_exec's exit code is not masked by the tee-grep pipeline
+      # inside a command substitution (PIPESTATUS[0] would point to $(...), not
+      # to container_root_exec).
+      _output=$(container_root_exec bash -s "$@" < "$_script_file" 2>&1); _rc=$?
+      tee -a "$LOG_FILE" <<< "$_output" | _filter_verbose_output || true
     else
-        _output=$(container_root_exec bash -s "$@" < "$_script_file" 2>&1)
-        _rc=$?
-        echo "$_output" >> "$LOG_FILE"
+      _output=$(container_root_exec bash -s "$@" < "$_script_file" 2>&1)
+      _rc=$?
+      echo "$_output" >> "$LOG_FILE"
     fi
     set -e
 
@@ -2701,56 +2710,55 @@ if [[ "$_safe_recovered" != "true" ]] && command -v gpg >/dev/null 2>&1 && comma
 fi
 
 # Method F: Controlled temporary SigLevel relaxation as last-ditch bootstrap
-# This is the most aggressive recovery method. It temporarily sets SigLevel
-# to TrustAll to allow pacman to sync and install the keyring package, then
-# immediately restores proper signature verification. This handles the case
-# where the keyring is completely empty and no other method can bootstrap it.
+# SECURITY MODEL: we NEVER write TrustAll to the real /etc/pacman.conf. Instead
+# we build a throwaway pacman.conf copy with SigLevel=TrustAll and run pacman
+# against it via `pacman --config <tmp>`. The real pacman.conf stays at its
+# secure value the entire time, so an untrappable death (SIGKILL, host OOM-kill,
+# power loss) leaves the container's signature-verification config intact — no
+# restore trap is needed because nothing was modified. This closes the prior
+# TrustAll-window risk where a mid-write kill could leave the file modified.
 if [[ "$_safe_recovered" != "true" ]]; then
     echo "Method F: Attempting controlled SigLevel relaxation bootstrap..."
-    echo "  WARNING: Temporarily disabling signature verification to bootstrap keyring."
-    echo "  This is a controlled recovery operation — proper security will be restored immediately."
-    # Save current SigLevel
-    _orig_siglevel=$(grep '^SigLevel' /etc/pacman.conf 2>/dev/null | head -1 || echo "Required DatabaseOptional")
-    _orig_siglevel_value="${_orig_siglevel#SigLevel = }"
-    # SIGTERM/SIGHUP trap to restore SigLevel if interrupted during TrustAll window
-    _restore_siglevel_on_signal() {
-        echo "  Restoring SigLevel after signal..."
-        _atomic_write_pacman_conf "${_orig_siglevel_value}"
-        exit 130
-    }
-    trap '_restore_siglevel_on_signal' TERM HUP
-    # Set TrustAll temporarily
-    _atomic_write_pacman_conf "TrustAll"
-    echo "  SigLevel set to TrustAll temporarily."
-    # Sync and install keyring
-    _remove_stale_lock
-    if pacman -Syy --noconfirm 2>/dev/null; then
-        if pacman -S --noconfirm --needed archlinux-keyring gnupg 2>/dev/null; then
-            echo "  Keyring package installed with TrustAll SigLevel."
-            # Now restore proper SigLevel and re-init
-            _atomic_write_pacman_conf "Required DatabaseOptional"
-            trap - TERM HUP
-            echo "  SigLevel restored to Required DatabaseOptional."
-            # Verify the keyring actually works with proper SigLevel
-            if pacman -Syy --noconfirm 2>/dev/null; then
-                echo "  Controlled SigLevel relaxation bootstrap succeeded."
-                _safe_recovered=true
+    echo "  WARNING: Temporarily disabling signature verification (in a throwaway config only) to bootstrap keyring."
+    echo "  The real /etc/pacman.conf is NOT modified; /etc/pacman.conf stays secure."
+    # Build a throwaway config: copy the real one, flip ONLY the copy to TrustAll.
+    _TA_CONF=$(mktemp /tmp/pacman-trustall.XXXXXX.conf) 2>/dev/null
+    if [[ -n "$_TA_CONF" ]] && cp -f /etc/pacman.conf "$_TA_CONF" 2>/dev/null; then
+        sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = TrustAll/" "$_TA_CONF"
+        grep -q '^SigLevel' "$_TA_CONF" || printf 'SigLevel = TrustAll\n' >> "$_TA_CONF"
+        echo "  Throwaway TrustAll config built: $_TA_CONF (real pacman.conf untouched)."
+        # Sync and install keyring USING the throwaway config only.
+        _remove_stale_lock
+        if pacman --config "$_TA_CONF" -Syy --noconfirm 2>/dev/null; then
+            if pacman --config "$_TA_CONF" -S --noconfirm --needed archlinux-keyring gnupg 2>/dev/null; then
+                echo "  Keyring package installed via TrustAll throwaway config."
+                echo "  Real /etc/pacman.conf still secure — no restore needed."
+                # Verify the keyring works with the REAL (secure) config.
+                if pacman -Syy --noconfirm 2>/dev/null; then
+                    echo "  Controlled SigLevel relaxation bootstrap succeeded."
+                    _safe_recovered=true
+                else
+                    echo "  Database sync failed with the real (secure) config. Keyring may be incomplete."
+                fi
             else
-                echo "  Database sync failed after restoring SigLevel. Keyring may be incomplete."
-                # Restore original SigLevel
-                _atomic_write_pacman_conf "${_orig_siglevel_value}"
+                echo "  Keyring package install failed even with TrustAll throwaway config."
             fi
         else
-            echo "  Keyring package install failed even with TrustAll."
-            trap - TERM HUP
-            # Restore original SigLevel
-            _atomic_write_pacman_conf "${_orig_siglevel_value}"
+            echo "  Database sync failed even with TrustAll throwaway config. Network may be down."
         fi
+        # Always remove the throwaway config (it contained the relaxed SigLevel).
+        rm -f "$_TA_CONF" 2>/dev/null || true
     else
-        echo "  Database sync failed even with TrustAll. Network may be down."
-        trap - TERM HUP
-        # Restore original SigLevel
-        _atomic_write_pacman_conf "${_orig_siglevel_value}"
+        # Could not build the throwaway config — refuse to touch the real one.
+        rm -f "${_TA_CONF:-/tmp/pacman-trustall.NOCONF}" 2>/dev/null || true
+        echo "  Could not build throwaway TrustAll config. Aborting Method F WITHOUT modifying the real pacman.conf."
+    fi
+    # Defensive: ensure the real config is at a secure value (no-op if already secure).
+    # This is belt-and-suspenders against any earlier buggy run that left TrustAll.
+    _cur_sl=$(grep '^SigLevel' /etc/pacman.conf 2>/dev/null | head -1 | sed 's/^SigLevel = //')
+    if [[ "$_cur_sl" == "TrustAll" ]]; then
+        echo "  WARNING: real pacman.conf detected at TrustAll — restoring to Required DatabaseOptional."
+        _atomic_write_pacman_conf "Required DatabaseOptional"
     fi
 fi
 
@@ -3335,9 +3343,15 @@ cat > /etc/sudoers.d/99-pamac-nopasswd <<SUDOERS
 # To remove: sudo rm /etc/sudoers.d/99-pamac-nopasswd
 # To widen:   re-run with --allow-wheel-nopasswd
 
+# makepkg is deliberately EXCLUDED from PAMAC_CMDS. Pamac invokes makepkg
+# through the systemd-run fake wrapper (which drops privileges for DynamicUser),
+# so makepkg itself never calls sudo. Including makepkg in passwordless sudoers
+# would let a malicious AUR PKGBUILD (which is an arbitrary shell script run
+# BY makepkg) invoke pacman directly as root, bypassing the privilege drop.
+# Consensus fix per security review:
+#   https://github.com/89luca89/distrobox/issues/636#issuecomment-2929404949
 Cmnd_Alias PAMAC_CMDS = /usr/bin/pacman, \\
     /usr/bin/yay, \\
-    /usr/bin/makepkg, \\
     /usr/bin/pacman-key, \\
     /usr/bin/paccache, \\
     /usr/bin/pacscripts
@@ -6161,8 +6175,10 @@ COMPAT_EOF
     set +e
     local _compat_output=""
     if [[ "$LOG_LEVEL" == "verbose" ]]; then
-        _compat_output=$(container_root_exec bash -s "$@" < "$_compat_script_file" 2>&1 | tee -a "$LOG_FILE" | _filter_verbose_output)
-        _compat_rc=${PIPESTATUS[0]}
+      # Same PIPESTATUS-in-subproc fix: capture exit directly from the
+      # assignment so container_root_exec failures are not masked.
+      _compat_output=$(container_root_exec bash -s "$@" < "$_compat_script_file" 2>&1); _compat_rc=$?
+      tee -a "$LOG_FILE" <<< "$_compat_output" | _filter_verbose_output || true
     else
         _compat_output=$(container_root_exec bash -s "$@" < "$_compat_script_file" 2>&1)
         _compat_rc=$?
@@ -8932,53 +8948,55 @@ if [[ -d "$_sys_kr" ]] && ls "$_sys_kr"/archlinux* >/dev/null 2>&1; then
 fi
 
 # Strategy 4: Controlled temporary SigLevel relaxation
-echo "Attempting controlled SigLevel relaxation..."
+# SECURITY MODEL: we NEVER write TrustAll to the real /etc/pacman.conf. We
+# build a throwaway config copy with SigLevel=TrustAll and run pacman against
+# it via `pacman --config <tmp>`. The real config stays secure the whole time,
+# so an untrappable death (SIGKILL/OOM/power loss) cannot leave the container
+# in an unverified state. No restore trap is needed.
+echo "Attempting controlled SigLevel relaxation (throwaway config)..."
 _orig_siglevel=$(grep '^SigLevel' /etc/pacman.conf 2>/dev/null | head -1 || echo "Required DatabaseOptional")
 _siglevel_value="${_orig_siglevel#SigLevel = }"
-# SIGTERM/SIGHUP trap to restore SigLevel if interrupted during TrustAll window
-_restore_siglevel_on_signal() {
-    echo "  Restoring SigLevel after signal..."
-    local _tmp_fix=$(mktemp /etc/pacman.conf.signal-fix.XXXXXX) 2>/dev/null
-    if [[ -n "$_tmp_fix" ]] && cp -f /etc/pacman.conf "$_tmp_fix" 2>/dev/null; then
-        sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = ${_siglevel_value}/" "$_tmp_fix"
-        grep -q '^SigLevel' "$_tmp_fix" || printf 'SigLevel = %s\n' "$_siglevel_value" >> "$_tmp_fix"
-        mv -f "$_tmp_fix" /etc/pacman.conf 2>/dev/null || true
-    fi
-    exit 130
-}
-trap '_restore_siglevel_on_signal' TERM HUP
-# Atomic write to avoid corruption
-_tmp_pconf=$(mktemp /etc/pacman.conf.recovery.XXXXXX) 2>/dev/null
-if [[ -n "$_tmp_pconf" ]] && cp -f /etc/pacman.conf "$_tmp_pconf" 2>/dev/null; then
-    sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = TrustAll/" "$_tmp_pconf"
-    grep -q '^SigLevel' "$_tmp_pconf" || printf 'SigLevel = TrustAll\n' >> "$_tmp_pconf"
-    mv -f "$_tmp_pconf" /etc/pacman.conf 2>/dev/null || true
-fi
-_remove_stale_lock
-if pacman -Syy --noconfirm 2>/dev/null && pacman -S --noconfirm --needed archlinux-keyring 2>/dev/null; then
-    # Restore proper SigLevel immediately
-    trap - TERM HUP
-    if [[ -n "$_tmp_pconf" ]]; then
-        _tmp_pconf2=$(mktemp /etc/pacman.conf.recovery2.XXXXXX) 2>/dev/null
-        if [[ -n "$_tmp_pconf2" ]] && cp -f /etc/pacman.conf "$_tmp_pconf2" 2>/dev/null; then
-            sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = ${_siglevel_value}/" "$_tmp_pconf2"
-            grep -q '^SigLevel' "$_tmp_pconf2" || printf 'SigLevel = %s\n' "$_siglevel_value" >> "$_tmp_pconf2"
-            mv -f "$_tmp_pconf2" /etc/pacman.conf 2>/dev/null || true
+_TA_CONF=$(mktemp /tmp/pacman-trustall.XXXXXX.conf) 2>/dev/null
+if [[ -n "$_TA_CONF" ]] && cp -f /etc/pacman.conf "$_TA_CONF" 2>/dev/null; then
+    sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = TrustAll/" "$_TA_CONF"
+    grep -q '^SigLevel' "$_TA_CONF" || printf 'SigLevel = TrustAll\n' >> "$_TA_CONF"
+    _remove_stale_lock
+    if pacman --config "$_TA_CONF" -Syy --noconfirm 2>/dev/null && \
+       pacman --config "$_TA_CONF" -S --noconfirm --needed archlinux-keyring 2>/dev/null; then
+        # Verify with the REAL (secure) config — never modify it.
+        rm -f "$_TA_CONF" 2>/dev/null || true
+        if pacman -Syy --noconfirm 2>/dev/null; then
+            echo "Keyring refresh succeeded with controlled SigLevel relaxation (throwaway config)."
+            date +%s > "$KEYRING_AGE_FILE" 2>/dev/null || true
+            # Defensive: ensure real config is secure before exiting.
+            _cur=$(grep '^SigLevel' /etc/pacman.conf 2>/dev/null | head -1 | sed 's/^SigLevel = //')
+            if [[ "$_cur" == "TrustAll" ]]; then
+                _rf=$(mktemp /etc/pacman.conf.atomic.XXXXXX) 2>/dev/null
+                if [[ -n "$_rf" ]] && cp -f /etc/pacman.conf "$_rf" 2>/dev/null; then
+                    sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' "$_rf"
+                    grep -q '^SigLevel' "$_rf" || printf 'SigLevel = Required DatabaseOptional\n' >> "$_rf"
+                    sync "$_rf" 2>/dev/null || sync 2>/dev/null || true
+                    mv -f "$_rf" /etc/pacman.conf 2>/dev/null || true
+                fi
+            fi
+            exit 0
         fi
     fi
-    echo "Keyring refresh succeeded with controlled SigLevel relaxation."
-    date +%s > "$KEYRING_AGE_FILE" 2>/dev/null || true
-    exit 0
+    rm -f "$_TA_CONF" 2>/dev/null || true
 else
-    trap - TERM HUP
-    # Restore SigLevel even on failure
-    if [[ -n "$_tmp_pconf" ]]; then
-        _tmp_pconf3=$(mktemp /etc/pacman.conf.recovery3.XXXXXX) 2>/dev/null
-        if [[ -n "$_tmp_pconf3" ]] && cp -f /etc/pacman.conf "$_tmp_pconf3" 2>/dev/null; then
-            sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = ${_siglevel_value}/" "$_tmp_pconf3"
-            grep -q '^SigLevel' "$_tmp_pconf3" || printf 'SigLevel = %s\n' "$_siglevel_value" >> "$_tmp_pconf3"
-            mv -f "$_tmp_pconf3" /etc/pacman.conf 2>/dev/null || true
-        fi
+    rm -f "${_TA_CONF:-/tmp/pacman-trustall.NOCONF}" 2>/dev/null || true
+    echo "Could not build throwaway TrustAll config; NOT modifying the real pacman.conf."
+fi
+# Defensive: if the real config somehow ended up at TrustAll, restore it.
+_cur_sl=$(grep '^SigLevel' /etc/pacman.conf 2>/dev/null | head -1 | sed 's/^SigLevel = //')
+if [[ "${_cur_sl:-}" == "TrustAll" ]]; then
+    echo "WARNING: real pacman.conf at TrustAll — restoring to Required DatabaseOptional."
+    _rf=$(mktemp /etc/pacman.conf.atomic.XXXXXX) 2>/dev/null
+    if [[ -n "$_rf" ]] && cp -f /etc/pacman.conf "$_rf" 2>/dev/null; then
+        sed -i 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' "$_rf"
+        grep -q '^SigLevel' "$_rf" || printf 'SigLevel = Required DatabaseOptional\n' >> "$_rf"
+        sync "$_rf" 2>/dev/null || sync 2>/dev/null || true
+        mv -f "$_rf" /etc/pacman.conf 2>/dev/null || true
     fi
 fi
 

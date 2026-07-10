@@ -7541,6 +7541,7 @@ for _desktop in \$(${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" bash -c
         # Special case: pamac-manager gets wrapper-host and rename
         if [[ "\$_pkg_name" == "org.manjaro.pamac.manager" ]]; then
             sed -i 's|^Name=.*|Name=Pamac|' "\$_host_file"
+            sed -i '/^Name\[/d' "\$_host_file"
             sed -i "s|^Exec=.*|Exec=\$HOME/.local/bin/pamac-manager-wrapper-host %U|" "\$_host_file"
         else
             sed -i "s|^Exec=.*|Exec=distrobox-enter -n ${CONTAINER_NAME} -- \\\${_app_exec} %f|" "\$_host_file"

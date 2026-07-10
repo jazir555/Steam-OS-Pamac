@@ -64,6 +64,7 @@ for _desktop in $(podman exec arch-pamac bash -c "pacman -Qeq | while read p; do
         # Special case: pamac-manager gets wrapper-host and rename
         if [[ "$_pkg_name" == "org.manjaro.pamac.manager" ]]; then
             sed -i 's|^Name=.*|Name=Pamac|' "$_host_file"
+            sed -i '/^Name\[/d' "$_host_file"
             sed -i "s|^Exec=.*|Exec=$HOME/.local/bin/pamac-manager-wrapper-host %U|" "$_host_file"
         else
             sed -i "s|^Exec=.*|Exec=distrobox-enter -n arch-pamac -- $_app_exec %f|" "$_host_file"

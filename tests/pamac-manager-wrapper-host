@@ -51,20 +51,18 @@ fi
 podman exec arch-pamac rm -rf /var/lib/pacman/sync/download-* 2>/dev/null || true
 
 # Ensure desktop files are exported from container to host
-# This runs on the HOST as deck user, so distrobox-export works properly.
+# This runs on the HOST as deck user. We copy .desktop files directly
+# from the container and patch the Exec line to use distrobox-enter.
 _export_dir="$HOME/.local/share/applications"
-_container_apps=$(podman exec arch-pamac pacman -Qeq 2>/dev/null || true)
-_changed=0
-for _pkg in $_container_apps; do
-    _desktops=$(podman exec arch-pamac pacman -Qql "$_pkg" 2>/dev/null | grep '\.desktop$' || true)
-    for _desktop in $_desktops; do
-        _base=$(basename "$_desktop")
-        _host_file="$_export_dir/arch-pamac-$_base"
-        if [[ ! -f "$_host_file" ]]; then
-            podman exec -u deck arch-pamac bash -c "export XDG_DATA_DIRS=/usr/local/share:/usr/share XDG_DATA_HOME=/home/deck/.local/share; distrobox-export --app \"$_desktop\"" 2>/dev/null || true
-            _changed=1
-        fi
-    done
+for _desktop in $(podman exec arch-pamac bash -c "pacman -Qeq | while read p; do pacman -Qql \$p 2>/dev/null; done" 2>/dev/null | grep '\.desktop$'); do
+    _base=$(basename "$_desktop")
+    _host_file="$_export_dir/arch-pamac-$_base"
+    if [[ ! -f "$_host_file" ]]; then
+        podman cp "arch-pamac:$_desktop" "$_host_file" 2>/dev/null || continue
+        # Patch Exec to use distrobox-enter
+        sed -i 's|^Exec=.*|Exec=distrobox-enter -n arch-pamac -- '"$(basename "$_desktop" .desktop)"' %f|' "$_host_file"
+        chmod 644 "$_host_file" 2>/dev/null
+    fi
 done
 
 DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" \

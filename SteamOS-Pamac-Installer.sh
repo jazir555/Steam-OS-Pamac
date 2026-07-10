@@ -7528,18 +7528,18 @@ fi
 ${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" rm -rf /var/lib/pacman/sync/download-* 2>/dev/null || true
 
 # Ensure desktop files are exported from container to host
-# This runs on the HOST as the user, so distrobox-export works properly.
+# Copy .desktop files directly from container and patch Exec to use distrobox-enter.
 _export_dir="\$HOME/.local/share/applications"
-_container_apps=\$(${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" pacman -Qeq 2>/dev/null || true)
-for _pkg in \$_container_apps; do
-    _desktops=\$(${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" pacman -Qql "\$_pkg" 2>/dev/null | grep '\.desktop$' || true)
-    for _desktop in \$_desktops; do
-        _base=\$(basename "\$_desktop")
-        _host_file="\$_export_dir/arch-pamac-\$_base"
-        if [[ ! -f "\$_host_file" ]]; then
-            ${CONTAINER_MANAGER:-podman} exec -u ${CURRENT_USER} "${CONTAINER_NAME}" bash -c "export XDG_DATA_DIRS=/usr/local/share:/usr/share XDG_DATA_HOME=/home/${CURRENT_USER}/.local/share; distrobox-export --app \"\$_desktop\"" 2>/dev/null || true
-        fi
-    done
+for _desktop in \$(${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" bash -c "pacman -Qeq | while read p; do pacman -Qql \\\$p 2>/dev/null; done" 2>/dev/null | grep '\.desktop$'); do
+    _base=\$(basename "\$_desktop")
+    _host_file="\$_export_dir/arch-pamac-\$_base"
+    if [[ ! -f "\$_host_file" ]]; then
+        ${CONTAINER_MANAGER:-podman} cp "${CONTAINER_NAME}:\$_desktop" "\$_host_file" 2>/dev/null || continue
+        # Patch Exec to use distrobox-enter
+        _pkg_name=\$(basename "\$_desktop" .desktop)
+        sed -i 's|^Exec=.*|Exec=distrobox-enter -n ${CONTAINER_NAME} -- \\\${_pkg_name} %f|' "\$_host_file"
+        chmod 644 "\$_host_file" 2>/dev/null
+    fi
 done
 
 # Launch Pamac in the background via distrobox
@@ -8229,9 +8229,9 @@ HOOKDEF
 set +e
 
 # distrobox-export refuses to run as root. Pacman hooks always run as root,
-# so re-exec as the container user to handle desktop file exports.
+# so skip export here — desktop file exports are handled by the installer
+# and host wrapper instead.
 if [[ "\$(id -u)" == "0" ]]; then
-    su -s /bin/bash ${current_user} -c "PATH=/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin /usr/local/bin/distrobox-export-hook.sh" 2>/dev/null || true
     exit 0
 fi
 

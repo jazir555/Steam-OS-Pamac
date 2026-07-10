@@ -7852,15 +7852,15 @@ log_msg "After setup: DISPLAY=\$DISPLAY WAYLAND=\$WAYLAND_DISPLAY XDG=\$XDG_RUNT
 APPSTREAM_URL="\$1"
 
 if [[ -z "\$APPSTREAM_URL" ]]; then
-log_msg "Error: No URL argument provided, falling through to Discover"
-exec plasma-discover "\$@"
+log_msg "Error: No URL argument provided"
+exit 1
 fi
 
 COMPONENT_ID="\${APPSTREAM_URL#appstream://}"
 
 if [[ -z "\$COMPONENT_ID" ]]; then
-log_msg "Error: Empty component ID, falling through to Discover"
-exec plasma-discover "\$@"
+log_msg "Error: Empty component ID"
+exit 1
 fi
 
 log_msg "Component ID: \$COMPONENT_ID"
@@ -7950,24 +7950,22 @@ exit 0
 else
 # Check if this is a Flatpak app — if so, let Discover handle it
 if flatpak list --app --columns=application 2>/dev/null | grep -q "^\$COMPONENT_ID\$"; then
-    log_msg "No pamac-managed app found for component: \$COMPONENT_ID (Flatpak), passing to Discover"
+    log_msg "Flatpak app found for component: \$COMPONENT_ID, passing to Discover"
     exec plasma-discover "\$@"
-else
-    # System/pacman app — open in Pamac so user can uninstall from there
-    # System/pacman app — uninstall directly via container
-    log_msg "No pamac-managed app found for component: \$COMPONENT_ID (pacman), uninstalling directly"
-    _pkg_name="\$(echo "\$COMPONENT_ID" | sed 's/\.desktop$//')"
-    if command -v kdialog >/dev/null 2>&1; then
-        CONFIRM=\$(kdialog --yesno "Remove \$_pkg_name? This was installed via Pamac." --title "Uninstall" 2>/dev/null)
-        if [[ \$? -ne 0 ]]; then
-            log_msg "User cancelled uninstall"
-            exit 0
-        fi
-    fi
-    nohup bash -c "podman exec -u 0 arch-pamac bash -c 'rm -f /var/lib/pacman/db.lck; pacman -R --noconfirm \$_pkg_name' 2>&1 && notify-send -i edit-delete 'Uninstalled' '\$_pkg_name has been removed.' 2>/dev/null || notify-send -i dialog-error 'Uninstall Failed' 'Could not remove \$_pkg_name' 2>/dev/null" &>/dev/null &
-    disown
-    exit 0
 fi
+# System/pacman app — uninstall directly via container
+log_msg "Uninstalling pacman app: \$COMPONENT_ID"
+_pkg_name="\$(echo "\$COMPONENT_ID" | sed 's/\.desktop$//')"
+if command -v kdialog >/dev/null 2>&1; then
+    CONFIRM=\$(kdialog --yesno "Remove \$_pkg_name? This was installed via Pamac." --title "Uninstall" 2>/dev/null)
+    if [[ \$? -ne 0 ]]; then
+        log_msg "User cancelled uninstall"
+        exit 0
+    fi
+fi
+nohup bash -c "podman exec -u 0 arch-pamac bash -c 'rm -f /var/lib/pacman/db.lck; pacman -R --noconfirm \$_pkg_name' 2>&1 && notify-send -i edit-delete 'Uninstalled' '\$_pkg_name has been removed.' 2>/dev/null || notify-send -i dialog-error 'Uninstall Failed' 'Could not remove \$_pkg_name' 2>/dev/null" &>/dev/null &
+disown
+exit 0
 fi
 APPSTREAM_EOF
 chmod +x "$appstream_handler"

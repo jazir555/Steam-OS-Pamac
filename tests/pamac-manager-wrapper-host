@@ -33,18 +33,13 @@ if [[ -d "$HOME/.local/bin" ]]; then
     export PATH="$HOME/.local/bin:$PATH"
 fi
 
-# Ensure host polkitd is running (handles auth for all containers on shared bus)
-if ! pgrep -x polkitd >/dev/null 2>&1; then
-    systemctl --user start polkit 2>/dev/null || true
-fi
-
-# Ensure container pamac-daemon is running
+# Ensure container services are running before entering (as root via podman)
 if ! podman exec arch-pamac pgrep -x pamac-daemon >/dev/null 2>&1; then
-    podman exec arch-pamac /usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true
-    # Wait for daemon to appear on D-Bus
+    podman exec -u 0 arch-pamac /usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true
+    # Wait for daemon to register on D-Bus
     _wait=0
     while [[ $_wait -lt 10 ]]; do
-        if podman exec arch-pamac busctl --system list 2>/dev/null | grep -q "org.manjaro.pamac.daemon"; then
+        if podman exec -u 0 arch-pamac busctl --system list 2>/dev/null | grep -q "org.manjaro.pamac.daemon"; then
             break
         fi
         sleep 1

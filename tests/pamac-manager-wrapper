@@ -13,6 +13,20 @@ if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
 fi
 
 rm -rf /var/lib/pacman/sync/download-* 2>/dev/null || true
+rm -f /var/lib/pacman/db.lck 2>/dev/null || true
+
+# Ensure DBs exist in the user's tmp path (required for trans_check_prepare).
+# Without this, the manager's own alpm handle fails with "invalid or corrupted database".
+_tmp_base="/tmp/pamac-$(id -un)/dbs"
+_tmp_dbs="$_tmp_base/sync"
+if [[ ! -d "$_tmp_dbs" ]] || [[ -z "$(ls "$_tmp_dbs"/*.db 2>/dev/null)" ]]; then
+    rm -rf "$_tmp_base" 2>/dev/null || true
+    mkdir -p "$_tmp_dbs"
+    ln -sf /var/lib/pacman/local "$_tmp_base/local"
+    cp /var/lib/pacman/sync/*.db "$_tmp_dbs/" 2>/dev/null || true
+    touch "$_tmp_dbs/refresh_timestamp"
+    chmod -R a+rX "$_tmp_base"
+fi
 
 if ! pgrep -x pamac-daemon >/dev/null 2>&1; then
     /usr/local/bin/pamac-session-bootstrap.sh 2>&1 || true

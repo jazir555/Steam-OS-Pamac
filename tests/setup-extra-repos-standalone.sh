@@ -42,7 +42,7 @@ if ! _repo_already_enabled "chaotic-aur"; then
         fi
     fi
     echo "Adding repository [chaotic-aur]..."
-    printf '\n[chaotic-aur]\nSigLevel = TrustedOnly\nInclude = /etc/pacman.d/chaotic-mirrorlist\n' >> /etc/pacman.conf
+    printf '\n[chaotic-aur]\nSigLevel = Optional\nInclude = /etc/pacman.d/chaotic-mirrorlist\n' >> /etc/pacman.conf
     mkdir -p /etc/pacman.d
     if ! [[ -f /etc/pacman.d/chaotic-mirrorlist ]] || ! grep -q '^Server' /etc/pacman.d/chaotic-mirrorlist 2>/dev/null; then
         if command -v curl >/dev/null 2>&1 && \
@@ -69,7 +69,7 @@ fi
 echo "=== Configuring archlinuxcn repository ==="
 if ! _repo_already_enabled "archlinuxcn"; then
     echo "Adding repository [archlinuxcn]..."
-    printf '\n[archlinuxcn]\nSigLevel = TrustedOnly\nServer = https://repo.archlinuxcn.org/$arch\n' >> /etc/pacman.conf
+    printf '\n[archlinuxcn]\nSigLevel = Optional\nServer = https://repo.archlinuxcn.org/$arch\n' >> /etc/pacman.conf
     pacman -Sy --noconfirm 2>/dev/null || true
     if pacman -S --noconfirm --needed archlinuxcn-keyring 2>/dev/null; then
         echo "archlinuxcn-keyring installed."
@@ -86,7 +86,7 @@ fi
 echo "=== Configuring endeavouros repository ==="
 if ! _repo_already_enabled "endeavouros"; then
     echo "Adding repository [endeavouros]..."
-    printf '\n[endeavouros]\nSigLevel = TrustedOnly\nServer = https://mirror.freedif.org/EndeavourOS/repo/$repo/$arch\n' >> /etc/pacman.conf
+    printf '\n[endeavouros]\nSigLevel = Optional\nServer = https://mirror.freedif.org/EndeavourOS/repo/$repo/$arch\n' >> /etc/pacman.conf
     pacman -Sy --noconfirm 2>/dev/null || true
     if pacman -S --noconfirm --needed endeavouros-keyring 2>/dev/null; then
         echo "endeavouros keyring installed."

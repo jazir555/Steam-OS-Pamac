@@ -3552,17 +3552,38 @@ fi
 # Ensure pacman keyring is initialized (first-run or corrupted)
 _ensure_keyring() {
 if [[ -f /etc/pacman.d/gnupg/pubring.gpg ]] && pacman-key --list-keys >/dev/null 2>&1; then
-    return 0
+    # Keyring exists — verify all repo keyrings are populated
+    local _populated
+    _populated=$(pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
+    if [[ "$_populated" -gt 10 ]]; then
+        return 0
+    fi
+    log_bootstrap "Keyring exists but only has $_populated keys. Re-populating..."
 fi
-log_bootstrap "Keyring missing or corrupted. Initializing..."
+log_bootstrap "Initializing pacman keyring..."
 rm -rf /etc/pacman.d/gnupg 2>/dev/null || true
 mkdir -p /etc/pacman.d/gnupg 2>/dev/null || true
 chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
-if pacman-key --init 2>/dev/null && pacman-key --populate archlinux 2>/dev/null; then
-    log_bootstrap "Keyring initialized successfully."
-else
-    log_bootstrap "WARNING: Keyring initialization failed."
-fi
+pacman-key --init 2>/dev/null || true
+# Populate all available keyrings (archlinux, blackarch, archlinuxcn, endeavouros, etc.)
+for _kr in /usr/share/pacman/keyrings/*.gpg; do
+    [[ -f "$_kr" ]] || continue
+    _kr_name=$(basename "$_kr" .gpg)
+    if pacman-key --populate "$_kr_name" 2>/dev/null; then
+        log_bootstrap "Populated keyring: $_kr_name"
+    fi
+done
+# Also import any locally added keys
+for _kr in /usr/share/pacman/keyrings/*.gpg; do
+    [[ -f "$_kr" ]] || continue
+    _kr_name=$(basename "$_kr" .gpg)
+    if pacman-key --lsign-key --no-confirm "pacman@$_kr_name" 2>/dev/null; then
+        log_bootstrap "Locally signed keyring: $_kr_name"
+    fi
+done
+local _count
+_count=$(pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
+log_bootstrap "Keyring initialized: $_count keys"
 }
 
 # Clean stale pacman lock file
@@ -4304,13 +4325,22 @@ fi
 
 _ensure_keyring() {
 if [[ -f /etc/pacman.d/gnupg/pubring.gpg ]] && pacman-key --list-keys >/dev/null 2>&1; then
-    return 0
+    local _populated
+    _populated=$(pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
+    if [[ "$_populated" -gt 10 ]]; then
+        return 0
+    fi
 fi
-log_bootstrap "Keyring missing or corrupted. Initializing..."
+log_bootstrap "Repairing keyring..."
 rm -rf /etc/pacman.d/gnupg 2>/dev/null || true
 mkdir -p /etc/pacman.d/gnupg 2>/dev/null || true
 chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
-pacman-key --init 2>/dev/null && pacman-key --populate archlinux 2>/dev/null || true
+pacman-key --init 2>/dev/null || true
+for _kr in /usr/share/pacman/keyrings/*.gpg; do
+    [[ -f "$_kr" ]] || continue
+    _kr_name=$(basename "$_kr" .gpg)
+    pacman-key --populate "$_kr_name" 2>/dev/null || true
+done
 }
 
 # Clean stale pacman lock file
@@ -7243,6 +7273,19 @@ fi
 # Clean stale pacman download dirs that cause "invalid database" errors
 rm -rf /var/lib/pacman/sync/download-* 2>/dev/null || true
 
+# Ensure DBs exist in the user's tmp path (required for trans_check_prepare).
+# Without this, pamac-manager's own alpm handle fails with "invalid or corrupted database".
+_tmp_base="/tmp/pamac-\$(id -un)/dbs"
+_tmp_dbs="\$_tmp_base/sync"
+if [[ ! -d "\$_tmp_dbs" ]] || [[ -z "\$(ls "\$_tmp_dbs"/*.db 2>/dev/null)" ]]; then
+    rm -rf "\$_tmp_base" 2>/dev/null || true
+    mkdir -p "\$_tmp_dbs"
+    ln -sf /var/lib/pacman/local "\$_tmp_base/local"
+    cp /var/lib/pacman/sync/*.db "\$_tmp_dbs/" 2>/dev/null || true
+    touch "\$_tmp_dbs/refresh_timestamp"
+    chmod -R a+rX "\$_tmp_base"
+fi
+
 # Check if daemon is running; only start if not
 if ! pgrep -x pamac-daemon >/dev/null 2>&1; then
     su -c '/usr/local/bin/pamac-session-bootstrap.sh' root 2>&1 || true
@@ -7467,7 +7510,7 @@ fi
 # injection is needed for modern KDE Plasma (5.27+) and GNOME (42+).
 
 # Ensure container services are running before entering (as root via podman)
-if ! ${CONTAINER_MANAGER:-podman} exec -u 0 "${CONTAINER_NAME}" pgrep -x pamac-daemon >/dev/null 2>&1; then
+if ! ${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" pgrep -x pamac-daemon >/dev/null 2>&1; then
     ${CONTAINER_MANAGER:-podman} exec -u 0 "${CONTAINER_NAME}" /usr/local/bin/pamac-session-bootstrap.sh >/dev/null 2>&1 || true
     # Wait for daemon to register on D-Bus before entering container
     _wait=0

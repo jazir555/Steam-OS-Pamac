@@ -7557,7 +7557,7 @@ for _desktop in \$(${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" bash -c
 
 [Desktop Action uninstall]
 Name=Uninstall \$_pkg_name
-Exec=\$HOME/.local/bin/steamos-pamac-uninstall --desktop-file arch-pamac-\$_base
+Exec=bash -c 'podman exec -u 0 arch-pamac pacman -R --noconfirm \$_pkg_name 2>/dev/null && rm -f \$_host_file && notify-send -i edit-delete "Uninstalled" "\$_pkg_name removed" 2>/dev/null'
 Icon=edit-delete
 ACTION_EOF
         fi

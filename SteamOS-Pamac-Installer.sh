@@ -8252,9 +8252,9 @@ HOOKDEF
 set +e
 
 # distrobox-export refuses to run as root. Pacman hooks always run as root,
-# so skip export here — desktop file exports are handled by the installer
-# and host wrapper instead.
+# so re-exec as the container user to handle desktop file exports.
 if [[ "\$(id -u)" == "0" ]]; then
+    su -s /bin/bash ${current_user} -c "PATH=/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin XDG_DATA_DIRS=/usr/local/share:/usr/share XDG_DATA_HOME=/home/${current_user}/.local/share /usr/local/bin/distrobox-export-hook.sh" 2>/dev/null || true
     exit 0
 fi
 

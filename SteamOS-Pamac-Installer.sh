@@ -7527,6 +7527,21 @@ fi
 # (these cause "invalid or corrupted database" errors)
 ${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" rm -rf /var/lib/pacman/sync/download-* 2>/dev/null || true
 
+# Ensure desktop files are exported from container to host
+# This runs on the HOST as the user, so distrobox-export works properly.
+_export_dir="\$HOME/.local/share/applications"
+_container_apps=\$(${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" pacman -Qeq 2>/dev/null || true)
+for _pkg in \$_container_apps; do
+    _desktops=\$(${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" pacman -Qql "\$_pkg" 2>/dev/null | grep '\.desktop$' || true)
+    for _desktop in \$_desktops; do
+        _base=\$(basename "\$_desktop")
+        _host_file="\$_export_dir/arch-pamac-\$_base"
+        if [[ ! -f "\$_host_file" ]]; then
+            ${CONTAINER_MANAGER:-podman} exec -u ${CURRENT_USER} "${CONTAINER_NAME}" bash -c "export XDG_DATA_DIRS=/usr/local/share:/usr/share XDG_DATA_HOME=/home/${CURRENT_USER}/.local/share; distrobox-export --app \"\$_desktop\"" 2>/dev/null || true
+        fi
+    done
+done
+
 # Launch Pamac in the background via distrobox
 # distrobox 1.8.x does not support --env; pass env via prefix instead
 DBUS_SESSION_BUS_ADDRESS="\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/\$(id -u)/bus}" \

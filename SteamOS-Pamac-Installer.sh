@@ -8097,6 +8097,53 @@ When = PostTransaction
 Exec = /usr/bin/rm -rf /var/lib/pacman/sync/download-*
 CLEANUP_HOOK
 
+# Orphan notification hook: alerts when packages become orphaned after removal
+cat > "$hook_dir/98-cleanup-orphans.hook" << 'ORPHAN_HOOK'
+[Trigger]
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Checking for orphaned packages...
+When = PostTransaction
+Exec = /usr/local/bin/cleanup-orphans-notify
+ORPHAN_HOOK
+
+cat > /usr/local/bin/cleanup-orphans-notify << 'ORPHAN_SCRIPT'
+#!/bin/bash
+orphans=$(pacman -Qtdq 2>/dev/null)
+if [[ -z "$orphans" ]]; then
+    exit 0
+fi
+count=$(echo "$orphans" | wc -l)
+if command -v notify-send >/dev/null 2>&1; then
+    notify-send -i edit-delete "Orphaned Packages" \
+        "$count orphaned package(s) found. Run 'cleanup-orphans' to remove them." 2>/dev/null
+fi
+ORPHAN_SCRIPT
+chmod +x /usr/local/bin/cleanup-orphans-notify
+
+cat > /usr/local/bin/cleanup-orphans << 'ORPHAN_CLEANUP'
+#!/bin/bash
+orphans=$(pacman -Qtdq 2>/dev/null)
+if [[ -z "$orphans" ]]; then
+    echo "No orphaned packages found."
+    exit 0
+fi
+echo "Orphaned packages:"
+echo "$orphans" | while read -r pkg; do echo "  - $pkg"; done
+echo ""
+read -rp "Remove these packages? [y/N] " confirm
+if [[ "$confirm" =~ ^[Yy]$ ]]; then
+    sudo pacman -Rns --noconfirm $orphans 2>&1
+    echo "Done."
+else
+    echo "Skipped."
+fi
+ORPHAN_CLEANUP
+chmod +x /usr/local/bin/cleanup-orphans
+
 cat > "$hook_dir/99-distrobox-export.hook" << 'HOOKDEF'
 [Trigger]
 Operation = Install

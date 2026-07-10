@@ -45,7 +45,7 @@ for pkg in $explicit_pkgs; do
 
 [Desktop Action uninstall]
 Name=Remove $pkg
-Exec=bash -c 'podman exec -u 0 arch-pamac pacman -R --noconfirm $pkg 2>/dev/null && rm -f $host_file && notify-send -i edit-delete "Uninstalled" "$pkg removed" 2>/dev/null'
+Exec=bash -c 'podman exec -u 0 arch-pamac pacman -R --noconfirm $pkg 2>/dev/null && rm -f $host_file && touch $(dirname $host_file) && notify-send -i edit-delete "Uninstalled" "$pkg removed" 2>/dev/null'
 Icon=edit-delete
 ACTION_EOF
                 fi

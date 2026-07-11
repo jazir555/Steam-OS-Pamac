@@ -8935,16 +8935,25 @@ trap 'rm -f "\$EXPLICIT_FILE" "\$NEW_STATE_FILE"' EXIT
 
 pacman -Qeq > "\$EXPLICIT_FILE" 2>/dev/null || true
 
-# Build a hash that captures BOTH the explicit package list AND the desktop
-# files shipped by those packages. Hashing only the package list would miss
-# package updates that change the .desktop contents (new Actions, renamed
-# Exec, updated Icon) without changing the explicit-install set — leaving
-# users with stale host menu entries until the package list changes.
-# We hash the content of every /usr/share/applications/*.desktop file using
-# md5sum (not just mtime/size) so that same-size rebuilds with different
-# content are still detected. The cost (~500 files) is negligible vs. the
-# full export pass that follows.
-CURRENT_HASH="\$(md5sum "\$EXPLICIT_FILE" 2>/dev/null | awk '{print \$1}')"
+# Two-stage caching: fast gate (mtime-based) + full content hash.
+# Stage 1: Hash package list + desktop file mtimes (stat-only, ~50ms).
+# If this matches the cached value, skip the expensive md5sum scan entirely.
+# Stage 2: Only when the fast gate differs, compute full content hash of
+# desktop files to catch same-mtime content changes (rare rebuilds).
+PKG_HASH="\$(md5sum "\$EXPLICIT_FILE" 2>/dev/null | awk '{print \$1}')"
+MTIME_HASH=""
+if [[ -d /usr/share/applications ]]; then
+    MTIME_HASH="\$(find /usr/share/applications -maxdepth 1 -type f -name '*.desktop' \
+        -printf '%T@ %s\n' 2>/dev/null | sort | md5sum | awk '{print \$1}')"
+fi
+FAST_HASH="\${PKG_HASH}:\${MTIME_HASH}"
+FAST_CACHE="\$STATE_DIR/.last-fast-hash"
+if [[ -f "\$FAST_CACHE" ]] && [[ "\$(cat "\$FAST_CACHE" 2>/dev/null)" == "\$FAST_HASH" ]]; then
+    echo "\$(date): Fast gate unchanged (pkg+mtimes=\${FAST_HASH:0:8}). Skipping export." >> "\$EXPORT_LOG"
+    exit 0
+fi
+# Fast gate differs — compute full content hash to confirm change
+CURRENT_HASH="\$PKG_HASH"
 if [[ -d /usr/share/applications ]]; then
     DESKTOP_SIG="\$(find /usr/share/applications -maxdepth 1 -type f -name '*.desktop' \
         -exec md5sum {} + 2>/dev/null | sort -k2 | md5sum | awk '{print \$1}')"
@@ -8953,12 +8962,15 @@ fi
 if [[ -f "\$HASH_FILE" ]]; then
     LAST_HASH="\$(cat "\$HASH_FILE" 2>/dev/null || echo "")"
     if [[ "\$CURRENT_HASH" == "\$LAST_HASH" ]]; then
-        echo "\$(date): Package list and desktop files unchanged (hash=\${CURRENT_HASH:0:8}). Skipping export." >> "\$EXPORT_LOG"
+        # Content unchanged despite mtime difference (e.g. touch without edit)
+        echo "\$FAST_HASH" > "\$FAST_CACHE" 2>/dev/null || true
+        echo "\$(date): Desktop content unchanged (hash=\${CURRENT_HASH:0:8}). Skipping export." >> "\$EXPORT_LOG"
         exit 0
     fi
 fi
+echo "\$FAST_HASH" > "\$FAST_CACHE" 2>/dev/null || true
 echo "\$CURRENT_HASH" > "\$HASH_FILE" 2>/dev/null || true
-echo "\$(date): Package list or desktop files changed (hash=\${CURRENT_HASH:0:8}). Running export." >> "\$EXPORT_LOG"
+echo "\$(date): Changes detected (pkg+mtimes=\${FAST_HASH:0:8}, content=\${CURRENT_HASH:0:8}). Running export." >> "\$EXPORT_LOG"
 
 should_export_desktop() {
     local desktop_file="\$1"

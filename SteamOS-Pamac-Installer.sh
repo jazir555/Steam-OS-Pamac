@@ -307,6 +307,8 @@ _filter_verbose_output() {
     # KEPT VISIBLE — they contain actionable status (e.g. package downgrades,
     # missing dependencies, version conflicts). Other :: lines (e.g. ::
     # Retrieving packages, :: Processing changes, :: Proceed) are also kept.
+    # Pin: filter targets pacman 7.x output formats. If pacman changes its
+    # :: prefix conventions, update the exclusion list accordingly.
     # Additional noise suppressed: plain "downloading" progress lines without
     # errors, "Nothing to do." churn, and "up to date" confirmations.
     grep -v -E '^\s*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database)|^downloading\s|^::(synchronizing|debug:)|^Nothing to do\.| is up to date$' || true
@@ -341,7 +343,7 @@ container_runtime() {
     fi
 }
 
-# container_runtime_privileged is intentionally a thin pass-through to
+# container_runtime_for_ops is intentionally a thin pass-through to
 # container_runtime (no sudo / no --privileged flag). Rootless podman already
 # runs the user's own containers; on Steam Deck the user owns the podman socket.
 # The name documents the *caller's intent* (these ops reach the container's
@@ -349,7 +351,7 @@ container_runtime() {
 # that would make repair_podman retry loops escalate to host root, which the
 # script deliberately avoids (rootless-by-design). See also SECURITY notes
 # around ALLOW_WHEEL_NOPASSWD.
-container_runtime_privileged() {
+container_runtime_for_ops() {
     container_runtime "$@"
 }
 
@@ -364,7 +366,7 @@ container_root_exec() {
     distrobox-enter "$CONTAINER_NAME" --root -- "$@" 2>/dev/null && return 0
     log_debug "distrobox-enter --root failed, falling back to direct container exec"
   fi
-  container_runtime_privileged exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" "$@"
+  container_runtime_for_ops exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" "$@"
 }
 
 container_user_exec() {
@@ -374,7 +376,7 @@ container_user_exec() {
       log_warn "Container not usable before user exec. Attempting anyway..."
     fi
   fi
-  container_runtime_privileged exec -i -u "$CURRENT_USER" \
+  container_runtime_for_ops exec -i -u "$CURRENT_USER" \
     -e HOME="/home/${CURRENT_USER}" \
     -e XDG_DATA_DIRS="/usr/local/share:/usr/share" \
     -e XDG_DATA_HOME="/home/${CURRENT_USER}/.local/share" \
@@ -388,7 +390,7 @@ container_cp_from() {
     if ! container_is_usable; then
         container_start 2>/dev/null || true
     fi
-    if container_runtime_privileged cp "$CONTAINER_NAME:$src" "$dst" 2>/dev/null; then
+    if container_runtime_for_ops cp "$CONTAINER_NAME:$src" "$dst" 2>/dev/null; then
         log_debug "Copied $src from container."
         return 0
     else
@@ -398,23 +400,23 @@ container_cp_from() {
 }
 
 container_start() {
-  container_runtime_privileged start "$CONTAINER_NAME" >>"$LOG_FILE" 2>&1 || true
+  container_runtime_for_ops start "$CONTAINER_NAME" >>"$LOG_FILE" 2>&1 || true
 }
 
 container_is_running() {
   local _running
-  _running=$(container_runtime_privileged inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null || echo "false")
+  _running=$(container_runtime_for_ops inspect "$CONTAINER_NAME" --format '{{.State.Running}}' 2>/dev/null || echo "false")
   [[ "$_running" == "true" ]]
 }
 
 container_get_status() {
-  container_runtime_privileged inspect "$CONTAINER_NAME" --format '{{.State.Status}}' 2>/dev/null || echo "not_found"
+  container_runtime_for_ops inspect "$CONTAINER_NAME" --format '{{.State.Status}}' 2>/dev/null || echo "not_found"
 }
 
 container_is_usable() {
   container_start 2>/dev/null || true
   local _output
-  _output=$(timeout ${CONTAINER_PROBE_TIMEOUT} container_runtime_privileged exec -i -e HOME="/home/${CURRENT_USER}" "$CONTAINER_NAME" bash -c "echo ok" </dev/null 2>/dev/null || echo "")
+  _output=$(timeout ${CONTAINER_PROBE_TIMEOUT} container_runtime_for_ops exec -i -e HOME="/home/${CURRENT_USER}" "$CONTAINER_NAME" bash -c "echo ok" </dev/null 2>/dev/null || echo "")
   [[ "$_output" == *"ok"* ]]
 }
 
@@ -475,7 +477,7 @@ ensure_container_healthy() {
 					log_warn "force_remove_container may not have fully removed '$CONTAINER_NAME'. Checking..."
 				fi
 				sleep 1
-				if container_runtime_privileged inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+				if container_runtime_for_ops inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
 					log_error "Container '$CONTAINER_NAME' still exists after force_remove. Manual intervention required."
 					log_info "Try: podman rm -f $CONTAINER_NAME && distrobox rm -f $CONTAINER_NAME"
 					return 1
@@ -520,7 +522,7 @@ _ensure_healthy_or_recreate() {
         log_info "Container signaled for recreation ($desc), attempt $_RECREATE_COUNT/$_MAX_RECREATES. Recreating..."
         if ! force_remove_container "$CONTAINER_NAME"; then
             log_warn "force_remove_container returned non-zero. Container may still exist."
-            if container_runtime_privileged inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+            if container_runtime_for_ops inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
                 log_error "Container '$CONTAINER_NAME' still exists after force removal. Cannot recreate."
                 _RECREATE_COUNT=0
                 return 1
@@ -553,12 +555,12 @@ _ensure_healthy_or_recreate() {
 force_remove_container() {
   local name="$1"
 
-  if ! container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
+  if ! container_runtime_for_ops inspect "$name" >/dev/null 2>&1; then
     return
   fi
 
   local status
-  status=$(container_runtime_privileged inspect "$name" --format '{{.State.Status}}' 2>/dev/null || echo "not_found")
+  status=$(container_runtime_for_ops inspect "$name" --format '{{.State.Status}}' 2>/dev/null || echo "not_found")
   if [[ "$status" == "not_found" ]]; then
     return
   fi
@@ -568,14 +570,14 @@ force_remove_container() {
     sleep 1
   fi
 
-  container_runtime_privileged rm -f "$name" 2>/dev/null || true
+  container_runtime_for_ops rm -f "$name" 2>/dev/null || true
 
-  if container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
+  if container_runtime_for_ops inspect "$name" >/dev/null 2>&1; then
     log_debug "podman rm -f did not remove '$name'. Retrying with --time 0 (immediate SIGKILL)..."
-    container_runtime_privileged rm -f --time 0 "$name" 2>/dev/null || true
+    container_runtime_for_ops rm -f --time 0 "$name" 2>/dev/null || true
   fi
 
-  if container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
+  if container_runtime_for_ops inspect "$name" >/dev/null 2>&1; then
     log_warn "podman rm -f --time 0 still failed for '$name'. The container engine may be corrupted."
     log_warn ""
     log_warn "IMPORTANT: A full 'podman system reset --force' would destroy ALL containers,"
@@ -584,7 +586,7 @@ force_remove_container() {
     log_warn ""
 
     local other_containers
-    other_containers=$(container_runtime_privileged ps -a --format '{{.Names}}' 2>/dev/null | grep -v "^${name}$" || true)
+    other_containers=$(container_runtime_for_ops ps -a --format '{{.Names}}' 2>/dev/null | grep -v "^${name}$" || true)
     if [[ -n "$other_containers" ]]; then
       log_warn "Other containers that would be destroyed by 'podman system reset':"
       while IFS= read -r oc; do
@@ -627,7 +629,7 @@ force_remove_container() {
     # masking a real reset failure. Capture-first makes the reset exit code
     # available via PIPESTATUS[0] / the command-substitution rc.
     local _reset_output _reset_rc=0
-    _reset_output=$(container_runtime_privileged system reset --force 2>&1) || _reset_rc=$?
+    _reset_output=$(container_runtime_for_ops system reset --force 2>&1) || _reset_rc=$?
     if [[ -n "$_reset_output" ]]; then
       while IFS= read -r line; do
         log_warn "  $line"
@@ -637,7 +639,7 @@ force_remove_container() {
       log_error "podman system reset --force FAILED (exit $_reset_rc). The container engine may need a reboot."
     fi
 
-    if container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
+    if container_runtime_for_ops inspect "$name" >/dev/null 2>&1; then
       log_error "Container '$name' still exists after system reset."
       log_error "Manual intervention required. Try in order:"
       log_error "  1. sudo podman rm -f '$name'"
@@ -647,7 +649,7 @@ force_remove_container() {
     fi
   fi
 
-  if container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
+  if container_runtime_for_ops inspect "$name" >/dev/null 2>&1; then
     return 1
   fi
 }
@@ -1140,7 +1142,7 @@ repair_podman() {
     fi
     if [[ "$skip_reset" != "true" ]]; then
         local reset_output rc=0
-        reset_output=$(container_runtime_privileged system reset --force 2>&1) && rc=0 || rc=$?
+        reset_output=$(container_runtime_for_ops system reset --force 2>&1) && rc=0 || rc=$?
         log_debug "podman system reset (exit $rc): $reset_output"
     fi
 
@@ -1482,6 +1484,20 @@ uninstall_setup() {
         gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" -f 2>/dev/null || true
     fi
 
+    # Clean host-side persistent changes created during install
+    if [[ "$DRY_RUN" != "true" ]]; then
+        local _xdg_override="$HOME/.config/systemd/user/plasma-plasmashell.service.d/override-xdg-data-dirs.conf"
+        [[ -f "$_xdg_override" ]] && { log_info "Removing XDG override: $_xdg_override"; rm -f "$_xdg_override"; }
+
+        local _envd="$HOME/.config/environment.d/30-xdg-data-dirs.conf"
+        [[ -f "$_envd" ]] && { log_info "Removing environment.d drop-in: $_envd"; rm -f "$_envd"; }
+
+        local _discover_svc="$HOME/.config/systemd/user/app-org.kde.discover.notifier@autostart.service"
+        [[ -L "$_discover_svc" || -f "$_discover_svc" ]] && { log_info "Unmasking Discover notifier: $_discover_svc"; systemctl --user unmask "app-org.kde.discover.notifier@autostart.service" 2>/dev/null || rm -f "$_discover_svc"; }
+
+        [[ -f "$HOME/.ssh/environment" ]] && { log_info "Note: ~/.ssh/environment may contain Pamac PATH entries; review manually."; }
+    fi
+
     log_success "Uninstallation completed."
 }
 
@@ -1509,6 +1525,8 @@ wait_for_container() {
     log_warn "[DRY RUN] Would wait for container '$CONTAINER_NAME'"
     return 0
   fi
+  # CONTAINER_START_TIMEOUT is the number of 2s-attempts (default 60 = ~120s).
+  # Named _TIMEOUT for backward compat with env-var overrides, but counts attempts.
   local max_attempts="${CONTAINER_START_TIMEOUT:-60}"
   local attempt=0
   _WFC_SAVED_ERREXIT=$(shopt -o -q errexit && echo "on" || echo "off")
@@ -1578,7 +1596,7 @@ wait_for_container() {
       container_start || true
     elif [[ $attempt -le 5 ]]; then
       local exit_code
-      exit_code=$(container_runtime_privileged inspect "$CONTAINER_NAME" --format '{{.State.ExitCode}}' 2>/dev/null || echo "unknown")
+      exit_code=$(container_runtime_for_ops inspect "$CONTAINER_NAME" --format '{{.State.ExitCode}}' 2>/dev/null || echo "unknown")
       log_warn "Container keeps exiting (exit code: $exit_code). Inspecting..." || true
       case "$exit_code" in
         137) log_error "Container was OOM-killed (exit 137). Not enough memory available." || true ;;
@@ -1658,7 +1676,7 @@ detect_init_support() {
     if [[ "$mgr" == "docker" ]]; then
         init_binary=$(docker info --format '{{.Host.InitPath}}' 2>/dev/null || echo "")
     else
-        init_binary=$(container_runtime_privileged info --format '{{.Host.InitPath}}' 2>/dev/null || echo "")
+        init_binary=$(container_runtime_for_ops info --format '{{.Host.InitPath}}' 2>/dev/null || echo "")
     fi
     if [[ -n "$init_binary" ]]; then
         local resolved
@@ -2828,7 +2846,8 @@ exec "${CMD_ARGS[@]}"
 fi
 SYSTEMD_RUN_FAKE_HEREDOC
     chmod +x /usr/local/sbin/systemd-run
-    _atomic_sed_inplace /usr/local/sbin/systemd-run "s/HOST_USER_PLACEHOLDER/${HOST_USER//\//\\/}/g"
+    _safe=${HOST_USER//\\/\\\\}; _safe=${_safe//&/\\&}; _safe=${_safe//\//\\/}
+    _atomic_sed_inplace /usr/local/sbin/systemd-run "s/HOST_USER_PLACEHOLDER/$_safe/g"
 }
 '
 

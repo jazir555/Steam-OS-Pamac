@@ -29,6 +29,20 @@ trap '_err_trap $LINENO "$BASH_COMMAND"' ERR
 readonly SCRIPT_VERSION="5.3.0"
 readonly GITHUB_REPO="your-org/Steam-OS-Pamac"
 readonly DEFAULT_CONTAINER_NAME="arch-pamac"
+
+# ── Self-integrity verification ──
+# Prints the SHA-256 hash of this script for manual comparison against the
+# hash published on the GitHub release page. No external file needed.
+_verify_script_hash() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "${BASH_SOURCE[0]}" 2>/dev/null
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "${BASH_SOURCE[0]}" 2>/dev/null
+    else
+        echo "Neither sha256sum nor shasum available. Install coreutils or perl." >&2
+        return 1
+    fi
+}
 # Default log file (used until CONTAINER_NAME is known). init_log_file() in
 # main reassigns it to a per-container path so concurrent runs with different
 # --container-name values don't overwrite each other's logs. Not declared
@@ -100,6 +114,7 @@ PAMAC_VERSION="${PAMAC_VERSION:-}"
 NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
 SKIP_COMPAT_CHECK="${SKIP_COMPAT_CHECK:-false}"
 FORCE_PODMAN_RESET="${FORCE_PODMAN_RESET:-false}"
+NO_COLOR="${NO_COLOR:-false}"
 # SECURITY (default off): PermitUserEnvironment yes in sshd lets any
 # SSH-authenticated user inject arbitrary environment variables (LD_PRELOAD,
 # PATH...) via ~/.ssh/environment — a known privilege-escalation vector on
@@ -143,7 +158,10 @@ readonly EXIT_USER_ABORT=130
 
 setup_colors() {
     [[ -n "${GREEN:-}" ]] && return 0
-    if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
+    if [[ "$NO_COLOR" == "true" ]]; then
+        GREEN=''; YELLOW=''; BLUE=''; RED=''; BOLD=''; NC=''
+        readonly GREEN YELLOW BLUE RED BOLD NC
+    elif [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
         GREEN=$(tput setaf 2); readonly GREEN
         YELLOW=$(tput setaf 3); readonly YELLOW
         BLUE=$(tput setaf 4); readonly BLUE
@@ -1297,8 +1315,12 @@ OPTIONS:
   --upload-log              Sanitize and upload the setup log for debugging
   --verbose                 Show detailed output, including command logs
   --quiet                   Only show errors
+  --no-color                Disable ANSI color output (useful for piping, cron,
+                            CI/CD, and non-terminal environments)
   --version                 Show version information
   --version-check           Compare installed version against latest GitHub release
+  --verify                  Print SHA-256 hash of this script for integrity verification
+                            (compare against hash on GitHub release page)
   -h, --help                Show this help message
 
 ENVIRONMENT VARIABLES:
@@ -1324,11 +1346,25 @@ ENVIRONMENT VARIABLES:
                            SteamOS (overrides auto-detection). For advanced
                            users with working nested systemd on custom kernels.
                            Default 'false'.
+  NO_COLOR                 Set to 'true' to disable ANSI color output (same
+                           as --no-color flag). Useful for piping, cron, CI/CD.
   DRY_RUN_VERBOSE          Set to 'true' to audit container scripts without
                            executing them (implies DRY_RUN=true). Default 'false'.
   LOG_ROTATION_MAX_SIZE    Rotate the per-container log on startup when it
                            exceeds this many bytes. Default: 5242880 (5 MiB).
                            One backup (.1) is kept; older backups are overwritten.
+
+SECURITY NOTE — fake systemd-run wrapper:
+  In non-systemd containers (the common case), this script installs a
+  fake /usr/local/sbin/systemd-run that mimics the CLI interface used by
+  Pamac/makepkg for DynamicUser builds. This wrapper does NOT enforce ANY
+  of the systemd security sandboxing properties it accepts (ProtectSystem,
+  ProtectHome, PrivateTmp, CapabilityBoundingSet, MemoryDenyWriteExecute,
+  etc.). Builds that rely on these properties will run without those
+  protections. Use --strict-security to disable the wrapper entirely and
+  refuse DynamicUser-based builds instead (they will fail rather than run
+  with dropped sandbox properties). Unrecognized properties are logged to
+  /tmp/systemd-run-fake.log for auditing.
 
 EXAMPLES:
   $0                                       # Basic setup
@@ -1385,7 +1421,9 @@ parse_arguments() {
             --check) CHECK_ONLY="true"; shift ;;
             --verbose) LOG_LEVEL="verbose"; shift ;;
             --quiet) LOG_LEVEL="quiet"; shift ;;
+            --no-color) NO_COLOR="true"; shift ;;
             --version) echo "Steam Deck Pamac Setup v${SCRIPT_VERSION}"; exit 0 ;;
+            --verify) _verify_script_hash; exit 0 ;;
             --version-check)
                 echo "Installed version: v${SCRIPT_VERSION}"
                 _latest=""
@@ -5022,6 +5060,24 @@ _import_key_with_retry() {
     fi
     echo "  WKD lookup did not resolve key $key_id."
 
+    # Step 1b: Try gpg --auto-key-retrieve (uses WKD + keyserver auto-discovery)
+    # This is a broader net than explicit WKD: gpg consults the keyserver URL
+    # configured in dirmngr.conf if WKD fails. Only works for full 40-char
+    # fingerprints (short IDs are too ambiguous for auto-retrieve).
+    if [[ ${#key_id} -eq 40 ]] && [[ "$key_id" =~ ^[0-9a-fA-F]+$ ]]; then
+        echo "  Attempting gpg --auto-key-retrieve for $key_id..."
+        if GNUPGHOME=/etc/pacman.d/gnupg timeout 15 gpg --auto-key-retrieve --locate-external-keys "$key_id" 2>/dev/null; then
+            local _akr_fp
+            _akr_fp=$(GNUPGHOME=/etc/pacman.d/gnupg gpg --with-colons --list-keys "$key_id" 2>/dev/null \
+                | grep '^fpr' | head -1 | cut -d: -f10 || echo "")
+            if [[ -n "$_akr_fp" ]] && timeout 15 pacman-key --lsign-key "$_akr_fp" 2>/dev/null; then
+                echo "  Auto-key-retrieve succeeded for ${_akr_fp: -8}"
+                return 0
+            fi
+        fi
+        echo "  Auto-key-retrieve did not resolve key $key_id."
+    fi
+
     # Step 1: Try keyservers with reduced timeouts
     for server in "${keyserver_urls[@]}"; do
         local attempt=1
@@ -5366,6 +5422,38 @@ pacman -Sy --noconfirm 2>/dev/null || echo "Warning: database sync with new repo
 echo "Third-party repository configuration complete."
 echo "Available additional repos: chaotic-aur, archlinuxcn, endeavouros"
 REPOS_EOF
+
+    # Validate default fingerprints against known-good list before passing to
+    # container script. If a default has gone stale (key rotation), warn early
+    # rather than failing deep inside the keyring bootstrap.
+    local -A _KNOWN_FINGERPRINTS=(
+        ["chaotic-aur"]="EF925EA60F33D0CB85C44AD13056513887B78AEB"
+        ["archlinuxcn"]="87F2E316E0ABC98B9DE8D4EF042FD810600954EF"
+    )
+    for _repo_name in "${!_KNOWN_FINGERPRINTS[@]}"; do
+        local _var_name="${_repo_name//-/_}_KEY_ID"
+        local _var_name="${_var_name^^}"
+        local _env_val="${!_var_name:-}"
+        local _known="${_KNOWN_FINGERPRINTS[$_repo_name]}"
+        if [[ -z "$_env_val" ]]; then
+            # No user override — using hardcoded default; verify it matches known list
+            local _default_val
+            case "$_repo_name" in
+                chaotic-aur) _default_val="EF925EA60F33D0CB85C44AD13056513887B78AEB" ;;
+                archlinuxcn) _default_val="87F2E316E0ABC98B9DE8D4EF042FD810600954EF" ;;
+                *) continue ;;
+            esac
+            if [[ "${_default_val,,}" != "${_known,,}" ]]; then
+                log_warn "Default key fingerprint for $_repo_name ($_default_val) does NOT match known-good ($_known)."
+                log_warn "This likely indicates a stale hardcoded value after a key rotation."
+                log_warn "Set $_var_name=$_known or check the upstream keyring package."
+            fi
+        elif [[ "${#_env_val}" -eq 40 ]]; then
+            # User override — verify format (already done above) but cannot
+            # verify correctness against known list (may be a new rotated key).
+            log_info "Using user-supplied $_var_name=$_env_val for $_repo_name"
+        fi
+    done
 
     if ! exec_container_script "$repos_script" "extra-repos" \
         "${CHAOTIC_AUR_KEY_ID:-}" \

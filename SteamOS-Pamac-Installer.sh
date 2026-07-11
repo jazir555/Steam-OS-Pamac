@@ -1,4 +1,13 @@
 #!/bin/bash
+# SteamOS Pamac Setup — installs Pamac inside a Distrobox container on SteamOS.
+#
+# IMPORTANT: This script uses interactive prompts (battery check, destructive
+# confirmations, etc.). It MUST be run with a connected terminal stdin.
+# Do NOT use `curl ... | bash` — that replaces stdin with the pipe and skips
+# all interactive prompts. Instead use:
+#   bash -c "$(curl -sSL <url>)"
+# This downloads the script first, then executes it as a string, preserving
+# stdin for interactive use.
 
 set -euo pipefail
 set -E

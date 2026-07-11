@@ -98,9 +98,24 @@ This gives you the best of both worlds: SteamOS's gaming-optimized stability wit
 
 # Steam-OS-Pamac
 
-Installation command (You will need to adjust the directory path if the script is not on the desktop)
+## Installation
 
-**chmod +x ~/Desktop/SteamOS-Pamac-Intaller.sh**
+### Option 1: Remote install (recommended)
+```bash
+bash -c "$(curl -sSL https://raw.githubusercontent.com/your-repo/Steam-OS-Pamac/main/SteamOS-Pamac-Installer.sh)"
+```
+
+> **Why not `curl | bash`?** Piping into bash (`curl ... | bash`) replaces stdin
+> with the pipe, so the script cannot read your keyboard for interactive prompts
+> (battery warnings, destructive-reset confirmations, etc.). Using command
+> substitution (`bash -c "$(curl ...)"`) downloads the script first, then
+> executes it as a string, leaving stdin connected to your terminal.
+
+### Option 2: Download and run locally
+```bash
+chmod +x ~/Desktop/SteamOS-Pamac-Installer.sh
+./SteamOS-Pamac-Installer.sh
+```
 
 
 

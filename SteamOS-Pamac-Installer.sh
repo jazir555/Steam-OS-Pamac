@@ -414,10 +414,23 @@ container_get_status() {
 }
 
 container_is_usable() {
+  # Cache: if the last successful probe was <5s ago, skip the expensive exec.
+  # This avoids spawning redundant "echo ok" probes when callers invoke
+  # container_root_exec / container_user_exec / container_cp_from in rapid
+  # succession (e.g., the install loop doing 20+ operations).
+  local _now
+  _now=$(date +%s 2>/dev/null || echo 0)
+  if [[ "${_LAST_USABLE_CHECK_TS:-0}" -gt 0 ]] && [[ $((_now - _LAST_USABLE_CHECK_TS)) -lt 5 ]]; then
+    return 0
+  fi
   container_start 2>/dev/null || true
   local _output
   _output=$(timeout ${CONTAINER_PROBE_TIMEOUT} container_runtime_for_ops exec -i -e HOME="/home/${CURRENT_USER}" "$CONTAINER_NAME" bash -c "echo ok" </dev/null 2>/dev/null || echo "")
-  [[ "$_output" == *"ok"* ]]
+  if [[ "$_output" == *"ok"* ]]; then
+    _LAST_USABLE_CHECK_TS=$_now
+    return 0
+  fi
+  return 1
 }
 
 container_get_status_safe() {
@@ -1501,24 +1514,7 @@ uninstall_setup() {
     log_success "Uninstallation completed."
 }
 
-_restore_errexit() {
-  if [[ "${_WFC_SAVED_ERREXIT:-}" == "on" ]]; then
-    set -e
-  fi
-  # Clear the RETURN trap so it does not fire spuriously in the caller.
-  trap - RETURN
-}
-
-# Signal handler: restore errexit, clear the signal trap, and re-raise the
-# identical signal so the script terminates rather than resuming the loop.
-# Without this, a SIGINT/TERM/HUP fires the trap, bash resumes at the next
-# command in the while loop, and the user must hit Ctrl-C a second time.
-_restore_and_die() {
-    local _sig=$1
-    _restore_errexit
-    trap - "$_sig"
-    kill -s "$_sig" $$ 2>/dev/null || exit 130
-}
+# ── Container wait helpers ──
 
 wait_for_container() {
   if [[ "$DRY_RUN" == "true" ]]; then
@@ -1529,18 +1525,23 @@ wait_for_container() {
   # Named _TIMEOUT for backward compat with env-var overrides, but counts attempts.
   local max_attempts="${CONTAINER_START_TIMEOUT:-60}"
   local attempt=0
-  _WFC_SAVED_ERREXIT=$(shopt -o -q errexit && echo "on" || echo "off")
+  local _saved_errexit
+  _saved_errexit=$(shopt -o -q errexit && echo "on" || echo "off")
   log_info "Waiting for container '$CONTAINER_NAME' to become ready..."
 
   set +e
-  # Install both RETURN (covers normal return) and INT/TERM (covers signal kill)
-  # traps so errexit is always restored on the way out of this function, even if
-  # the user hits Ctrl-C (a bare RETURN trap does not fire on a signal death,
-  # which previously left `set +e` sticky in the caller's scope).
-  trap '_restore_errexit' RETURN
-  trap '_restore_and_die INT'  INT
-  trap '_restore_and_die TERM' TERM
-  trap '_restore_and_die HUP'  HUP
+  # Signal handlers restore errexit and re-raise so the script terminates
+  # cleanly rather than resuming the loop mid-signal.
+  _wfc_cleanup() {
+    if [[ "$_saved_errexit" == "on" ]]; then
+      set -e
+    fi
+    trap - RETURN INT TERM HUP
+  }
+  trap '_wfc_cleanup; return 1' RETURN
+  trap '_wfc_cleanup; trap - INT; kill -s INT $$ 2>/dev/null || exit 130' INT
+  trap '_wfc_cleanup; trap - TERM; kill -s TERM $$ 2>/dev/null || exit 143' TERM
+  trap '_wfc_cleanup; trap - HUP; kill -s HUP $$ 2>/dev/null || exit 129' HUP
 
   while true; do
     attempt=$((attempt + 1))
@@ -2219,6 +2220,17 @@ _atomic_sed_inplace() {
     sync "$_tmp" 2>/dev/null || sync 2>/dev/null || true
     mv -f "$_tmp" "$_target"
 }
+
+# Escape all sed-special characters in a replacement string.
+# Use this when embedding user-supplied values into s/pattern/replacement/exprs.
+# Characters escaped: \ & / (the three that break s/// sed substitutions).
+_sed_escape_replacement() {
+    local _s="$1"
+    _s="${_s//\\/\\\\}"
+    _s="${_s//&/\\&}"
+    _s="${_s//\//\\/}"
+    echo "$_s"
+}
 _calc_makepkg_jobs() {
     local ram_per_job_kb=768000
     local mem_avail_kb=0
@@ -2386,6 +2398,13 @@ install_base_devel_batched() {
 # Write the fake systemd-run wrapper script. Shared between install and
 # repair paths. The heredoc body is at column 0 (no leading whitespace)
 # because the kernel requires the shebang to be byte 0 of the file.
+#
+# SECURITY NOTE: This wrapper is a compatibility shim only. It does NOT
+# enforce any of the systemd security sandboxing properties it accepts
+# (ProtectSystem, ProtectHome, PrivateTmp, CapabilityBoundingSet, etc.).
+# Builds that rely on these properties will run without those protections
+# in non-systemd containers. Use --strict-security to disable this wrapper
+# entirely and refuse DynamicUser-based builds instead.
 _write_fake_systemd_run_wrapper() {
     mkdir -p /usr/local/sbin
     cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE_HEREDOC'
@@ -2846,7 +2865,7 @@ exec "${CMD_ARGS[@]}"
 fi
 SYSTEMD_RUN_FAKE_HEREDOC
     chmod +x /usr/local/sbin/systemd-run
-    _safe=${HOST_USER//\\/\\\\}; _safe=${_safe//&/\\&}; _safe=${_safe//\//\\/}
+    _safe=$(_sed_escape_replacement "$HOST_USER")
     _atomic_sed_inplace /usr/local/sbin/systemd-run "s/HOST_USER_PLACEHOLDER/$_safe/g"
 }
 _atomic_write_pacman_conf() {
@@ -3047,8 +3066,12 @@ _exec_handle_result() {
             log_warn "$_kind '$_desc' got exit $_rc without completion marker in non-init container. May be premature container stop."
         fi
         container_start 2>/dev/null || true
-        # Only run heavy DB repair if output suggests pacman DB corruption
-        if echo "$_output" | grep -qiE "database|corrupt|invalid|signature|could not open|failed to init"; then
+        # Only run heavy DB repair if output contains strong corruption
+        # indicators. Broad terms like bare "database" or "invalid" alone
+        # would false-positive on informational messages; require a compound
+        # match (e.g., "database error", "invalid signature") to reduce
+        # unnecessary repair runs that waste time and risk data loss.
+        if echo "$_output" | grep -qiE "database.*(corrupt|error|incomplete|missing)|corrupt(ed)? (database|package)|invalid.*(signature|database)|signature.*(invalid|missing|corrupt)|could not open|failed to init.*database"; then
             log_info "DB corruption indicators detected in output — running repair..."
             repair_pacman_db
         fi
@@ -6877,6 +6900,17 @@ configure_ssh_environment() {
         log_info "SSH PermitUserEnvironment is disabled (default for security). Pass --enable-ssh-env to opt in on a single-user trusted host."
         return 0
     fi
+
+    # Multi-user detection: PermitUserEnvironment exposes every user's
+    # ~/.ssh/environment to SSH sessions. On a shared host, one user could
+    # inject variables (e.g., LD_PRELOAD) that affect other users' sessions.
+    # Warn if more than one interactive user (UID >= 1000, login shell) exists.
+    local _login_users
+    _login_users=$(awk -F: '$3 >= 1000 && $7 !~ /(nologin|false|sync|shutdown|halt)$/ {print $1}' /etc/passwd 2>/dev/null | wc -l || echo "1")
+    if [[ "$_login_users" -gt 1 ]]; then
+        log_warn "Multi-user system detected ($_login_users interactive users). PermitUserEnvironment is a privilege-escalation vector on shared hosts."
+        log_warn "Continuing because --enable-ssh-env was explicitly passed. Ensure this is intentional."
+    fi
     if [[ ! -f "$permit_env_conf" ]]; then
         # Backup existing sshd config before modification
         if [[ -d "$sshd_conf_dir" ]]; then
@@ -8255,13 +8289,14 @@ pacman -Qeq > "\$EXPLICIT_FILE" 2>/dev/null || true
 # package updates that change the .desktop contents (new Actions, renamed
 # Exec, updated Icon) without changing the explicit-install set — leaving
 # users with stale host menu entries until the package list changes.
-# We hash mtimes+sizes of every /usr/share/applications/*.desktop file; this
-# changes whenever a package update rewrites a desktop file, while staying
-# cheap (one stat per file, no content read).
+# We hash the content of every /usr/share/applications/*.desktop file using
+# md5sum (not just mtime/size) so that same-size rebuilds with different
+# content are still detected. The cost (~500 files) is negligible vs. the
+# full export pass that follows.
 CURRENT_HASH="\$(md5sum "\$EXPLICIT_FILE" 2>/dev/null | awk '{print \$1}')"
 if [[ -d /usr/share/applications ]]; then
     DESKTOP_SIG="\$(find /usr/share/applications -maxdepth 1 -type f -name '*.desktop' \
-        -printf '%p %s %T@\n' 2>/dev/null | sort | md5sum | awk '{print \$1}')"
+        -exec md5sum {} + 2>/dev/null | sort -k2 | md5sum | awk '{print \$1}')"
     CURRENT_HASH="\${CURRENT_HASH}:\${DESKTOP_SIG}"
 fi
 if [[ -f "\$HASH_FILE" ]]; then

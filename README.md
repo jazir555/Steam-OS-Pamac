@@ -192,6 +192,27 @@ or manually restore them per the in-script guidance.
 desktop file exports, pamac configuration, and the GUI/CLI wrappers
 all survive normal `steamOS update` cycles.
 
+### Non-SteamOS Compatibility
+
+The script works on any Linux distribution with systemd and a supported
+container runtime (podman or Docker). However, some features are
+SteamOS-specific:
+
+| Feature | SteamOS | Other distros |
+|---------|---------|---------------|
+| Read-only rootfs detection | Automatic | N/A (skipped) |
+| subuid/subgid configuration | Automatic | Automatic |
+| KDE Discover notifier suppression | Automatic (KDE only) | N/A (skipped) |
+| SSH environment configuration | Automatic | N/A (skipped) |
+| Desktop file export | Automatic | Automatic |
+| AUR wrapper (yay/paru) | Automatic | Automatic |
+| D-Bus policy configuration | Automatic | Automatic |
+
+On non-SteamOS systems, the script skips SteamOS-specific features
+(read-only rootfs handling, SSH env, Discover notifier) and focuses on
+container setup, desktop exports, and AUR wrapper installation. The
+container, pamac, and desktop integration work identically.
+
 ### Verification Test
 When you run the script, you'll see this final success message:
 ```

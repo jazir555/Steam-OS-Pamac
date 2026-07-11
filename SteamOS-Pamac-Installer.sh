@@ -2044,53 +2044,174 @@ if [[ -d "$_db_backup" ]] && [[ -d /var/lib/pacman/local ]]; then
     fi
 fi
 
-# ── Strategy 9: Nuclear — wipe and rebuild entire local DB ──
+# ── Strategy 9: Validate and repair desc file fields ──
 echo ""
-echo "=== Strategy 9: Full DB rebuild (last resort) ==="
-echo "  WARNING: This will remove ALL database entries and rebuild from scratch."
-echo "  Installed packages on disk will NOT be deleted — only the tracking DB is rebuilt."
-_inner_remove_stale_lock
-
-# Save list of installed packages before wipe
-_installed_before=$(pacman -Q 2>/dev/null || true)
-
-# Move entire local DB to a safe location
-_db_nuclear="/var/lib/pacman/local/.db-nuclear-backup-$(date +%Y%m%d-%H%M%S)"
-mv /var/lib/pacman/local "$_db_nuclear" 2>/dev/null || true
-mkdir -p /var/lib/pacman/local 2>/dev/null || true
-
-# Re-sync from repos to get a fresh DB
-_inner_remove_stale_lock
-if pacman -Syy --noconfirm 2>/dev/null; then
-    echo "  Fresh database sync succeeded."
-    
-    # Reinstall all previously installed packages from cache/repos
-    if [[ -n "$_installed_before" ]]; then
-        _reinstalled=0
-        while IFS= read -r _pkg_line; do
-            [[ -z "$_pkg_line" ]] && continue
-            _pkg_name=$(echo "$_pkg_line" | awk "{print \$1}")
-            if pacman -S --noconfirm --needed "$_pkg_name" 2>/dev/null; then
-                _reinstalled=$((_reinstalled + 1))
+echo "=== Strategy 9: Validate desc file fields ==="
+_repaired_desc=0
+for _db_dir in /var/lib/pacman/local/*/; do
+    [[ -d "$_db_dir" ]] || continue
+    _pkg_name=$(basename "$_db_dir")
+    [[ "$_pkg_name" == *".db-backup"* ]] && continue
+    [[ -f "$_db_dir/desc" ]] || continue
+    # Check for critical fields: %NAME%, %VERSION%
+    if ! grep -q "^%NAME%$" "$_db_dir/desc" 2>/dev/null; then
+        echo "  $_pkg_name: missing %NAME% field in desc — reconstructing"
+        # Reconstruct NAME from directory name (pkgname-version format)
+        local _reconstructed_name="${_pkg_name%%-[0-9]*}"
+        if [[ -n "$_reconstructed_name" ]]; then
+            # Insert %NAME% at the beginning of desc
+            local _tmp_desc
+            _tmp_desc=$(mktemp)
+            printf '%%NAME%%\n%s\n\n' "$_reconstructed_name" | cat - "$_db_dir/desc" > "$_tmp_desc" 2>/dev/null
+            if [[ -s "$_tmp_desc" ]]; then
+                mv "$_tmp_desc" "$_db_dir/desc" 2>/dev/null || rm -f "$_tmp_desc"
+                _repaired_desc=$((_repaired_desc + 1))
+            else
+                rm -f "$_tmp_desc"
             fi
-        done <<< "$_installed_before"
-        echo "  Reinstalled $_reinstalled packages."
+        fi
     fi
-    
-    if _inner_db_is_healthy; then
-        echo "Database consistent after Strategy 9 (full rebuild)."
-        exit 0
+    if ! grep -q "^%VERSION%$" "$_db_dir/desc" 2>/dev/null; then
+        echo "  $_pkg_name: missing %VERSION% field in desc — reconstructing"
+        local _reconstructed_ver="${_pkg_name##*-}"
+        if [[ -n "$_reconstructed_ver" ]] && [[ "$_reconstructed_ver" != "$_pkg_name" ]]; then
+            # Rebuild desc: keep everything up to %NAME% block, add VERSION
+            local _tmp_desc
+            _tmp_desc=$(mktemp)
+            # Extract everything up to and including %NAME% block, skip blank line
+            awk "BEGIN{s=0} /^%NAME%\$/{print; s=1; next} s && /^[[:space:]]*\$/{print; s=2; next} s==2{next} {print}" \
+                "$_db_dir/desc" > "$_tmp_desc" 2>/dev/null
+            # Append VERSION block
+            printf '\n%%VERSION%%\n%s\n\n' "$_reconstructed_ver" >> "$_tmp_desc"
+            # Append everything from %DESC% onwards
+            awk "/^%DESC%\$/{p=1} p{print}" "$_db_dir/desc" >> "$_tmp_desc" 2>/dev/null
+            if [[ -s "$_tmp_desc" ]]; then
+                mv "$_tmp_desc" "$_db_dir/desc" 2>/dev/null || rm -f "$_tmp_desc"
+                _repaired_desc=$((_repaired_desc + 1))
+            else
+                rm -f "$_tmp_desc"
+            fi
+        fi
+    fi
+done
+echo "  Repaired $_repaired_desc desc files."
+if _inner_db_is_healthy; then
+    echo "Database consistent after Strategy 9 (desc field repair)."
+    exit 0
+fi
+
+# ── Strategy 10: Verify file lists against disk ──
+echo ""
+echo "=== Strategy 10: Verify file lists against disk ==="
+_missing_files=0
+_orphan_pkgs=0
+for _db_dir in /var/lib/pacman/local/*/; do
+    [ -d "$_db_dir" ] || continue
+    _pkg_name=$(basename "$_db_dir")
+    case "$_pkg_name" in *.db-backup*) continue ;; esac
+    [ -f "$_db_dir/files" ] || continue
+    _total_files=0
+    _missing_count=0
+    while IFS= read -r _file_line; do
+        case "$_file_line" in
+            %DIR%|%FILES%|%BACKUP%|"") continue ;;
+            [[:space:]]*) continue ;;
+        esac
+        if [ "${_file_line#/}" != "$_file_line" ]; then
+            _total_files=$((_total_files + 1))
+            if [ ! -e "$_file_line" ] && [ ! -L "$_file_line" ]; then
+                _missing_count=$((_missing_count + 1))
+            fi
+        fi
+    done < "$_db_dir/files"
+    if [ "$_total_files" -gt 0 ] && [ "$_missing_count" -eq "$_total_files" ]; then
+        echo "  $_pkg_name: ALL $_total_files files missing from disk"
+        _orphan_pkgs=$((_orphan_pkgs + 1))
+    elif [ "$_missing_count" -gt 0 ] && [ $((_total_files - _missing_count)) -eq 0 ]; then
+        echo "  $_pkg_name: $_missing_count/$_total_files files missing (entirely absent)"
+        _orphan_pkgs=$((_orphan_pkgs + 1))
+    fi
+    _missing_files=$((_missing_files + $_missing_count))
+done
+echo "  Found $_missing_files total missing file entries across all packages."
+echo "  $_orphan_pkgs packages have all files missing from disk."
+if [ "$_orphan_pkgs" -gt 0 ]; then
+    echo "  These packages may need manual reinstallation: pacman -S <pkgname>"
+    echo "  Or batch reinstall all native packages: pacman -S --needed \$(pacman -Qnq)"
+fi
+        fi
+    done < "$_db_dir/files"
+    if [[ $_total_files -gt 0 ]] && [[ $_missing_count -eq $_total_files ]]; then
+        echo "  $_pkg_name: ALL $_total_files files missing from disk"
+        _orphan_pkgs=$((_orphan_pkgs + 1))
+    elif [[ $_missing_count -gt 0 ]] && [[ $((_total_files - _missing_count)) -eq 0 ]]; then
+        echo "  $_pkg_name: $_missing_count/$_total_files files missing (entirely absent)"
+        _orphan_pkgs=$((_orphan_pkgs + 1))
+    fi
+    _missing_files=$((_missing_files + $_missing_count))
+done
+echo "  Found $_missing_files total missing file entries across all packages."
+echo "  $_orphan_pkgs packages have all files missing from disk."
+if [[ $_orphan_pkgs -gt 0 ]]; then
+    echo "  These packages may need manual reinstallation: pacman -S <pkgname>"
+    echo "  Or batch reinstall: pacman -S --needed \$(pacman -Qnq)"
+fi
+if _inner_db_is_healthy; then
+    echo "Database consistent after Strategy 10 (file verification)."
+    exit 0
+fi
+
+# ── Strategy 11: pacman --debug deep inspection ──
+echo ""
+echo "=== Strategy 11: pacman --debug deep inspection ==="
+_inner_remove_stale_lock
+_debug_output=$(pacman --debug 2>&1 || true)
+_debug_issues=$(echo "$_debug_output" | grep -iE "warning|error|missing|corrupt|invalid" | head -20 || true)
+if [[ -n "$_debug_issues" ]]; then
+    echo "  Found issues from pacman --debug:"
+    echo "$_debug_issues" | while IFS= read -r _line; do
+        echo "    $_line"
+    done
+    # Attempt to fix common issues found by --debug
+    # 1. Missing files DB entries — reinstall affected packages
+    _debug_missing=$(echo "$_debug_output" | grep -oP "error: .*: missing file" | awk -F': ' '{print $2}' | sort -u || true)
+    if [[ -n "$_debug_missing" ]]; then
+        echo "  Attempting to fix missing file entries..."
+        _fixed=0
+        while IFS= read -r _missing_entry; do
+            [[ -z "$_missing_entry" ]] && continue
+            # Find which package owns this file
+            _owning_pkg=$(pacman -Qoq "$_missing_entry" 2>/dev/null || true)
+            if [[ -n "$_owning_pkg" ]]; then
+                pacman -S --noconfirm --needed "$_owning_pkg" 2>/dev/null && _fixed=$((_fixed + 1))
+            fi
+        done <<< "$_debug_missing"
+        echo "  Fixed $_fixed packages with missing file entries."
+    fi
+    # 2. Check for and fix directory permissions
+    _bad_dirs=$(echo "$_debug_output" | grep -oP "warning: .*: .*: No such file or directory" | awk '{print $NF}' | sort -u || true)
+    if [[ -n "$_bad_dirs" ]]; then
+        echo "  Creating missing directories referenced by packages..."
+        while IFS= read -r _dir; do
+            [[ -z "$_dir" ]] && continue
+            if [[ "$_dir" == /* ]]; then
+                mkdir -p "$_dir" 2>/dev/null || true
+            fi
+        done <<< "$_bad_dirs"
     fi
 else
-    echo "  Fresh database sync failed. Restoring from nuclear backup..."
-    rm -rf /var/lib/pacman/local 2>/dev/null || true
-    mv "$_db_nuclear" /var/lib/pacman/local 2>/dev/null || true
+    echo "  pacman --debug found no additional issues."
+fi
+
+if _inner_db_is_healthy; then
+    echo "Database consistent after Strategy 11 (deep inspection)."
+    exit 0
 fi
 
 # ── Final: all strategies exhausted ──
 echo ""
 echo "=== DB Repair: Final Status ==="
-echo "All 9 repair strategies attempted."
+echo "All 11 repair strategies attempted."
 echo ""
 echo "Remaining issues:"
 pacman -Dk 2>&1 | head -20 || true
@@ -2098,8 +2219,9 @@ echo ""
 echo "The system may still be partially functional."
 echo "Manual recovery options:"
 echo "  1. pacman -Syyu --overwrite \"*\"  (full upgrade with overwrite)"
-echo "  2. rm -rf /var/lib/pacman/local && pacman -Syy  (full DB rebuild)"
-echo "  3. Check filesystem: fsck $(df /var/lib/pacman 2>/dev/null | awk "NR==2{print \$6}" || echo "/")"
+echo "  2. Reinstall individual packages: pacman -S <pkgname>"
+echo "  3. Batch reinstall all native packages: pacman -S --needed \$(pacman -Qnq)"
+echo "  4. Check filesystem: fsck $(df /var/lib/pacman 2>/dev/null | awk "NR==2{print \$6}" || echo "/")"
 echo ""
 echo "WARNING: Some inconsistencies may be non-fatal and can be ignored if"
 echo "the system is otherwise working. Not every -Dk warning requires action."

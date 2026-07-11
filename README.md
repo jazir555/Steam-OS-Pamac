@@ -176,6 +176,22 @@ model.
 - It does not disable Secure Boot or other firmware protections
 - It does not create system-wide service accounts or daemons
 
+### Post-Upgrade Maintenance
+
+**SSH configuration (`--enable-ssh-env` only):** Major SteamOS version
+upgrades (e.g. 3.x → 4.x) may rewrite host-side files under `/etc/ssh/`.
+If you used `--enable-ssh-env`, the following may need re-creation after
+a major upgrade:
+- `/etc/ssh/sshd_config.d/permit-user-env.conf` (PermitUserEnvironment)
+- `~/.ssh/environment` (host environment variables)
+
+Re-run the script with `--enable-ssh-env` to re-apply these settings,
+or manually restore them per the in-script guidance.
+
+**Everything else persists** across SteamOS updates: container data,
+desktop file exports, pamac configuration, and the GUI/CLI wrappers
+all survive normal `steamOS update` cycles.
+
 ### Verification Test
 When you run the script, you'll see this final success message:
 ```

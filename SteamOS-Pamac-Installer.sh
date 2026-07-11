@@ -6870,6 +6870,9 @@ configure_ssh_environment() {
     # Only write PermitUserEnvironment yes when the user explicitly opted in
     # via --enable-ssh-env. Default off: this setting is a privilege-escalation
     # vector on multi-user hosts (see ENABLE_SSH_ENV comment near top of script).
+    # NOTE: Major SteamOS upgrades may overwrite /etc/ssh/ configs. Users who
+    # enabled this option should re-run with --enable-ssh-env after major
+    # SteamOS version upgrades (documented in README).
     if [[ "$ENABLE_SSH_ENV" != "true" ]]; then
         log_info "SSH PermitUserEnvironment is disabled (default for security). Pass --enable-ssh-env to opt in on a single-user trusted host."
         return 0
@@ -8364,6 +8367,9 @@ PAMAC_DESKTOP
   # re-entry into action sections, and preserves all non-owned lines.
   # Pre-flight: verify Python 3 executable is reachable before testing modules,
   # so builds don't break inside minimal containers with broken interpreters.
+  # NOTE: Minimal Arch base images occasionally split python-configparser
+  # into separate packages on major Python version bumps. The pacman -S
+  # fallback below handles this automatically.
   _python3_ok=false
   if command -v python3 >/dev/null 2>&1; then
     if python3 -c "import configparser" >/dev/null 2>&1; then

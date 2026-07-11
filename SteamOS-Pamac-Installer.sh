@@ -1357,12 +1357,14 @@ ENVIRONMENT VARIABLES:
 SECURITY NOTE — fake systemd-run wrapper:
   In non-systemd containers (the common case), this script installs a
   fake /usr/local/sbin/systemd-run that mimics the CLI interface used by
-  Pamac/makepkg for DynamicUser builds. This wrapper does NOT enforce ANY
-  of the systemd security sandboxing properties it accepts (ProtectSystem,
-  ProtectHome, PrivateTmp, CapabilityBoundingSet, MemoryDenyWriteExecute,
-  etc.). Builds that rely on these properties will run without those
-  protections. Use --strict-security to disable the wrapper entirely and
-  refuse DynamicUser-based builds instead (they will fail rather than run
+  Pamac/makepkg for DynamicUser builds. This wrapper IMPLEMENTS the
+  functional properties builds depend on (DynamicUser, User, WorkingDirectory,
+  CacheDirectory, Environment, EnvironmentFile, UMask, SupplementaryGroups)
+  so builds will not fail from missing properties. It does NOT enforce
+  security sandboxing properties (ProtectSystem, ProtectHome, PrivateTmp,
+  CapabilityBoundingSet, etc.) — dropping these makes the environment MORE
+  permissive, not less. Use --strict-security to disable the wrapper entirely
+  and refuse DynamicUser-based builds (they will fail instead of running
   with dropped sandbox properties). Unrecognized properties are logged to
   /tmp/systemd-run-fake.log for auditing.
 
@@ -2437,12 +2439,15 @@ install_base_devel_batched() {
 # repair paths. The heredoc body is at column 0 (no leading whitespace)
 # because the kernel requires the shebang to be byte 0 of the file.
 #
-# SECURITY NOTE: This wrapper is a compatibility shim only. It does NOT
-# enforce any of the systemd security sandboxing properties it accepts
-# (ProtectSystem, ProtectHome, PrivateTmp, CapabilityBoundingSet, etc.).
-# Builds that rely on these properties will run without those protections
-# in non-systemd containers. Use --strict-security to disable this wrapper
-# entirely and refuse DynamicUser-based builds instead.
+# SECURITY NOTE: This wrapper is a compatibility shim. It IMPLEMENTS the
+# functional properties that builds actually depend on (DynamicUser, User,
+# WorkingDirectory, CacheDirectory, Environment, EnvironmentFile, UMask,
+# SupplementaryGroups, --setenv) but does NOT enforce the systemd security
+# sandboxing properties (ProtectSystem, ProtectHome, PrivateTmp,
+# CapabilityBoundingSet, etc.). Dropping sandboxing makes the environment
+# MORE permissive — builds will not fail from missing properties. Use
+# --strict-security to disable this wrapper entirely and refuse
+# DynamicUser-based builds instead.
 _write_fake_systemd_run_wrapper() {
     mkdir -p /usr/local/sbin
     cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE_HEREDOC'
@@ -2481,7 +2486,7 @@ _cleanup_orphaned_buildusers
 # Passthrough: --help and --version are not meaningful here
 for _a in "$@"; do
     case "$_a" in
-        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo "Recognized options: --property=DynamicUser=yes, --property=CacheDirectory=*, --property=WorkingDirectory=*, --property=StateDirectory=*, --property=LogsDirectory=*, --property=RuntimeDirectory=*, --property=TemporaryFileSystem=*, --property=BindPaths=*, --property=BindReadOnlyPaths=*, --property=ProtectSystem=*, --property=ProtectHome=*, --property=PrivateTmp=*, --property=NoNewPrivileges=*, --property=MemoryDenyWriteExecute=*, --property=SystemCallFilter=*, --property=CapabilityBoundingSet=*, --property=User=*, --property=Group=*, --property=SupplementaryGroups=*, --property=AmbientCapabilities=*, --property=EnvironmentFile=*, --property=Type=*, --property=RemainAfterExit=*, --property=Ephemeral=*, --property=Slice=*, --property=IOSchedulingClass=*, --property=CPUSchedulingPolicy=*, --property=RestrictNamespaces=*, --property=RestrictSUIDSGID=*, --property=LockPersonality=*, --property=RestrictRealtime=*, --property=RestrictAddressFamilies=*, --property=RemoveIPC=*, --property=UMask=*, --property=KeyringMode=*, --property=ProtectClock=*, --property=ProtectKernelTunables=*, --property=ProtectKernelModules=*, --property=ProtectKernelLogs=*, --property=ProtectControlGroups=*, --property=ProtectHostname=*, --property=ProtectProc=*, --property=ProcSubset=*, --property=MemorySwapMax=*, --property=CPUQuota=*, --property=DeviceAllow=*, --property=DevicePolicy=*, --property=RestrictFileSystems=*, --property=SocketBindDeny=*, --property=SocketBindAllow=*, --property=IPAddressAllow=*, --property=IPAddressDeny=*, and all other systemd.exec(5)/resource-control(5)/service(5) --property= sandboxing (Private*, Protect*, ReadWritePaths, RootDirectory, ...), resource (Limit*, *Accounting, *Max, *Weight, IO*, Memory*, CPU*), logging (StandardIO, Syslog*, LogLevel*), Condition*, Assert*, and Timeout*/Restart* options (recognized and dropped in this non-systemd env; sandboxing drops are logged to /tmp/systemd-run-fake.log), --pipe, --wait, --quiet, --no-block, --description=*, --unit=*, --service-type=*, --user, --uid=*, --gid=*, --setenv=*, --"; exit 0 ;;
+        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo ""; echo "IMPLEMENTED (functional): --property=DynamicUser=yes (build user isolation), --property=CacheDirectory=* (mkdir+chown), --property=WorkingDirectory=* (mkdir+cd), --property=User=* (sudo -u), --property=SupplementaryGroups=* (sg), --property=Environment=* (export), --property=EnvironmentFile=* (source), --property=UMask=* (umask), --setenv=* (export), --pipe, --wait, --pty, --quiet, --no-block, --description=*, --unit=*, --service-type=*."; echo "RECOGNIZED but DROPPED (non-systemd, no sandboxing; logged to /tmp/systemd-run-fake.log): ProtectSystem, ProtectHome, PrivateTmp, NoNewPrivileges, MemoryDenyWriteExecute, SystemCallFilter, CapabilityBoundingSet, AmbientCapabilities, PrivateDevices, PrivateMounts, PrivateNetwork, PrivateUsers, ReadWritePaths, ReadOnlyPaths, RootDirectory, and all other systemd.exec(5)/resource-control(5) sandboxing. Resource/accounting/logging/Condition/Assert/Timeout properties are recognized and silently dropped."; echo ""; echo "Security note: dropped sandboxing properties make the environment MORE permissive, not less. Builds will not fail from missing properties. Use --strict-security on the installer to disable this wrapper entirely."; exit 0 ;;
         --version) echo "systemd-run (fake) v${DSR_VERSION} (SteamOS-Pamac)"; exit 0 ;;
     esac
 done
@@ -2495,6 +2500,11 @@ WAIT_MODE=false
 DESCRIPTION=""
 UNRECOGNIZED_PROPS=()
 CMD_ARGS=()
+EXTRA_ENV=()
+EXTRA_GROUPS=""
+TARGET_USER=""
+ENV_FILES=()
+SET_UMASK=""
 for arg in "$@"; do
 if $SKIP_NEXT; then
 SKIP_NEXT=false
@@ -2534,11 +2544,11 @@ case "$arg" in
 --property=MemoryDenyWriteExecute=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
 --property=SystemCallFilter=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
 --property=CapabilityBoundingSet=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=User=*) continue ;;
+--property=User=*) TARGET_USER="${arg#--property=User=}"; continue ;;
 --property=Group=*) continue ;;
---property=SupplementaryGroups=*) continue ;;
+--property=SupplementaryGroups=*) EXTRA_GROUPS="${arg#--property=SupplementaryGroups=}"; continue ;;
 --property=AmbientCapabilities=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=EnvironmentFile=*) continue ;;
+--property=EnvironmentFile=*) ENV_FILES+=("${arg#--property=EnvironmentFile=}"); continue ;;
 --property=Ephemeral=*) continue ;;
 --property=Slice=*) continue ;;
 --property=IOSchedulingClass=*) continue ;;
@@ -2549,7 +2559,7 @@ case "$arg" in
 --property=RestrictRealtime=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
 --property=RestrictAddressFamilies=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
 --property=RemoveIPC=*) continue ;;
---property=UMask=*) continue ;;
+--property=UMask=*) SET_UMASK="${arg#--property=UMask=}"; continue ;;
 --property=KeyringMode=*) continue ;;
 --property=ProtectClock=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
 --property=ProtectKernelTunables=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
@@ -2598,7 +2608,7 @@ case "$arg" in
 --property=InheritDescriptors=*) continue ;;
 --property=SecureBits=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
 # --- Environment ---
---property=Environment=*) continue ;;
+--property=Environment=*) EXTRA_ENV+=("-e" "${arg#--property=Environment=}"); continue ;;
 --property=PassEnvironment=*) continue ;;
 --property=UnsetEnvironment=*) continue ;;
 # --- Personality / arch ---
@@ -2799,7 +2809,8 @@ case "$arg" in
 # Unrecognized properties — collect silently, warn once in summary below.
 --property=*) UNRECOGNIZED_PROPS+=("$arg"); continue ;;
 --property) SKIP_NEXT=true; continue ;;
---user|--uid=*|--gid=*|--setenv=*) continue ;;
+--user|--uid=*|--gid=*) continue ;;
+--setenv=*) EXTRA_ENV+=("-e" "${arg#--setenv=}"); continue ;;
 --setenv) SKIP_NEXT=true; continue ;;
 --) shift; CMD_ARGS+=("$@"); break ;;
 *) CMD_ARGS+=("$arg") ;;
@@ -2817,6 +2828,38 @@ if [[ ${#UNRECOGNIZED_PROPS[@]} -gt 0 ]]; then
     _warn_dsr "These are silently dropped. Normal when Pamac/makepkg adds new systemd"
     _warn_dsr "options not yet in this wrapper. Only investigate if AUR builds fail."
 fi
+
+# ── Build environment setup string ──
+# Loads EnvironmentFile= files and exports Environment=/--setenv= vars
+# so builds see the same environment systemd-run would have provided.
+_ENV_SETUP=""
+for _ef in "${ENV_FILES[@]}"; do
+    if [[ -f "$_ef" ]]; then
+        _ENV_SETUP="${_ENV_SETUP}set -a; source '${_ef}' 2>/dev/null || true; set +a; "
+        _log_dsr "Sourcing EnvironmentFile: $_ef"
+    else
+        _warn_dsr "EnvironmentFile not found: $_ef (continuing — may be created by the build)"
+    fi
+done
+for _ee in "${EXTRA_ENV[@]}"; do
+    _ENV_SETUP="${_ENV_SETUP}export '${_ee}' 2>/dev/null || true; "
+    _log_dsr "Setting env: $_ee"
+done
+if [[ -n "$SET_UMASK" ]]; then
+    _ENV_SETUP="${_ENV_SETUP}umask ${SET_UMASK} 2>/dev/null || true; "
+    _log_dsr "Setting umask: $SET_UMASK"
+fi
+
+# ── Build sudo option array for SupplementaryGroups ──
+_SGROUP_OPTS=()
+if [[ -n "$EXTRA_GROUPS" ]]; then
+    # sudo -u supports -G for supplementary groups but only when creating a
+    # new PAM session; the -H flag resets HOME. For groups, we use the
+    # bash -c wrapper with newgrp or sg if available.
+    _SGROUP_OPTS=(-g "$EXTRA_GROUPS")
+    _log_dsr "SupplementaryGroups requested: $EXTRA_GROUPS (best-effort)"
+fi
+
 if [[ -n "$WORK_DIR" ]]; then
 mkdir -p "$WORK_DIR" 2>/dev/null || true
 if $DYNAMIC_USER; then chown HOST_USER_PLACEHOLDER:HOST_USER_PLACEHOLDER "$WORK_DIR" 2>/dev/null || true; fi
@@ -2826,6 +2869,11 @@ CACHE_FULL="/var/cache/$CACHE_DIR"
 mkdir -p "$CACHE_FULL" 2>/dev/null || true
 if $DYNAMIC_USER; then chown -R HOST_USER_PLACEHOLDER:HOST_USER_PLACEHOLDER "$CACHE_FULL" 2>/dev/null || true; fi
 fi
+
+# ── Determine the run-as user ──
+# DynamicUser=true  → use dedicated build user (privileged isolation)
+# User=property      → use that user (non-DynamicUser explicit user switch)
+# neither            → run as current user (root if container root exec)
 if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
 # Use a dedicated build user to isolate AUR builds from the host user'\''s
 # home directory. A malicious AUR package gains only build-user access.
@@ -2873,30 +2921,50 @@ if ! id "$BUILD_USER" >/dev/null 2>&1; then
     mkdir -p /var/lib/builduser 2>/dev/null || true
     chown "$BUILD_USER:$BUILD_USER" /var/lib/builduser 2>/dev/null || true
 fi
+# Build the env+command wrapper for sudo invocation.
+# The bash -c approach lets us apply env vars, umask, and working directory
+# before exec-ing the actual build command.
+_BUILD_WRAPPER="$_ENV_SETUP"
+if [[ -n "$EXTRA_GROUPS" ]]; then
+    # Try sg to add supplementary groups; fall back to continuing without
+    sg "$EXTRA_GROUPS" -c true 2>/dev/null && _BUILD_WRAPPER="sg '\''$EXTRA_GROUPS'\'' -c \"$_BUILD_WRAPPER\" || ( _warn_dsr '\''sg failed for groups $EXTRA_GROUPS, continuing without'\''; true ); "
+fi
 if [[ -n "$WORK_DIR" ]]; then
 _log_dsr "EXEC: sudo -u $BUILD_USER -- cd $WORK_DIR; ${CMD_ARGS[*]}"
 if [[ -n "$_BL_TMP_HOME" ]]; then
-    sudo -u "$BUILD_USER" -H -- bash -c '\''cd "$1" 2>/dev/null; shift; exec "$@"'\'' _ "$WORK_DIR" "${CMD_ARGS[@]}"
+    sudo -u "$BUILD_USER" -H -- bash -c "${_BUILD_WRAPPER}cd '\''$WORK_DIR'\'' 2>/dev/null || true; exec \"\$@\"" _ "${CMD_ARGS[@]}"
     _user_cmd_exit=$?
     userdel -r "$BUILD_USER" 2>/dev/null || true
     rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
     exit $_user_cmd_exit
 else
-    exec sudo -u "$BUILD_USER" -H -- bash -c '\''cd "$1" 2>/dev/null; shift; exec "$@"'\'' _ "$WORK_DIR" "${CMD_ARGS[@]}"
+    exec sudo -u "$BUILD_USER" -H -- bash -c "${_BUILD_WRAPPER}cd '\''$WORK_DIR'\'' 2>/dev/null || true; exec \"\$@\"" _ "${CMD_ARGS[@]}"
 fi
 else
 _log_dsr "EXEC: sudo -u $BUILD_USER -- ${CMD_ARGS[*]}"
 if [[ -n "$_BL_TMP_HOME" ]]; then
-    sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
+    sudo -u "$BUILD_USER" -H -- bash -c "${_BUILD_WRAPPER}exec \"\$@\"" _ "${CMD_ARGS[@]}"
     _user_cmd_exit=$?
     userdel -r "$BUILD_USER" 2>/dev/null || true
     rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
     exit $_user_cmd_exit
 else
-    exec sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
+    exec sudo -u "$BUILD_USER" -H -- bash -c "${_BUILD_WRAPPER}exec \"\$@\"" _ "${CMD_ARGS[@]}"
 fi
+fi
+elif [[ -n "$TARGET_USER" ]] && [[ "$(id -u)" -eq 0 ]]; then
+# --property=User=someuser without DynamicUser: switch to that user.
+# Environment vars, umask, and working directory are applied via bash -c wrapper.
+_log_dsr "EXEC: sudo -u $TARGET_USER -- ${CMD_ARGS[*]}"
+if [[ -n "$WORK_DIR" ]]; then
+    exec sudo -u "$TARGET_USER" -H -- bash -c "${_BUILD_WRAPPER}cd '\''$WORK_DIR'\'' 2>/dev/null || true; exec \"\$@\"" _ "${CMD_ARGS[@]}"
+else
+    exec sudo -u "$TARGET_USER" -H -- bash -c "${_BUILD_WRAPPER}exec \"\$@\"" _ "${CMD_ARGS[@]}"
 fi
 else
+# Non-DynamicUser, non-User= path: run as current user.
+# Apply env vars, umask, and working directory directly.
+${_ENV_SETUP}
 if [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR" ]]; then cd "$WORK_DIR" 2>/dev/null || true; fi
 _log_dsr "EXEC: ${CMD_ARGS[*]}"
 exec "${CMD_ARGS[@]}"

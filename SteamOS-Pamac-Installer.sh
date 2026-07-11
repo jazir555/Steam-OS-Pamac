@@ -2291,11 +2291,27 @@ _atomic_sed_inplace() {
 # Escape all sed-special characters in a replacement string.
 # Use this when embedding user-supplied values into s/pattern/replacement/exprs.
 # Characters escaped: \ & / (the three that break s/// sed substitutions).
+# When the delimiter is |, only \ and & need escaping (not /).
 _sed_escape_replacement() {
     local _s="$1"
     _s="${_s//\\/\\\\}"
     _s="${_s//&/\\&}"
     _s="${_s//\//\\/}"
+    echo "$_s"
+}
+# Escape sed-special characters in a search pattern.
+# Characters escaped: \ / [ ] ^ $ . * (these are regex/sed metacharacters).
+# Use when embedding user-supplied values into the search side of s/pattern/replacement/.
+_sed_escape_pattern() {
+    local _s="$1"
+    _s="${_s//\\/\\\\}"
+    _s="${_s//\//\\/}"
+    _s="${_s//\[/\\[}"
+    _s="${_s//\]/\\]}"
+    _s="${_s//^/\\^}"
+    _s="${_s//\$/\\\$}"
+    _s="${_s//./\\.}"
+    _s="${_s//\*/\\*}"
     echo "$_s"
 }
 _calc_makepkg_jobs() {
@@ -2485,6 +2501,8 @@ _write_fake_systemd_run_wrapper() {
 # Prints visible warnings to stderr when unrecognized properties are detected.
 _DSR_LOG="/tmp/systemd-run-fake.log"
 DSR_VERSION="2.0"
+# Strict-security mode: when true, seccomp compilation failure is fatal.
+_DSR_STRICT_SECURITY="${_STRICT_SECURITY_MODE:-false}"
 _log_dsr() { echo "[$(date '\''+%H:%M:%S'\'')] $*" >> "$_DSR_LOG" 2>/dev/null; }
 _warn_dsr() { echo "systemd-run(fake): WARNING: $*" >> "$_DSR_LOG" 2>/dev/null; echo "systemd-run(fake): WARNING: $*" >&2 2>/dev/null || true; }
 
@@ -3363,6 +3381,13 @@ if $_NEEDS_SANDBOX; then
     _seccomp_args="$(_build_seccomp_args)"
     if [[ -n "$_seccomp_args" ]]; then
         _SECCOMP_HELPER="$(_compile_seccomp_helper)" || _SECCOMP_HELPER=""
+        if [[ -z "$_SECCOMP_HELPER" ]] && [[ "$_DSR_STRICT_SECURITY" == "true" ]]; then
+            echo "systemd-run(fake): FATAL: seccomp helper compilation failed under --strict-security." >&2
+            echo "  Sandboxing properties (MemoryDenyWriteExecute, RestrictSUIDSGID, etc.)" >&2
+            echo "  cannot be enforced without the seccomp helper. Aborting to avoid" >&2
+            echo "  running with degraded security." >&2
+            exit 1
+        fi
     fi
     # Build the sandboxed command
     if [[ -n "$WORK_DIR" ]]; then
@@ -3419,6 +3444,11 @@ if $_NEEDS_SANDBOX; then
     _seccomp_args="$(_build_seccomp_args)"
     if [[ -n "$_seccomp_args" ]]; then
         _SECCOMP_HELPER="$(_compile_seccomp_helper)" || _SECCOMP_HELPER=""
+        if [[ -z "$_SECCOMP_HELPER" ]] && [[ "$_DSR_STRICT_SECURITY" == "true" ]]; then
+            echo "systemd-run(fake): FATAL: seccomp helper compilation failed under --strict-security." >&2
+            echo "  Sandboxing properties cannot be enforced. Aborting." >&2
+            exit 1
+        fi
     fi
     if [[ -n "$_SECCOMP_HELPER" ]]; then
         _DSR_SBOX="exec ${_CAP_PRIV}${_NNP}sudo -u '$TARGET_USER' -H -- $_SECCOMP_HELPER $_seccomp_args -- bash -c '$_INNER_CMD' -- ${CMD_ARGS[*]}"
@@ -3441,10 +3471,27 @@ if $_NEEDS_SANDBOX; then
     [[ -n "${_DSR_CAP_ARGS:-}" ]] && _CAP_PRIV="setpriv ${_DSR_CAP_ARGS} -- "
     _NNP=""
     [[ "${_DSR_NO_NEW_PRIVS:-}" == "true" ]] && _NNP="setpriv --no-new-privs -- "
-    exec unshare --mount --propagation slave bash -c "
-        _apply_sandbox
-        ${_NNP}${_CAP_PRIV}exec \"\${@}\"
-    " -- "${CMD_ARGS[@]}"
+    _SECCOMP_HELPER=""
+    _seccomp_args="$(_build_seccomp_args)"
+    if [[ -n "$_seccomp_args" ]]; then
+        _SECCOMP_HELPER="$(_compile_seccomp_helper)" || _SECCOMP_HELPER=""
+        if [[ -z "$_SECCOMP_HELPER" ]] && [[ "$_DSR_STRICT_SECURITY" == "true" ]]; then
+            echo "systemd-run(fake): FATAL: seccomp helper compilation failed under --strict-security." >&2
+            echo "  Sandboxing properties cannot be enforced. Aborting." >&2
+            exit 1
+        fi
+    fi
+    if [[ -n "$_SECCOMP_HELPER" ]]; then
+        exec unshare --mount --propagation slave bash -c "
+            _apply_sandbox
+            ${_NNP}${_CAP_PRIV}$_SECCOMP_HELPER $_seccomp_args -- exec \"\${@}\"
+        " -- "${CMD_ARGS[@]}"
+    else
+        exec unshare --mount --propagation slave bash -c "
+            _apply_sandbox
+            ${_NNP}${_CAP_PRIV}exec \"\${@}\"
+        " -- "${CMD_ARGS[@]}"
+    fi
 else
     exec "${CMD_ARGS[@]}"
 fi

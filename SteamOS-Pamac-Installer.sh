@@ -2329,6 +2329,34 @@ return 0
 PAMAC_COMMON
 fi
 . /usr/local/lib/pamac-common.sh
+# Integrity check: verify the sourced file defines the expected function.
+# A corrupted or truncated pamac-common.sh would silently break all container
+# scripts that depend on _safe_sleep. If the check fails, rewrite the file.
+if ! declare -f _safe_sleep >/dev/null 2>&1; then
+    echo "WARNING: /usr/local/lib/pamac-common.sh is corrupted (missing _safe_sleep). Rewriting."
+    rm -f /usr/local/lib/pamac-common.sh 2>/dev/null || true
+    cat > /usr/local/lib/pamac-common.sh << '\''PAMAC_COMMON'\''
+_safe_sleep() {
+local _d="$1"
+case "$_d" in ''|*[!0-9]*) _d=1 ;; esac
+if sleep "$_d" 2>/dev/null; then return 0; fi
+if command -v python3 >/dev/null 2>&1; then
+    python3 -c "import time,sys; time.sleep(float(sys.argv[1]))" "$_d" 2>/dev/null && return 0
+fi
+if command -v perl >/dev/null 2>&1; then
+    perl -e "select undef,undef,undef,\$ARGV[0]" "$_d" 2>/dev/null && return 0
+fi
+local _target=\$(( _d + 0 ))
+[[ \$_target -lt 1 ]] && _target=1
+local _start=\$SECONDS
+while (( SECONDS - _start < _target )); do
+    read -t 1 _dummy </dev/null 2>/dev/null || true
+done
+return 0
+}
+PAMAC_COMMON
+    . /usr/local/lib/pamac-common.sh
+fi
 _remove_stale_lock() {
     local _lock="/var/lib/pacman/db.lck"
     if [[ ! -f "$_lock" ]]; then return 0; fi
@@ -3783,13 +3811,8 @@ SYSTEMD_RUN_FAKE_HEREDOC
 _atomic_write_pacman_conf() {
     local target="/etc/pacman.conf"
     local new_siglevel="$1"
-    local tmp
-    tmp=$(mktemp "${target}.atomic.XXXXXX") || { echo "FATAL: mktemp failed"; return 1; }
-    cp -f "$target" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
-    sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = ${new_siglevel}/" "$tmp"
-    grep -q '^SigLevel' "$tmp" || printf 'SigLevel = %s\n' "$new_siglevel" >> "$tmp"
-    sync "$tmp" 2>/dev/null || sync 2>/dev/null || true
-    mv -f "$tmp" "$target"
+    _atomic_sed_inplace "$target" "s|^[[:space:]]*SigLevel.*|SigLevel = ${new_siglevel}|"
+    grep -q '^SigLevel' "$target" 2>/dev/null || printf 'SigLevel = %s\n' "$new_siglevel" >> "$target"
 }
 '
 

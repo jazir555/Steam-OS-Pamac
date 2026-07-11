@@ -8199,6 +8199,7 @@ flock -n 9 || exit 0
 APP_DIR="/home/${current_user}/.local/share/applications"
 STATE_DIR="/home/${current_user}/.local/share/steamos-pamac/${container_name}"
 STATE_FILE="\$STATE_DIR/exported-apps.list"
+CONTAINER_MANAGER="${DISTROBOX_CONTAINER_MANAGER:-podman}"
 EXPORT_LOG="\$STATE_DIR/export-hook.log"
 EXPLICIT_FILE="\$(mktemp)"
 NEW_STATE_FILE="\$(mktemp)"
@@ -8279,6 +8280,7 @@ annotate_desktop() {
     local app_name="\$2"
     local export_name="\$3"
     local owner_pkg="\$4"
+    local _cm="\${5:-\${CONTAINER_MANAGER:-podman}}"
 
     [[ -f "\$desktop_file" ]] || return 1
 
@@ -8313,7 +8315,7 @@ X-SteamOS-Pamac-SourcePackage=pamac-aur
 
 [Desktop Action uninstall]
 Name=Uninstall Packages
-Exec=bash -c '\\$(command -v podman || command -v docker || echo podman) exec -u 0 ${container_name} pacman -R --noconfirm pamac-aur 2>/dev/null && rm -f /home/${current_user}/.local/share/applications/${container_name}-org.manjaro.pamac.manager.desktop && touch /home/${current_user}/.local/share/applications && notify-send -i edit-delete "Uninstalled" "pamac-aur removed" 2>/dev/null'
+Exec=bash -c '${DISTROBOX_CONTAINER_MANAGER:-podman} exec -u 0 ${container_name} pacman -R --noconfirm pamac-aur 2>/dev/null && rm -f /home/${current_user}/.local/share/applications/${container_name}-org.manjaro.pamac.manager.desktop && touch /home/${current_user}/.local/share/applications && notify-send -i edit-delete "Uninstalled" "pamac-aur removed" 2>/dev/null'
 Icon=edit-delete
 PAMAC_DESKTOP
     _fix_desktop_permissions "\$desktop_file"
@@ -8390,7 +8392,7 @@ PAMAC_DESKTOP
         _desktop_bn=app_name ".desktop"
         _host_file="/home/" user "/.local/share/applications/" container "-" _desktop_bn
         _apps_dir="/home/" user "/.local/share/applications"
-        printf "Exec=bash -c '\\$(command -v podman || command -v docker || echo podman) exec -u 0 %s pacman -R --noconfirm %s 2>/dev/null && rm -f %s && touch %s && notify-send -i edit-delete \"Uninstalled\" \"%s removed\" 2>/dev/null'\n", container, owner_pkg, _host_file, _apps_dir, owner_pkg
+        printf "Exec=bash -c '%s exec -u 0 %s pacman -R --noconfirm %s 2>/dev/null && rm -f %s && touch %s && notify-send -i edit-delete \"Uninstalled\" \"%s removed\" 2>/dev/null'\n" "\$_cm" container, owner_pkg, _host_file, _apps_dir, owner_pkg
         print "Icon=edit-delete"
     }
     { print }
@@ -8400,7 +8402,7 @@ PAMAC_DESKTOP
   fi
   desktop_basename="\$(basename "\$desktop_file")"
 
-  python3 - "\$desktop_file" "\$desktop_basename" "${container_name}" "${current_user}" "\$export_name" "\$app_name" "\$owner_pkg" << 'PYTHON_DESKTOP_REWRITE'
+  python3 - "\$desktop_file" "\$desktop_basename" "${container_name}" "${current_user}" "\$export_name" "\$app_name" "\$owner_pkg" "\$_cm" << 'PYTHON_DESKTOP_REWRITE'
 import sys, configparser, io
 
 desktop_path = sys.argv[1]
@@ -8410,6 +8412,7 @@ current_user = sys.argv[4]
 export_name = sys.argv[5]
 app_name = sys.argv[6]
 owner_pkg = sys.argv[7]
+_cm = sys.argv[8]
 
 # Read raw file to preserve sections configparser may flatten
 with open(desktop_path, 'r') as f:
@@ -8491,7 +8494,7 @@ _apps_dir = f'/home/{current_user}/.local/share/applications'
 lines.append('')
 lines.append('[Desktop Action uninstall]')
 lines.append(f'Name=Uninstall {owner_pkg}')
-lines.append(f"Exec=bash -c '\\$(command -v podman || command -v docker || echo podman) exec -u 0 {container_name} pacman -R --noconfirm {owner_pkg} 2>/dev/null && rm -f {_host_desktop_path} && touch {_apps_dir} && notify-send -i edit-delete \"Uninstalled\" \"{owner_pkg} removed\" 2>/dev/null'")
+lines.append(f"Exec=bash -c '{_cm} exec -u 0 {container_name} pacman -R --noconfirm {owner_pkg} 2>/dev/null && rm -f {_host_desktop_path} && touch {_apps_dir} && notify-send -i edit-delete \"Uninstalled\" \"{owner_pkg} removed\" 2>/dev/null'")
 lines.append('Icon=edit-delete')
 
 for section, items in other_sections.items():

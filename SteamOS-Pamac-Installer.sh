@@ -88,6 +88,7 @@ EXPORT_ONLY="${EXPORT_ONLY:-false}"
 LOG_LEVEL="${LOG_LEVEL:-normal}"
 PAMAC_VERSION="${PAMAC_VERSION:-}"
 NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
+SKIP_COMPAT_CHECK="${SKIP_COMPAT_CHECK:-false}"
 # SECURITY (default off): PermitUserEnvironment yes in sshd lets any
 # SSH-authenticated user inject arbitrary environment variables (LD_PRELOAD,
 # PATH...) via ~/.ssh/environment — a known privilege-escalation vector on
@@ -248,6 +249,12 @@ sanitize_and_upload_log() {
         -e 's/(Bearer |Authorization:)[^ ]*/\1<REDACTED>/gi' \
         -e 's/password[=: ].*$/password=<REDACTED>/gi' \
         -e 's/token[=: ].*$/token=<REDACTED>/gi' \
+        -e 's/secret[=: ].*$/secret=<REDACTED>/gi' \
+        -e 's/api[_-]?key[=: ].*$/api_key=<REDACTED>/gi' \
+        -e 's/access[_-]?key[=: ].*$/access_key=<REDACTED>/gi' \
+        -e 's/AWS_[A-Z_]*[=: ].*$/<REDACTED>/gi' \
+        -e 's/\?key=[^ &]*$/\?key=<REDACTED>/gi' \
+        -e 's/base64,[A-Za-z0-9+/]\{32,\}[=]*/base64,<REDACTED>/gi' \
         "$LOG_FILE" > "$sanitized_log" 2>/dev/null || {
             log_warn "Log sanitization failed. Uploading raw log."
             cp -f "$LOG_FILE" "$sanitized_log"
@@ -615,12 +622,15 @@ force_remove_container() {
       done <<< "$_reset_output"
     fi
     if [[ "$_reset_rc" -ne 0 ]]; then
-      log_warn "podman system reset --force returned exit code $_reset_rc (reset itself failed). Continuing to check..."
+      log_error "podman system reset --force FAILED (exit $_reset_rc). The container engine may need a reboot."
     fi
 
     if container_runtime_privileged inspect "$name" >/dev/null 2>&1; then
-      log_error "Container '$name' still exists after system reset. Manual intervention required."
-      log_info "Try: sudo podman rm -f '$name' or reboot the system."
+      log_error "Container '$name' still exists after system reset."
+      log_error "Manual intervention required. Try in order:"
+      log_error "  1. sudo podman rm -f '$name'"
+      log_error "  2. sudo systemctl --user restart podman && sudo podman rm -f '$name'"
+      log_error "  3. Reboot the system, then run this script again"
       return 1
     fi
   fi
@@ -1205,6 +1215,9 @@ OPTIONS:
   --disable-multilib        Explicitly disable 32-bit package support
   --pamac-version VERSION    Pin pamac-aur to a specific AUR version/commit
                              (default: latest; use "latest" for automatic)
+  --skip-compat-check        Skip pamac-aur AUR compatibility check (avoids
+                             AUR RPC dependency; for users who know their
+                             pacman version is compatible)
   --enable-gaming            Install extra gaming packages
   --disable-gaming           Do not install gaming packages (default)
   --enable-extra-repos       Enable popular third-party repositories (default)
@@ -1312,6 +1325,7 @@ parse_arguments() {
                 PAMAC_VERSION="$2"
                 shift 2
                 ;;
+            --skip-compat-check) SKIP_COMPAT_CHECK="true"; shift ;;
             --uninstall) UNINSTALL="true"; shift ;;
             --status) STATUS="true"; shift ;;
             --update) UPDATE="true"; shift ;;
@@ -1447,7 +1461,7 @@ wait_for_container() {
     log_warn "[DRY RUN] Would wait for container '$CONTAINER_NAME'"
     return 0
   fi
-  local max_attempts=30
+  local max_attempts="${CONTAINER_START_TIMEOUT:-60}"
   local attempt=0
   _WFC_SAVED_ERREXIT=$(shopt -o -q errexit && echo "on" || echo "off")
   log_info "Waiting for container '$CONTAINER_NAME' to become ready..."
@@ -2144,7 +2158,13 @@ _atomic_sed_inplace() {
     local _target="$1"; shift
     local _tmp; _tmp=$(mktemp "${_target}.atomic.XXXXXX") || { echo "FATAL: mktemp failed for atomic sed on $_target"; return 1; }
     cp -f "$_target" "$_tmp" 2>/dev/null || { rm -f "$_tmp"; return 1; }
-    for _expr in "$@"; do sed -i "$_expr" "$_tmp"; done
+    for _expr in "$@"; do
+        if ! sed -i "$_expr" "$_tmp"; then
+            echo "FATAL: sed expression failed: $_expr" >&2
+            rm -f "$_tmp"
+            return 1
+        fi
+    done
     sync "$_tmp" 2>/dev/null || sync 2>/dev/null || true
     mv -f "$_tmp" "$_target"
 }
@@ -2192,7 +2212,7 @@ safe_install() {
                     sync 2>/dev/null || true
                     _safe_sleep 5
                     # On OOM, try to free some cache
-                    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+                    echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
                     ;;
                 1)
                 echo "  Exit 1: General error (dependency conflict, etc.)."
@@ -5505,6 +5525,10 @@ BUILD_EOF
 }
 
 ensure_pamac_aur_compat() {
+    if [[ "${SKIP_COMPAT_CHECK:-}" == "true" ]]; then
+        log_info "Skipping pamac-aur compatibility check (--skip-compat-check)."
+        return 0
+    fi
     log_step "Ensuring pamac-aur AUR compatibility with container pacman"
 
     local compat_script
@@ -7103,8 +7127,16 @@ export XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}
 if [[ -z "\${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
     if [[ -S "\$XDG_RUNTIME_DIR/bus" ]]; then
         export DBUS_SESSION_BUS_ADDRESS="unix:path=\$XDG_RUNTIME_DIR/bus"
-    else
+    elif [[ -S "/run/user/\$(id -u)/bus" ]]; then
         export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$(id -u)/bus"
+    else
+        # Fallback: check /tmp/dbus-* for non-systemd or alternative hosts
+        _dbus_sock=\$(ls /tmp/dbus-* 2>/dev/null | head -1)
+        if [[ -n "\$_dbus_sock" && -S "\$_dbus_sock" ]]; then
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=\$_dbus_sock"
+        else
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$(id -u)/bus"
+        fi
     fi
 fi
 
@@ -8160,6 +8192,10 @@ if [[ "\$(id -u)" == "0" ]]; then
     su -s /bin/bash ${current_user} -c "PATH=/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin XDG_DATA_DIRS=/usr/local/share:/usr/share XDG_DATA_HOME=/home/${current_user}/.local/share /usr/local/bin/distrobox-export-hook.sh" 2>/dev/null || true
     exit 0
 fi
+
+# Prevent concurrent hook execution (two pacman transactions racing)
+exec 9>/tmp/distrobox-export-hook.lock
+flock -n 9 || exit 0
 
 APP_DIR="/home/${current_user}/.local/share/applications"
 STATE_DIR="/home/${current_user}/.local/share/steamos-pamac/${container_name}"

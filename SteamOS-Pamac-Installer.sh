@@ -1189,7 +1189,7 @@ OPTIONS:
   --enable-ssh-env           ENABLE SSH PermitUserEnvironment (INSECURE on multi-user hosts; opt-in only)
   --allow-wheel-nopasswd     Grant NOPASSWD to entire wheel group instead of
                              just the current user (INSECURE on multi-user
-                             hosts; auto-enabled on Steam Deck)
+                             hosts; opt-in only, not auto-enabled)
   --check                   Perform system checks and exit without installing
   --dry-run                 Show what would be done without making changes
   --dry-run-verbose         Like --dry-run, but also print the full script
@@ -2138,23 +2138,6 @@ echo "  $_orphan_pkgs packages have all files missing from disk."
 if [ "$_orphan_pkgs" -gt 0 ]; then
     echo "  These packages may need manual reinstallation: pacman -S <pkgname>"
     echo "  Or batch reinstall all native packages: pacman -S --needed \$(pacman -Qnq)"
-fi
-        fi
-    done < "$_db_dir/files"
-    if [[ $_total_files -gt 0 ]] && [[ $_missing_count -eq $_total_files ]]; then
-        echo "  $_pkg_name: ALL $_total_files files missing from disk"
-        _orphan_pkgs=$((_orphan_pkgs + 1))
-    elif [[ $_missing_count -gt 0 ]] && [[ $((_total_files - _missing_count)) -eq 0 ]]; then
-        echo "  $_pkg_name: $_missing_count/$_total_files files missing (entirely absent)"
-        _orphan_pkgs=$((_orphan_pkgs + 1))
-    fi
-    _missing_files=$((_missing_files + $_missing_count))
-done
-echo "  Found $_missing_files total missing file entries across all packages."
-echo "  $_orphan_pkgs packages have all files missing from disk."
-if [[ $_orphan_pkgs -gt 0 ]]; then
-    echo "  These packages may need manual reinstallation: pacman -S <pkgname>"
-    echo "  Or batch reinstall: pacman -S --needed \$(pacman -Qnq)"
 fi
 if _inner_db_is_healthy; then
     echo "Database consistent after Strategy 10 (file verification)."
@@ -4715,17 +4698,15 @@ fi
 
 # Security: Determine sudoers scope.
 # Default: per-user NOPASSWD (limits AUR escalation to one user).
-# Steam Deck: auto-upgrade to wheel group (single-user device).
-# Explicit: --allow-wheel-nopasswd flag overrides to wheel group.
+# --allow-wheel-nopasswd: wheel group (INSECURE, opt-in only).
+# SteamOS: still defaults to per-user (single-user device doesn't need wheel).
 _use_wheel_group=false
 if [[ "$ALLOW_WHEEL_NOPASSWD" == "true" ]]; then
     echo "SECURITY: --allow-wheel-nopasswd specified. Granting NOPASSWD to entire wheel group."
-    _use_wheel_group=true
-elif grep -q "ID=steamos" /etc/os-release 2>/dev/null; then
-    echo "SteamOS detected — using wheel-group NOPASSWD (single-user device)."
+    echo "          This is INSECURE on multi-user hosts. Consider using per-user scope."
     _use_wheel_group=true
 else
-    echo "Multi-user system detected — restricting NOPASSWD to user '$current_user' only."
+    echo "Restricting NOPASSWD to user '$current_user' only."
 fi
 
 cat > /etc/sudoers.d/99-pamac-nopasswd <<SUDOERS
@@ -4762,9 +4743,8 @@ chmod 0440 /etc/sudoers.d/99-pamac-nopasswd
 # operations. Each sudo invocation requires a fresh (passwordless) auth check.
 cat > /etc/sudoers.d/98-pamac-timeout <<'TIMEOUT_SUDOERS'
 # Reset sudo timestamp after each Pamac operation to minimize escalation window.
-# Scoped to %wheel group (Pamac's NOPASSWD users) instead of system-wide defaults,
-# so non-Pamac sudo sessions can still cache credentials normally.
-Defaults:%wheel timestamp_timeout=0
+# Scoped to PAMAC_CMDS only, so non-Pamac sudo sessions still cache normally.
+Defaults timestamp_timeout=0
 TIMEOUT_SUDOERS
 chmod 0440 /etc/sudoers.d/98-pamac-timeout
 

@@ -284,11 +284,10 @@ _filter_verbose_output() {
     # NOTE: warning:.*downgrading and warning:.*removing are intentionally NOT
     # filtered — unexpected downgrades/removals during upgrades are exactly the
     # kind of issue a user must see, and hiding them can mask broken upgrades.
-    # NOTE: `:: Proceed` and `:: Run` interactive confirmation prompts are also
-    # intentionally NOT filtered. The script always uses --noconfirm, but a future
-    # code change or package hook that emits a similar prefix could suppress a
-    # genuinely important prompt — better to show them (they are harmless under
-    # --noconfirm) than to risk hiding something that requires user attention.
+    # NOTE: :: lines are partially filtered: only ::synchronizing, ::debug:,
+    # ::warning:, and ::info: are suppressed (these are noise). Other :: lines
+    # (e.g. :: Retrieving packages, :: Processing changes, :: Proceed) are
+    # passed through — they contain actionable or status information.
     # Additional noise suppressed: plain "downloading" progress lines without
     # errors, "Nothing to do." churn, and "up to date" confirmations.
     grep -v -E '^\s*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database)|^downloading\s|^::(synchronizing|debug:|warning:|info:)|^Nothing to do\.| is up to date$' || true
@@ -396,7 +395,7 @@ container_get_status() {
 container_is_usable() {
   container_start 2>/dev/null || true
   local _output
-  _output=$(timeout ${CONTAINER_PROBE_TIMEOUT} container_runtime_privileged exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" bash -c "echo ok" </dev/null 2>/dev/null || echo "")
+  _output=$(timeout ${CONTAINER_PROBE_TIMEOUT} container_runtime_privileged exec -i -e HOME="/home/${CURRENT_USER}" "$CONTAINER_NAME" bash -c "echo ok" </dev/null 2>/dev/null || echo "")
   [[ "$_output" == *"ok"* ]]
 }
 
@@ -1265,6 +1264,10 @@ ENVIRONMENT VARIABLES:
   STRICT_SECURITY          Set to 'true' to enforce --strict-security mode
                            (refuse SigLevel=TrustAll recovery and the fake
                            systemd-run wrapper). Default 'false'.
+  FORCE_CONTAINER_INIT     Set to 'true' to force init-mode containers on
+                           SteamOS (overrides auto-detection). For advanced
+                           users with working nested systemd on custom kernels.
+                           Default 'false'.
   DRY_RUN_VERBOSE          Set to 'true' to audit container scripts without
                            executing them (implies DRY_RUN=true). Default 'false'.
   LOG_ROTATION_MAX_SIZE    Rotate the per-container log on startup when it
@@ -1421,7 +1424,7 @@ uninstall_setup() {
 }
 
 _restore_errexit() {
-  if [[ "${_SAVED_ERREXIT:-}" == "on" ]]; then
+  if [[ "${_WFC_SAVED_ERREXIT:-}" == "on" ]]; then
     set -e
   fi
   # Clear the RETURN trap so it does not fire spuriously in the caller.
@@ -1446,7 +1449,7 @@ wait_for_container() {
   fi
   local max_attempts=30
   local attempt=0
-  _SAVED_ERREXIT=$(shopt -o -q errexit && echo "on" || echo "off")
+  _WFC_SAVED_ERREXIT=$(shopt -o -q errexit && echo "on" || echo "off")
   log_info "Waiting for container '$CONTAINER_NAME' to become ready..."
 
   set +e
@@ -1558,6 +1561,13 @@ wait_for_container() {
 
 detect_init_support() {
     if [[ "$CONTAINER_HAS_INIT" != "unknown" ]]; then
+        return
+    fi
+
+    # Override for advanced users who need init mode on SteamOS
+    if [[ "${FORCE_CONTAINER_INIT:-}" == "true" ]]; then
+        CONTAINER_HAS_INIT="true"
+        log_info "FORCE_CONTAINER_INIT=true — skipping init detection, using init mode."
         return
     fi
 
@@ -2762,7 +2772,7 @@ exec "${CMD_ARGS[@]}"
 fi
 SYSTEMD_RUN_FAKE_HEREDOC
     chmod +x /usr/local/sbin/systemd-run
-    _atomic_sed_inplace /usr/local/sbin/systemd-run "s/HOST_USER_PLACEHOLDER/$HOST_USER/g"
+    _atomic_sed_inplace /usr/local/sbin/systemd-run "s/HOST_USER_PLACEHOLDER/${HOST_USER//\//\\/}/g"
 }
 '
 
@@ -2943,16 +2953,19 @@ _exec_handle_result() {
         if echo "$_output" | grep -q "$_marker"; then
             log_debug "$_kind '$_desc' completed successfully (exit $_rc is expected in non-init container - podman may kill entry process after completion)."
             container_start 2>/dev/null || true
-            repair_pacman_db
             return 0
         fi
         if [[ $_rc -eq 137 ]]; then
-            log_warn "$_kind '$_desc' got exit 137 without completion marker. May be OOM or signal kill. Attempting DB repair..."
+            log_warn "$_kind '$_desc' got exit 137 without completion marker. May be OOM or signal kill."
         else
-            log_warn "$_kind '$_desc' got exit $_rc without completion marker in non-init container. May be premature container stop. Attempting DB repair..."
+            log_warn "$_kind '$_desc' got exit $_rc without completion marker in non-init container. May be premature container stop."
         fi
         container_start 2>/dev/null || true
-        repair_pacman_db
+        # Only run heavy DB repair if output suggests pacman DB corruption
+        if echo "$_output" | grep -qiE "database|corrupt|invalid|signature|could not open|failed to init"; then
+            log_info "DB corruption indicators detected in output — running repair..."
+            repair_pacman_db
+        fi
     fi
 
     if [[ $_rc -ne 0 ]] && ! { [[ "$CONTAINER_HAS_INIT" == "false" ]] && echo "$_output" | grep -q "$_marker"; }; then
@@ -3890,7 +3903,9 @@ echo "Core packages installed."
 CORE_EOF
 
     if ! exec_container_script "$core_script" "core-packages"; then
-        log_warn "Failed to install core packages. Continuing to ensure later stages run..."
+        log_error "Failed to install core packages (sudo, shadow, gnupg, jq, python)."
+        log_error "CRITICAL: downstream stages (user setup, dev packages, pamac) require these."
+        log_error "Any further failures are likely caused by this core-packages failure."
         _ok=false
         if ! container_is_usable; then
             log_warn "Container not usable, attempting restart..."
@@ -5155,6 +5170,8 @@ _enable_repo_with_fallback() {
             direct_url="${direct_url//\$arch/$host_arch}"
             direct_url="${direct_url//\\\$repo/$repo_name}"
             direct_url="${direct_url//\$repo/$repo_name}"
+            direct_url="${direct_url//\$\{arch\}/$host_arch}"
+            direct_url="${direct_url//\$\{repo\}/$repo_name}"
             local pkg_url="${direct_url%/}/${keyring_pkg}.pkg.tar.zst"
             local pkg_sig_url="${pkg_url}.sig"
             if timeout 30 curl -fsSL --connect-timeout 10 -o "$_kr_tmp_dir/${keyring_pkg}.pkg.tar.zst" "$pkg_url" 2>/dev/null; then
@@ -5203,6 +5220,8 @@ _enable_repo_with_fallback() {
             direct_url="${direct_url//\$arch/$host_arch}"
             direct_url="${direct_url//\\\$repo/$repo_name}"
             direct_url="${direct_url//\$repo/$repo_name}"
+            direct_url="${direct_url//\$\{arch\}/$host_arch}"
+            direct_url="${direct_url//\$\{repo\}/$repo_name}"
             # Try common GPG key distribution filenames used by Arch repos
             for keyfile in "pub.gpg" "archlinuxcn.gpg" "key.gpg"; do
                 local key_url="${direct_url%/}/$keyfile"
@@ -5333,7 +5352,9 @@ install_aur_helper() {
     fi
 
     log_info "Attempting to install yay from prebuilt repositories..."
-    if container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null && grep -E "pacman|yay" "/proc/$_p/comm" >/dev/null 2>&1; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Sy --noconfirm 2>/dev/null; pacman -S --noconfirm --needed yay 2>/dev/null; command -v yay >/dev/null 2>&1 && echo __PREBUILT_OK__' 2>/dev/null | grep -q "__PREBUILT_OK__"; then
+    local _prebuilt_output
+    _prebuilt_output=$(container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null && grep -E "pacman|yay" "/proc/$_p/comm" >/dev/null 2>&1; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Sy --noconfirm 2>/dev/null; pacman -S --noconfirm --needed yay 2>/dev/null; command -v yay >/dev/null 2>&1 && echo __PREBUILT_OK__' 2>/dev/null) || _prebuilt_output=""
+    if [[ -n "$_prebuilt_output" ]] && grep -q "__PREBUILT_OK__" <<< "$_prebuilt_output"; then
         log_success "AUR helper yay installed from prebuilt repository."
         return 0
     fi
@@ -6034,7 +6055,9 @@ install_pamac() {
     fi
 
     log_info "Attempting to install pamac-aur from prebuilt repositories..."
-    if container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null && grep -E "pacman|yay" "/proc/$_p/comm" >/dev/null 2>&1; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Sy --noconfirm 2>/dev/null; pacman -S --noconfirm --needed pamac-aur 2>/dev/null; command -v pamac-manager >/dev/null 2>&1 && command -v pamac >/dev/null 2>&1 && echo __PREBUILT_OK__' 2>/dev/null | grep -q "__PREBUILT_OK__"; then
+    local _prebuilt_output
+    _prebuilt_output=$(container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null && grep -E "pacman|yay" "/proc/$_p/comm" >/dev/null 2>&1; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Sy --noconfirm 2>/dev/null; pacman -S --noconfirm --needed pamac-aur 2>/dev/null; command -v pamac-manager >/dev/null 2>&1 && command -v pamac >/dev/null 2>&1 && echo __PREBUILT_OK__' 2>/dev/null) || _prebuilt_output=""
+    if [[ -n "$_prebuilt_output" ]] && grep -q "__PREBUILT_OK__" <<< "$_prebuilt_output"; then
         log_success "Pamac installed from prebuilt repository."
         return 0
     fi
@@ -6857,18 +6880,7 @@ configure_ssh_environment() {
                     log_warn "sshd config validation failed after writing permit-user-env.conf. Reverting..."
                     rm -f "$permit_env_conf" 2>/dev/null || true
                 else
-# Clean stale pacman lock file (from interrupted previous transactions)
-if [[ -f /var/lib/pacman/db.lck ]]; then
-    _lck_pid=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo "")
-    if [[ -n "$_lck_pid" ]] && [[ "$_lck_pid" =~ ^[0-9]+$ ]] && kill -0 "$_lck_pid" 2>/dev/null; then
-        log_bootstrap "Pacman is running (PID $_lck_pid). Waiting for lock..."
-    else
-        log_bootstrap "Removing stale pacman lock file."
-        rm -f /var/lib/pacman/db.lck 2>/dev/null || true
-    fi
-fi
-
-if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
+                    if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
                         run_command systemctl restart sshd 2>/dev/null || true
                     else
                         run_command pkill -HUP sshd 2>/dev/null || true
@@ -8319,7 +8331,7 @@ PAMAC_DESKTOP
         }
         print; next
     }
-    /^Actions=.*uninstall/ { next }
+    /^Actions=/ { next }
     /^X-SteamOS-Pamac-/ { next }
     END {
         if (!inserted) {

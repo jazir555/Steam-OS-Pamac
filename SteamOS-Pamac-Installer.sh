@@ -4197,7 +4197,12 @@ touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
 
 
 # Source shared _safe_sleep (written by _CONTAINER_PREAMBLE on first run)
-[ -f /usr/local/lib/pamac-common.sh ] && . /usr/local/lib/pamac-common.sh
+if [ -f /usr/local/lib/pamac-common.sh ]; then
+    . /usr/local/lib/pamac-common.sh
+else
+    # Minimal fallback if shared file is missing/corrupted
+    _safe_sleep() { local _d="${1:-1}"; case "$_d" in ''|*[!0-9]*) _d=1 ;; esac; sleep "$_d" 2>/dev/null || true; }
+fi
 
 log_bootstrap() {
 echo "[$(date '+%H:%M:%S')] $*" >> "$BOOTSTRAP_LOG" 2>/dev/null || true
@@ -4501,7 +4506,12 @@ touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
 
 
 # Source shared _safe_sleep (written by _CONTAINER_PREAMBLE on first run)
-[ -f /usr/local/lib/pamac-common.sh ] && . /usr/local/lib/pamac-common.sh
+if [ -f /usr/local/lib/pamac-common.sh ]; then
+    . /usr/local/lib/pamac-common.sh
+else
+    # Minimal fallback if shared file is missing/corrupted
+    _safe_sleep() { local _d="${1:-1}"; case "$_d" in ''|*[!0-9]*) _d=1 ;; esac; sleep "$_d" 2>/dev/null || true; }
+fi
 
 log_bootstrap() {
 echo "[$(date '+%H:%M:%S')] $*" >> "$BOOTSTRAP_LOG" 2>/dev/null || true

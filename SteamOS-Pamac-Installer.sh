@@ -7082,7 +7082,26 @@ rm -rf /var/lib/pacman/sync/download-* 2>/dev/null || true
 # Without this, pamac-manager's own alpm handle fails with "invalid or corrupted database".
 _tmp_base="/tmp/pamac-\$(id -un)/dbs"
 _tmp_dbs="\$_tmp_base/sync"
+_tmp_lock="\$_tmp_base/.sync_lock"
+
+# Use flock to prevent concurrent sync operations (Pamac GUI + CLI racing)
+mkdir -p "\$_tmp_base" 2>/dev/null
+exec 9>"\$_tmp_lock"
+flock -n 9 2>/dev/null || { echo "Another sync in progress, waiting..."; flock 9; }
+
+# Refresh if tmp_dbs doesn't exist, is empty, or source DBs are newer
+_needs_refresh=false
 if [[ ! -d "\$_tmp_dbs" ]] || [[ -z "\$(ls "\$_tmp_dbs"/*.db 2>/dev/null)" ]]; then
+    _needs_refresh=true
+else
+    _src_newest=\$(stat -c %Y /var/lib/pacman/sync/*.db 2>/dev/null | sort -rn | head -1 || echo "0")
+    _tmp_newest=\$(stat -c %Y "\$_tmp_dbs"/*.db 2>/dev/null | sort -rn | head -1 || echo "0")
+    if [[ "\$_src_newest" -gt "\$_tmp_newest" ]]; then
+        _needs_refresh=true
+    fi
+fi
+
+if [[ "\$_needs_refresh" == "true" ]]; then
     rm -rf "\$_tmp_base" 2>/dev/null || true
     mkdir -p "\$_tmp_dbs"
     ln -sf /var/lib/pacman/local "\$_tmp_base/local"
@@ -7090,6 +7109,8 @@ if [[ ! -d "\$_tmp_dbs" ]] || [[ -z "\$(ls "\$_tmp_dbs"/*.db 2>/dev/null)" ]]; t
     touch "\$_tmp_dbs/refresh_timestamp"
     chmod -R a+rX "\$_tmp_base"
 fi
+
+exec 9>&-
 
 # Check if daemon is running; only start if not
 if ! pgrep -x pamac-daemon >/dev/null 2>&1; then

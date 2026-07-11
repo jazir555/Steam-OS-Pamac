@@ -113,7 +113,6 @@ LOG_LEVEL="${LOG_LEVEL:-normal}"
 PAMAC_VERSION="${PAMAC_VERSION:-}"
 NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
 SKIP_COMPAT_CHECK="${SKIP_COMPAT_CHECK:-false}"
-FORCE_PODMAN_RESET="${FORCE_PODMAN_RESET:-false}"
 NO_COLOR="${NO_COLOR:-false}"
 # SECURITY (default off): PermitUserEnvironment yes in sshd lets any
 # SSH-authenticated user inject arbitrary environment variables (LD_PRELOAD,
@@ -611,73 +610,15 @@ force_remove_container() {
   if container_runtime_for_ops inspect "$name" >/dev/null 2>&1; then
     log_warn "podman rm -f --time 0 still failed for '$name'. The container engine may be corrupted."
     log_warn ""
-    log_warn "IMPORTANT: A full 'podman system reset --force' would destroy ALL containers,"
-    log_warn "images, and volumes — not just this one. This script will NOT do that"
-    log_warn "automatically because it can destroy other distroboxes and podman workloads."
-    log_warn ""
-
-    local other_containers
-    other_containers=$(container_runtime_for_ops ps -a --format '{{.Names}}' 2>/dev/null | grep -v "^${name}$" || true)
-    if [[ -n "$other_containers" ]]; then
-      log_warn "Other containers that would be destroyed by 'podman system reset':"
-      while IFS= read -r oc; do
-        log_warn "  - $oc"
-      done <<< "$other_containers"
-      log_warn ""
-    fi
-
     log_warn "Manual recovery options (in order of safety):"
     log_warn "  1. podman rm -f --time 0 '$name'  (immediate SIGKILL, no grace period)"
     log_warn "  2. podman stop '$name' && podman rm '$name'  (stop then remove)"
     log_warn "  3. systemctl --user restart podman  (restart the engine)"
     log_warn "  4. podman system reset --force     (DESTRUCTIVE: removes ALL containers)"
-
-    if [[ "$NON_INTERACTIVE" == "true" ]]; then
-      log_warn "Non-interactive mode (--non-interactive) — skipping podman system reset to avoid data loss."
-      log_info "Run this script without --non-interactive to approve, or try: podman system reset --force"
-      return
-    fi
-
-    if [[ -t 0 ]]; then
-      echo -ne "${RED}${BOLD}Type 'reset' to run 'podman system reset --force' (destroys ALL containers), or anything else to skip: ${NC}" >&2
-      local cleanup_confirm
-      read -r cleanup_confirm
-      if [[ "$cleanup_confirm" != "reset" ]]; then
-        log_warn "User declined podman system reset. Skipping."
-        log_info "Try manually: podman rm -f '$name' or podman system reset --force"
-        return
-      fi
-    else
-      log_warn "Non-interactive session — skipping podman system reset to avoid data loss."
-      log_info "Run this script interactively to approve, or try: podman system reset --force"
-      return
-    fi
-
-    log_warn "Running 'podman system reset --force' — this will destroy ALL containers, images, and volumes."
-    # Capture the reset's own output+exit, then stream lines to the log.
-    # The previous form piped into `| while read` and grabbed `$?` from the
-    # while loop (always 0 under pipefail because the consumer succeeds),
-    # masking a real reset failure. Capture-first makes the reset exit code
-    # available via PIPESTATUS[0] / the command-substitution rc.
-    local _reset_output _reset_rc=0
-    _reset_output=$(container_runtime_for_ops system reset --force 2>&1) || _reset_rc=$?
-    if [[ -n "$_reset_output" ]]; then
-      while IFS= read -r line; do
-        log_warn "  $line"
-      done <<< "$_reset_output"
-    fi
-    if [[ "$_reset_rc" -ne 0 ]]; then
-      log_error "podman system reset --force FAILED (exit $_reset_rc). The container engine may need a reboot."
-    fi
-
-    if container_runtime_for_ops inspect "$name" >/dev/null 2>&1; then
-      log_error "Container '$name' still exists after system reset."
-      log_error "Manual intervention required. Try in order:"
-      log_error "  1. sudo podman rm -f '$name'"
-      log_error "  2. sudo systemctl --user restart podman && sudo podman rm -f '$name'"
-      log_error "  3. Reboot the system, then run this script again"
-      return 1
-    fi
+    log_warn ""
+    log_warn "The script will NOT run 'podman system reset --force' automatically."
+    log_warn "If you need it, run it manually after backing up important containers."
+    return 1
   fi
 
   if container_runtime_for_ops inspect "$name" >/dev/null 2>&1; then
@@ -1143,56 +1084,16 @@ repair_podman() {
         fi
     fi
 
-    # Step 7: System reset (destructive, requires user confirmation)
-    log_warn "Podman database may be corrupted. A full system reset is required but is DESTRUCTIVE."
-    log_warn "WARNING: 'podman system reset --force' will remove ALL containers, images, and volumes — not just the Pamac container. Any other distroboxes or podman workloads will be lost."
-    local existing_containers
-    existing_containers=$(podman ps -aq 2>/dev/null || true)
-    local container_count=0
-    if [[ -n "$existing_containers" ]]; then
-        container_count=$(echo "$existing_containers" | wc -l)
-        log_warn "The following $container_count container(s) currently exist and will ALL be destroyed:"
-        while IFS= read -r ec; do
-            [[ -n "$ec" ]] && log_warn "  - $ec"
-        done <<< "$existing_containers"
-    fi
-    local skip_reset=false
-    if [[ "$FORCE_PODMAN_RESET" == "true" ]]; then
-        log_info "Force-reset requested (--force-reset). Proceeding with podman system reset."
-    elif [[ "$NON_INTERACTIVE" == "true" ]]; then
-        log_warn "Non-interactive mode (--non-interactive) — skipping automatic podman system reset to avoid data loss."
-        log_info "Run this script without --non-interactive to approve, or try: podman system reset --force"
-        skip_reset=true
-    elif [[ -t 0 ]]; then
-        echo -ne "${RED}${BOLD}Type 'reset' to proceed with podman system reset (destroys ALL containers), or anything else to skip: ${NC}" >&2
-        local reset_confirm
-        read -r reset_confirm
-        if [[ "$reset_confirm" != "reset" ]]; then
-            log_warn "User declined podman system reset. Skipping to next recovery step."
-            log_info "You can run 'podman system reset --force' manually if needed."
-            skip_reset=true
-        fi
-    else
-        log_warn "Non-interactive session — skipping automatic podman system reset to avoid data loss."
-        log_info "Run 'podman system reset --force' manually if you want to reset all podman data."
-        skip_reset=true
-    fi
-    if [[ "$skip_reset" != "true" ]]; then
-        local reset_output rc=0
-        reset_output=$(container_runtime_for_ops system reset --force 2>&1) && rc=0 || rc=$?
-        log_debug "podman system reset (exit $rc): $reset_output"
-    fi
-
-    if [[ "$skip_reset" != "true" ]] && podman info >/dev/null 2>&1; then
-        log_success "Podman recovered after system reset."
-        return 0
-    fi
-
-    if [[ "$skip_reset" != "true" ]]; then
-        log_warn "System reset did not recover podman. Storage may be deeply corrupted."
-        log_info "Try: podman system reset --force && sudo reboot"
-        log_info "A full reboot after reset can clear stale kernel state."
-    fi
+    # Step 7: System reset — guidance only, not executed automatically
+    log_warn "Podman storage may be deeply corrupted."
+    log_warn ""
+    log_warn "If previous recovery steps failed, you may need a full system reset."
+    log_warn "This is DESTRUCTIVE — it removes ALL containers, images, and volumes."
+    log_warn ""
+    log_warn "To proceed, run manually AFTER backing up important containers:"
+    log_warn "  podman system reset --force"
+    log_warn "  sudo reboot"
+    log_warn ""
 
     # Step 8: Storage migration
     log_info "Attempting to migrate podman storage..."
@@ -1282,20 +1183,6 @@ OPTIONS:
   --skip-compat-check        Skip pamac-aur AUR compatibility check (avoids
                              AUR RPC dependency; for users who know their
                              pacman version is compatible)
-  --force-reset              Skip interactive confirmation for podman system
-                             reset (DESTRUCTIVE: removes ALL containers)
-  --enable-gaming            Install extra gaming packages
-  --disable-gaming           Do not install gaming packages (default)
-  --enable-extra-repos       Enable popular third-party repositories (default)
-  --disable-extra-repos      Do not add third-party repositories
-  --enable-build-cache      Enable persistent build cache for yay (default)
-  --disable-build-cache     Disable persistent build cache for yay
-  --optimize-mirrors        Select fastest Pacman mirrors (default)
-  --no-optimize-mirrors     Do not change default Pacman mirrors
-  --uninstall               Remove container and all related files
-  --update                  Update packages (pacman -Syu + yay -Syu) without full rebuild
-  --status                  Check container health, Pamac installation, and export status
-  --export-only              Re-export apps to host menu without running full setup
   --non-interactive          Skip all interactive prompts (safe for automation)
   --disable-pin-alpm        Do NOT defer libalpm/pacman upgrade (risky on
                              rolling release containers; not recommended)
@@ -1414,7 +1301,6 @@ parse_arguments() {
                 shift 2
                 ;;
             --skip-compat-check) SKIP_COMPAT_CHECK="true"; shift ;;
-            --force-reset) FORCE_PODMAN_RESET="true"; shift ;;
             --uninstall) UNINSTALL="true"; shift ;;
             --status) STATUS="true"; shift ;;
             --update) UPDATE="true"; shift ;;

@@ -4172,6 +4172,7 @@ read -r -d '' critical_script <<'CRITICAL_EOF' || true
 set -uo pipefail
 
 HOST_USER="$1"
+_STRICT_SECURITY_MODE="${2:-}"
 
 echo "Installing Pamac bootstrap helper..."
 cat > /usr/local/bin/pamac-session-bootstrap.sh << 'BOOTSTRAP'
@@ -4435,12 +4436,12 @@ echo "D-Bus system policy for pamac-daemon created."
 echo "Critical helpers setup finished."
 CRITICAL_EOF
 
-if ! exec_container_script "$critical_script" "critical-helpers" "$CURRENT_USER"; then
+if ! exec_container_script "$critical_script" "critical-helpers" "$CURRENT_USER" "${STRICT_SECURITY:-false}"; then
 log_warn "Critical helpers setup had issues, retrying..."
 container_start 2>/dev/null || true
 sleep 3
 if container_is_usable; then
-if ! exec_container_script "$critical_script" "critical-helpers-retry" "$CURRENT_USER"; then
+if ! exec_container_script "$critical_script" "critical-helpers-retry" "$CURRENT_USER" "${STRICT_SECURITY:-false}"; then
 log_warn "Critical helpers retry also failed. Will verify and repair after base setup."
 _ok=false
 fi

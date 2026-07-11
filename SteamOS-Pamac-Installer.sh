@@ -68,12 +68,18 @@ OPTIMIZE_MIRRORS="${OPTIMIZE_MIRRORS:-true}"
 # Trusted GPG fingerprints for third-party repos.
 # Priority order:
 #   1. archlinux-keyring + WKD/mirror dynamic discovery (preferred)
-#   2. Secure versioned JSON endpoint below (fingerprinted, cached, with ETag)
-#   3. Hardcoded fallback values (last resort — may become stale after key rotations)
-readonly TRUSTED_KEYS_JSON_URL="${TRUSTED_KEYS_JSON_URL:-https://raw.githubusercontent.com/89luca89/distrobox/main/trusted-keys.json}"
-readonly TRUSTED_KEYS_CACHE_TTL=86400  # 24 hours
+#   2. Hardcoded fallback values (last resort — may become stale after key rotations)
+#
+# NOTE: A prior implementation fetched a "trusted-keys.json" from the distrobox
+# upstream, pinned to a commit SHA for reproducibility. That file never existed
+# in the 89luca89/distrobox repository (verified via GitHub tree + git history
+# API) — the URL 404'd on every run and the fetch silently fell through to the
+# hardcoded fallback below. The dead JSON fetch has been removed; the dynamic
+# discovery (Steps 1-3) + hardcoded fallback (Step 5) chain is sufficient and
+# honest. See _enable_repo_with_fallback in configure_extra_repos.
 
 DRY_RUN="${DRY_RUN:-false}"
+DRY_RUN_VERBOSE="${DRY_RUN_VERBOSE:-false}"
 CHECK_ONLY="${CHECK_ONLY:-false}"
 STATUS="${STATUS:-false}"
 UNINSTALL="${UNINSTALL:-false}"
@@ -91,6 +97,13 @@ ENABLE_SSH_ENV="${ENABLE_SSH_ENV:-false}"
 ALLOW_WHEEL_NOPASSWD="${ALLOW_WHEEL_NOPASSWD:-false}"
 UPLOAD_LOG="${UPLOAD_LOG:-false}"
 PIN_ALPM="${PIN_ALPM:-true}"
+# SECURITY: --strict-security mode. When enabled, the script refuses to relax
+# signature verification (SigLevel=TrustAll methods are skipped), refuses to
+# install the fake systemd-run wrapper (DynamicUser privilege-drop shim), and
+# fails fast when any cryptographic bootstrap would otherwise degrade security.
+# This is intended for users who want every operation to be cryptographically
+# verified and verify that the container's init/pamac version are compatible.
+STRICT_SECURITY="${STRICT_SECURITY:-false}"
 
 # Exit code used when the user declines an interactive prompt (e.g. low battery).
 # 130 is the conventional shell exit for "terminated by SIGINT" — distinct from a
@@ -118,7 +131,11 @@ initialize_logging() {
 
     local dry_run_header=""
     if [[ "$DRY_RUN" == "true" ]]; then
-        dry_run_header=" (DRY RUN MODE)"
+        if [[ "$DRY_RUN_VERBOSE" == "true" ]]; then
+            dry_run_header=" (DRY RUN VERBOSE MODE)"
+        else
+            dry_run_header=" (DRY RUN MODE)"
+        fi
     fi
 
     {
@@ -1108,6 +1125,19 @@ OPTIONS:
                              hosts; auto-enabled on Steam Deck)
   --check                   Perform system checks and exit without installing
   --dry-run                 Show what would be done without making changes
+  --dry-run-verbose         Like --dry-run, but also print the full script
+                             content that would execute inside the container
+                             (implies --dry-run; useful for auditing what
+                             changes the container would receive)
+  --strict-security         Refuse to relax signature verification (skip
+                             SigLevel=TrustAll recovery, keep all packages
+                             cryptographically verified). Also refuses to
+                             install the fake systemd-run wrapper used for
+                             DynamicUser AUR builds in non-systemd containers
+                             (such builds will fail instead of running with
+                             dropped sandbox properties). Failures during the
+                             keyring bootstrap cause the step to fail fast
+                             rather than degrade to an unverified state.
   --upload-log              Sanitize and upload the setup log for debugging
   --verbose                 Show detailed output, including command logs
   --quiet                   Only show errors
@@ -1130,9 +1160,11 @@ ENVIRONMENT VARIABLES:
   CHAOTIC_AUR_KEY_ID       Override the Chaotic-AUR signing key fingerprint
   ARCHLINUXCN_KEY_ID       Override the archlinuxcn signing key fingerprint
   ENDEAVOUROS_KEY_ID       Override the EndeavourOS signing key fingerprint
-  TRUSTED_KEYS_JSON_URL    URL for versioned JSON with trusted repo fingerprints
-                            (default: https://raw.githubusercontent.com/...)
-                            JSON format: {"repo-name": {"fingerprint": "HEXFP", ...}}
+  STRICT_SECURITY          Set to 'true' to enforce --strict-security mode
+                           (refuse SigLevel=TrustAll recovery and the fake
+                           systemd-run wrapper). Default 'false'.
+  DRY_RUN_VERBOSE          Set to 'true' to audit container scripts without
+                           executing them (implies DRY_RUN=true). Default 'false'.
 
 EXAMPLES:
   $0                                       # Basic setup
@@ -1182,6 +1214,8 @@ parse_arguments() {
             --allow-wheel-nopasswd) ALLOW_WHEEL_NOPASSWD="true"; shift ;;
             --upload-log) UPLOAD_LOG="true"; shift ;;
             --dry-run) DRY_RUN="true"; shift ;;
+            --dry-run-verbose) DRY_RUN="true"; DRY_RUN_VERBOSE="true"; shift ;;
+            --strict-security) STRICT_SECURITY="true"; shift ;;
             --check) CHECK_ONLY="true"; shift ;;
             --verbose) LOG_LEVEL="verbose"; shift ;;
             --quiet) LOG_LEVEL="quiet"; shift ;;
@@ -2191,6 +2225,11 @@ exec_container_script() {
     # covers early exits. Both paths are gated by the guard and exit-code check.
     printf '\n[ $? -eq 0 ] && echo "%s"\ntrap - EXIT\n' "$_marker" >> "$_script_file"
 
+  if _exec_dry_run_verbose "$_desc" "$_script_file"; then
+    rm -f "$_script_file"
+    return 0
+  fi
+
   set +e
   local _output=""
   if [[ "$LOG_LEVEL" == "verbose" ]]; then
@@ -2247,6 +2286,11 @@ exec_container_pipe() {
     # EXIT trap covers early `exit 0` cases. Both gated by pamac_script_marked.
     printf '\n[ $? -eq 0 ] && echo "%s"\ntrap - EXIT\n' "$_marker" >> "$_script_file"
 
+    if _exec_dry_run_verbose "$_desc" "$_script_file"; then
+        rm -f "$_script_file"
+        return 0
+    fi
+
     set +e
     local _output=""
     if [[ "$LOG_LEVEL" == "verbose" ]]; then
@@ -2287,6 +2331,25 @@ _exec_install_marker_trap() {
         printf '%s\n' "PAMAC_PREV_EXIT_TRAP=\$(trap -p EXIT 2>/dev/null | sed -e \"s/^trap -- //\" -e \"s/ EXIT\$//\")"
         printf '%s\n' "trap pamac_emit_marker EXIT"
     } >> "$_file"
+}
+
+# Shared helper: dry-run-verbose short-circuit. When --dry-run-verbose (which
+# implies --dry-run) is active, print the assembled container script that WOULD
+# have executed inside the container and return true (1) so the caller returns
+# 0 without executing. Returns false (0) when dry-run-verbose is off so the
+# caller proceeds with the normal container exec. Moves both call sites
+# (exec_container_script and exec_container_pipe) behind one implementation.
+# Args: $1=description, $2=script file path. Caller removes $_script_file on true.
+_exec_dry_run_verbose() {
+    if [[ "${DRY_RUN_VERBOSE:-}" != "true" ]]; then
+        return 1
+    fi
+    local _desc="$1" _file="$2"
+    log_warn "[DRY RUN VERBOSE] Container script '$_desc' — script that would execute inside the container:"
+    printf '%s\n' "----- BEGIN CONTAINER SCRIPT: $_desc -----"
+    cat "$_file"
+    printf '%s\n' "----- END CONTAINER SCRIPT: $_desc -----"
+    return 0
 }
 
 # Shared helper: post-run recovery + error reporting for container scripts.
@@ -2400,6 +2463,9 @@ configure_container_base() {
     local keyring_script
     read -r -d '' keyring_script <<'KEYRING_EOF' || true
 set -uo pipefail
+
+# Arg 1: STRICT_SECURITY flag ("true" disables TrustAll relaxation recovery).
+_STRICT_SECURITY_MODE="${1:-}"
 
 _remove_stale_lock
 
@@ -2718,6 +2784,12 @@ fi
 # restore trap is needed because nothing was modified. This closes the prior
 # TrustAll-window risk where a mid-write kill could leave the file modified.
 if [[ "$_safe_recovered" != "true" ]]; then
+if [[ "$_STRICT_SECURITY_MODE" == "true" ]]; then
+    echo "Method F: SKIPPED (--strict-security: refusing SigLevel=TrustAll relaxation)."
+    echo "  All prior safe methods (A-E) failed to bootstrap the keyring."
+    echo "  Re-run without --strict-security to allow this last-resort recovery,"
+    echo "  or manually import the archlinux-keyring inside the container."
+else
     echo "Method F: Attempting controlled SigLevel relaxation bootstrap..."
     echo "  WARNING: Temporarily disabling signature verification (in a throwaway config only) to bootstrap keyring."
     echo "  The real /etc/pacman.conf is NOT modified; /etc/pacman.conf stays secure."
@@ -2760,6 +2832,7 @@ if [[ "$_safe_recovered" != "true" ]]; then
         echo "  WARNING: real pacman.conf detected at TrustAll — restoring to Required DatabaseOptional."
         _atomic_write_pacman_conf "Required DatabaseOptional"
     fi
+fi
 fi
 
 if [[ "$_safe_recovered" == "true" ]]; then
@@ -3008,7 +3081,7 @@ echo "Keyring initialization and self-healing complete."
 rm -f "$_KEYRING_SENTINEL" 2>/dev/null || true
 KEYRING_EOF
 
-    if ! exec_container_script "$keyring_script" "keyring-init"; then
+    if ! exec_container_script "$keyring_script" "keyring-init" "${STRICT_SECURITY:-false}"; then
         log_error "Keyring initialization and self-healing failed permanently."
         log_error "The container cannot operate securely without valid package signatures."
         log_error "This usually indicates a broken base image, missing network connectivity, or corrupted keyring."
@@ -3692,7 +3765,11 @@ chmod +x /usr/local/bin/pamac-session-bootstrap.sh
 echo "Bootstrap helper installed."
 
 echo "Installing fake systemd-run wrapper for non-systemd AUR builds..."
-if ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/dev/null 2>&1; then
+if [[ "$_STRICT_SECURITY_MODE" == "true" ]]; then
+    echo "SKIPPED fake systemd-run wrapper (--strict-security: refuses DynamicUser shim)."
+    echo "  AUR builds that need systemd-run --property=DynamicUser=yes will fail in"
+    echo "  non-systemd containers instead of running with dropped sandbox properties."
+elif ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/dev/null 2>&1; then
 cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE'
 #!/bin/bash
 # Fake systemd-run for non-systemd containers (Distrobox).
@@ -4265,6 +4342,7 @@ read -r -d '' repair_script <<'REPAIR_EOF' || true
 set -uo pipefail
 
 HOST_USER="$1"
+_STRICT_SECURITY_MODE="${2:-}"
 
 repaired=0
 
@@ -4452,7 +4530,9 @@ fi
 
 if [[ ! -x /usr/local/sbin/systemd-run ]]; then
 echo "Repairing: fake systemd-run wrapper..."
-if ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/dev/null 2>&1; then
+if [[ "$_STRICT_SECURITY_MODE" == "true" ]]; then
+    echo "SKIPPED fake systemd-run wrapper repair (--strict-security: refuses DynamicUser shim)."
+elif ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/dev/null 2>&1; then
 mkdir -p /usr/local/sbin
 cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE'
 #!/bin/bash
@@ -5000,7 +5080,7 @@ REPAIR_EOF
 
 local repair_ok=false
 for attempt in 1 2 3; do
-if exec_container_script "$repair_script" "critical-helpers-repair-attempt-$attempt" "$CURRENT_USER"; then
+if exec_container_script "$repair_script" "critical-helpers-repair-attempt-$attempt" "$CURRENT_USER" "${STRICT_SECURITY:-false}"; then
 repair_ok=true
 break
 fi
@@ -5167,12 +5247,11 @@ set -uo pipefail
 # Import host environment variable overrides passed as positional args.
 # Single-quoted heredocs prevent host-side variable expansion, so the caller
 # passes these as arguments to exec_container_script and we read them here.
-# Args: $1=TRUSTED_KEYS_JSON_URL, $2=CHAOTIC_AUR_KEY_ID,
-#       $3=ARCHLINUXCN_KEY_ID, $4=ENDEAVOUROS_KEY_ID
-[[ -n "${1:-}" ]] && export TRUSTED_KEYS_JSON_URL="$1"
-[[ -n "${2:-}" ]] && export CHAOTIC_AUR_KEY_ID="$2"
-[[ -n "${3:-}" ]] && export ARCHLINUXCN_KEY_ID="$3"
-[[ -n "${4:-}" ]] && export ENDEAVOUROS_KEY_ID="$4"
+# Args: $1=CHAOTIC_AUR_KEY_ID,
+#       $2=ARCHLINUXCN_KEY_ID, $3=ENDEAVOUROS_KEY_ID
+[[ -n "${1:-}" ]] && export CHAOTIC_AUR_KEY_ID="$1"
+[[ -n "${2:-}" ]] && export ARCHLINUXCN_KEY_ID="$2"
+[[ -n "${3:-}" ]] && export ENDEAVOUROS_KEY_ID="$3"
 
 _remove_stale_lock
 
@@ -5451,47 +5530,7 @@ _enable_repo_with_fallback() {
         fi
     fi
 
-    # Step 4: Fetch trusted fingerprint from secure versioned JSON endpoint
-    # This endpoint is versioned and fingerprinted; it provides up-to-date keys
-    # without requiring hardcoding that can become stale after key rotations.
-    if [[ "$key_ok" != "true" ]] && command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-        echo "Attempting trusted fingerprint fetch from JSON endpoint..."
-        _json_url="${TRUSTED_KEYS_JSON_URL:-https://raw.githubusercontent.com/89luca89/distrobox/main/trusted-keys.json}"
-        _json_tmp=$(mktemp -d /var/tmp/pamac-keys-json-XXXXXX) && chmod 700 "$_json_tmp" 2>/dev/null || _json_tmp=$(mktemp -d)
-        _repo_tmp_dirs+=("$_json_tmp")
-        if timeout 15 curl -sfL --connect-timeout 10 --max-time 30 \
-            -H "Accept: application/json" \
-            -o "$_json_tmp/keys.json" \
-            "$_json_url" 2>/dev/null; then
-            # Validate response is valid JSON with expected structure before trusting
-            if ! jq -e 'type == "object"' "$_json_tmp/keys.json" >/dev/null 2>&1; then
-                echo "  JSON endpoint returned non-object response. Rejecting."
-            elif jq -e 'has("error")' "$_json_tmp/keys.json" >/dev/null 2>&1; then
-                echo "  JSON endpoint returned an error. Rejecting."
-            else
-                _json_fp=$(jq -r --arg repo "$repo_name" '.[$repo].fingerprint // empty' "$_json_tmp/keys.json" 2>/dev/null || echo "")
-                if [[ -n "$_json_fp" ]]; then
-                    # Validate fingerprint is a 40-character hex string
-                    if [[ ! "$_json_fp" =~ ^[0-9a-fA-F]{40}$ ]]; then
-                        echo "  JSON endpoint returned invalid fingerprint format: $_json_fp. Rejecting."
-                    else
-                        echo "  Trusted fingerprint for $repo_name from JSON: ${_json_fp: -8}"
-                        key_id="$_json_fp"
-                        if _import_key_with_retry "$_json_fp"; then
-                            key_ok=true
-                        fi
-                    fi
-                else
-                    echo "  No trusted fingerprint found for $repo_name in JSON endpoint."
-                fi
-            fi
-        else
-            echo "  JSON endpoint unreachable or invalid response."
-        fi
-        rm -rf "$_json_tmp" 2>/dev/null || true
-    fi
-
-    # Step 5: Import the signing key from keyservers as last resort (uses hardcoded fallback fingerprint)
+    # Step 4: Import the signing key from keyservers as last resort (uses hardcoded fallback fingerprint)
     if [[ "$key_ok" != "true" ]] && command -v pacman-key >/dev/null 2>&1; then
         echo "WARNING: Using hardcoded fallback fingerprint for $repo_name (key_id=$key_id)."
         echo "  This fingerprint may be STALE after key rotations. If key import fails,"
@@ -5503,7 +5542,7 @@ _enable_repo_with_fallback() {
         fi
     fi
 
-    # Step 6: Write the repo entry with appropriate SigLevel
+    # Step 5: Write the repo entry with appropriate SigLevel
     if [[ "$key_ok" == "true" ]]; then
         printf '\n[%s]\nSigLevel = Optional\n%b' "$repo_name" "$server_lines" >> /etc/pacman.conf
         echo "$repo_name repository configured (Optional)."
@@ -5563,7 +5602,6 @@ echo "Available additional repos: chaotic-aur, archlinuxcn, endeavouros"
 REPOS_EOF
 
     if ! exec_container_script "$repos_script" "extra-repos" \
-        "${TRUSTED_KEYS_JSON_URL:-}" \
         "${CHAOTIC_AUR_KEY_ID:-}" \
         "${ARCHLINUXCN_KEY_ID:-}" \
         "${ENDEAVOUROS_KEY_ID:-}"; then
@@ -6171,6 +6209,11 @@ COMPAT_EOF
     local _compat_marker
     _compat_marker="COMPAT_CHECK_$(head -c 8 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$")"
     printf '\necho "%s"\n' "$_compat_marker" >> "$_compat_script_file"
+
+    if _exec_dry_run_verbose "pamac-aur compatibility check" "$_compat_script_file"; then
+        rm -f "$_compat_script_file"
+        return 0
+    fi
 
     set +e
     local _compat_output=""
@@ -8883,6 +8926,10 @@ cat > /usr/local/bin/pamac-keyring-refresh.sh << 'REFRESH'
 #!/bin/bash
 set +e
 
+# Strict-security flag, baked into this script at install time by the
+# installer. When "true", Strategy 4 (SigLevel=TrustAll recovery) is skipped.
+_STRICT_SECURITY_MODE=_STRICT_SECURITY_BAKED_IN_
+
 _remove_stale_lock() {
     local _lock="/var/lib/pacman/db.lck"
     if [[ ! -f "$_lock" ]]; then return 0; fi
@@ -8905,7 +8952,7 @@ if [[ -f "$KEYRING_AGE_FILE" ]]; then
     last_refresh=$(cat "$KEYRING_AGE_FILE" 2>/dev/null || echo "0")
     now=$(date +%s 2>/dev/null || echo "0")
     age=$(( now - last_refresh ))
-    if [[ "$age" -lt "$REFRESH_INTERVAL ]] && [[ "$age" -ge 0 ]]; then
+    if [[ "$age" -lt "$REFRESH_INTERVAL" ]] && [[ "$age" -ge 0 ]]; then
         exit 0
     fi
 fi
@@ -8953,6 +9000,11 @@ fi
 # it via `pacman --config <tmp>`. The real config stays secure the whole time,
 # so an untrappable death (SIGKILL/OOM/power loss) cannot leave the container
 # in an unverified state. No restore trap is needed.
+if [[ "$_STRICT_SECURITY_MODE" == "true" ]]; then
+    echo "Strategy 4 SKIPPED (--strict-security: refusing SigLevel=TrustAll recovery in keyring refresh)."
+    echo "  Strategies 1-3 failed; re-run the installer without --strict-security or"
+    echo "  manually import archlinux-keyring inside the container."
+else
 echo "Attempting controlled SigLevel relaxation (throwaway config)..."
 _orig_siglevel=$(grep '^SigLevel' /etc/pacman.conf 2>/dev/null | head -1 || echo "Required DatabaseOptional")
 _siglevel_value="${_orig_siglevel#SigLevel = }"
@@ -8986,6 +9038,7 @@ if [[ -n "$_TA_CONF" ]] && cp -f /etc/pacman.conf "$_TA_CONF" 2>/dev/null; then
 else
     rm -f "${_TA_CONF:-/tmp/pacman-trustall.NOCONF}" 2>/dev/null || true
     echo "Could not build throwaway TrustAll config; NOT modifying the real pacman.conf."
+fi
 fi
 # Defensive: if the real config somehow ended up at TrustAll, restore it.
 _cur_sl=$(grep '^SigLevel' /etc/pacman.conf 2>/dev/null | head -1 | sed 's/^SigLevel = //')
@@ -9114,6 +9167,12 @@ fi
 
 echo "Keyring refresh wrapper installed."
 KEYRING_REFRESH_EOF
+
+    # Bake the current STRICT_SECURITY setting into the generated
+    # pamac-keyring-refresh.sh as a literal constant. The inner script runs
+    # later (via timer/hook) without the installer's variables, so the flag
+    # must be embedded now rather than read at refresh time.
+    keyring_script="${keyring_script//_STRICT_SECURITY_BAKED_IN_/${STRICT_SECURITY:-false}}"
 
     if ! exec_container_script "$keyring_script" "keyring-refresh-setup"; then
         log_warn "Keyring refresh setup had issues. Continuing..."

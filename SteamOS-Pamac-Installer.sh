@@ -105,6 +105,10 @@ PIN_ALPM="${PIN_ALPM:-true}"
 # verified and verify that the container's init/pamac version are compatible.
 STRICT_SECURITY="${STRICT_SECURITY:-false}"
 
+# Maximum per-container log file size in bytes before rotate-on-startup.
+# Old log is moved to ${LOG_FILE}.1 and overwritten if it already exists.
+LOG_ROTATION_MAX_SIZE="${LOG_ROTATION_MAX_SIZE:-5242880}"  # 5 MiB
+
 # Exit code used when the user declines an interactive prompt (e.g. low battery).
 # 130 is the conventional shell exit for "terminated by SIGINT" — distinct from a
 # genuine success (0) so wrapper scripts can tell an abort from a clean run.
@@ -128,6 +132,23 @@ setup_colors() {
 initialize_logging() {
     local os_version
     os_version=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo 'Unknown')
+
+    # Rotate the log if it has grown beyond the configured max size. This keeps
+    # per-container logs from filling the user's home directory on repeated
+    # install/update runs. We keep exactly one backup generation.
+    if [[ -n "${LOG_FILE:-}" ]] && [[ -f "$LOG_FILE" ]]; then
+        local _log_size
+        local _max_size="${LOG_ROTATION_MAX_SIZE:-5242880}"
+        if [[ ! "$_max_size" =~ ^[0-9]+$ ]]; then
+            _max_size=5242880
+        fi
+        _log_size=$(stat -c '%s' "$LOG_FILE" 2>/dev/null || echo "0")
+        if [[ "$_log_size" =~ ^[0-9]+$ ]] && [[ "$_log_size" -gt "$_max_size" ]]; then
+            # Only print to stderr/stdout before logging is ready; then rotate.
+            echo "Rotating log (size ${_log_size} bytes exceeds ${_max_size} bytes): $LOG_FILE" >&2
+            mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null || rm -f "$LOG_FILE" 2>/dev/null || true
+        fi
+    fi
 
     local dry_run_header=""
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -801,9 +822,41 @@ check_system_requirements() {
         log_info "Not running on SteamOS. Script will adapt automatically."
     fi
 
+    check_network_connectivity
     check_kernel_glibc_compat
 
     [[ "$all_ok" == "true" ]]
+}
+
+# Network pre-flight: the keyring bootstrap (pacman -Sy archlinux-keyring) and
+# mirror/wkd key discovery ALL require outbound HTTPS to archlinux.org or the
+# chosen mirror. Failing these 5 strategies later produces confusing cryptic
+# errors (gpg keyserver timeouts, "invalid or corrupted package" hits) without
+# identifying the root cause. Probe up-front so the user gets an actionable
+# "no network" message before the container is even created. The mirror
+# list later is independent of this probe — this is an early-warn heuristic.
+check_network_connectivity() {
+    log_step "Checking outbound network connectivity..."
+    local _probe_url="https://archlinux.org"
+    local _http_code
+    _http_code=$(timeout 5 curl -sI --connect-timeout 3 --max-time 5 -o /dev/null -w "%{http_code}" "$_probe_url" 2>/dev/null || echo "000")
+    case "$_http_code" in
+        000)
+            log_warn "No outbound network connectivity detected (cannot reach $_probe_url)."
+            log_warn "The keyring bootstrap (Methods A-E in the container) requires HTTPS access to Arch mirrors/keyservers."
+            log_info "If you know the host is offline, install cached packages instead, or:"
+            log_info "  - Verify DNS: getent hosts archlinux.org"
+            log_info "  - Test direct: curl -I $_probe_url"
+            log_info "  - Behind captive portal/proxy? export https_proxy=http://host:port"
+            log_info "Proceeding anyway — the script will attempt keyring recovery and report failures at runtime if needed."
+            ;;
+        2*|3*)
+            log_success "Network connectivity OK (HTTP $_http_code from $_probe_url)."
+            ;;
+        *)
+            log_debug "Reachable probe (HTTP $_http_code) — common redirect/maintenance code, treating as reachable."
+            ;;
+    esac
 }
 
 check_kernel_glibc_compat() {
@@ -1165,6 +1218,9 @@ ENVIRONMENT VARIABLES:
                            systemd-run wrapper). Default 'false'.
   DRY_RUN_VERBOSE          Set to 'true' to audit container scripts without
                            executing them (implies DRY_RUN=true). Default 'false'.
+  LOG_ROTATION_MAX_SIZE    Rotate the per-container log on startup when it
+                           exceeds this many bytes. Default: 5242880 (5 MiB).
+                           One backup (.1) is kept; older backups are overwritten.
 
 EXAMPLES:
   $0                                       # Basic setup
@@ -1982,8 +2038,10 @@ fi
 # advances once per real second of wall time, so we poll until the requested
 # number of whole seconds elapses. The case guard above restricted \$_d to
 # [0-9] (floats sanitized to 1), so the arithmetic here is integer-safe.
-# Returns 1 to signal that no precise sub-second timer ran; retry callers
-# should treat non-zero as \"no real delay happened\" (but a real delay did).
+# Returns 0: a real wall-clock delay DID happen even though no precise sub-
+# second timer fired; callers should not interpret a non-zero exit as \"no
+# delay happened\" — the function always sleeps at least the requested integer
+# number of seconds (or 1s minimum) when reached.
 local _target=\$(( _d + 0 ))
 [[ \$_target -lt 1 ]] && _target=1
 local _start=\$SECONDS
@@ -1994,7 +2052,7 @@ while (( SECONDS - _start < _target )); do
     # regardless of the callers stdin state (terminal, pipe, or closed fd).
     read -t 1 _dummy </dev/null 2>/dev/null || true
 done
-return 1
+return 0
 }
 _remove_stale_lock() {
     local _lock="/var/lib/pacman/db.lck"
@@ -3608,8 +3666,10 @@ fi
 # advances once per real second of wall time, so we poll until the requested
 # number of whole seconds elapses. The case guard above restricted $_d to
 # [0-9] (floats sanitized to 1), so the arithmetic here is integer-safe.
-# Returns 1 to signal that no precise sub-second timer ran; retry callers
-# should treat non-zero as 'no real delay happened' (but a real delay did).
+# Returns 0: a real wall-clock delay DID happen even though no precise sub-
+# second timer fired; callers should not interpret a non-zero exit as "no
+# delay happened" — the function always sleeps at least the requested integer
+# number of seconds (or 1s minimum) when reached.
 local _target=$(( _d + 0 ))
 [[ $_target -lt 1 ]] && _target=1
 local _start=$SECONDS
@@ -3619,7 +3679,7 @@ while (( SECONDS - _start < _target )); do
     # the caller's stdin state (terminal, pipe, or closed fd).
     read -t 1 _dummy </dev/null 2>/dev/null || true
 done
-return 1
+return 0
 }
 
 log_bootstrap() {
@@ -4272,7 +4332,7 @@ fi
 
 echo "Creating D-Bus system policy for pamac-daemon..."
 mkdir -p /usr/share/dbus-1/system.d
-cat > /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf << 'DBUS_CONF'
+cat > /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf << DBUS_CONF
 <!DOCTYPE busconfig PUBLIC
 "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
 "http://www.freedesktop.org/standards/dbus-1.0/busconfig.dtd">
@@ -4283,7 +4343,7 @@ cat > /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf << 'DBUS_CONF'
 <allow send_destination="org.manjaro.pamac.daemon"/>
 </policy>
 
-<policy user="deck">
+<policy user="$HOST_USER">
 <allow own="org.manjaro.pamac.daemon"/>
 <allow send_destination="org.manjaro.pamac.daemon"/>
 </policy>
@@ -4400,8 +4460,10 @@ fi
 # advances once per real second of wall time, so we poll until the requested
 # number of whole seconds elapses. The case guard above restricted $_d to
 # [0-9] (floats sanitized to 1), so the arithmetic here is integer-safe.
-# Returns 1 to signal that no precise sub-second timer ran; retry callers
-# should treat non-zero as 'no real delay happened' (but a real delay did).
+# Returns 0: a real wall-clock delay DID happen even though no precise sub-
+# second timer fired; callers should not interpret a non-zero exit as "no
+# delay happened" — the function always sleeps at least the requested integer
+# number of seconds (or 1s minimum) when reached.
 local _target=$(( _d + 0 ))
 [[ $_target -lt 1 ]] && _target=1
 local _start=$SECONDS
@@ -4411,7 +4473,7 @@ while (( SECONDS - _start < _target )); do
     # the caller's stdin state (terminal, pipe, or closed fd).
     read -t 1 _dummy </dev/null 2>/dev/null || true
 done
-return 1
+return 0
 }
 
 log_bootstrap() {
@@ -5035,10 +5097,10 @@ echo "Functional systemd detected, skipping fake systemd-run."
 fi
 fi
 
-if [[ ! -f /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf ]] || ! grep -q 'policy user="deck"' /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf 2>/dev/null; then
+if [[ ! -f /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf ]] || ! grep -q "policy user=\"$HOST_USER\"" /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf 2>/dev/null; then
 echo "Repairing: D-Bus system policy for pamac-daemon..."
 mkdir -p /usr/share/dbus-1/system.d
-cat > /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf << 'DBUS_CONF'
+cat > /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf << DBUS_CONF
 <!DOCTYPE busconfig PUBLIC
 "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
 "http://www.freedesktop.org/standards/dbus-1.0/busconfig.dtd">
@@ -5049,7 +5111,7 @@ cat > /usr/share/dbus-1/system.d/org.manjaro.pamac.daemon.conf << 'DBUS_CONF'
 <allow send_destination="org.manjaro.pamac.daemon"/>
 </policy>
 
-<policy user="deck">
+<policy user="$HOST_USER">
 <allow own="org.manjaro.pamac.daemon"/>
 <allow send_destination="org.manjaro.pamac.daemon"/>
 </policy>
@@ -5419,6 +5481,21 @@ _enable_repo_with_fallback() {
     local _normalized="${repo_name//-/_}"
     env_var_name="${_normalized^^}_KEY_ID"
     local key_id="${!env_var_name:-$default_key_id}"
+
+    # Validate the resolved key_id is a 40-char hex fingerprint OR empty/informative
+    # short prefix (the bootstrap chain below probes keyservers + mirror paths and
+    # confirms a live fingerprint before trusting it — but if the USER-supplied
+    # override is malformed, fail fast with an actionable error instead of
+    # attempting to import garbage and producing confusing keyserver failures.
+    if [[ -n "${!env_var_name:-}" ]] && [[ "$key_id" != "$default_key_id" ]]; then
+        if [[ ! "$key_id" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "ERROR: $env_var_name='$key_id' is not a valid 40-character hex fingerprint."
+            echo "       GPG fingerprints must be a 40-character hexadecimal string (e.g. 30565AC3868033CA...)."
+            echo "       Short IDs (16-char or 8-char) are rejected for security (collision/ambiguous-match)."
+            echo "       Clear $env_var_name or set it to the full fingerprint and re-run."
+            return 1
+        fi
+    fi
 
     echo "Adding repository [$repo_name] (key_id=$key_id)..."
 

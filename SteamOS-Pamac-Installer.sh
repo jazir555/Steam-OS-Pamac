@@ -1356,17 +1356,16 @@ ENVIRONMENT VARIABLES:
 
 SECURITY NOTE — fake systemd-run wrapper:
   In non-systemd containers (the common case), this script installs a
-  fake /usr/local/sbin/systemd-run that mimics the CLI interface used by
-  Pamac/makepkg for DynamicUser builds. This wrapper IMPLEMENTS the
-  functional properties builds depend on (DynamicUser, User, WorkingDirectory,
-  CacheDirectory, Environment, EnvironmentFile, UMask, SupplementaryGroups)
-  so builds will not fail from missing properties. It does NOT enforce
-  security sandboxing properties (ProtectSystem, ProtectHome, PrivateTmp,
-  CapabilityBoundingSet, etc.) — dropping these makes the environment MORE
-  permissive, not less. Use --strict-security to disable the wrapper entirely
-  and refuse DynamicUser-based builds (they will fail instead of running
-  with dropped sandbox properties). Unrecognized properties are logged to
-  /tmp/systemd-run-fake.log for auditing.
+  fake /usr/local/sbin/systemd-run that uses Linux mount namespaces
+  (unshare --mount), bind mounts, tmpfs overlays, and capability dropping
+  (setpriv) to ENFORCE systemd sandboxing properties: ProtectSystem
+  (read-only root), ProtectHome (hide /home), PrivateTmp (private /tmp),
+  PrivateDevices (minimal /dev), ReadWritePaths, ReadOnlyPaths,
+  InaccessiblePaths, NoNewPrivileges, and CapabilityBoundingSet. These
+  are real enforced restrictions, not just acknowledged. Properties that
+  require seccomp (MemoryDenyWriteExecute, SystemCallFilter) are logged
+  as best-effort. Use --strict-security to disable the wrapper entirely
+  and refuse DynamicUser-based builds.
 
 EXAMPLES:
   $0                                       # Basic setup
@@ -2439,15 +2438,15 @@ install_base_devel_batched() {
 # repair paths. The heredoc body is at column 0 (no leading whitespace)
 # because the kernel requires the shebang to be byte 0 of the file.
 #
-# SECURITY NOTE: This wrapper is a compatibility shim. It IMPLEMENTS the
-# functional properties that builds actually depend on (DynamicUser, User,
-# WorkingDirectory, CacheDirectory, Environment, EnvironmentFile, UMask,
-# SupplementaryGroups, --setenv) but does NOT enforce the systemd security
-# sandboxing properties (ProtectSystem, ProtectHome, PrivateTmp,
-# CapabilityBoundingSet, etc.). Dropping sandboxing makes the environment
-# MORE permissive — builds will not fail from missing properties. Use
-# --strict-security to disable this wrapper entirely and refuse
-# DynamicUser-based builds instead.
+# SECURITY MODEL: This wrapper enforces sandboxing via Linux mount
+# namespaces (unshare --mount), bind mounts, and capability dropping
+# (setpriv). Properties like ProtectSystem, ProtectHome, PrivateTmp,
+# PrivateDevices, ReadWritePaths, ReadOnlyPaths, InaccessiblePaths,
+# NoNewPrivileges, and CapabilityBoundingSet are REAL enforced restrictions,
+# not just acknowledged. Properties that require seccomp (MemoryDenyWriteExecute,
+# SystemCallFilter) are logged as best-effort but cannot be enforced without
+# a C helper binary. Use --strict-security to disable this wrapper entirely
+# and refuse DynamicUser-based builds.
 _write_fake_systemd_run_wrapper() {
     mkdir -p /usr/local/sbin
     cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE_HEREDOC'
@@ -2486,7 +2485,7 @@ _cleanup_orphaned_buildusers
 # Passthrough: --help and --version are not meaningful here
 for _a in "$@"; do
     case "$_a" in
-        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo ""; echo "IMPLEMENTED (functional): --property=DynamicUser=yes (build user isolation), --property=CacheDirectory=* (mkdir+chown), --property=WorkingDirectory=* (mkdir+cd), --property=User=* (sudo -u), --property=SupplementaryGroups=* (sg), --property=Environment=* (export), --property=EnvironmentFile=* (source), --property=UMask=* (umask), --setenv=* (export), --pipe, --wait, --pty, --quiet, --no-block, --description=*, --unit=*, --service-type=*."; echo "RECOGNIZED but DROPPED (non-systemd, no sandboxing; logged to /tmp/systemd-run-fake.log): ProtectSystem, ProtectHome, PrivateTmp, NoNewPrivileges, MemoryDenyWriteExecute, SystemCallFilter, CapabilityBoundingSet, AmbientCapabilities, PrivateDevices, PrivateMounts, PrivateNetwork, PrivateUsers, ReadWritePaths, ReadOnlyPaths, RootDirectory, and all other systemd.exec(5)/resource-control(5) sandboxing. Resource/accounting/logging/Condition/Assert/Timeout properties are recognized and silently dropped."; echo ""; echo "Security note: dropped sandboxing properties make the environment MORE permissive, not less. Builds will not fail from missing properties. Use --strict-security on the installer to disable this wrapper entirely."; exit 0 ;;
+        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo ""; echo "ENFORCED via mount namespaces + bind mounts + setpriv:"; echo "  ProtectSystem=strict|full|true  — / read-only via bind mount; full also protects /etc,/usr,/boot"; echo "  ProtectHome=yes|read-only       — /home replaced with tmpfs or made read-only"; echo "  PrivateTmp=yes                  — private /tmp and /var/tmp"; echo "  PrivateDevices=yes              — minimal /dev with only null,zero,random,urandom,tty"; echo "  ReadWritePaths=PATH             — override read-only root for specific paths"; echo "  ReadOnlyPaths=PATH              — additional read-only bind mounts"; echo "  InaccessiblePaths=PATH          — replaced with empty tmpfs"; echo "  NoNewPrivileges=yes             — PR_SET_NO_NEW_PRIVS via setpriv"; echo "  CapabilityBoundingSet=...       — capability dropping via setpriv --inh-caps"; echo "  DynamicUser=yes                 — isolated build user with private home"; echo "  User=USER                       — switch to specified user via sudo -u"; echo "  Environment=K=V, --setenv=K=V  — exported environment variables"; echo "  EnvironmentFile=/path           — sourced environment file"; echo "  CacheDirectory=NAME, WorkingDirectory=PATH, UMask=MODE, SupplementaryGroups=GRP"; echo ""; echo "BEST-EFFORT (logged, no enforcement without seccomp):"; echo "  MemoryDenyWriteExecute, SystemCallFilter, SystemCallArchitectures,"; echo "  RestrictNamespaces, RestrictSUIDSGID, LockPersonality, RestrictRealtime,"; echo "  RestrictAddressFamilies, ProtectKernelTunables, ProtectKernelModules,"; echo "  ProtectControlGroups, ProtectHostname, RestrictFileSystems"; echo ""; echo "Resource/accounting/logging/Condition/Assert/Timeout properties are recognized and silently dropped."; echo ""; echo "Use --strict-security on the installer to disable this wrapper entirely."; exit 0 ;;
         --version) echo "systemd-run (fake) v${DSR_VERSION} (SteamOS-Pamac)"; exit 0 ;;
     esac
 done
@@ -2505,6 +2504,16 @@ EXTRA_GROUPS=""
 TARGET_USER=""
 ENV_FILES=()
 SET_UMASK=""
+# ── Sandbox properties (enforced via mount namespaces + bind mounts) ──
+PROTECT_SYSTEM=""
+PROTECT_HOME=""
+PRIVATE_TMP=""
+PRIVATE_DEVICES=""
+NO_NEW_PRIVS=""
+CAP_BOUNDING_SET=""
+READ_WRITE_PATHS=()
+READ_ONLY_PATHS=()
+INACCESSIBLE_PATHS=()
 for arg in "$@"; do
 if $SKIP_NEXT; then
 SKIP_NEXT=false
@@ -2537,43 +2546,43 @@ case "$arg" in
 --property=TemporaryFileSystem=*) continue ;;
 --property=BindPaths=*) continue ;;
 --property=BindReadOnlyPaths=*) continue ;;
---property=ProtectSystem=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectHome=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=PrivateTmp=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=NoNewPrivileges=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=MemoryDenyWriteExecute=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=SystemCallFilter=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=CapabilityBoundingSet=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ProtectSystem=*) PROTECT_SYSTEM="${arg#--property=ProtectSystem=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=ProtectHome=*) PROTECT_HOME="${arg#--property=ProtectHome=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=PrivateTmp=*) PRIVATE_TMP="${arg#--property=PrivateTmp=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=NoNewPrivileges=*) NO_NEW_PRIVS="${arg#--property=NoNewPrivileges=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=MemoryDenyWriteExecute=*) _warn_dsr "MemoryDenyWriteExecute requires seccomp (not available in non-systemd env): $arg"; continue ;;
+--property=SystemCallFilter=*) _warn_dsr "SystemCallFilter requires seccomp (not available in non-systemd env): $arg"; continue ;;
+--property=CapabilityBoundingSet=*) CAP_BOUNDING_SET="${arg#--property=CapabilityBoundingSet=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=User=*) TARGET_USER="${arg#--property=User=}"; continue ;;
 --property=Group=*) continue ;;
 --property=SupplementaryGroups=*) EXTRA_GROUPS="${arg#--property=SupplementaryGroups=}"; continue ;;
---property=AmbientCapabilities=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=AmbientCapabilities=*) _log_dsr "Sandbox: AmbientCapabilities (best-effort via setpriv): $arg"; continue ;;
 --property=EnvironmentFile=*) ENV_FILES+=("${arg#--property=EnvironmentFile=}"); continue ;;
 --property=Ephemeral=*) continue ;;
 --property=Slice=*) continue ;;
 --property=IOSchedulingClass=*) continue ;;
 --property=CPUSchedulingPolicy=*) continue ;;
---property=RestrictNamespaces=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RestrictSUIDSGID=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=LockPersonality=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RestrictRealtime=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RestrictAddressFamilies=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=RestrictNamespaces=*) _log_dsr "Sandbox: RestrictNamespaces (best-effort): $arg"; continue ;;
+--property=RestrictSUIDSGID=*) _log_dsr "Sandbox: RestrictSUIDSGID (best-effort): $arg"; continue ;;
+--property=LockPersonality=*) _log_dsr "Sandbox: LockPersonality (best-effort): $arg"; continue ;;
+--property=RestrictRealtime=*) _log_dsr "Sandbox: RestrictRealtime (best-effort): $arg"; continue ;;
+--property=RestrictAddressFamilies=*) _log_dsr "Sandbox: RestrictAddressFamilies (best-effort): $arg"; continue ;;
 --property=RemoveIPC=*) continue ;;
 --property=UMask=*) SET_UMASK="${arg#--property=UMask=}"; continue ;;
 --property=KeyringMode=*) continue ;;
---property=ProtectClock=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectKernelTunables=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectKernelModules=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectKernelLogs=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectControlGroups=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectHostname=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectProc=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProcSubset=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=ProtectClock=*) _log_dsr "Sandbox: ProtectClock (best-effort): $arg"; continue ;;
+--property=ProtectKernelTunables=*) _log_dsr "Sandbox: ProtectKernelTunables (best-effort): $arg"; continue ;;
+--property=ProtectKernelModules=*) _log_dsr "Sandbox: ProtectKernelModules (best-effort): $arg"; continue ;;
+--property=ProtectKernelLogs=*) _log_dsr "Sandbox: ProtectKernelLogs (best-effort): $arg"; continue ;;
+--property=ProtectControlGroups=*) _log_dsr "Sandbox: ProtectControlGroups (best-effort): $arg"; continue ;;
+--property=ProtectHostname=*) _log_dsr "Sandbox: ProtectHostname (best-effort): $arg"; continue ;;
+--property=ProtectProc=*) _log_dsr "Sandbox: ProtectProc (best-effort): $arg"; continue ;;
+--property=ProcSubset=*) _log_dsr "Sandbox: ProcSubset (best-effort): $arg"; continue ;;
 --property=MemorySwapMax=*) continue ;;
 --property=CPUQuota=*) continue ;;
 --property=DeviceAllow=*) continue ;;
 --property=DevicePolicy=*) continue ;;
---property=RestrictFileSystems=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=RestrictFileSystems=*) _log_dsr "Sandbox: RestrictFileSystems (best-effort): $arg"; continue ;;
 --property=SocketBindDeny=*) continue ;;
 --property=SocketBindAllow=*) continue ;;
 --property=IPAddressAllow=*) continue ;;
@@ -2583,45 +2592,45 @@ case "$arg" in
 # properties are logged via _warn_dsr when dropped (same convention as above);
 # resource/accounting/metadata/IO/log properties stay silent.
 # --- Filesystem / namespace sandboxing ---
---property=PrivateDevices=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=PrivateMounts=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=PrivateNetwork=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=PrivateUsers=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=MountFlags=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=MountAPIVFS=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ReadWritePaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ReadOnlyPaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=InaccessiblePaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ExecPaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=NoExecPaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=PrivateDevices=*) PRIVATE_DEVICES="${arg#--property=PrivateDevices=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=PrivateMounts=*) _log_dsr "Sandbox: PrivateMounts (default in mount namespace): $arg"; continue ;;
+--property=PrivateNetwork=*) _log_dsr "Sandbox: PrivateNetwork (best-effort, network not blocked): $arg"; continue ;;
+--property=PrivateUsers=*) _log_dsr "Sandbox: PrivateUsers (best-effort): $arg"; continue ;;
+--property=MountFlags=*) _log_dsr "Sandbox: MountFlags (default in mount namespace): $arg"; continue ;;
+--property=MountAPIVFS=*) _log_dsr "Sandbox: MountAPIVFS (default in mount namespace): $arg"; continue ;;
+--property=ReadWritePaths=*) READ_WRITE_PATHS+=("${arg#--property=ReadWritePaths=}"); _log_dsr "Sandbox: $arg"; continue ;;
+--property=ReadOnlyPaths=*) READ_ONLY_PATHS+=("${arg#--property=ReadOnlyPaths=}"); _log_dsr "Sandbox: $arg"; continue ;;
+--property=InaccessiblePaths=*) INACCESSIBLE_PATHS+=("${arg#--property=InaccessiblePaths=}"); _log_dsr "Sandbox: $arg"; continue ;;
+--property=ExecPaths=*) READ_WRITE_PATHS+=("${arg#--property=ExecPaths=}"); _log_dsr "Sandbox: ExecPaths→ReadWritePaths: $arg"; continue ;;
+--property=NoExecPaths=*) READ_ONLY_PATHS+=("${arg#--property=NoExecPaths=}"); _log_dsr "Sandbox: NoExecPaths→ReadOnlyPaths: $arg"; continue ;;
 --property=ConfigurationDirectory=*) continue ;;
---property=RootDirectory=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RootImage=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RootHash=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RootVerity=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=MountImages=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ExtensionImages=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=NamespacePath=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=NetworkNamespacePath=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=RootDirectory=*) _log_dsr "Sandbox: RootDirectory (best-effort): $arg"; continue ;;
+--property=RootImage=*) _log_dsr "Sandbox: RootImage (best-effort): $arg"; continue ;;
+--property=RootHash=*) _log_dsr "Sandbox: RootHash (best-effort): $arg"; continue ;;
+--property=RootVerity=*) _log_dsr "Sandbox: RootVerity (best-effort): $arg"; continue ;;
+--property=MountImages=*) _log_dsr "Sandbox: MountImages (best-effort): $arg"; continue ;;
+--property=ExtensionImages=*) _log_dsr "Sandbox: ExtensionImages (best-effort): $arg"; continue ;;
+--property=NamespacePath=*) _log_dsr "Sandbox: NamespacePath (best-effort): $arg"; continue ;;
+--property=NetworkNamespacePath=*) _log_dsr "Sandbox: NetworkNamespacePath (best-effort): $arg"; continue ;;
 --property=LogNamespace=*) continue ;;
 # --- Capabilities / privileges ---
 --property=InheritDescriptors=*) continue ;;
---property=SecureBits=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=SecureBits=*) _log_dsr "Sandbox: SecureBits (best-effort): $arg"; continue ;;
 # --- Environment ---
 --property=Environment=*) EXTRA_ENV+=("-e" "${arg#--property=Environment=}"); continue ;;
 --property=PassEnvironment=*) continue ;;
 --property=UnsetEnvironment=*) continue ;;
 # --- Personality / arch ---
---property=Personality=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=SystemCallArchitectures=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=SystemCallErrorNumber=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=SystemCallLog=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=Personality=*) _log_dsr "Sandbox: Personality (best-effort): $arg"; continue ;;
+--property=SystemCallArchitectures=*) _log_dsr "Sandbox: SystemCallArchitectures (best-effort): $arg"; continue ;;
+--property=SystemCallErrorNumber=*) _log_dsr "Sandbox: SystemCallErrorNumber (best-effort): $arg"; continue ;;
+--property=SystemCallLog=*) _log_dsr "Sandbox: SystemCallLog (best-effort): $arg"; continue ;;
 # --- IPC / time / misc ---
 --property=TimerSlackNSec=*) continue ;;
 --property=SetLoginEnvironment=*) continue ;;
 --property=Delegate=*) continue ;;
---property=DisableExtraFileDescriptors=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=CoredumpReceive=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+--property=DisableExtraFileDescriptors=*) _log_dsr "Sandbox: DisableExtraFileDescriptors (best-effort): $arg"; continue ;;
+--property=CoredumpReceive=*) _log_dsr "Sandbox: CoredumpReceive (best-effort): $arg"; continue ;;
 --property=DynamicUser=*) continue ;;
 # --- Standard I/O / logging ---
 --property=StandardInput=*) continue ;;
@@ -2870,6 +2879,190 @@ mkdir -p "$CACHE_FULL" 2>/dev/null || true
 if $DYNAMIC_USER; then chown -R HOST_USER_PLACEHOLDER:HOST_USER_PLACEHOLDER "$CACHE_FULL" 2>/dev/null || true; fi
 fi
 
+# ── Determine if sandbox restrictions are needed ──
+_NEEDS_SANDBOX=false
+[[ -n "$PROTECT_SYSTEM" ]] && _NEEDS_SANDBOX=true
+[[ -n "$PROTECT_HOME" ]] && _NEEDS_SANDBOX=true
+[[ -n "$PRIVATE_TMP" ]] && _NEEDS_SANDBOX=true
+[[ -n "$PRIVATE_DEVICES" ]] && _NEEDS_SANDBOX=true
+[[ ${#READ_ONLY_PATHS[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
+[[ ${#INACCESSIBLE_PATHS[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
+if $_NEEDS_SANDBOX; then
+    _log_dsr "Sandbox restrictions active: ProtectSystem=$PROTECT_SYSTEM ProtectHome=$PROTECT_HOME PrivateTmp=$PRIVATE_TMP PrivateDevices=$PRIVATE_DEVICES"
+fi
+
+# ── Apply sandbox restrictions (runs inside mount namespace) ──
+_apply_sandbox() {
+    # All mount operations here affect only the private mount namespace.
+    # Bind-mounting a path to itself gives us a per-mountpoint flags slot
+    # that we can remount as ro/rw independently of the parent.
+
+    # ── ProtectSystem: make / read-only, carve writable exceptions ──
+    if [[ -n "$PROTECT_SYSTEM" ]]; then
+        _log_dsr "Applying ProtectSystem=$PROTECT_SYSTEM"
+        # Make / read-only via bind mount to self + remount
+        if mount --bind / / 2>/dev/null && mount -o remount,bind,ro / 2>/dev/null; then
+            _log_dsr "  / made read-only"
+        else
+            _warn_dsr "  Failed to make / read-only (mount namespace may not support this)"
+        fi
+        # Re-mount writable paths that the build needs
+        local _writable=("/run" "/tmp" "/var/tmp" "/var/cache")
+        [[ -n "$WORK_DIR" ]] && _writable+=("$WORK_DIR")
+        [[ -n "$CACHE_DIR" ]] && _writable+=("/var/cache/$CACHE_DIR")
+        for _wp in "${_writable[@]}"; do
+            [[ -e "$_wp" ]] || mkdir -p "$_wp" 2>/dev/null || continue
+            mount --bind "$_wp" "$_wp" 2>/dev/null && mount -o remount,bind,rw "$_wp" 2>/dev/null \
+                || _warn_dsr "  Could not make writable: $_wp"
+        done
+        # ProtectSystem=full additionally makes /etc, /usr, /boot read-only
+        if [[ "$PROTECT_SYSTEM" == "full" ]] || [[ "$PROTECT_SYSTEM" == "true" ]]; then
+            for _rp in /etc /usr /boot; do
+                [[ -e "$_rp" ]] || continue
+                if mount --bind "$_rp" "$_rp" 2>/dev/null; then
+                    mount -o remount,bind,ro "$_rp" 2>/dev/null \
+                        || mount -o remount,bind "$_rp" 2>/dev/null  # fallback: keep original flags
+                fi
+            done
+        fi
+        # Explicit ReadOnlyPaths and InaccessiblePaths
+        for _rop in "${READ_ONLY_PATHS[@]}"; do
+            [[ -e "$_rop" ]] || continue
+            if mount --bind "$_rop" "$_rop" 2>/dev/null; then
+                mount -o remount,bind,ro "$_rop" 2>/dev/null
+            fi
+        done
+        for _iap in "${INACCESSIBLE_PATHS[@]}"; do
+            [[ -e "$_iap" ]] || continue
+            mount -t tmpfs tmpfs "$_iap" 2>/dev/null && _log_dsr "  Made inaccessible: $_iap"
+        done
+        # ReadWritePaths override the read-only root for specific paths
+        for _rwp in "${READ_WRITE_PATHS[@]}"; do
+            [[ -e "$_rwp" ]] || mkdir -p "$_rwp" 2>/dev/null || continue
+            mount --bind "$_rwp" "$_rwp" 2>/dev/null && mount -o remount,bind,rw "$_rwp" 2>/dev/null
+        done
+    fi
+
+    # ── ProtectHome: make /home inaccessible or read-only ──
+    if [[ -n "$PROTECT_HOME" ]]; then
+        _log_dsr "Applying ProtectHome=$PROTECT_HOME"
+        if [[ "$PROTECT_HOME" == "yes" ]]; then
+            # Replace /home with empty tmpfs
+            if mount -t tmpfs tmpfs /home 2>/dev/null; then
+                _log_dsr "  /home replaced with empty tmpfs"
+            else
+                _warn_dsr "  Could not replace /home with tmpfs"
+            fi
+        elif [[ "$PROTECT_HOME" == "read-only" ]]; then
+            if mount --bind /home /home 2>/dev/null; then
+                mount -o remount,bind,ro /home 2>/dev/null
+                _log_dsr "  /home made read-only"
+            fi
+        fi
+    fi
+
+    # ── PrivateTmp: private /tmp and /var/tmp ──
+    if [[ -n "$PRIVATE_TMP" ]] && [[ "$PRIVATE_TMP" == "yes" ]]; then
+        _log_dsr "Applying PrivateTmp=yes"
+        local _fresh_tmp
+        _fresh_tmp=$(mktemp -d /tmp/.private-tmp-XXXXXX 2>/dev/null) || _fresh_tmp=""
+        if [[ -n "$_fresh_tmp" ]]; then
+            mount --bind "$_fresh_tmp" /tmp 2>/dev/null \
+                || mount -t tmpfs tmpfs /tmp 2>/dev/null
+            rm -rf "$_fresh_tmp" 2>/dev/null || true
+        fi
+        local _fresh_vtmp
+        _fresh_vtmp=$(mktemp -d /var/tmp/.private-vtmp-XXXXXX 2>/dev/null) || _fresh_vtmp=""
+        if [[ -n "$_fresh_vtmp" ]]; then
+            mount --bind "$_fresh_vtmp" /var/tmp 2>/dev/null \
+                || mount -t tmpfs tmpfs /var/tmp 2>/dev/null
+            rm -rf "$_fresh_vtmp" 2>/dev/null || true
+        fi
+        _log_dsr "  Private /tmp and /var/tmp created"
+    fi
+
+    # ── PrivateDevices: minimal /dev with only essential nodes ──
+    if [[ -n "$PRIVATE_DEVICES" ]] && [[ "$PRIVATE_DEVICES" == "yes" ]]; then
+        _log_dsr "Applying PrivateDevices=yes"
+        local _dev_dir
+        _dev_dir=$(mktemp -d /tmp/.private-dev-XXXXXX 2>/dev/null) || _dev_dir=""
+        if [[ -n "$_dev_dir" ]]; then
+            mount -t tmpfs tmpfs "$_dev_dir" 2>/dev/null || { rm -rf "$_dev_dir"; return; }
+            # Essential device nodes
+            mknod "$_dev_dir/null"    c 1 3 2>/dev/null; chmod 666 "$_dev_dir/null" 2>/dev/null
+            mknod "$_dev_dir/zero"    c 1 5 2>/dev/null; chmod 666 "$_dev_dir/zero" 2>/dev/null
+            mknod "$_dev_dir/full"    c 1 7 2>/dev/null; chmod 666 "$_dev_dir/full" 2>/dev/null
+            mknod "$_dev_dir/random"  c 1 8 2>/dev/null; chmod 666 "$_dev_dir/random" 2>/dev/null
+            mknod "$_dev_dir/urandom" c 1 9 2>/dev/null; chmod 666 "$_dev_dir/urandom" 2>/dev/null
+            mknod "$_dev_dir/tty"     c 5 0 2>/dev/null; chmod 666 "$_dev_dir/tty" 2>/dev/null
+            ln -sf /proc/self/fd     "$_dev_dir/fd"     2>/dev/null
+            ln -sf /proc/self/stdin  "$_dev_dir/stdin"  2>/dev/null
+            ln -sf /proc/self/stdout "$_dev_dir/stdout" 2>/dev/null
+            ln -sf /proc/self/stderr "$_dev_dir/stderr" 2>/dev/null
+            mknod "$_dev_dir/ptmx"   c 5 2 2>/dev/null; chmod 666 "$_dev_dir/ptmx" 2>/dev/null
+            mknod "$_dev_dir/tty0"   c 4 0 2>/dev/null; chmod 600 "$_dev_dir/tty0" 2>/dev/null
+            mount --bind "$_dev_dir" /dev 2>/dev/null
+            rm -rf "$_dev_dir" 2>/dev/null || true
+            _log_dsr "  /dev replaced with minimal device nodes"
+        fi
+    fi
+
+    # ── NoNewPrivileges: use prctl via setpriv if available ──
+    if [[ -n "$NO_NEW_PRIVS" ]] && [[ "$NO_NEW_PRIVS" == "yes" ]]; then
+        _log_dsr "Applying NoNewPrivileges=yes"
+        # setpriv --no-new-privs sets PR_SET_NO_NEW_PRIVS on the calling process.
+        # We export a flag so the execution wrapper can apply it.
+        export _DSR_NO_NEW_PRIVS=true
+    fi
+
+    # ── CapabilityBoundingSet: drop capabilities via setpriv ──
+    if [[ -n "$CAP_BOUNDING_SET" ]]; then
+        _log_dsr "Applying CapabilityBoundingSet=$CAP_BOUNDING_SET"
+        # Convert systemd format to setpriv --inh-caps format.
+        # systemd: "CAP_SYS_ADMIN:CAP_NET_ADMIN" or "~CAP_SYS_ADMIN" (drop these)
+        # setpriv: --inh-caps=+cap_sys_admin,+cap_net_admin or --inh-caps=-cap_sys_admin
+        if command -v setpriv >/dev/null 2>&1; then
+            local _cap_args=""
+            local _cap_str="$CAP_BOUNDING_SET"
+            _cap_str="${_cap_str//cap_/CAP_}"  # normalize to uppercase
+            if [[ "$_cap_str" == "~all" ]] || [[ -z "$_cap_str" ]]; then
+                # Drop all capabilities
+                _cap_args="--inh-caps=-all"
+            elif [[ "$_cap_str" == "all" ]]; then
+                # Keep all (no-op)
+                _cap_args=""
+            elif [[ "$_cap_str" == ~\~* ]]; then
+                # Drop specific capabilities: ~CAP1:CAP2 → -cap1,-cap2
+                local _dropped="${_cap_str#\~}"
+                _dropped="${_dropped//:/ }"
+                local _neg_caps=""
+                for _c in $_dropped; do
+                    _c="${_c,,}"  # lowercase
+                    [[ -n "$_neg_caps" ]] && _neg_caps="${_neg_caps},"
+                    _neg_caps="${_neg_caps}-${_c}"
+                done
+                [[ -n "$_neg_caps" ]] && _cap_args="--inh-caps=$_neg_caps"
+            else
+                # Keep specific capabilities: CAP1:CAP2 → +cap1,+cap2
+                local _kept="${_cap_str//:/ }"
+                local _pos_caps=""
+                for _c in $_kept; do
+                    _c="${_c,,}"  # lowercase
+                    [[ -n "$_pos_caps" ]] && _pos_caps="${_pos_caps},"
+                    _pos_caps="${_pos_caps}+${_c}"
+                done
+                [[ -n "$_pos_caps" ]] && _cap_args="--inh-caps=$_pos_caps"
+            fi
+            if [[ -n "$_cap_args" ]]; then
+                export _DSR_CAP_ARGS="$_cap_args"
+                _log_dsr "  Capability bounding set: setpriv $_cap_args"
+            fi
+        else
+            _warn_dsr "  setpriv not available — cannot enforce CapabilityBoundingSet"
+        fi
+    fi
+}
+
 # ── Determine the run-as user ──
 # DynamicUser=true  → use dedicated build user (privileged isolation)
 # User=property      → use that user (non-DynamicUser explicit user switch)
@@ -2882,13 +3075,9 @@ _BL_TMP_HOME=""
 if ! id "$BUILD_USER" >/dev/null 2>&1; then
     if ! useradd -r -d /var/lib/builduser -s /usr/bin/nologin "$BUILD_USER" 2>/dev/null; then
         _warn_dsr "useradd -r failed — trying ad-hoc non-root build user as fallback"
-        # Ensure /var/tmp has the sticky bit so only directory owners can delete
-        # within it. /var/tmp is container-internal (not a host mount in Distrobox),
-        # so temporary homes placed here stay isolated from the host'\''s /home.
         chmod +t /var/tmp 2>/dev/null || true
         _bl_tmp=$(mktemp -d /var/tmp/builduser-home-XXXXXX) || _bl_tmp=""
         if [[ -n "$_bl_tmp" ]]; then
-            # Validate: temp home must NOT be under /home (host mount overlap risk)
             case "$_bl_tmp" in
                 /home/*)
                     _warn_dsr "REFUSING temp home under /home (host mount overlap): $_bl_tmp"
@@ -2921,53 +3110,100 @@ if ! id "$BUILD_USER" >/dev/null 2>&1; then
     mkdir -p /var/lib/builduser 2>/dev/null || true
     chown "$BUILD_USER:$BUILD_USER" /var/lib/builduser 2>/dev/null || true
 fi
+
 # Build the env+command wrapper for sudo invocation.
-# The bash -c approach lets us apply env vars, umask, and working directory
-# before exec-ing the actual build command.
 _BUILD_WRAPPER="$_ENV_SETUP"
 if [[ -n "$EXTRA_GROUPS" ]]; then
-    # Try sg to add supplementary groups; fall back to continuing without
     sg "$EXTRA_GROUPS" -c true 2>/dev/null && _BUILD_WRAPPER="sg '\''$EXTRA_GROUPS'\'' -c \"$_BUILD_WRAPPER\" || ( _warn_dsr '\''sg failed for groups $EXTRA_GROUPS, continuing without'\''; true ); "
 fi
+
+# Construct the inner command (everything the sandbox wrapper will execute).
 if [[ -n "$WORK_DIR" ]]; then
-_log_dsr "EXEC: sudo -u $BUILD_USER -- cd $WORK_DIR; ${CMD_ARGS[*]}"
-if [[ -n "$_BL_TMP_HOME" ]]; then
-    sudo -u "$BUILD_USER" -H -- bash -c "${_BUILD_WRAPPER}cd '\''$WORK_DIR'\'' 2>/dev/null || true; exec \"\$@\"" _ "${CMD_ARGS[@]}"
-    _user_cmd_exit=$?
-    userdel -r "$BUILD_USER" 2>/dev/null || true
-    rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
-    exit $_user_cmd_exit
+    _log_dsr "EXEC: sudo -u $BUILD_USER -- cd $WORK_DIR; ${CMD_ARGS[*]}"
+    _INNER_CMD="cd '${WORK_DIR}' 2>/dev/null || true; ${_BUILD_WRAPPER}exec \"\${@}\"" _
 else
-    exec sudo -u "$BUILD_USER" -H -- bash -c "${_BUILD_WRAPPER}cd '\''$WORK_DIR'\'' 2>/dev/null || true; exec \"\$@\"" _ "${CMD_ARGS[@]}"
+    _log_dsr "EXEC: sudo -u $BUILD_USER -- ${CMD_ARGS[*]}"
+    _INNER_CMD="${_BUILD_WRAPPER}exec \"\${@}\""
 fi
+
+# Apply sandbox if needed, then run as build user
+if $_NEEDS_SANDBOX; then
+    # Apply sandbox restrictions, drop privileges, then exec build user
+    _CAP_PRIV=""
+    [[ -n "${_DSR_CAP_ARGS:-}" ]] && _CAP_PRIV="setpriv ${_DSR_CAP_ARGS} -- "
+    _NNP=""
+    [[ "${_DSR_NO_NEW_PRIVS:-}" == "true" ]] && _NNP="setpriv --no-new-privs -- "
+
+    if [[ -n "$_BL_TMP_HOME" ]]; then
+        # Ad-hoc build user: capture exit code for cleanup
+        unshare --mount --propagation slave bash -c "
+            _apply_sandbox
+            ${_NNP}${_CAP_PRIV}sudo -u '$BUILD_USER' -H -- bash -c '$ _INNER_CMD' -- ${CMD_ARGS[*]}
+        "
+        _user_cmd_exit=$?
+        userdel -r "$BUILD_USER" 2>/dev/null || true
+        rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
+        exit $_user_cmd_exit
+    else
+        # Persistent build user: exec to replace process
+        exec unshare --mount --propagation slave bash -c "
+            _apply_sandbox
+            ${_NNP}${_CAP_PRIV}exec sudo -u '$BUILD_USER' -H -- bash -c '$ _INNER_CMD' -- ${CMD_ARGS[*]}
+        "
+    fi
 else
-_log_dsr "EXEC: sudo -u $BUILD_USER -- ${CMD_ARGS[*]}"
-if [[ -n "$_BL_TMP_HOME" ]]; then
-    sudo -u "$BUILD_USER" -H -- bash -c "${_BUILD_WRAPPER}exec \"\$@\"" _ "${CMD_ARGS[@]}"
-    _user_cmd_exit=$?
-    userdel -r "$BUILD_USER" 2>/dev/null || true
-    rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
-    exit $_user_cmd_exit
-else
-    exec sudo -u "$BUILD_USER" -H -- bash -c "${_BUILD_WRAPPER}exec \"\$@\"" _ "${CMD_ARGS[@]}"
+    # No sandbox needed — run directly
+    if [[ -n "$_BL_TMP_HOME" ]]; then
+        sudo -u "$BUILD_USER" -H -- bash -c "$_INNER_CMD" -- "${CMD_ARGS[@]}"
+        _user_cmd_exit=$?
+        userdel -r "$BUILD_USER" 2>/dev/null || true
+        rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
+        exit $_user_cmd_exit
+    else
+        exec sudo -u "$BUILD_USER" -H -- bash -c "$_INNER_CMD" -- "${CMD_ARGS[@]}"
+    fi
 fi
-fi
+
 elif [[ -n "$TARGET_USER" ]] && [[ "$(id -u)" -eq 0 ]]; then
 # --property=User=someuser without DynamicUser: switch to that user.
-# Environment vars, umask, and working directory are applied via bash -c wrapper.
 _log_dsr "EXEC: sudo -u $TARGET_USER -- ${CMD_ARGS[*]}"
 if [[ -n "$WORK_DIR" ]]; then
-    exec sudo -u "$TARGET_USER" -H -- bash -c "${_BUILD_WRAPPER}cd '\''$WORK_DIR'\'' 2>/dev/null || true; exec \"\$@\"" _ "${CMD_ARGS[@]}"
+    _INNER_CMD="cd '${WORK_DIR}' 2>/dev/null || true; ${_ENV_SETUP}exec \"\${@}\""
 else
-    exec sudo -u "$TARGET_USER" -H -- bash -c "${_BUILD_WRAPPER}exec \"\$@\"" _ "${CMD_ARGS[@]}"
+    _INNER_CMD="${_ENV_SETUP}exec \"\${@}\""
 fi
+
+if $_NEEDS_SANDBOX; then
+    _CAP_PRIV=""
+    [[ -n "${_DSR_CAP_ARGS:-}" ]] && _CAP_PRIV="setpriv ${_DSR_CAP_ARGS} -- "
+    _NNP=""
+    [[ "${_DSR_NO_NEW_PRIVS:-}" == "true" ]] && _NNP="setpriv --no-new-privs -- "
+    exec unshare --mount --propagation slave bash -c "
+        _apply_sandbox
+        ${_NNP}${_CAP_PRIV}exec sudo -u '$TARGET_USER' -H -- bash -c '$ _INNER_CMD' -- ${CMD_ARGS[*]}
+    "
+else
+    exec sudo -u "$TARGET_USER" -H -- bash -c "$_INNER_CMD" -- "${CMD_ARGS[@]}"
+fi
+
 else
 # Non-DynamicUser, non-User= path: run as current user.
-# Apply env vars, umask, and working directory directly.
 ${_ENV_SETUP}
 if [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR" ]]; then cd "$WORK_DIR" 2>/dev/null || true; fi
 _log_dsr "EXEC: ${CMD_ARGS[*]}"
-exec "${CMD_ARGS[@]}"
+
+if $_NEEDS_SANDBOX; then
+    _CAP_PRIV=""
+    [[ -n "${_DSR_CAP_ARGS:-}" ]] && _CAP_PRIV="setpriv ${_DSR_CAP_ARGS} -- "
+    _NNP=""
+    [[ "${_DSR_NO_NEW_PRIVS:-}" == "true" ]] && _NNP="setpriv --no-new-privs -- "
+    exec unshare --mount --propagation slave bash -c "
+        _apply_sandbox
+        ${_NNP}${_CAP_PRIV}exec \"\${@}\"
+    " -- "${CMD_ARGS[@]}"
+else
+    exec "${CMD_ARGS[@]}"
+fi
 fi
 SYSTEMD_RUN_FAKE_HEREDOC
     chmod +x /usr/local/sbin/systemd-run

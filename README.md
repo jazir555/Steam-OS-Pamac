@@ -132,6 +132,50 @@ E --> F
 F --> G[SteamOS Application Menu]
 ```
 
+## Security Model
+
+This script makes deliberate security tradeoffs to provide a seamless
+package-manager experience on a locked-down gaming device. Understanding
+these tradeoffs helps you decide if the script is right for your threat
+model.
+
+### Isolation
+- All package operations run inside a Distrobox/Podman rootless container
+- The host SteamOS is never directly modified (except for desktop-file
+  symlinks in `~/.local/share/applications`)
+- Container storage lives in `~/.local/share/containers/`, not on the
+  root filesystem
+
+### Privilege Escalation
+- **Polkit rules**: On single-user devices (1 human user detected), the
+  wheel group gets passwordless `org.manjaro.pamac.*` via polkit. On
+  multi-user hosts, the rule is scoped to the installing user only.
+- **Sudoers**: `timestamp_timeout=0` scoped to `%wheel` — sudo credentials
+  are not cached between operations, limiting the escalation window.
+- **`--strict-security`**: Disables the `SigLevel = TrustAll` keyring
+  recovery fallback and the fake `systemd-run` wrapper. AUR builds that
+  rely on `DynamicUser=yes` will fail under strict mode, which is the
+  correct behavior for security-sensitive hosts.
+
+### Fake systemd-run
+- The wrapper only triggers when real systemd is unavailable inside the
+  container — it is never installed on the host.
+- It logs all operations to `/tmp/systemd-run-fake.log` for auditability.
+- Under `--strict-security`, the wrapper is refused entirely.
+
+### AUR Trust
+- The Chaotic-AUR, archlinuxcn, and EndeavourOS repositories are
+  optional and gated behind `--enable-extra-repos`. They are disabled
+  by default.
+- Key imports use dynamic discovery first (mirror-distributed keyring
+  packages) before falling back to keyservers. User-configurable
+  `*_KEY_ID` env vars always override hardcoded fallbacks.
+
+### What the script does NOT do
+- It does not modify SteamOS read-only partitions
+- It does not disable Secure Boot or other firmware protections
+- It does not create system-wide service accounts or daemons
+
 ### Verification Test
 When you run the script, you'll see this final success message:
 ```

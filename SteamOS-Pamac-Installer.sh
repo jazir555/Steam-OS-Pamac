@@ -301,13 +301,14 @@ _filter_verbose_output() {
     # NOTE: warning:.*downgrading and warning:.*removing are intentionally NOT
     # filtered — unexpected downgrades/removals during upgrades are exactly the
     # kind of issue a user must see, and hiding them can mask broken upgrades.
-    # NOTE: :: lines are partially filtered: only ::synchronizing, ::debug:,
-    # ::warning:, and ::info: are suppressed (these are noise). Other :: lines
-    # (e.g. :: Retrieving packages, :: Processing changes, :: Proceed) are
-    # passed through — they contain actionable or status information.
+    # NOTE: :: lines are partially filtered: only ::synchronizing and ::debug:
+    # are suppressed (these are noise). ::warning: and ::info: are intentionally
+    # KEPT VISIBLE — they contain actionable status (e.g. package downgrades,
+    # missing dependencies, version conflicts). Other :: lines (e.g. ::
+    # Retrieving packages, :: Processing changes, :: Proceed) are also kept.
     # Additional noise suppressed: plain "downloading" progress lines without
     # errors, "Nothing to do." churn, and "up to date" confirmations.
-    grep -v -E '^\s*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database)|^downloading\s|^::(synchronizing|debug:|warning:|info:)|^Nothing to do\.| is up to date$' || true
+    grep -v -E '^\s*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database)|^downloading\s|^::(synchronizing|debug:)|^Nothing to do\.| is up to date$' || true
 }
 
 run_command() {
@@ -1281,6 +1282,7 @@ OPTIONS:
   --verbose                 Show detailed output, including command logs
   --quiet                   Only show errors
   --version                 Show version information
+  --version-check           Compare installed version against latest GitHub release
   -h, --help                Show this help message
 
 ENVIRONMENT VARIABLES:
@@ -1368,6 +1370,25 @@ parse_arguments() {
             --verbose) LOG_LEVEL="verbose"; shift ;;
             --quiet) LOG_LEVEL="quiet"; shift ;;
             --version) echo "Steam Deck Pamac Setup v${SCRIPT_VERSION}"; exit 0 ;;
+            --version-check)
+                echo "Installed version: v${SCRIPT_VERSION}"
+                _latest=""
+                _latest=$(curl -sf --connect-timeout 5 --max-time 10 \
+                    "https://api.github.com/repos/${GITHUB_REPO:-your-org/Steam-OS-Pamac}/releases/latest" 2>/dev/null \
+                    | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+                if [[ -n "$_latest" ]]; then
+                    echo "Latest release:    v${_latest#v}"
+                    if [[ "$_latest#v" == "$SCRIPT_VERSION" ]]; then
+                        echo "Status: Up to date."
+                    else
+                        echo "Status: Update available. Download the latest from:"
+                        echo "  https://github.com/${GITHUB_REPO:-your-org/Steam-OS-Pamac}/releases/latest"
+                    fi
+                else
+                    echo "Could not fetch latest release (network issue)."
+                fi
+                exit 0
+                ;;
             -h|--help) show_usage; exit 0 ;;
             *) log_error "Unknown option: $1"; show_usage; exit 1 ;;
         esac
@@ -3355,56 +3376,11 @@ if [[ "$_safe_recovered" != "true" ]]; then
     fi
 fi
 
-# Method E: Web Key Directory (WKD) lookups for individual Arch Linux master keys
-# WKD allows fetching GPG keys via HTTPS using the key owner's domain, without
-# relying on keyservers. This queries openpgpkey.archlinux.org for each of the
-# Arch Linux master signing keys.
-if [[ "$_safe_recovered" != "true" ]] && command -v gpg >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
-    echo "Method E: Attempting Web Key Directory (WKD) lookups for Arch Linux master keys..."
-    # Known Arch Linux master signing key IDs (may rotate — these are common long-lived keys)
-    _arch_master_keys=(
-        "DB273E7112E976A32A658B9D9D3D0F9C3F4C419B"  # David Runge
-        "56C3E775E72B0C8BFD975F8510DDB6C069A926C1"  # Jan Alexander Steffens (fta)
-        "B81515D46F1161234E8A4BEB6BFF5AA654FABD5A"  # Levente Polyák (anthraxx)
-    )
-    for _mk_id in "${_arch_master_keys[@]}"; do
-        echo "  Attempting WKD lookup for key $_mk_id..."
-        # WKD URL pattern: https://openpgpkey.archlinux.org/.well-known/openpgpkey/hu/<40-char-fingerprint>
-        # Convert fingerprint to WKD local-part format (lowercase, split into 2-char chunks)
-        _wkd_fp_lower=$(echo "$_mk_id" | tr 'A-F' 'a-f')
-        _wkd_local=""
-        _chunk=""
-        for (( i=0; i<${#_wkd_fp_lower}; i++ )); do
-            _chunk="${_chunk}${_wkd_fp_lower:$i:1}"
-            if (( ${#_chunk} == 2 )); then
-                [[ -n "$_wkd_local" ]] && _wkd_local="${_wkd_local}."
-                _wkd_local="${_wkd_local}${_chunk}"
-                _chunk=""
-            fi
-        done
-        [[ -n "$_chunk" ]] && _wkd_local="${_wkd_local}.${_chunk}"
-        _wkd_url="https://openpgpkey.archlinux.org/.well-known/openpgpkey/hu/${_wkd_local}"
-        _wkd_tmp=$(mktemp /var/tmp/pamac-wkd-XXXXXX) && chmod 700 "$_wkd_tmp" 2>/dev/null || _wkd_tmp=$(mktemp)
-        if timeout 15 curl -fsSL --connect-timeout 5 --max-time 10 -o "$_wkd_tmp" "$_wkd_url" 2>/dev/null; then
-            if file "$_wkd_tmp" 2>/dev/null | grep -qi "GPG\|PGP"; then
-                echo "    WKD returned valid key for $_mk_id"
-                if timeout 30 gpg --homedir /etc/pacman.d/gnupg --import "$_wkd_tmp" 2>/dev/null; then
-                    echo "    Imported key $_mk_id via WKD"
-                fi
-            else
-                echo "    WKD response was not a valid GPG key"
-            fi
-        else
-            echo "    WKD lookup failed for $_mk_id (server may not support WKD)"
-        fi
-        rm -f "$_wkd_tmp" 2>/dev/null || true
-    done
-    # After WKD imports, try to populate
-    if pacman-key --populate archlinux 2>/dev/null; then
-        echo "  WKD key imports + populate succeeded."
-        _safe_recovered=true
-    fi
-fi
+# Method E removed: WKD lookups for Arch Linux master keys.
+# Previously attempted WKD via openpgpkey.archlinux.org, but the local-part
+# construction from fingerprints did not match the server's actual endpoint
+# (the server uses a non-standard path scheme), making this method unreliable.
+# Methods A-D + F + G already provide sufficient key recovery coverage.
 
 # Method F: Controlled temporary SigLevel relaxation as last-ditch bootstrap
 # SECURITY MODEL: we NEVER write TrustAll to the real /etc/pacman.conf. Instead
@@ -4139,18 +4115,31 @@ echo "Installing polkit..."
 if pacman -S --noconfirm --needed polkit; then
 polkit_dir="/etc/polkit-1/rules.d"
 mkdir -p "$polkit_dir"
-printf '%s\n' 'polkit.addRule(function(action, subject) {' \
-' if (action.id.indexOf("org.manjaro.pamac.") == 0 &&' \
-'   subject.isInGroup("wheel")) {' \
-'   return polkit.Result.YES;' \
-' }' \
-'});' > "$polkit_dir/10-pamac-nopasswd.rules"
+# Detect single-user (Steam Deck) vs multi-user hosts.
+# On single-user devices, wheel-group blanket allow is safe.
+# On multi-user hosts, restrict to the installing user only.
+_human_users=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' | wc -l)
+if [[ "$_human_users" -le 1 ]]; then
+    printf '%s\n' 'polkit.addRule(function(action, subject) {' \
+    ' if (action.id.indexOf("org.manjaro.pamac.") == 0 &&' \
+    '   subject.isInGroup("wheel")) {' \
+    '   return polkit.Result.YES;' \
+    ' }' \
+    '});' > "$polkit_dir/10-pamac-nopasswd.rules"
+    echo "polkit passwordless rule created for pamac operations (wheel group — single-user host)."
+else
+    _current_user=$(whoami)
+    printf '%s\n' 'polkit.addRule(function(action, subject) {' \
+    ' if (action.id.indexOf("org.manjaro.pamac.") == 0 &&' \
+    "   subject.user == \"$_current_user\") {" \
+    '   return polkit.Result.YES;' \
+    ' }' \
+    '});' > "$polkit_dir/10-pamac-nopasswd.rules"
+    echo "polkit passwordless rule created for pamac operations (restricted to user $_current_user — multi-user host)."
+fi
 # polkitd drops privileges to uid 966 (polkitd) — it needs read access to rules
 chmod 755 /etc/polkit-1 /etc/polkit-1/rules.d 2>/dev/null || true
-echo "polkit passwordless rule created for pamac operations (wheel group only)."
-echo "SECURITY: This rule grants passwordless package management to any local, active wheel-group"
-echo "          member. Safe on single-user devices (e.g. Steam Deck). On multi-user hosts,"
-echo "          consider restricting the subject check to a specific user or removing the rule."
+echo "SECURITY: On single-user hosts, passwordless access is wheel-group-wide."
 if ! id polkitd >/dev/null 2>&1; then
 useradd -r -d / -s /usr/bin/nologin polkitd 2>/dev/null || echo "Note: polkitd user creation failed"
 fi
@@ -5304,8 +5293,9 @@ _enable_repo_with_fallback \
     "https://mirror.freedif.org/EndeavourOS/repo/\$repo/\$arch" \
     "https://mirror.endeavouros.com/EndeavourOS/repo/\$repo/\$arch" \
     "https://mirror.enderunix.org/endeavouros/repo/\$repo/\$arch"
-echo "Note: F52611D11AFD4556 is a short ID — verify at https://github.com/endeavouros-team"
-echo "  Override with: ENDEAVOUROS_KEY_ID=<FULL_FINGERPRINT>  (40 hex chars)"
+echo "Note: F52611D11AFD4556 is a 16-char short ID (cannot verify online)."
+echo "  Override with: ENDEAVOUROS_KEY_ID=<FULL_40_CHAR_FINGERPRINT>"
+echo "  Find the full fingerprint at: pacman-key --list-keys endeavouros (inside a working EndeavourOS install)"
 
 echo "=== Configuring mesa-git repository (disabled by default - can break GPU drivers) ==="
 if ! _repo_already_enabled "mesa-git"; then

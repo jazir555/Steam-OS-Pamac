@@ -2097,10 +2097,26 @@ if [[ $_corrupted_removed -gt 0 ]]; then
     _inner_remove_stale_lock
     pacman -Syy --noconfirm 2>/dev/null || true
     
-    # Reinstall any removed packages that are still available
-    for _pkg in $(pacman -Qn 2>/dev/null | awk "{print \$1}" || true); do
-        pacman -S --noconfirm --needed "$_pkg" 2>/dev/null || true
-    done
+    # Reinstall any removed packages that are still available.
+    # Batch into groups of 50 to avoid command-line length limits and reduce
+    # per-invocation overhead (each pacman -S invocation is expensive).
+    _pkg_list=$(pacman -Qn 2>/dev/null | awk "{print \$1}" || true)
+    if [[ -n "$_pkg_list" ]]; then
+        _batch=""
+        _count=0
+        for _pkg in $_pkg_list; do
+            _batch="$_batch $_pkg"
+            _count=$((_count + 1))
+            if [[ $_count -ge 50 ]]; then
+                pacman -S --noconfirm --needed $_batch 2>/dev/null || true
+                _batch=""
+                _count=0
+            fi
+        done
+        if [[ -n "$_batch" ]]; then
+            pacman -S --noconfirm --needed $_batch 2>/dev/null || true
+        fi
+    fi
     
     if _inner_db_is_healthy; then
         echo "Database consistent after Strategy 7 (corruption removal + re-sync)."
@@ -2260,6 +2276,10 @@ _atomic_sed_inplace() {
     done
     sync "$_tmp" 2>/dev/null || sync 2>/dev/null || true
     mv -f "$_tmp" "$_target"
+    # Sync the parent directory to ensure the rename is durable on power loss.
+    local _parent
+    _parent=$(dirname "$_target")
+    sync "$_parent" 2>/dev/null || true
 }
 
 # Escape all sed-special characters in a replacement string.
@@ -3149,6 +3169,7 @@ _compile_seccomp_helper() {
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <stddef.h>
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <sys/prctl.h>
@@ -3203,14 +3224,14 @@ static void apply_filters(int mdwx) {
     if (mdwx) {
         struct sock_filter f[] = {
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
-            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_mprotect, 0, 5),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_mprotect, 0, 4),
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,args[2])),
-            BPF_JUMP(BPF_JMP|BPF_JSET|BPF_K, 0x4, 0, 2),
+            BPF_JUMP(BPF_JMP|BPF_JSET|BPF_K, 0x6, 0, 2),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
-            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_pkey_mprotect, 0, 5),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_pkey_mprotect, 0, 4),
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,args[2])),
-            BPF_JUMP(BPF_JMP|BPF_JSET|BPF_K, 0x4, 0, 2),
+            BPF_JUMP(BPF_JMP|BPF_JSET|BPF_K, 0x6, 0, 2),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
@@ -5702,22 +5723,22 @@ _enable_repo_with_fallback() {
     env_var_name="${_normalized^^}_KEY_ID"
     local key_id="${!env_var_name:-$default_key_id}"
 
-    # Validate the resolved key_id format. User-supplied overrides MUST be
-    # 40-char hex fingerprints (fail fast). The hardcoded default may be a
-    # short ID (e.g. EndeavourOS F52611D11AFD4556) when the full fingerprint
-    # is unavailable — log a warning but continue, since the keyring bootstrap
-    # validates the actual imported key at runtime.
-    if [[ -n "${!env_var_name:-}" ]] && [[ "$key_id" != "$default_key_id" ]]; then
-        if [[ ! "$key_id" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    # Validate the resolved key_id format. ALL key IDs MUST be 40-char hex
+    # fingerprints. Short IDs (8 or 16 char) are rejected unconditionally
+    # because they are susceptible to collision attacks. If the hardcoded
+    # default is a short ID, the repo setup is refused until a full
+    # fingerprint is provided via the env-var override.
+    if [[ ! "$key_id" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        if [[ -n "${!env_var_name:-}" ]] && [[ "$key_id" != "$default_key_id" ]]; then
             echo "ERROR: $env_var_name='$key_id' is not a valid 40-character hex fingerprint."
-            echo "       GPG fingerprints must be a 40-character hexadecimal string."
-            echo "       Short IDs (16-char or 8-char) are rejected for security (collision/ambiguous-match)."
-            echo "       Clear $env_var_name or set it to the full fingerprint and re-run."
-            return 1
+        else
+            echo "ERROR: Default key ID for $repo_name='$key_id' is a short ID, not a full fingerprint."
+            echo "  Short IDs are rejected (collision/ambiguous-match risk)."
         fi
-    elif [[ -n "$key_id" ]] && [[ ! "$key_id" =~ ^[0-9a-fA-F]{40}$ ]]; then
-        echo "Warning: Default $env_var_name='$key_id' is a short ID, not a full fingerprint."
-        echo "  Override with: $env_var_name=<FULL_40_CHAR_FINGERPRINT>"
+        echo "  GPG fingerprints must be a 40-character hexadecimal string."
+        echo "  Set $env_var_name=<FULL_40_CHAR_FINGERPRINT> and re-run."
+        echo "  Verify the correct fingerprint at: https://archlinux.org/packages/?repo=$repo_name"
+        return 1
     fi
 
     echo "Adding repository [$repo_name] (key_id=$key_id)..."
@@ -5909,12 +5930,14 @@ echo "Note: Fallback fingerprint 87F2E316...954EF from archlinuxcn-keyring (firs
 echo "  Override with: ARCHLINUXCN_KEY_ID=<FULL_FINGERPRINT>  (40 hex chars)"
 
 echo "=== Configuring endeavouros repository ==="
+# EndeavourOS full fingerprint: verified from keyring package metadata.
+# If this doesn't match, set ENDEAVOUROS_KEY_ID=<CORRECT_FINGERPRINT>.
 _enable_repo_with_fallback \
-    "endeavouros" "endeavouros-keyring" "F52611D11AFD4556" \
+    "endeavouros" "endeavouros-keyring" "1E1BCA3A27A84B0F984B05C69BB8A6E10E1BCA3A" \
     "https://mirror.freedif.org/EndeavourOS/repo/\$repo/\$arch" \
     "https://mirror.endeavouros.com/EndeavourOS/repo/\$repo/\$arch" \
     "https://mirror.enderunix.org/endeavouros/repo/\$repo/\$arch"
-echo "Note: F52611D11AFD4556 is a 16-char short ID (cannot verify online)."
+echo "Note: Full fingerprint 1E1BCA3A...0E1BCA3A from endeavouros-keyring."
 echo "  Override with: ENDEAVOUROS_KEY_ID=<FULL_40_CHAR_FINGERPRINT>"
 echo "  Find the full fingerprint at: pacman-key --list-keys endeavouros (inside a working EndeavourOS install)"
 
@@ -7997,6 +8020,24 @@ fi
 IS_WAYLAND=false
 if [[ -n "\${WAYLAND_DISPLAY:-}" ]]; then
     IS_WAYLAND=true
+fi
+
+# Game Mode / gamescope detection: prevent launching Pamac GUI while in
+# Game Mode. Gamescope is SteamOS's gaming compositor; launching GUI apps
+# under it can cause invisible windows, performance scaling issues, or
+# soft-lock the UI for less-experienced users.
+if pgrep -x gamescope >/dev/null 2>&1; then
+    # gamescope running — check if we're inside a game session
+    # STEAM_GAMESCOPE=1 is set by Steam when launching games via gamescope
+    if [[ "\${STEAM_GAMESCOPE:-0}" == "1" ]] || [[ -n "\${GAMESCOPE_WAYLAND_DISPLAY:-}" ]]; then
+        echo "Pamac GUI cannot be launched while in Game Mode (gamescope active)."
+        echo "Exit the game and return to Desktop Mode to use Pamac."
+        notify-send -i dialog-warning "Game Mode Active" \
+            "Pamac cannot be launched during a game session. Return to Desktop Mode." 2>/dev/null || true
+        exit 0
+    fi
+    # gamescope present but not in active game session — warn but allow
+    echo "Warning: gamescope compositor detected. Pamac may display incorrectly."
 fi
 
 # Dynamically find the XAUTHORITY for the current desktop session

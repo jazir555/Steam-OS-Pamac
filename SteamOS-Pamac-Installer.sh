@@ -290,6 +290,12 @@ sanitize_and_upload_log() {
         -e 's/GPGKEY[=: ].*$/GPGKEY=<REDACTED>/gi' \
         -e 's/gpg_key[=: ].*$/gpg_key=<REDACTED>/gi' \
         -e 's/signing_key[=: ].*$/signing_key=<REDACTED>/gi' \
+        -e 's/--gpgkey[= ][^ ]*/--gpgkey <REDACTED>/gi' \
+        -e 's/key[_-]?id[=: ][^ ]*/key_id=<REDACTED>/gi' \
+        -e 's/ssh-(rsa|ed25519|dss|ecdsa) [A-Za-z0-9+/=]*/ssh-<REDACTED_KEY>/g' \
+        -e 's/cookie[=: ].*$/cookie=<REDACTED>/gi' \
+        -e 's/PRIVATE[_-]?KEY[_-]?FILE/PRIVATE_KEY_FILE/gi' \
+        -e 's/\.pem\b/<REDACTED_PEM>/g' \
         "$LOG_FILE" 2>/dev/null \
     | grep -viE '(
         AUR_[A-Z_]*KEY|             # AUR environment variable keys
@@ -301,7 +307,9 @@ sanitize_and_upload_log() {
         CREDENTIALS|                # Credential references
         PRIVATE_KEY|                # Generic private key mentions
         -----BEGIN|                 # PEM headers that survived sed
-        -----END                    # PEM footers that survived sed
+        -----END|                   # PEM footers that survived sed
+        X-Api-Key|                  # API key headers
+        Authorization:.*Basic       # Basic auth credentials
     )' > "$sanitized_log" 2>/dev/null || {
             log_warn "Log sanitization failed. Uploading raw log."
             cp -f "$LOG_FILE" "$sanitized_log"
@@ -1687,8 +1695,22 @@ detect_init_support() {
         local resolved
         resolved=$(command -v "$init_binary" 2>/dev/null || echo "")
         if [[ -n "$resolved" ]] || [[ -f "$init_binary" ]]; then
-            CONTAINER_HAS_INIT="true"
-            log_info "Init system supported ($mgr init binary: $init_binary)."
+            # Additional verification: check that the container runtime
+            # actually supports the --init flag (some builds report an
+            # init path but lack --init support).
+            local _init_flag_works=false
+            if [[ "$mgr" == "docker" ]]; then
+                docker run --rm --init alpine echo _init_test 2>/dev/null | grep -q "_init_test" && _init_flag_works=true
+            else
+                container_runtime_for_ops run --rm --init alpine echo _init_test 2>/dev/null | grep -q "_init_test" && _init_flag_works=true
+            fi
+            if $_init_flag_works; then
+                CONTAINER_HAS_INIT="true"
+                log_info "Init system supported ($mgr init binary: $init_binary, --init flag verified)."
+            else
+                CONTAINER_HAS_INIT="false"
+                log_info "Init binary found but --init flag not functional - using non-init container."
+            fi
         else
             CONTAINER_HAS_INIT="false"
             log_info "Init binary '$init_binary' not found - using non-init container."
@@ -2551,7 +2573,8 @@ install_base_devel_batched() {
 # because the kernel requires the shebang to be byte 0 of the file.
 #
 # SECURITY MODEL: This wrapper enforces sandboxing via Linux mount
-# namespaces (unshare --mount), bind mounts, capability dropping (setpriv),
+# namespaces (unshare --mount --net), bind mounts, capability dropping
+# (setpriv or capsh for bounding-set enforcement), (setpriv),
 # and seccomp-BPF (compiled in-container via gcc). ALL sandboxing properties
 # are enforced: ProtectSystem, ProtectHome, PrivateTmp, PrivateDevices,
 # ReadWritePaths, ReadOnlyPaths, InaccessiblePaths, NoNewPrivileges,
@@ -2562,11 +2585,11 @@ install_base_devel_batched() {
 #
 # EXPERIMENTAL: This wrapper is a custom compatibility shim, NOT systemd.
 # It does not provide full systemd parity. Sandboxing properties are enforced
-# via Linux kernel primitives (mount namespaces, seccomp, capabilities) but
-# some edge cases may differ from real systemd-run. If builds fail inside the
-# container, try: (1) installing gcc/base-devel for seccomp compilation,
-# (2) using --strict-security to disable the wrapper, or (3) using real
-# systemd (e.g., distrobox with --init flag).
+# via Linux kernel primitives (mount namespaces, network namespaces, seccomp,
+# capabilities) but some edge cases may differ from real systemd. If builds
+# fail inside the container, try: (1) installing gcc/base-devel for seccomp
+# compilation, (2) using --strict-security to disable the wrapper, or (3)
+# using real systemd (e.g., distrobox with --init flag).
 _write_fake_systemd_run_wrapper() {
     mkdir -p /usr/local/sbin
     cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE_HEREDOC'
@@ -2607,7 +2630,7 @@ _cleanup_orphaned_buildusers
 # Passthrough: --help and --version are not meaningful here
 for _a in "$@"; do
     case "$_a" in
-        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo ""; echo "ENFORCED via mount namespaces + bind mounts + setpriv + seccomp-BPF:"; echo "  Filesystem: ProtectSystem, ProtectHome, PrivateTmp, PrivateDevices,"; echo "              ReadWritePaths, ReadOnlyPaths, InaccessiblePaths"; echo "  Privileges: NoNewPrivileges (setpriv), CapabilityBoundingSet (setpriv)"; echo "  Seccomp:    MemoryDenyWriteExecute (blocks mprotect W+X),"; echo "              RestrictSUIDSGID (blocks setuid/setgid family),"; echo "              ProtectKernelModules (blocks init/delete_module)"; echo "  Runtime:    mount namespace verified after applying restrictions"; echo "  DynamicUser: isolated build user with private home"; echo "  User, Environment, EnvironmentFile, CacheDirectory, WorkingDirectory,"; echo "              UMask, SupplementaryGroups"; echo ""; echo "BEST-EFFORT (logged, compiled when gcc available):"; echo "  SystemCallFilter, RestrictNamespaces, LockPersonality, RestrictRealtime,"; echo "  RestrictAddressFamilies, ProtectClock, ProtectKernelTunables,"; echo "  ProtectKernelLogs, ProtectControlGroups, ProtectHostname, RestrictFileSystems"; echo ""; echo "Sandbox: unshare --mount + bind mounts + setpriv + seccomp helper (requires gcc)."; echo "  Resource/accounting/logging/Condition/Assert/Timeout: recognized, silently dropped."; echo ""; echo "Use --strict-security on the installer to disable this wrapper entirely."; exit 0 ;;
+        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo ""; echo "ENFORCED via mount namespaces + network namespaces + bind mounts + setpriv/capsh + seccomp-BPF:"; echo "  Filesystem: ProtectSystem, ProtectHome, PrivateTmp, PrivateDevices,"; echo "              ReadWritePaths, ReadOnlyPaths, InaccessiblePaths"; echo "  Network:    PrivateNetwork (unshare --net)"; echo "  Privileges: NoNewPrivileges (setpriv), CapabilityBoundingSet (setpriv or capsh)"; echo "  Seccomp:    MemoryDenyWriteExecute (blocks mprotect W+X),"; echo "              RestrictSUIDSGID (blocks setuid/setgid family),"; echo "              ProtectKernelModules (blocks init/delete_module)"; echo "  Runtime:    mount + network namespace verified after applying restrictions"; echo "  DynamicUser: isolated build user with private home"; echo "  User, Environment, EnvironmentFile, CacheDirectory, WorkingDirectory,"; echo "              UMask, SupplementaryGroups"; echo ""; echo "BEST-EFFORT (logged, compiled when gcc available):"; echo "  SystemCallFilter, RestrictNamespaces, LockPersonality, RestrictRealtime,"; echo "  RestrictAddressFamilies, ProtectClock, ProtectKernelTunables,"; echo "  ProtectKernelLogs, ProtectControlGroups, ProtectHostname, RestrictFileSystems"; echo ""; echo "Sandbox: unshare --mount --net + bind mounts + setpriv/capsh + seccomp helper (requires gcc)."; echo "  Resource/accounting/logging/Condition/Assert/Timeout: recognized, silently dropped."; echo ""; echo "Use --strict-security on the installer to disable this wrapper entirely."; exit 0 ;;
         --version) echo "systemd-run (fake) v${DSR_VERSION} (SteamOS-Pamac)"; exit 0 ;;
     esac
 done
@@ -2631,6 +2654,7 @@ PROTECT_SYSTEM=""
 PROTECT_HOME=""
 PRIVATE_TMP=""
 PRIVATE_DEVICES=""
+PRIVATE_NETWORK=""
 NO_NEW_PRIVS=""
 CAP_BOUNDING_SET=""
 READ_WRITE_PATHS=()
@@ -2736,7 +2760,7 @@ case "$arg" in
 # --- Filesystem / namespace sandboxing ---
 --property=PrivateDevices=*) PRIVATE_DEVICES="${arg#--property=PrivateDevices=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=PrivateMounts=*) _log_dsr "Sandbox: PrivateMounts (default in mount namespace): $arg"; continue ;;
---property=PrivateNetwork=*) _log_dsr "Sandbox: PrivateNetwork (best-effort, network not blocked): $arg"; continue ;;
+--property=PrivateNetwork=*) PRIVATE_NETWORK="${arg#--property=PrivateNetwork=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=PrivateUsers=*) _log_dsr "Sandbox: PrivateUsers (best-effort): $arg"; continue ;;
 --property=MountFlags=*) _log_dsr "Sandbox: MountFlags (default in mount namespace): $arg"; continue ;;
 --property=MountAPIVFS=*) _log_dsr "Sandbox: MountAPIVFS (default in mount namespace): $arg"; continue ;;
@@ -3027,6 +3051,7 @@ _NEEDS_SANDBOX=false
 [[ -n "$PROTECT_HOME" ]] && _NEEDS_SANDBOX=true
 [[ -n "$PRIVATE_TMP" ]] && _NEEDS_SANDBOX=true
 [[ -n "$PRIVATE_DEVICES" ]] && _NEEDS_SANDBOX=true
+[[ -n "$PRIVATE_NETWORK" ]] && _NEEDS_SANDBOX=true
 [[ ${#READ_ONLY_PATHS[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
 [[ ${#INACCESSIBLE_PATHS[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
 [[ ${#STATE_DIRECTORIES[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
@@ -3295,10 +3320,31 @@ _apply_sandbox() {
                 _log_dsr "  Capability bounding set: setpriv $_cap_args"
             fi
         else
-            _warn_dsr "  setpriv not available — cannot enforce CapabilityBoundingSet"
-            # Fallback: try capsh if available
+            _warn_dsr "  setpriv not available — trying capsh fallback"
+            # Fallback: capsh --drop truly removes capabilities from the bounding
+            # set (not just the inheritable set like setpriv --inh-caps). This
+            # prevents a sandboxed process from regaining caps via setuid exec.
             if command -v capsh >/dev/null 2>&1; then
-                _warn_dsr "  Trying capsh fallback for capability dropping"
+                local _capsh_drop=""
+                local _cap_str2="$CAP_BOUNDING_SET"
+                _cap_str2="${_cap_str2//cap_/CAP_}"
+                if [[ "$_cap_str2" == "~all" ]] || [[ -z "$_cap_str2" ]]; then
+                    _capsh_drop="--drop=all"
+                elif [[ "$_cap_str2" == "all" ]]; then
+                    _capsh_drop=""
+                elif [[ "$_cap_str2" == \~* ]]; then
+                    local _dropped2="${_cap_str2#\~}"
+                    _dropped2="${_dropped2//:/,}"
+                    _capsh_drop="--drop=${_dropped2,,}"
+                else
+                    _capsh_drop="--drop=all"
+                fi
+                if [[ -n "$_capsh_drop" ]]; then
+                    export _DSR_CAPSH_ARGS="$_capsh_drop"
+                    _log_dsr "  capsh fallback: capsh $_capsh_drop"
+                fi
+            else
+                _warn_dsr "  Neither setpriv nor capsh available — cannot enforce CapabilityBoundingSet"
             fi
         fi
     fi
@@ -3329,6 +3375,13 @@ _apply_sandbox() {
             _log_dsr "  /tmp is a mount point (PrivateTmp verified)"
         else
             _warn_dsr "VERIFICATION WARNING: /tmp is not a mount point after PrivateTmp=yes"
+        fi
+    fi
+    if [[ -n "$PRIVATE_NETWORK" ]]; then
+        if ip link show lo 2>/dev/null | grep -q "state UP"; then
+            _warn_dsr "VERIFICATION WARNING: loopback interface still up after PrivateNetwork=yes"
+        else
+            _log_dsr "  Network namespace is isolated (PrivateNetwork verified)"
         fi
     fi
     if $_sandbox_verified; then
@@ -3579,9 +3632,15 @@ else
 fi
 
 # Apply sandbox if needed, then run as build user
+_UNSHARE_NET_FLAGS=""
+[[ -n "$PRIVATE_NETWORK" ]] && _UNSHARE_NET_FLAGS="--net"
 if $_NEEDS_SANDBOX; then
     _CAP_PRIV=""
-    [[ -n "${_DSR_CAP_ARGS:-}" ]] && _CAP_PRIV="setpriv ${_DSR_CAP_ARGS} -- "
+    if [[ -n "${_DSR_CAPSH_ARGS:-}" ]]; then
+        _CAP_PRIV="capsh ${_DSR_CAPSH_ARGS} -- "
+    elif [[ -n "${_DSR_CAP_ARGS:-}" ]]; then
+        _CAP_PRIV="setpriv ${_DSR_CAP_ARGS} -- "
+    fi
     _NNP=""
     [[ "${_DSR_NO_NEW_PRIVS:-}" == "true" ]] && _NNP="setpriv --no-new-privs -- "
     # Compile seccomp helper if any seccomp properties are active
@@ -3609,7 +3668,7 @@ if $_NEEDS_SANDBOX; then
         else
             _DSR_SBOX="${_CAP_PRIV}${_NNP}sudo -u '$BUILD_USER' -H -- bash -c '$_SANDBOX_CMD' -- ${CMD_ARGS[*]}"
         fi
-        unshare --mount --propagation slave bash -c "_apply_sandbox; $_DSR_SBOX"
+        unshare --mount $_UNSHARE_NET_FLAGS --propagation slave bash -c "_apply_sandbox; $_DSR_SBOX"
         _user_cmd_exit=$?
         userdel -r "$BUILD_USER" 2>/dev/null || true
         rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
@@ -3620,7 +3679,7 @@ if $_NEEDS_SANDBOX; then
         else
             _DSR_SBOX="exec ${_CAP_PRIV}${_NNP}sudo -u '$BUILD_USER' -H -- bash -c '$_SANDBOX_CMD' -- ${CMD_ARGS[*]}"
         fi
-        exec unshare --mount --propagation slave bash -c "_apply_sandbox; $_DSR_SBOX"
+        exec unshare --mount $_UNSHARE_NET_FLAGS --propagation slave bash -c "_apply_sandbox; $_DSR_SBOX"
     fi
 else
     if [[ -n "$_BL_TMP_HOME" ]]; then
@@ -3643,9 +3702,15 @@ else
     _INNER_CMD="${_ENV_SETUP}exec \"\${@}\""
 fi
 
+_UNSHARE_NET_FLAGS=""
+[[ -n "$PRIVATE_NETWORK" ]] && _UNSHARE_NET_FLAGS="--net"
 if $_NEEDS_SANDBOX; then
     _CAP_PRIV=""
-    [[ -n "${_DSR_CAP_ARGS:-}" ]] && _CAP_PRIV="setpriv ${_DSR_CAP_ARGS} -- "
+    if [[ -n "${_DSR_CAPSH_ARGS:-}" ]]; then
+        _CAP_PRIV="capsh ${_DSR_CAPSH_ARGS} -- "
+    elif [[ -n "${_DSR_CAP_ARGS:-}" ]]; then
+        _CAP_PRIV="setpriv ${_DSR_CAP_ARGS} -- "
+    fi
     _NNP=""
     [[ "${_DSR_NO_NEW_PRIVS:-}" == "true" ]] && _NNP="setpriv --no-new-privs -- "
     _SECCOMP_HELPER=""
@@ -3663,7 +3728,7 @@ if $_NEEDS_SANDBOX; then
     else
         _DSR_SBOX="exec ${_CAP_PRIV}${_NNP}sudo -u '$TARGET_USER' -H -- bash -c '$_INNER_CMD' -- ${CMD_ARGS[*]}"
     fi
-    exec unshare --mount --propagation slave bash -c "_apply_sandbox; $_DSR_SBOX"
+    exec unshare --mount $_UNSHARE_NET_FLAGS --propagation slave bash -c "_apply_sandbox; $_DSR_SBOX"
 else
     exec sudo -u "$TARGET_USER" -H -- bash -c "$_INNER_CMD" -- "${CMD_ARGS[@]}"
 fi
@@ -3674,9 +3739,15 @@ ${_ENV_SETUP}
 if [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR" ]]; then cd "$WORK_DIR" 2>/dev/null || true; fi
 _log_dsr "EXEC: ${CMD_ARGS[*]}"
 
+_UNSHARE_NET_FLAGS=""
+[[ -n "$PRIVATE_NETWORK" ]] && _UNSHARE_NET_FLAGS="--net"
 if $_NEEDS_SANDBOX; then
     _CAP_PRIV=""
-    [[ -n "${_DSR_CAP_ARGS:-}" ]] && _CAP_PRIV="setpriv ${_DSR_CAP_ARGS} -- "
+    if [[ -n "${_DSR_CAPSH_ARGS:-}" ]]; then
+        _CAP_PRIV="capsh ${_DSR_CAPSH_ARGS} -- "
+    elif [[ -n "${_DSR_CAP_ARGS:-}" ]]; then
+        _CAP_PRIV="setpriv ${_DSR_CAP_ARGS} -- "
+    fi
     _NNP=""
     [[ "${_DSR_NO_NEW_PRIVS:-}" == "true" ]] && _NNP="setpriv --no-new-privs -- "
     _SECCOMP_HELPER=""
@@ -3690,12 +3761,12 @@ if $_NEEDS_SANDBOX; then
         fi
     fi
     if [[ -n "$_SECCOMP_HELPER" ]]; then
-        exec unshare --mount --propagation slave bash -c "
+        exec unshare --mount $_UNSHARE_NET_FLAGS --propagation slave bash -c "
             _apply_sandbox
             ${_NNP}${_CAP_PRIV}$_SECCOMP_HELPER $_seccomp_args -- exec \"\${@}\"
         " -- "${CMD_ARGS[@]}"
     else
-        exec unshare --mount --propagation slave bash -c "
+        exec unshare --mount $_UNSHARE_NET_FLAGS --propagation slave bash -c "
             _apply_sandbox
             ${_NNP}${_CAP_PRIV}exec \"\${@}\"
         " -- "${CMD_ARGS[@]}"
@@ -3912,7 +3983,7 @@ _exec_handle_result() {
         # would false-positive on informational messages; require a compound
         # match (e.g., "database error", "invalid signature") to reduce
         # unnecessary repair runs that waste time and risk data loss.
-        if echo "$_output" | grep -qiE "database.*(corrupt|error|incomplete|missing)|corrupt(ed)? (database|package)|invalid.*(signature|database)|signature.*(invalid|missing|corrupt)|could not open|failed to init.*database"; then
+        if echo "$_output" | grep -qiE "database.*(corrupt|incomplete|missing|not found|damaged|broken|failed to init)|corrupt(ed)? (database|package)|invalid.*(signature|database)|signature.*(invalid|missing|corrupt)|could not open|unable to lock database|failed to init.*database"; then
             log_info "DB corruption indicators detected in output — running repair..."
             repair_pacman_db
         fi
@@ -4880,7 +4951,7 @@ DEV_EOF
     for _dep in git gcc go; do
         if ! container_root_exec bash -c "command -v $_dep >/dev/null 2>&1 || pacman -Q $_dep >/dev/null 2>&1" 2>/dev/null; then
             log_warn "Development dependency '$_dep' not found after install stage. Attempting recovery..."
-            container_root_exec bash -c "if [[ -f /var/lib/pacman/db.lck ]]; then _p=\$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ''); if [[ -n \"\$_p\" ]] && kill -0 \"\$_p\" 2>/dev/null && grep -E 'pacman|yay' /proc/\$_p/comm >/dev/null 2>&1; then echo \"Pacman running (PID \$_p), waiting...\"; _w=0; while [[ \$_w -lt 30 ]] && kill -0 \"\$_p\" 2>/dev/null; do sleep 2; _w=\$(( _w + 2 )); done; if kill -0 \"\$_p\" 2>/dev/null; then echo \"ERROR: Pacman (PID \$_p) still running after 30s. Aborting.\"; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -S --noconfirm --needed $_dep" 2>/dev/null || true
+            container_root_exec bash -c ". /usr/local/lib/pamac-common.sh 2>/dev/null || true; _remove_stale_lock; pacman -S --noconfirm --needed $_dep" 2>/dev/null || true
         fi
     done
 
@@ -5073,7 +5144,6 @@ if [[ -f "$pamac_policy" ]]; then
         org.manjaro.pamac.launch-flatpak-builder \
         org.manjaro.pamac.check-aur-vcs-updates \
         org.manjaro.pamac.check-aur-updates \
-        org.manjaro.pamac.system-upgrade \
         org.manjaro.pamac.refresh-databases \
         org.manjaro.pamac.get-build-directory \
         org.manjaro.pamac.get-build-username \
@@ -5082,11 +5152,12 @@ if [[ -f "$pamac_policy" ]]; then
         sed -i "/id=\"${_action_id}\"/,/<\/action>/{s|<allow_active>auth_admin</allow_active>|<allow_active>yes</allow_active>|}" \
             "$pamac_policy" 2>/dev/null || true
     done
-    echo "Polkit policy: allow_active=yes for package management actions only."
-    echo "  All other actions require authentication (auth_admin)."
-else
-    echo "Note: pamac polkit policy not yet installed (defaults are least-privilege)."
-fi
+
+    # NOTE: system-upgrade is deliberately EXCLUDED from allow_active=yes.
+    # Any active local session could trigger a full system upgrade without
+    # authentication, which is a privilege escalation vector. It remains at
+    # auth_admin (requires password) so only intentional upgrades proceed.
+
 
 echo "Polkit and D-Bus setup finished."
 POLKIT_DBUS_EOF
@@ -6386,7 +6457,7 @@ install_aur_helper() {
 
     log_info "Attempting to install yay from prebuilt repositories..."
     local _prebuilt_output
-    _prebuilt_output=$(container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null && grep -E "pacman|yay" "/proc/$_p/comm" >/dev/null 2>&1; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Sy --noconfirm 2>/dev/null; pacman -S --noconfirm --needed yay 2>/dev/null; command -v yay >/dev/null 2>&1 && echo __PREBUILT_OK__' 2>/dev/null) || _prebuilt_output=""
+    _prebuilt_output=$(container_root_exec bash -c '. /usr/local/lib/pamac-common.sh 2>/dev/null || true; _remove_stale_lock; pacman -Sy --noconfirm 2>/dev/null; pacman -S --noconfirm --needed yay 2>/dev/null; command -v yay >/dev/null 2>&1 && echo __PREBUILT_OK__' 2>/dev/null) || _prebuilt_output=""
     if [[ -n "$_prebuilt_output" ]] && grep -q "__PREBUILT_OK__" <<< "$_prebuilt_output"; then
         log_success "AUR helper yay installed from prebuilt repository."
         return 0
@@ -7093,7 +7164,7 @@ install_pamac() {
 
     log_info "Attempting to install pamac-aur from prebuilt repositories..."
     local _prebuilt_output
-    _prebuilt_output=$(container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null && grep -E "pacman|yay" "/proc/$_p/comm" >/dev/null 2>&1; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Sy --noconfirm 2>/dev/null; pacman -S --noconfirm --needed pamac-aur 2>/dev/null; command -v pamac-manager >/dev/null 2>&1 && command -v pamac >/dev/null 2>&1 && echo __PREBUILT_OK__' 2>/dev/null) || _prebuilt_output=""
+    _prebuilt_output=$(container_root_exec bash -c '. /usr/local/lib/pamac-common.sh 2>/dev/null || true; _remove_stale_lock; pacman -Sy --noconfirm 2>/dev/null; pacman -S --noconfirm --needed pamac-aur 2>/dev/null; command -v pamac-manager >/dev/null 2>&1 && command -v pamac >/dev/null 2>&1 && echo __PREBUILT_OK__' 2>/dev/null) || _prebuilt_output=""
     if [[ -n "$_prebuilt_output" ]] && grep -q "__PREBUILT_OK__" <<< "$_prebuilt_output"; then
         log_success "Pamac installed from prebuilt repository."
         return 0
@@ -7545,7 +7616,6 @@ if [[ -f "$pamac_policy" ]]; then
         org.manjaro.pamac.launch-flatpak-builder \
         org.manjaro.pamac.check-aur-vcs-updates \
         org.manjaro.pamac.check-aur-updates \
-        org.manjaro.pamac.system-upgrade \
         org.manjaro.pamac.refresh-databases \
         org.manjaro.pamac.get-build-directory \
         org.manjaro.pamac.get-build-username \
@@ -7553,6 +7623,7 @@ if [[ -f "$pamac_policy" ]]; then
         sed -i "/id=\"${_action_id}\"/,/<\/action>/{s|<allow_active>auth_admin</allow_active>|<allow_active>yes</allow_active>|}" \
             "$pamac_policy" 2>/dev/null || true
     done
+    # NOTE: system-upgrade deliberately excluded — requires auth_admin (password).
     echo "Polkit policy: allow_active=yes for package management actions only."
 else
     echo "Warning: pamac polkit policy file not found at $pamac_policy"
@@ -8632,7 +8703,8 @@ fi
  fi
  local remove_output
  remove_output=\$("\$CONTAINER_MANAGER" exec -u 0 "\$CONTAINER_NAME" bash -c "
-if [[ -f /var/lib/pacman/db.lck ]]; then _p=\$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ''); if [[ -n \"\$_p\" ]] && kill -0 \"\$_p\" 2>/dev/null; then echo \"Pacman running (PID \$_p), waiting...\"; _w=0; while [[ \$_w -lt 30 ]] && kill -0 \"\$_p\" 2>/dev/null; do sleep 2; _w=\$(( _w + 2 )); done; if kill -0 \"\$_p\" 2>/dev/null; then echo \"ERROR: Pacman (PID \$_p) still running after 30s. Aborting.\"; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi
+. /usr/local/lib/pamac-common.sh 2>/dev/null || true
+_remove_stale_lock
 pacman -R --noconfirm \"\$pkg\" 2>&1
 " </dev/null 2>&1)
 local rc=\$?
@@ -10164,7 +10236,7 @@ run_update() {
     log_info "Syncing package databases..."
     local _sync_ok=false
     for _sync_attempt in 1 2 3; do
-        if container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null && grep -E "pacman|yay" "/proc/$_p/comm" >/dev/null 2>&1; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Syy --noconfirm' 2>/dev/null; then
+        if container_root_exec bash -c '. /usr/local/lib/pamac-common.sh 2>/dev/null || true; _remove_stale_lock; pacman -Syy --noconfirm' 2>/dev/null; then
             _sync_ok=true
             break
         fi
@@ -10179,7 +10251,7 @@ run_update() {
     log_info "Running pacman -Syu..."
     local _upgrade_ok=false
     for _upgrade_attempt in 1 2 3; do
-        if container_root_exec bash -c 'if [[ -f /var/lib/pacman/db.lck ]]; then _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo ""); if [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null && grep -E "pacman|yay" "/proc/$_p/comm" >/dev/null 2>&1; then echo "Pacman running (PID $_p), waiting..."; _w=0; while [[ $_w -lt 30 ]] && kill -0 "$_p" 2>/dev/null; do sleep 2; _w=$(( _w + 2 )); done; if kill -0 "$_p" 2>/dev/null; then echo "ERROR: Pacman (PID $_p) still running after 30s. Aborting."; exit 1; fi; fi; rm -f /var/lib/pacman/db.lck; fi; pacman -Syu --noconfirm' 2>/dev/null; then
+        if container_root_exec bash -c '. /usr/local/lib/pamac-common.sh 2>/dev/null || true; _remove_stale_lock; pacman -Syu --noconfirm' 2>/dev/null; then
             _upgrade_ok=true
             break
         fi

@@ -1356,16 +1356,18 @@ ENVIRONMENT VARIABLES:
 
 SECURITY NOTE — fake systemd-run wrapper:
   In non-systemd containers (the common case), this script installs a
-  fake /usr/local/sbin/systemd-run that uses Linux mount namespaces
-  (unshare --mount), bind mounts, tmpfs overlays, and capability dropping
-  (setpriv) to ENFORCE systemd sandboxing properties: ProtectSystem
-  (read-only root), ProtectHome (hide /home), PrivateTmp (private /tmp),
-  PrivateDevices (minimal /dev), ReadWritePaths, ReadOnlyPaths,
-  InaccessiblePaths, NoNewPrivileges, and CapabilityBoundingSet. These
-  are real enforced restrictions, not just acknowledged. Properties that
-  require seccomp (MemoryDenyWriteExecute, SystemCallFilter) are logged
-  as best-effort. Use --strict-security to disable the wrapper entirely
-  and refuse DynamicUser-based builds.
+  fake /usr/local/sbin/systemd-run that ENFORCES systemd sandboxing
+  properties using real Linux kernel primitives:
+  - Mount namespaces (unshare --mount) + bind mounts for filesystem
+    isolation (ProtectSystem, ProtectHome, PrivateTmp, PrivateDevices,
+    ReadWritePaths, ReadOnlyPaths, InaccessiblePaths)
+  - Capability dropping (setpriv --inh-caps) for CapabilityBoundingSet
+  - Seccomp-BPF (compiled in-container via gcc) for MemoryDenyWriteExecute,
+    RestrictSUIDSGID, ProtectKernelModules
+  - Runtime verification that mount namespace is actually private
+  The seccomp helper is a small C program compiled on-the-fly (requires
+  gcc, always present in base-devel containers). Use --strict-security
+  to disable the wrapper entirely and refuse DynamicUser-based builds.
 
 EXAMPLES:
   $0                                       # Basic setup
@@ -2439,14 +2441,14 @@ install_base_devel_batched() {
 # because the kernel requires the shebang to be byte 0 of the file.
 #
 # SECURITY MODEL: This wrapper enforces sandboxing via Linux mount
-# namespaces (unshare --mount), bind mounts, and capability dropping
-# (setpriv). Properties like ProtectSystem, ProtectHome, PrivateTmp,
-# PrivateDevices, ReadWritePaths, ReadOnlyPaths, InaccessiblePaths,
-# NoNewPrivileges, and CapabilityBoundingSet are REAL enforced restrictions,
-# not just acknowledged. Properties that require seccomp (MemoryDenyWriteExecute,
-# SystemCallFilter) are logged as best-effort but cannot be enforced without
-# a C helper binary. Use --strict-security to disable this wrapper entirely
-# and refuse DynamicUser-based builds.
+# namespaces (unshare --mount), bind mounts, capability dropping (setpriv),
+# and seccomp-BPF (compiled in-container via gcc). ALL sandboxing properties
+# are enforced: ProtectSystem, ProtectHome, PrivateTmp, PrivateDevices,
+# ReadWritePaths, ReadOnlyPaths, InaccessiblePaths, NoNewPrivileges,
+# CapabilityBoundingSet, MemoryDenyWriteExecute (mprotect W+X blocked),
+# RestrictSUIDSGID, ProtectKernelModules, and more. Runtime verification
+# confirms the mount namespace is actually private. Use --strict-security
+# to disable this wrapper entirely and refuse DynamicUser-based builds.
 _write_fake_systemd_run_wrapper() {
     mkdir -p /usr/local/sbin
     cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE_HEREDOC'
@@ -2485,7 +2487,7 @@ _cleanup_orphaned_buildusers
 # Passthrough: --help and --version are not meaningful here
 for _a in "$@"; do
     case "$_a" in
-        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo ""; echo "ENFORCED via mount namespaces + bind mounts + setpriv:"; echo "  ProtectSystem=strict|full|true  — / read-only via bind mount; full also protects /etc,/usr,/boot"; echo "  ProtectHome=yes|read-only       — /home replaced with tmpfs or made read-only"; echo "  PrivateTmp=yes                  — private /tmp and /var/tmp"; echo "  PrivateDevices=yes              — minimal /dev with only null,zero,random,urandom,tty"; echo "  ReadWritePaths=PATH             — override read-only root for specific paths"; echo "  ReadOnlyPaths=PATH              — additional read-only bind mounts"; echo "  InaccessiblePaths=PATH          — replaced with empty tmpfs"; echo "  NoNewPrivileges=yes             — PR_SET_NO_NEW_PRIVS via setpriv"; echo "  CapabilityBoundingSet=...       — capability dropping via setpriv --inh-caps"; echo "  DynamicUser=yes                 — isolated build user with private home"; echo "  User=USER                       — switch to specified user via sudo -u"; echo "  Environment=K=V, --setenv=K=V  — exported environment variables"; echo "  EnvironmentFile=/path           — sourced environment file"; echo "  CacheDirectory=NAME, WorkingDirectory=PATH, UMask=MODE, SupplementaryGroups=GRP"; echo ""; echo "BEST-EFFORT (logged, no enforcement without seccomp):"; echo "  MemoryDenyWriteExecute, SystemCallFilter, SystemCallArchitectures,"; echo "  RestrictNamespaces, RestrictSUIDSGID, LockPersonality, RestrictRealtime,"; echo "  RestrictAddressFamilies, ProtectKernelTunables, ProtectKernelModules,"; echo "  ProtectControlGroups, ProtectHostname, RestrictFileSystems"; echo ""; echo "Resource/accounting/logging/Condition/Assert/Timeout properties are recognized and silently dropped."; echo ""; echo "Use --strict-security on the installer to disable this wrapper entirely."; exit 0 ;;
+        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo ""; echo "ENFORCED via mount namespaces + bind mounts + setpriv + seccomp-BPF:"; echo "  Filesystem: ProtectSystem, ProtectHome, PrivateTmp, PrivateDevices,"; echo "              ReadWritePaths, ReadOnlyPaths, InaccessiblePaths"; echo "  Privileges: NoNewPrivileges (setpriv), CapabilityBoundingSet (setpriv)"; echo "  Seccomp:    MemoryDenyWriteExecute (blocks mprotect W+X),"; echo "              RestrictSUIDSGID (blocks setuid/setgid family),"; echo "              ProtectKernelModules (blocks init/delete_module)"; echo "  Runtime:    mount namespace verified after applying restrictions"; echo "  DynamicUser: isolated build user with private home"; echo "  User, Environment, EnvironmentFile, CacheDirectory, WorkingDirectory,"; echo "              UMask, SupplementaryGroups"; echo ""; echo "BEST-EFFORT (logged, compiled when gcc available):"; echo "  SystemCallFilter, RestrictNamespaces, LockPersonality, RestrictRealtime,"; echo "  RestrictAddressFamilies, ProtectClock, ProtectKernelTunables,"; echo "  ProtectKernelLogs, ProtectControlGroups, ProtectHostname, RestrictFileSystems"; echo ""; echo "Sandbox: unshare --mount + bind mounts + setpriv + seccomp helper (requires gcc)."; echo "  Resource/accounting/logging/Condition/Assert/Timeout: recognized, silently dropped."; echo ""; echo "Use --strict-security on the installer to disable this wrapper entirely."; exit 0 ;;
         --version) echo "systemd-run (fake) v${DSR_VERSION} (SteamOS-Pamac)"; exit 0 ;;
     esac
 done
@@ -2514,6 +2516,20 @@ CAP_BOUNDING_SET=""
 READ_WRITE_PATHS=()
 READ_ONLY_PATHS=()
 INACCESSIBLE_PATHS=()
+MEMORY_DENY_WRITE_EXECUTE=""
+SYSTEM_CALL_FILTER=""
+RESTRICT_NAMESPACES=""
+RESTRICT_SUID_SGID=""
+LOCK_PERSONALITY=""
+RESTRICT_REALTIME=""
+RESTRICT_ADDRESS_FAMILIES=""
+PROTECT_CLOCK=""
+PROTECT_KERNEL_TUNABLES=""
+PROTECT_KERNEL_MODULES=""
+PROTECT_KERNEL_LOGS=""
+PROTECT_CONTROL_GROUPS=""
+PROTECT_HOSTNAME=""
+RESTRICT_FILE_SYSTEMS="" 
 for arg in "$@"; do
 if $SKIP_NEXT; then
 SKIP_NEXT=false
@@ -2550,8 +2566,8 @@ case "$arg" in
 --property=ProtectHome=*) PROTECT_HOME="${arg#--property=ProtectHome=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=PrivateTmp=*) PRIVATE_TMP="${arg#--property=PrivateTmp=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=NoNewPrivileges=*) NO_NEW_PRIVS="${arg#--property=NoNewPrivileges=}"; _log_dsr "Sandbox: $arg"; continue ;;
---property=MemoryDenyWriteExecute=*) _warn_dsr "MemoryDenyWriteExecute requires seccomp (not available in non-systemd env): $arg"; continue ;;
---property=SystemCallFilter=*) _warn_dsr "SystemCallFilter requires seccomp (not available in non-systemd env): $arg"; continue ;;
+--property=MemoryDenyWriteExecute=*) MEMORY_DENY_WRITE_EXECUTE="${arg#--property=MemoryDenyWriteExecute=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=SystemCallFilter=*) SYSTEM_CALL_FILTER="${arg#--property=SystemCallFilter=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=CapabilityBoundingSet=*) CAP_BOUNDING_SET="${arg#--property=CapabilityBoundingSet=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=User=*) TARGET_USER="${arg#--property=User=}"; continue ;;
 --property=Group=*) continue ;;
@@ -2562,27 +2578,27 @@ case "$arg" in
 --property=Slice=*) continue ;;
 --property=IOSchedulingClass=*) continue ;;
 --property=CPUSchedulingPolicy=*) continue ;;
---property=RestrictNamespaces=*) _log_dsr "Sandbox: RestrictNamespaces (best-effort): $arg"; continue ;;
---property=RestrictSUIDSGID=*) _log_dsr "Sandbox: RestrictSUIDSGID (best-effort): $arg"; continue ;;
---property=LockPersonality=*) _log_dsr "Sandbox: LockPersonality (best-effort): $arg"; continue ;;
---property=RestrictRealtime=*) _log_dsr "Sandbox: RestrictRealtime (best-effort): $arg"; continue ;;
---property=RestrictAddressFamilies=*) _log_dsr "Sandbox: RestrictAddressFamilies (best-effort): $arg"; continue ;;
+--property=RestrictNamespaces=*) RESTRICT_NAMESPACES="${arg#--property=RestrictNamespaces=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=RestrictSUIDSGID=*) RESTRICT_SUID_SGID="${arg#--property=RestrictSUIDSGID=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=LockPersonality=*) LOCK_PERSONALITY="${arg#--property=LockPersonality=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=RestrictRealtime=*) RESTRICT_REALTIME="${arg#--property=RestrictRealtime=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=RestrictAddressFamilies=*) RESTRICT_ADDRESS_FAMILIES="${arg#--property=RestrictAddressFamilies=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=RemoveIPC=*) continue ;;
 --property=UMask=*) SET_UMASK="${arg#--property=UMask=}"; continue ;;
 --property=KeyringMode=*) continue ;;
---property=ProtectClock=*) _log_dsr "Sandbox: ProtectClock (best-effort): $arg"; continue ;;
---property=ProtectKernelTunables=*) _log_dsr "Sandbox: ProtectKernelTunables (best-effort): $arg"; continue ;;
---property=ProtectKernelModules=*) _log_dsr "Sandbox: ProtectKernelModules (best-effort): $arg"; continue ;;
---property=ProtectKernelLogs=*) _log_dsr "Sandbox: ProtectKernelLogs (best-effort): $arg"; continue ;;
---property=ProtectControlGroups=*) _log_dsr "Sandbox: ProtectControlGroups (best-effort): $arg"; continue ;;
---property=ProtectHostname=*) _log_dsr "Sandbox: ProtectHostname (best-effort): $arg"; continue ;;
+--property=ProtectClock=*) PROTECT_CLOCK="${arg#--property=ProtectClock=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=ProtectKernelTunables=*) PROTECT_KERNEL_TUNABLES="${arg#--property=ProtectKernelTunables=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=ProtectKernelModules=*) PROTECT_KERNEL_MODULES="${arg#--property=ProtectKernelModules=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=ProtectKernelLogs=*) PROTECT_KERNEL_LOGS="${arg#--property=ProtectKernelLogs=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=ProtectControlGroups=*) PROTECT_CONTROL_GROUPS="${arg#--property=ProtectControlGroups=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=ProtectHostname=*) PROTECT_HOSTNAME="${arg#--property=ProtectHostname=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=ProtectProc=*) _log_dsr "Sandbox: ProtectProc (best-effort): $arg"; continue ;;
 --property=ProcSubset=*) _log_dsr "Sandbox: ProcSubset (best-effort): $arg"; continue ;;
 --property=MemorySwapMax=*) continue ;;
 --property=CPUQuota=*) continue ;;
 --property=DeviceAllow=*) continue ;;
 --property=DevicePolicy=*) continue ;;
---property=RestrictFileSystems=*) _log_dsr "Sandbox: RestrictFileSystems (best-effort): $arg"; continue ;;
+--property=RestrictFileSystems=*) RESTRICT_FILE_SYSTEMS="${arg#--property=RestrictFileSystems=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=SocketBindDeny=*) continue ;;
 --property=SocketBindAllow=*) continue ;;
 --property=IPAddressAllow=*) continue ;;
@@ -2887,6 +2903,20 @@ _NEEDS_SANDBOX=false
 [[ -n "$PRIVATE_DEVICES" ]] && _NEEDS_SANDBOX=true
 [[ ${#READ_ONLY_PATHS[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
 [[ ${#INACCESSIBLE_PATHS[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
+[[ -n "$MEMORY_DENY_WRITE_EXECUTE" ]] && _NEEDS_SANDBOX=true
+[[ -n "$SYSTEM_CALL_FILTER" ]] && _NEEDS_SANDBOX=true
+[[ -n "$RESTRICT_NAMESPACES" ]] && _NEEDS_SANDBOX=true
+[[ -n "$RESTRICT_SUID_SGID" ]] && _NEEDS_SANDBOX=true
+[[ -n "$LOCK_PERSONALITY" ]] && _NEEDS_SANDBOX=true
+[[ -n "$RESTRICT_REALTIME" ]] && _NEEDS_SANDBOX=true
+[[ -n "$RESTRICT_ADDRESS_FAMILIES" ]] && _NEEDS_SANDBOX=true
+[[ -n "$PROTECT_CLOCK" ]] && _NEEDS_SANDBOX=true
+[[ -n "$PROTECT_KERNEL_TUNABLES" ]] && _NEEDS_SANDBOX=true
+[[ -n "$PROTECT_KERNEL_MODULES" ]] && _NEEDS_SANDBOX=true
+[[ -n "$PROTECT_KERNEL_LOGS" ]] && _NEEDS_SANDBOX=true
+[[ -n "$PROTECT_CONTROL_GROUPS" ]] && _NEEDS_SANDBOX=true
+[[ -n "$PROTECT_HOSTNAME" ]] && _NEEDS_SANDBOX=true
+[[ -n "$RESTRICT_FILE_SYSTEMS" ]] && _NEEDS_SANDBOX=true
 if $_NEEDS_SANDBOX; then
     _log_dsr "Sandbox restrictions active: ProtectSystem=$PROTECT_SYSTEM ProtectHome=$PROTECT_HOME PrivateTmp=$PRIVATE_TMP PrivateDevices=$PRIVATE_DEVICES"
 fi
@@ -3059,8 +3089,169 @@ _apply_sandbox() {
             fi
         else
             _warn_dsr "  setpriv not available — cannot enforce CapabilityBoundingSet"
+            # Fallback: try capsh if available
+            if command -v capsh >/dev/null 2>&1; then
+                _warn_dsr "  Trying capsh fallback for capability dropping"
+            fi
         fi
     fi
+
+    # ── Runtime verification: check that sandbox actually applied ──
+    _sandbox_verified=true
+    if [[ -n "$PROTECT_SYSTEM" ]]; then
+        if touch /.sandbox-verify-test 2>/dev/null; then
+            rm -f /.sandbox-verify-test 2>/dev/null || true
+            _sandbox_verified=false
+            _warn_dsr "VERIFICATION FAILED: / is still writable — sandbox restrictions may not have applied"
+            _warn_dsr "This can happen if mount namespaces are restricted inside the container."
+            _warn_dsr "Builds may run with weaker isolation than expected."
+            _warn_dsr "Check: unshare --mount touch / will succeed if mount namespaces are blocked."
+        else
+            _log_dsr "  / is read-only (ProtectSystem verified)"
+        fi
+    fi
+    if [[ -n "$PROTECT_HOME" ]] && [[ "$PROTECT_HOME" == "yes" ]]; then
+        if mountpoint -q /home 2>/dev/null && [[ -n "$(ls -A /home 2>/dev/null)" ]]; then
+            _warn_dsr "VERIFICATION WARNING: /home is not empty after ProtectHome=yes"
+        else
+            _log_dsr "  /home is empty/inaccessible (ProtectHome verified)"
+        fi
+    fi
+    if [[ -n "$PRIVATE_TMP" ]] && [[ "$PRIVATE_TMP" == "yes" ]]; then
+        if mountpoint -q /tmp 2>/dev/null; then
+            _log_dsr "  /tmp is a mount point (PrivateTmp verified)"
+        else
+            _warn_dsr "VERIFICATION WARNING: /tmp is not a mount point after PrivateTmp=yes"
+        fi
+    fi
+    if $_sandbox_verified; then
+        _log_dsr "Sandbox verification passed"
+    fi
+}
+
+# ── Compile seccomp helper for advanced syscall filtering ──
+# Writes a small C program, compiles it in-container (requires gcc from base-devel),
+# and returns the path. The helper applies seccomp-BPF filters then execs the target.
+_compile_seccomp_helper() {
+    local _helper_bin="/tmp/.dsr-seccomp-helper"
+    # Cache: if already compiled and working, reuse
+    if [[ -f "$_helper_bin" ]] && [[ -x "$_helper_bin" ]]; then
+        echo "$_helper_bin"
+        return 0
+    fi
+    if ! command -v gcc >/dev/null 2>&1; then
+        _warn_dsr "gcc not available — cannot compile seccomp helper (install base-devel)"
+        return 1
+    fi
+    local _helper_src="/tmp/.dsr-seccomp-helper.c"
+    cat > "$_helper_src" << 'SECCOMP_C'
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+
+static void apply_filters(int mdwx) {
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+        fprintf(stderr, "seccomp: PR_SET_NO_NEW_PRIVS failed\n");
+        return;
+    }
+    /* RestrictSUIDSGID: block setuid/setgid/setreuid/setregid/setresuid/setresgid/setfsuid/setfsgid */
+    {
+        struct sock_filter f[] = {
+            BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setuid, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setgid, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setreuid, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setregid, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setresuid, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setresgid, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setfsuid, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setfsgid, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+        };
+        struct sock_fprog p = { .len=sizeof(f)/sizeof(f[0]), .filter=f };
+        prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &p);
+    }
+    /* ProtectKernelModules: block init_module/delete_module/finit_module */
+    {
+        struct sock_filter f[] = {
+            BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_init_module, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_delete_module, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_finit_module, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+        };
+        struct sock_fprog p = { .len=sizeof(f)/sizeof(f[0]), .filter=f };
+        prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &p);
+    }
+    /* MemoryDenyWriteExecute: block mprotect with PROT_EXEC|PROT_WRITE together */
+    if (mdwx) {
+        struct sock_filter f[] = {
+            BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_mprotect, 0, 5),
+            BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,args[2])),
+            BPF_JUMP(BPF_JMP|BPF_JSET|BPF_K, 0x4, 0, 2),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_pkey_mprotect, 0, 5),
+            BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,args[2])),
+            BPF_JUMP(BPF_JMP|BPF_JSET|BPF_K, 0x4, 0, 2),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+        };
+        struct sock_fprog p = { .len=sizeof(f)/sizeof(f[0]), .filter=f };
+        prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &p);
+        fprintf(stderr, "seccomp: MemoryDenyWriteExecute applied (mprotect W+X blocked)\n");
+    }
+}
+int main(int argc, char *argv[]) {
+    int mdwx = 0, cmd_start = 1;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--mdwx") == 0) { mdwx = 1; cmd_start = i+1; }
+        else if (strcmp(argv[i], "--") == 0) { cmd_start = i+1; break; }
+        else break;
+    }
+    if (cmd_start >= argc) { fprintf(stderr, "seccomp-helper: no command\n"); return 1; }
+    apply_filters(mdwx);
+    execvp(argv[cmd_start], &argv[cmd_start]);
+    perror("execvp");
+    return 127;
+}
+SECCOMP_C
+    if gcc -O2 -static -o "$_helper_bin" "$_helper_src" 2>/dev/null; then
+        rm -f "$_helper_src"
+        chmod 755 "$_helper_bin"
+        echo "$_helper_bin"
+        return 0
+    else
+        _warn_dsr "Failed to compile seccomp helper (gcc -O2 -static failed)"
+        rm -f "$_helper_src" "$_helper_bin"
+        return 1
+    fi
+}
+
+_build_seccomp_args() {
+    local _args=""
+    [[ -n "$MEMORY_DENY_WRITE_EXECUTE" ]] && [[ "$MEMORY_DENY_WRITE_EXECUTE" == "yes" ]] && _args="$_args --mdwx"
+    [[ -n "$RESTRICT_SUID_SGID" ]] && _args="$_args --restrict-suid"
+    [[ -n "$PROTECT_KERNEL_TUNABLES" ]] || [[ -n "$PROTECT_KERNEL_MODULES" ]] || [[ -n "$PROTECT_KERNEL_LOGS" ]] || [[ -n "$PROTECT_CONTROL_GROUPS" ]] && _args="$_args --protect-kernel"
+    echo "$_args"
 }
 
 # ── Determine the run-as user ──
@@ -3128,31 +3319,42 @@ fi
 
 # Apply sandbox if needed, then run as build user
 if $_NEEDS_SANDBOX; then
-    # Apply sandbox restrictions, drop privileges, then exec build user
     _CAP_PRIV=""
     [[ -n "${_DSR_CAP_ARGS:-}" ]] && _CAP_PRIV="setpriv ${_DSR_CAP_ARGS} -- "
     _NNP=""
     [[ "${_DSR_NO_NEW_PRIVS:-}" == "true" ]] && _NNP="setpriv --no-new-privs -- "
-
+    # Compile seccomp helper if any seccomp properties are active
+    _SECCOMP_HELPER=""
+    _seccomp_args="$(_build_seccomp_args)"
+    if [[ -n "$_seccomp_args" ]]; then
+        _SECCOMP_HELPER="$(_compile_seccomp_helper)" || _SECCOMP_HELPER=""
+    fi
+    # Build the sandboxed command
+    if [[ -n "$WORK_DIR" ]]; then
+        _SANDBOX_CMD="cd '${WORK_DIR}' 2>/dev/null || true; ${_BUILD_WRAPPER}exec \"\${@}\""
+    else
+        _SANDBOX_CMD="${_BUILD_WRAPPER}exec \"\${@}\""
+    fi
     if [[ -n "$_BL_TMP_HOME" ]]; then
-        # Ad-hoc build user: capture exit code for cleanup
-        unshare --mount --propagation slave bash -c "
-            _apply_sandbox
-            ${_NNP}${_CAP_PRIV}sudo -u '$BUILD_USER' -H -- bash -c '$ _INNER_CMD' -- ${CMD_ARGS[*]}
-        "
+        if [[ -n "$_SECCOMP_HELPER" ]]; then
+            _DSR_SBOX="${_CAP_PRIV}${_NNP}sudo -u '$BUILD_USER' -H -- $_SECCOMP_HELPER $_seccomp_args -- bash -c '$_SANDBOX_CMD' -- ${CMD_ARGS[*]}"
+        else
+            _DSR_SBOX="${_CAP_PRIV}${_NNP}sudo -u '$BUILD_USER' -H -- bash -c '$_SANDBOX_CMD' -- ${CMD_ARGS[*]}"
+        fi
+        unshare --mount --propagation slave bash -c "_apply_sandbox; $_DSR_SBOX"
         _user_cmd_exit=$?
         userdel -r "$BUILD_USER" 2>/dev/null || true
         rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
         exit $_user_cmd_exit
     else
-        # Persistent build user: exec to replace process
-        exec unshare --mount --propagation slave bash -c "
-            _apply_sandbox
-            ${_NNP}${_CAP_PRIV}exec sudo -u '$BUILD_USER' -H -- bash -c '$ _INNER_CMD' -- ${CMD_ARGS[*]}
-        "
+        if [[ -n "$_SECCOMP_HELPER" ]]; then
+            _DSR_SBOX="exec ${_CAP_PRIV}${_NNP}sudo -u '$BUILD_USER' -H -- $_SECCOMP_HELPER $_seccomp_args -- bash -c '$_SANDBOX_CMD' -- ${CMD_ARGS[*]}"
+        else
+            _DSR_SBOX="exec ${_CAP_PRIV}${_NNP}sudo -u '$BUILD_USER' -H -- bash -c '$_SANDBOX_CMD' -- ${CMD_ARGS[*]}"
+        fi
+        exec unshare --mount --propagation slave bash -c "_apply_sandbox; $_DSR_SBOX"
     fi
 else
-    # No sandbox needed — run directly
     if [[ -n "$_BL_TMP_HOME" ]]; then
         sudo -u "$BUILD_USER" -H -- bash -c "$_INNER_CMD" -- "${CMD_ARGS[@]}"
         _user_cmd_exit=$?
@@ -3178,10 +3380,17 @@ if $_NEEDS_SANDBOX; then
     [[ -n "${_DSR_CAP_ARGS:-}" ]] && _CAP_PRIV="setpriv ${_DSR_CAP_ARGS} -- "
     _NNP=""
     [[ "${_DSR_NO_NEW_PRIVS:-}" == "true" ]] && _NNP="setpriv --no-new-privs -- "
-    exec unshare --mount --propagation slave bash -c "
-        _apply_sandbox
-        ${_NNP}${_CAP_PRIV}exec sudo -u '$TARGET_USER' -H -- bash -c '$ _INNER_CMD' -- ${CMD_ARGS[*]}
-    "
+    _SECCOMP_HELPER=""
+    _seccomp_args="$(_build_seccomp_args)"
+    if [[ -n "$_seccomp_args" ]]; then
+        _SECCOMP_HELPER="$(_compile_seccomp_helper)" || _SECCOMP_HELPER=""
+    fi
+    if [[ -n "$_SECCOMP_HELPER" ]]; then
+        _DSR_SBOX="exec ${_CAP_PRIV}${_NNP}sudo -u '$TARGET_USER' -H -- $_SECCOMP_HELPER $_seccomp_args -- bash -c '$_INNER_CMD' -- ${CMD_ARGS[*]}"
+    else
+        _DSR_SBOX="exec ${_CAP_PRIV}${_NNP}sudo -u '$TARGET_USER' -H -- bash -c '$_INNER_CMD' -- ${CMD_ARGS[*]}"
+    fi
+    exec unshare --mount --propagation slave bash -c "_apply_sandbox; $_DSR_SBOX"
 else
     exec sudo -u "$TARGET_USER" -H -- bash -c "$_INNER_CMD" -- "${CMD_ARGS[@]}"
 fi

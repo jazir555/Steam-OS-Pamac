@@ -27,7 +27,7 @@ trap '_err_trap $LINENO "$BASH_COMMAND"' ERR
 #   <<EOF    — host variables expand at write-time; use \$ for literal $
 
 readonly SCRIPT_VERSION="5.3.0"
-readonly GITHUB_REPO="your-org/Steam-OS-Pamac"
+readonly GITHUB_REPO="Steam-OS-Pamac/Steam-OS-Pamac"
 readonly DEFAULT_CONTAINER_NAME="arch-pamac"
 
 # ── Self-integrity verification ──
@@ -781,6 +781,12 @@ check_battery_power() {
             status=$(cat "$status_file" 2>/dev/null || echo "Unknown")
         fi
 
+        # Validate capacity is a number before integer comparison
+        if [[ ! "$capacity" =~ ^[0-9]+$ ]]; then
+            log_debug "Battery '$bat_name': capacity unreadable ($capacity), skipping."
+            continue
+        fi
+
         if [[ "$capacity" -lt 0 || "$capacity" -gt 100 ]]; then
             log_debug "Battery '$bat_name': capacity unreadable ($capacity%), skipping."
             continue
@@ -1429,9 +1435,9 @@ parse_arguments() {
             --verify) _verify_script_hash; exit 0 ;;
             --version-check)
                 echo "Installed version: v${SCRIPT_VERSION}"
-                _latest=""
+                local _latest=""
                 _latest=$(curl -sf --connect-timeout 5 --max-time 10 \
-                    "https://api.github.com/repos/${GITHUB_REPO:-your-org/Steam-OS-Pamac}/releases/latest" 2>/dev/null \
+                    "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null \
                     | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
                 if [[ -n "$_latest" ]]; then
                     echo "Latest release:    v${_latest#v}"
@@ -3245,6 +3251,7 @@ int main(int argc, char *argv[]) {
     int mdwx = 0, cmd_start = 1;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--mdwx") == 0) { mdwx = 1; cmd_start = i+1; }
+        else if (strcmp(argv[i], "--seccomp") == 0) { cmd_start = i+1; }
         else if (strcmp(argv[i], "--") == 0) { cmd_start = i+1; break; }
         else break;
     }
@@ -3269,9 +3276,16 @@ SECCOMP_C
 
 _build_seccomp_args() {
     local _args=""
-    [[ -n "$MEMORY_DENY_WRITE_EXECUTE" ]] && [[ "$MEMORY_DENY_WRITE_EXECUTE" == "yes" ]] && _args="$_args --mdwx"
-    [[ -n "$RESTRICT_SUID_SGID" ]] && _args="$_args --restrict-suid"
-    [[ -n "$PROTECT_KERNEL_TUNABLES" ]] || [[ -n "$PROTECT_KERNEL_MODULES" ]] || [[ -n "$PROTECT_KERNEL_LOGS" ]] || [[ -n "$PROTECT_CONTROL_GROUPS" ]] && _args="$_args --protect-kernel"
+    # The seccomp helper unconditionally applies RestrictSUIDSGID and ProtectKernelModules.
+    # We only need to pass --mdwx if MemoryDenyWriteExecute is requested.
+    # However, we must return a non-empty string if ANY seccomp property is active
+    # so that the caller knows to invoke the helper.
+    if [[ -n "$MEMORY_DENY_WRITE_EXECUTE" ]] || [[ -n "$RESTRICT_SUID_SGID" ]] || \
+       [[ -n "$PROTECT_KERNEL_TUNABLES" ]] || [[ -n "$PROTECT_KERNEL_MODULES" ]] || \
+       [[ -n "$PROTECT_KERNEL_LOGS" ]] || [[ -n "$PROTECT_CONTROL_GROUPS" ]]; then
+        _args="--seccomp"
+        [[ "$MEMORY_DENY_WRITE_EXECUTE" == "yes" ]] && _args="$_args --mdwx"
+    fi
     echo "$_args"
 }
 
@@ -7496,10 +7510,16 @@ configure_ssh_environment() {
         return 0
     fi
 
-    if ! _is_root_writable; then
-        log_info "Root filesystem is read-only – skipping SSH / profile host configuration."
-        log_info "These optional tweaks are only needed for advanced SSH remote access."
-        return 0
+    # We are running as a regular user. To modify /etc/ssh, we need sudo.
+    local _use_sudo=""
+    if ! [ -w /etc ]; then
+        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            _use_sudo="sudo -n"
+        else
+            log_warn "Cannot modify /etc/ssh without root privileges. Please run manually:"
+            log_warn "  sudo mkdir -p /etc/ssh/sshd_config.d && echo 'PermitUserEnvironment yes' | sudo tee /etc/ssh/sshd_config.d/permit-user-env.conf && sudo pkill -HUP sshd"
+            return 0
+        fi
     fi
 
     local ssh_dir="$HOME/.ssh"
@@ -7514,91 +7534,33 @@ configure_ssh_environment() {
 
     local sshd_conf_dir="/etc/ssh/sshd_config.d"
     local permit_env_conf="$sshd_conf_dir/permit-user-env.conf"
-    # Only write PermitUserEnvironment yes when the user explicitly opted in
-    # via --enable-ssh-env. Default off: this setting is a privilege-escalation
-    # vector on multi-user hosts (see ENABLE_SSH_ENV comment near top of script).
-    # NOTE: Major SteamOS upgrades may overwrite /etc/ssh/ configs. Users who
-    # enabled this option should re-run with --enable-ssh-env after major
-    # SteamOS version upgrades (documented in README).
+
     if [[ "$ENABLE_SSH_ENV" != "true" ]]; then
-        log_info "SSH PermitUserEnvironment is disabled (default for security). Pass --enable-ssh-env to opt in on a single-user trusted host."
+        log_info "SSH PermitUserEnvironment is disabled (default). Pass --enable-ssh-env to opt in."
         return 0
     fi
 
     # Multi-user detection: PermitUserEnvironment exposes every user's
     # ~/.ssh/environment to SSH sessions. On a shared host, one user could
     # inject variables (e.g., LD_PRELOAD) that affect other users' sessions.
-    # Warn if more than one interactive user (UID >= 1000, login shell) exists.
     local _login_users
     _login_users=$(awk -F: '$3 >= 1000 && $7 !~ /(nologin|false|sync|shutdown|halt)$/ {print $1}' /etc/passwd 2>/dev/null | wc -l || echo "1")
     if [[ "$_login_users" -gt 1 ]]; then
-        log_warn "Multi-user system detected ($_login_users interactive users). PermitUserEnvironment is a privilege-escalation vector on shared hosts."
-        log_warn "Continuing because --enable-ssh-env was explicitly passed. Ensure this is intentional."
+        log_warn "Multi-user system detected ($_login_users interactive users). PermitUserEnvironment is a privilege-escalation vector."
     fi
+
     if [[ ! -f "$permit_env_conf" ]]; then
-        # Backup existing sshd config before modification
-        if [[ -d "$sshd_conf_dir" ]]; then
-            cp -a "$sshd_conf_dir" "${sshd_conf_dir}.backup-$(date +%Y%m%d)" 2>/dev/null || true
-        fi
-        # Validate sshd config before writing
-        local _sshd_valid=true
-        if command -v sshd >/dev/null 2>&1; then
-            if ! sshd -t 2>/dev/null; then
-                log_warn "Existing sshd config has errors. Fix before enabling PermitUserEnvironment."
-                _sshd_valid=false
-            fi
-        fi
-        if [[ "$_sshd_valid" == "true" ]]; then
-            if mkdir -p "$sshd_conf_dir" 2>/dev/null; then
-                echo "PermitUserEnvironment yes" | run_command tee "$permit_env_conf" > /dev/null 2>&1
-                # Validate the new config before restarting
-                if command -v sshd >/dev/null 2>&1 && ! sshd -t 2>/dev/null; then
-                    log_warn "sshd config validation failed after writing permit-user-env.conf. Reverting..."
-                    rm -f "$permit_env_conf" 2>/dev/null || true
-                else
-                    if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
-                        run_command systemctl restart sshd 2>/dev/null || true
-                    else
-                        run_command pkill -HUP sshd 2>/dev/null || true
-                    fi
-                    log_info "Enabled PermitUserEnvironment in sshd"
-                fi
-            else
-                log_warn "Could not create sshd config directory (need sudo)"
-                if command -v sudo >/dev/null 2>&1; then
-                    if sudo -n true 2>/dev/null; then
-                        sudo -n mkdir -p "$sshd_conf_dir" 2>/dev/null || true
-                        echo "PermitUserEnvironment yes" | sudo -n tee "$permit_env_conf" > /dev/null 2>&1 || true
-                        sudo -n pkill -HUP sshd 2>/dev/null || true
-                        log_info "Enabled PermitUserEnvironment via sudo (NOPASSWD)"
-                    else
-                        log_warn "sudo requires a password and this step cannot proceed non-interactively. To enable SSH PermitUserEnvironment manually, run:"
-                        log_warn "  sudo mkdir -p $sshd_conf_dir && echo 'PermitUserEnvironment yes' | sudo tee $permit_env_conf && sudo pkill -HUP sshd"
-                    fi
-                fi
-            fi
-        fi
+        $_use_sudo mkdir -p "$sshd_conf_dir" 2>/dev/null
+        echo "PermitUserEnvironment yes" | $_use_sudo tee "$permit_env_conf" > /dev/null 2>&1
+        $_use_sudo pkill -HUP sshd 2>/dev/null || true
+        log_info "Enabled PermitUserEnvironment in sshd"
     fi
 
     local profile_d_file="/etc/profile.d/deck-local-bin.sh"
     if [[ ! -f "$profile_d_file" ]]; then
-        echo 'export PATH="/home/'"$CURRENT_USER"'/.local/bin:$PATH"' | run_command tee "$profile_d_file" > /dev/null 2>&1 || true
-        if [[ ! -f "$profile_d_file" ]]; then
-            if command -v sudo >/dev/null 2>&1; then
-                if sudo -n true 2>/dev/null; then
-                    echo 'export PATH="/home/'"$CURRENT_USER"'/.local/bin:$PATH"' | sudo -n tee "$profile_d_file" > /dev/null 2>&1 || true
-                else
-                    log_warn "sudo requires a password and this step cannot proceed non-interactively. To create $profile_d_file manually, run:"
-                    log_warn "  echo 'export PATH=\"/home/$CURRENT_USER/.local/bin:\$PATH\"' | sudo tee $profile_d_file"
-                fi
-            fi
-        fi
-        if [[ -f "$profile_d_file" ]]; then
-            chmod 644 "$profile_d_file" 2>/dev/null || true
-            log_info "Created $profile_d_file"
-        else
-            log_warn "Could not create $profile_d_file"
-        fi
+        echo 'export PATH="/home/'"$CURRENT_USER"'/.local/bin:$PATH"' | $_use_sudo tee "$profile_d_file" > /dev/null 2>&1 || true
+        $_use_sudo chmod 644 "$profile_d_file" 2>/dev/null || true
+        log_info "Created $profile_d_file"
     fi
 
     log_success "SSH environment configured for nested commands"

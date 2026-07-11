@@ -2088,48 +2088,33 @@ echo "the system is otherwise working. Not every -Dk warning requires action."
 }
 
 # shellcheck disable=SC2016,SC1078,SC1079
-_CONTAINER_PREAMBLE='_safe_sleep() {
-# CANONICAL DEFINITION — keep in sync with the two copies in
-# pamac-session-bootstrap.sh (critical_script and repair_script).
-# All three must be functionally identical.
+# _safe_sleep is extracted to /usr/local/lib/pamac-common.sh (written once on
+# first container script execution). All container scripts source it instead of
+# defining inline. This eliminates the 3-copy maintenance burden.
+_CONTAINER_PREAMBLE='if [[ ! -f /usr/local/lib/pamac-common.sh ]]; then
+mkdir -p /usr/local/lib 2>/dev/null
+cat > /usr/local/lib/pamac-common.sh << '\''PAMAC_COMMON'\''
+_safe_sleep() {
 local _d="$1"
-# Sanitize argument to a positive INTEGER (default 1s) before passing to
-# timers. Floats are NOT allowed: bash arithmetic ($(( ... ))) cannot handle
-# decimals and would crash the script under `set -e`, so we reject anything
-# containing a non-digit (including '.') and default to 1.
-case "$_d" in
-    ''|*[!0-9]*) _d=1 ;;
-esac
+case "$_d" in ''|*[!0-9]*) _d=1 ;; esac
 if sleep "$_d" 2>/dev/null; then return 0; fi
-# sleep is unavailable/broken — try a real timer that actually delays.
-# (read -t </dev/null returns immediately on EOF, so it is NOT a sleep.)
 if command -v python3 >/dev/null 2>&1; then
     python3 -c "import time,sys; time.sleep(float(sys.argv[1]))" "$_d" 2>/dev/null && return 0
 fi
 if command -v perl >/dev/null 2>&1; then
     perl -e "select undef,undef,undef,\$ARGV[0]" "$_d" 2>/dev/null && return 0
 fi
-# No working timer available: degrade to a \$SECONDS-based wall-clock wait so
-# retry loops neither busy-pin a core NOR return in <10ms. bashs \$SECONDS
-# advances once per real second of wall time, so we poll until the requested
-# number of whole seconds elapses. The case guard above restricted \$_d to
-# [0-9] (floats sanitized to 1), so the arithmetic here is integer-safe.
-# Returns 0: a real wall-clock delay DID happen even though no precise sub-
-# second timer fired; callers should not interpret a non-zero exit as \"no
-# delay happened\" — the function always sleeps at least the requested integer
-# number of seconds (or 1s minimum) when reached.
 local _target=\$(( _d + 0 ))
 [[ \$_target -lt 1 ]] && _target=1
 local _start=\$SECONDS
 while (( SECONDS - _start < _target )); do
-    # Use read -t to yield CPU instead of busy-pinning a core to 100%.
-    # This prevents battery drain on handheld devices when sleep is broken.
-    # Redirect stdin from /dev/null so read always times out after ~1s
-    # regardless of the callers stdin state (terminal, pipe, or closed fd).
     read -t 1 _dummy </dev/null 2>/dev/null || true
 done
 return 0
 }
+PAMAC_COMMON
+fi
+. /usr/local/lib/pamac-common.sh
 _remove_stale_lock() {
     local _lock="/var/lib/pacman/db.lck"
     if [[ ! -f "$_lock" ]]; then return 0; fi
@@ -4210,39 +4195,9 @@ mkdir -p /var/log 2>/dev/null || true
 chmod 1777 /var/log 2>/dev/null || true
 touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
 
-_safe_sleep() {
-# COPY #1 of 3 — keep in sync with _CONTAINER_PREAMBLE and repair_script copy.
-local _d="$1"
-case "$_d" in ''|*[!0-9]*) _d=1 ;; esac
-if sleep "$_d" 2>/dev/null; then return 0; fi
-# sleep is unavailable/broken — try a real timer that actually delays.
-# (read -t </dev/null returns immediately on EOF, so it is NOT a sleep.)
-if command -v python3 >/dev/null 2>&1; then
-    python3 -c "import time,sys; time.sleep(float(sys.argv[1]))" "$_d" 2>/dev/null && return 0
-fi
-if command -v perl >/dev/null 2>&1; then
-    perl -e "select undef,undef,undef,\$ARGV[0]" "$_d" 2>/dev/null && return 0
-fi
-# No working timer available: degrade to a $SECONDS-based wall-clock wait so
-# retry loops neither busy-pin a core NOR return in <10ms. bash's $SECONDS
-# advances once per real second of wall time, so we poll until the requested
-# number of whole seconds elapses. The case guard above restricted $_d to
-# [0-9] (floats sanitized to 1), so the arithmetic here is integer-safe.
-# Returns 0: a real wall-clock delay DID happen even though no precise sub-
-# second timer fired; callers should not interpret a non-zero exit as "no
-# delay happened" — the function always sleeps at least the requested integer
-# number of seconds (or 1s minimum) when reached.
-local _target=$(( _d + 0 ))
-[[ $_target -lt 1 ]] && _target=1
-local _start=$SECONDS
-while (( SECONDS - _start < _target )); do
-    local _dummy
-    # Redirect from /dev/null so read always times out after ~1s regardless of
-    # the caller's stdin state (terminal, pipe, or closed fd).
-    read -t 1 _dummy </dev/null 2>/dev/null || true
-done
-return 0
-}
+
+# Source shared _safe_sleep (written by _CONTAINER_PREAMBLE on first run)
+[ -f /usr/local/lib/pamac-common.sh ] && . /usr/local/lib/pamac-common.sh
 
 log_bootstrap() {
 echo "[$(date '+%H:%M:%S')] $*" >> "$BOOTSTRAP_LOG" 2>/dev/null || true
@@ -4544,39 +4499,9 @@ mkdir -p /var/log 2>/dev/null || true
 chmod 1777 /var/log 2>/dev/null || true
 touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
 
-_safe_sleep() {
-# COPY #1 of 3 — keep in sync with _CONTAINER_PREAMBLE and repair_script copy.
-local _d="$1"
-case "$_d" in ''|*[!0-9]*) _d=1 ;; esac
-if sleep "$_d" 2>/dev/null; then return 0; fi
-# sleep is unavailable/broken — try a real timer that actually delays.
-# (read -t </dev/null returns immediately on EOF, so it is NOT a sleep.)
-if command -v python3 >/dev/null 2>&1; then
-    python3 -c "import time,sys; time.sleep(float(sys.argv[1]))" "$_d" 2>/dev/null && return 0
-fi
-if command -v perl >/dev/null 2>&1; then
-    perl -e "select undef,undef,undef,\$ARGV[0]" "$_d" 2>/dev/null && return 0
-fi
-# No working timer available: degrade to a $SECONDS-based wall-clock wait so
-# retry loops neither busy-pin a core NOR return in <10ms. bash's $SECONDS
-# advances once per real second of wall time, so we poll until the requested
-# number of whole seconds elapses. The case guard above restricted $_d to
-# [0-9] (floats sanitized to 1), so the arithmetic here is integer-safe.
-# Returns 0: a real wall-clock delay DID happen even though no precise sub-
-# second timer fired; callers should not interpret a non-zero exit as "no
-# delay happened" — the function always sleeps at least the requested integer
-# number of seconds (or 1s minimum) when reached.
-local _target=$(( _d + 0 ))
-[[ $_target -lt 1 ]] && _target=1
-local _start=$SECONDS
-while (( SECONDS - _start < _target )); do
-    local _dummy
-    # Redirect from /dev/null so read always times out after ~1s regardless of
-    # the caller's stdin state (terminal, pipe, or closed fd).
-    read -t 1 _dummy </dev/null 2>/dev/null || true
-done
-return 0
-}
+
+# Source shared _safe_sleep (written by _CONTAINER_PREAMBLE on first run)
+[ -f /usr/local/lib/pamac-common.sh ] && . /usr/local/lib/pamac-common.sh
 
 log_bootstrap() {
 echo "[$(date '+%H:%M:%S')] $*" >> "$BOOTSTRAP_LOG" 2>/dev/null || true
@@ -5315,20 +5240,20 @@ _enable_repo_with_fallback() {
 
 echo "=== Configuring Chaotic-AUR repository ==="
 _enable_repo_with_fallback \
-    "chaotic-aur" "chaotic-keyring" "30565AC3868033CA" \
+    "chaotic-aur" "chaotic-keyring" "EF925EA60F33D0CB85C44AD13056513887B78AEB" \
     "https://cdn-mirror.chaotic.cx/chaotic-aur/\$arch" \
     "https://geo-mirror.chaotic.cx/chaotic-aur/\$arch" \
     "https://mirror.chaotic.cx/chaotic-aur/\$arch"
-echo "Note: Fallback fingerprint 30565AC3868033CA may be stale after key rotation."
+echo "Note: Fallback fingerprint EF925EA6...78AEB (pedrohlc) from chaotic-aur/keyring."
 echo "  Override with: CHAOTIC_AUR_KEY_ID=<FULL_FINGERPRINT>  (40 hex chars)"
 
 echo "=== Configuring archlinuxcn repository ==="
 _enable_repo_with_fallback \
-    "archlinuxcn" "archlinuxcn-keyring" "11C2E2D1D43CF75C" \
+    "archlinuxcn" "archlinuxcn-keyring" "87F2E316E0ABC98B9DE8D4EF042FD810600954EF" \
     "https://repo.archlinuxcn.org/\$arch" \
     "https://mirrors.tuna.tsinghua.edu.cn/archlinuxcn/\$arch" \
     "https://mirror.sjtu.edu.cn/archlinuxcn/\$arch"
-echo "Note: Fallback fingerprint 11C2E2D1D43CF75C may be stale after key rotation."
+echo "Note: Fallback fingerprint 87F2E316...954EF from archlinuxcn-keyring (first key)."
 echo "  Override with: ARCHLINUXCN_KEY_ID=<FULL_FINGERPRINT>  (40 hex chars)"
 
 echo "=== Configuring endeavouros repository ==="
@@ -5337,7 +5262,7 @@ _enable_repo_with_fallback \
     "https://mirror.freedif.org/EndeavourOS/repo/\$repo/\$arch" \
     "https://mirror.endeavouros.com/EndeavourOS/repo/\$repo/\$arch" \
     "https://mirror.enderunix.org/endeavouros/repo/\$repo/\$arch"
-echo "Note: Fallback fingerprint F52611D11AFD4556 may be stale after key rotation."
+echo "Note: F52611D11AFD4556 is a short ID — verify at https://github.com/endeavouros-team"
 echo "  Override with: ENDEAVOUROS_KEY_ID=<FULL_FINGERPRINT>  (40 hex chars)"
 
 echo "=== Configuring mesa-git repository (disabled by default - can break GPU drivers) ==="

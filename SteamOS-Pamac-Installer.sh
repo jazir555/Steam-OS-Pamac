@@ -265,7 +265,10 @@ sanitize_and_upload_log() {
     sanitized_log=$(mktemp "${_SCRIPT_TMPDIR:-/tmp}/pamac-sanitized-XXXXXXXX") || { log_error "Failed to create temp file for sanitization."; return 1; }
 
     # Sanitize: strip ANSI colors, user home paths, hostnames, IPs,
-    # SSH keys, tokens, and other sensitive patterns.
+    # SSH keys, tokens, AUR credentials, and other sensitive patterns.
+    # Uses both sed (in-place transforms) and grep -v (line removal) for
+    # maximum coverage. Known-sensitive patterns are removed entirely;
+    # ambiguous patterns are redacted in-place.
     sed \
         -e 's/\x1B\[[0-9;]*[A-Za-z]//g' \
         -e "s|$HOME|~HOME|g" \
@@ -283,7 +286,22 @@ sanitize_and_upload_log() {
         -e 's/AWS_[A-Z_]*[=: ].*$/<REDACTED>/gi' \
         -e 's/\?key=[^ &]*$/\?key=<REDACTED>/gi' \
         -e 's/base64,[A-Za-z0-9+/]\{32,\}[=]*/base64,<REDACTED>/gi' \
-        "$LOG_FILE" > "$sanitized_log" 2>/dev/null || {
+        -e 's/GPGKEY[=: ].*$/GPGKEY=<REDACTED>/gi' \
+        -e 's/gpg_key[=: ].*$/gpg_key=<REDACTED>/gi' \
+        -e 's/signing_key[=: ].*$/signing_key=<REDACTED>/gi' \
+        "$LOG_FILE" 2>/dev/null \
+    | grep -viE '(
+        AUR_[A-Z_]*KEY|             # AUR environment variable keys
+        makepkg.*GPGKEY|            # makepkg GPG configuration
+        pacman-key.*--lsign|        # Key signing commands with fingerprints
+        gpg.*--import.*KEYS?|       # Key import commands
+        SSH_PRIVATE_KEY|            # SSH key references
+        COOKIE_|                    # Cookie variables
+        CREDENTIALS|                # Credential references
+        PRIVATE_KEY|                # Generic private key mentions
+        -----BEGIN|                 # PEM headers that survived sed
+        -----END                    # PEM footers that survived sed
+    )' > "$sanitized_log" 2>/dev/null || {
             log_warn "Log sanitization failed. Uploading raw log."
             cp -f "$LOG_FILE" "$sanitized_log"
         }
@@ -2611,6 +2629,12 @@ CAP_BOUNDING_SET=""
 READ_WRITE_PATHS=()
 READ_ONLY_PATHS=()
 INACCESSIBLE_PATHS=()
+STATE_DIRECTORIES=()
+LOGS_DIRECTORIES=()
+RUNTIME_DIRECTORIES=()
+BIND_PATHS=()
+BIND_RO_PATHS=()
+TMPFS_SPECS=()
 MEMORY_DENY_WRITE_EXECUTE=""
 SYSTEM_CALL_FILTER=""
 RESTRICT_NAMESPACES=""
@@ -2649,14 +2673,14 @@ case "$arg" in
 # every dropped property to /tmp/systemd-run-fake.log so a build that depended
 # on a property'\''s behavior (not just its presence) is debuggable. Resource and
 # metadata properties that have no sandboxing impact stay silent for brevity.
---property=StateDirectory=*) continue ;;
---property=LogsDirectory=*) continue ;;
---property=RuntimeDirectory=*) continue ;;
+--property=StateDirectory=*) STATE_DIRECTORIES+=("${arg#--property=StateDirectory=}"); _log_dsr "Sandbox: $arg"; continue ;;
+--property=LogsDirectory=*) LOGS_DIRECTORIES+=("${arg#--property=LogsDirectory=}"); _log_dsr "Sandbox: $arg"; continue ;;
+--property=RuntimeDirectory=*) RUNTIME_DIRECTORIES+=("${arg#--property=RuntimeDirectory=}"); _log_dsr "Sandbox: $arg"; continue ;;
 --property=Type=*) continue ;;
 --property=RemainAfterExit=*) continue ;;
---property=TemporaryFileSystem=*) continue ;;
---property=BindPaths=*) continue ;;
---property=BindReadOnlyPaths=*) continue ;;
+--property=TemporaryFileSystem=*) TMPFS_SPECS+=("${arg#--property=TemporaryFileSystem=}"); _log_dsr "Sandbox: $arg"; continue ;;
+--property=BindPaths=*) BIND_PATHS+=("${arg#--property=BindPaths=}"); _log_dsr "Sandbox: $arg"; continue ;;
+--property=BindReadOnlyPaths=*) BIND_RO_PATHS+=("${arg#--property=BindReadOnlyPaths=}"); _log_dsr "Sandbox: $arg"; continue ;;
 --property=ProtectSystem=*) PROTECT_SYSTEM="${arg#--property=ProtectSystem=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=ProtectHome=*) PROTECT_HOME="${arg#--property=ProtectHome=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=PrivateTmp=*) PRIVATE_TMP="${arg#--property=PrivateTmp=}"; _log_dsr "Sandbox: $arg"; continue ;;
@@ -2998,6 +3022,12 @@ _NEEDS_SANDBOX=false
 [[ -n "$PRIVATE_DEVICES" ]] && _NEEDS_SANDBOX=true
 [[ ${#READ_ONLY_PATHS[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
 [[ ${#INACCESSIBLE_PATHS[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
+[[ ${#STATE_DIRECTORIES[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
+[[ ${#LOGS_DIRECTORIES[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
+[[ ${#RUNTIME_DIRECTORIES[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
+[[ ${#BIND_PATHS[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
+[[ ${#BIND_RO_PATHS[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
+[[ ${#TMPFS_SPECS[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
 [[ -n "$MEMORY_DENY_WRITE_EXECUTE" ]] && _NEEDS_SANDBOX=true
 [[ -n "$SYSTEM_CALL_FILTER" ]] && _NEEDS_SANDBOX=true
 [[ -n "$RESTRICT_NAMESPACES" ]] && _NEEDS_SANDBOX=true
@@ -3131,6 +3161,72 @@ _apply_sandbox() {
             _log_dsr "  /dev replaced with minimal device nodes"
         fi
     fi
+
+    # ── StateDirectory: create /var/lib/<name> owned by build user ──
+    for _sd in "${STATE_DIRECTORIES[@]}"; do
+        local _sd_path="/var/lib/$_sd"
+        mkdir -p "$_sd_path" 2>/dev/null || continue
+        chown "${BUILD_USER:-root}:${BUILD_USER:-root}" "$_sd_path" 2>/dev/null || true
+        _log_dsr "  StateDirectory: $_sd_path"
+    done
+
+    # ── LogsDirectory: create /var/log/<name> owned by build user ──
+    for _ld in "${LOGS_DIRECTORIES[@]}"; do
+        local _ld_path="/var/log/$_ld"
+        mkdir -p "$_ld_path" 2>/dev/null || continue
+        chown "${BUILD_USER:-root}:${BUILD_USER:-root}" "$_ld_path" 2>/dev/null || true
+        _log_dsr "  LogsDirectory: $_ld_path"
+    done
+
+    # ── RuntimeDirectory: create /run/<name> owned by build user ──
+    for _rd in "${RUNTIME_DIRECTORIES[@]}"; do
+        local _rd_path="/run/$_rd"
+        mkdir -p "$_rd_path" 2>/dev/null || continue
+        chown "${BUILD_USER:-root}:${BUILD_USER:-root}" "$_rd_path" 2>/dev/null || true
+        chmod 0755 "$_rd_path" 2>/dev/null || true
+        _log_dsr "  RuntimeDirectory: $_rd_path"
+    done
+
+    # ── TemporaryFileSystem: mount tmpfs at specified path with options ──
+    for _tfs in "${TMPFS_SPECS[@]}"; do
+        local _tfs_path="${_tfs%%:*}"
+        local _tfs_opts="${_tfs#*:}"
+        [[ -z "$_tfs_path" ]] && continue
+        mkdir -p "$_tfs_path" 2>/dev/null || continue
+        if [[ -n "$_tfs_opts" ]]; then
+            mount -t tmpfs -o "$_tfs_opts" tmpfs "$_tfs_path" 2>/dev/null \
+                || mount -t tmpfs tmpfs "$_tfs_path" 2>/dev/null
+        else
+            mount -t tmpfs tmpfs "$_tfs_path" 2>/dev/null
+        fi
+        _log_dsr "  TemporaryFileSystem: $_tfs_path (opts: ${_tfs_opts:-none})"
+    done
+
+    # ── BindPaths: bind-mount source to destination (writable) ──
+    for _bp in "${BIND_PATHS[@]}"; do
+        local _src="${_bp%%:*}"
+        local _dst="${_bp#*:}"
+        [[ -z "$_src" || -z "$_dst" ]] && continue
+        mkdir -p "$_src" "$_dst" 2>/dev/null || continue
+        mount --bind "$_src" "$_dst" 2>/dev/null \
+            && _log_dsr "  BindPaths: $_src → $_dst" \
+            || _warn_dsr "  Failed BindPaths: $_src → $_dst"
+    done
+
+    # ── BindReadOnlyPaths: bind-mount source to destination (read-only) ──
+    for _brp in "${BIND_RO_PATHS[@]}"; do
+        local _src="${_brp%%:*}"
+        local _dst="${_brp#*:}"
+        [[ -z "$_src" || -z "$_dst" ]] && continue
+        mkdir -p "$_src" "$_dst" 2>/dev/null || continue
+        if mount --bind "$_src" "$_dst" 2>/dev/null; then
+            mount -o remount,bind,ro "$_dst" 2>/dev/null \
+                && _log_dsr "  BindReadOnlyPaths: $_src → $_dst" \
+                || _warn_dsr "  Failed to make read-only: $_dst"
+        else
+            _warn_dsr "  Failed BindReadOnlyPaths: $_src → $_dst"
+        fi
+    done
 
     # ── NoNewPrivileges: use prctl via setpriv if available ──
     if [[ -n "$NO_NEW_PRIVS" ]] && [[ "$NO_NEW_PRIVS" == "yes" ]]; then
@@ -4920,19 +5016,34 @@ fi
 echo "Setting pamac polkit policy for passwordless operation..."
 pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
 if [[ -f "$pamac_policy" ]]; then
-    # Set allow_active=yes for package management actions only (install,
-    # remove, update, build). Keep allow_any=no and allow_inactive=no
-    # to prevent unauthenticated remote access or inactive-session abuse.
-    # The container runs its own private system bus + polkitd (not the host's),
-    # so these in-container values are authoritative. Any remaining auth_admin
-    # value would trigger a password prompt with no polkit-agent inside the
-    # container to handle it, freezing the GUI.
+    # Restrict allow_active=yes to ONLY the actions that Pamac GUI actually
+    # needs (install, remove, update, build). Leave all other actions at their
+    # upstream defaults (typically auth_admin). This limits the surface area:
+    # a malicious AUR PKGBUILD running as the user can only invoke these
+    # specific actions without authentication, not arbitrary polkit operations.
     _atomic_sed_inplace "$pamac_policy" \
-        's|<allow_any>[^<]*</allow_any>|<allow_any>no</allow_any>|g' \
-        's|<allow_active>[^<]*</allow_active>|<allow_active>yes</allow_active>|g' \
-        's|<allow_inactive>[^<]*</allow_inactive>|<allow_inactive>no</allow_inactive>|g'
-    echo "Polkit policy set to allow_active=yes (local active sessions only)."
-    echo "  allow_any=no, allow_inactive=no (remote/inactive sessions blocked)."
+        's|<allow_active>[^<]*</allow_active>|<allow_active>auth_admin</allow_active>|g'
+    # Now selectively enable only package-management actions
+    for _action_id in \
+        org.manjaro.pamac.install \
+        org.manjaro.pamac.install-update \
+        org.manjaro.pamac.remove \
+        org.manjaro.pamac.update \
+        org.manjaro.pamac.build \
+        org.manjaro.pamac.launch-flatpak-builder \
+        org.manjaro.pamac.check-aur-vcs-updates \
+        org.manjaro.pamac.check-aur-updates \
+        org.manjaro.pamac.system-upgrade \
+        org.manjaro.pamac.refresh-databases \
+        org.manjaro.pamac.get-build-directory \
+        org.manjaro.pamac.get-build-username \
+        org.manjaro.pamac.build-install; do
+        # Replace the action's own <allow_active> with yes (if the action exists)
+        sed -i "/id=\"${_action_id}\"/,/<\/action>/{s|<allow_active>auth_admin</allow_active>|<allow_active>yes</allow_active>|}" \
+            "$pamac_policy" 2>/dev/null || true
+    done
+    echo "Polkit policy: allow_active=yes for package management actions only."
+    echo "  All other actions require authentication (auth_admin)."
 else
     echo "Note: pamac polkit policy not yet installed (defaults are least-privilege)."
 fi
@@ -7381,13 +7492,28 @@ echo "BuildDirectory set to /home/$current_user/.pamac-build"
 echo "Setting pamac polkit policy for passwordless operation..."
 pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
 if [[ -f "$pamac_policy" ]]; then
-    # Set allow_active=yes for local active sessions only.
-    # allow_any=no, allow_inactive=no prevents remote/inactive abuse.
+    # Set all allow_active to auth_admin first, then selectively enable
+    # only package management actions (see stage-6a block for full list).
     _atomic_sed_inplace "$pamac_policy" \
-        's|<allow_any>[^<]*</allow_any>|<allow_any>no</allow_any>|g' \
-        's|<allow_active>[^<]*</allow_active>|<allow_active>yes</allow_active>|g' \
-        's|<allow_inactive>[^<]*</allow_inactive>|<allow_inactive>no</allow_inactive>|g'
-    echo "Polkit policy set to allow_active=yes (local active sessions only)."
+        's|<allow_active>[^<]*</allow_active>|<allow_active>auth_admin</allow_active>|g'
+    for _action_id in \
+        org.manjaro.pamac.install \
+        org.manjaro.pamac.install-update \
+        org.manjaro.pamac.remove \
+        org.manjaro.pamac.update \
+        org.manjaro.pamac.build \
+        org.manjaro.pamac.launch-flatpak-builder \
+        org.manjaro.pamac.check-aur-vcs-updates \
+        org.manjaro.pamac.check-aur-updates \
+        org.manjaro.pamac.system-upgrade \
+        org.manjaro.pamac.refresh-databases \
+        org.manjaro.pamac.get-build-directory \
+        org.manjaro.pamac.get-build-username \
+        org.manjaro.pamac.build-install; do
+        sed -i "/id=\"${_action_id}\"/,/<\/action>/{s|<allow_active>auth_admin</allow_active>|<allow_active>yes</allow_active>|}" \
+            "$pamac_policy" 2>/dev/null || true
+    done
+    echo "Polkit policy: allow_active=yes for package management actions only."
 else
     echo "Warning: pamac polkit policy file not found at $pamac_policy"
 fi

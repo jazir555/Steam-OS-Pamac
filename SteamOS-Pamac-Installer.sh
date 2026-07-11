@@ -89,6 +89,7 @@ LOG_LEVEL="${LOG_LEVEL:-normal}"
 PAMAC_VERSION="${PAMAC_VERSION:-}"
 NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
 SKIP_COMPAT_CHECK="${SKIP_COMPAT_CHECK:-false}"
+FORCE_PODMAN_RESET="${FORCE_PODMAN_RESET:-false}"
 # SECURITY (default off): PermitUserEnvironment yes in sshd lets any
 # SSH-authenticated user inject arbitrary environment variables (LD_PRELOAD,
 # PATH...) via ~/.ssh/environment — a known privilege-escalation vector on
@@ -1106,7 +1107,9 @@ repair_podman() {
         done <<< "$existing_containers"
     fi
     local skip_reset=false
-    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    if [[ "$FORCE_PODMAN_RESET" == "true" ]]; then
+        log_info "Force-reset requested (--force-reset). Proceeding with podman system reset."
+    elif [[ "$NON_INTERACTIVE" == "true" ]]; then
         log_warn "Non-interactive mode (--non-interactive) — skipping automatic podman system reset to avoid data loss."
         log_info "Run this script without --non-interactive to approve, or try: podman system reset --force"
         skip_reset=true
@@ -1135,6 +1138,12 @@ repair_podman() {
         return 0
     fi
 
+    if [[ "$skip_reset" != "true" ]]; then
+        log_warn "System reset did not recover podman. Storage may be deeply corrupted."
+        log_info "Try: podman system reset --force && sudo reboot"
+        log_info "A full reboot after reset can clear stale kernel state."
+    fi
+
     # Step 8: Storage migration
     log_info "Attempting to migrate podman storage..."
     podman system migrate 2>/dev/null || true
@@ -1150,16 +1159,21 @@ repair_podman() {
     log_error "Rootless podman cannot run containers. This is required for secure"
     log_error "isolation — running containers as host root via sudo is INSECURE."
     log_error ""
-    log_error "Common causes and manual fixes:"
-    log_error "  1. Missing subuid/subgid mappings:"
-    log_error "     sudo usermod --add-subuids ${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1)) --add-subgids ${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1)) $(whoami)"
+    log_error "Steps tried: XDG_RUNTIME_DIR fix, subuid/subgid check, socket start,"
+    log_error "  lock cleanup, permission fix, database rebuild, system reset, storage migration."
+    log_error ""
+    log_error "Manual recovery options (in order of safety):"
+    log_error "  1. Check subuid/subgid:"
+    log_error "     grep $(whoami) /etc/subuid /etc/subgid"
+    log_error "     If missing: sudo usermod --add-subuids ${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1)) --add-subgids ${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1)) $(whoami)"
     log_error "     Then log out and back in."
-    log_error "  2. Corrupted podman storage (nuclear option — destroys ALL podman data):"
+    log_error "  2. Nuclear reset (destroys ALL podman data — containers, images, volumes):"
     log_error "     podman system reset --force"
-    log_error "  3. Missing XDG_RUNTIME_DIR (user session issue):"
+    log_error "     This is the most likely fix for corrupted storage."
+    log_error "  3. Check user session:"
     log_error "     sudo loginctl enable-linger $(whoami)"
     log_error "     Then log out and back in."
-    log_error "  4. SteamOS read-only rootfs blocking storage:"
+    log_error "  4. SteamOS read-only rootfs:"
     log_error "     Ensure /home is writable (it should be by default on Steam Deck)."
     log_error ""
     log_error "After fixing, try running this script again."
@@ -1218,6 +1232,8 @@ OPTIONS:
   --skip-compat-check        Skip pamac-aur AUR compatibility check (avoids
                              AUR RPC dependency; for users who know their
                              pacman version is compatible)
+  --force-reset              Skip interactive confirmation for podman system
+                             reset (DESTRUCTIVE: removes ALL containers)
   --enable-gaming            Install extra gaming packages
   --disable-gaming           Do not install gaming packages (default)
   --enable-extra-repos       Enable popular third-party repositories (default)
@@ -1326,6 +1342,7 @@ parse_arguments() {
                 shift 2
                 ;;
             --skip-compat-check) SKIP_COMPAT_CHECK="true"; shift ;;
+            --force-reset) FORCE_PODMAN_RESET="true"; shift ;;
             --uninstall) UNINSTALL="true"; shift ;;
             --status) STATUS="true"; shift ;;
             --update) UPDATE="true"; shift ;;

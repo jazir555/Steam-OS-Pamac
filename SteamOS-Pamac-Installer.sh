@@ -3266,11 +3266,14 @@ for _ks in "hkps://keyserver.ubuntu.com" "hkps://keys.openpgp.org" "hkps://pgp.m
     _ks_host="${_ks#hkps://}"
     _ks_host="${_ks_host#https://}"
     _ks_host="${_ks_host#http://}"
-    if timeout 3 bash -c "echo >/dev/tcp/$_ks_host/443" 2>/dev/null; then
-        echo "  $_ks: REACHABLE (port 443)"
+    # Use curl instead of /dev/tcp (which is compile-time optional in Bash
+    # and missing in POSIX sh/dash). curl is required for keyring bootstrap
+    # and is guaranteed available at this point in the script.
+    if timeout 5 curl -fsSI --connect-timeout 3 "https://$_ks_host" >/dev/null 2>&1; then
+        echo "  $_ks: REACHABLE (HTTPS)"
         _KS_REACHABLE+=("$_ks")
     else
-        echo "  $_ks: UNREACHABLE on port 443 (will skip)"
+        echo "  $_ks: UNREACHABLE on HTTPS (will skip)"
         _KS_UNREACHABLE+=("$_ks")
     fi
 done
@@ -3497,9 +3500,9 @@ else
     else
         echo "    https://archlinux.org: FAILED (port 443 may be blocked)"
     fi
-    echo "  Keyserver connectivity (port 443):"
+    echo "  Keyserver connectivity (HTTPS):"
     for _diag_ks in "keyserver.ubuntu.com" "keys.openpgp.org" "pgp.mit.edu"; do
-        if timeout 3 bash -c "echo >/dev/tcp/$_diag_ks/443" 2>/dev/null; then
+        if timeout 5 curl -fsSI --connect-timeout 3 "https://$_diag_ks" >/dev/null 2>&1; then
             echo "    $_diag_ks: REACHABLE"
         else
             echo "    $_diag_ks: UNREACHABLE"
@@ -5020,6 +5023,10 @@ _import_key_with_retry() {
                     # This protects against a coincidental 16-char collision:
                     # we count ALL fingerprints ending in $key_id and require
                     # that count to be exactly 1.
+                    # NOTE: For third-party repos (Chaotic-AUR, archlinuxcn,
+                    # EndeavourOS), always prefer full 40-char fingerprints via
+                    # env-var overrides. The suffix-matching fallback exists for
+                    # backward compatibility but is weaker than exact match.
                     elif [[ $_kid_len -ge 16 ]] && [[ "$_is_hex" == "true" ]] && [[ "$_clean_fp" == *"$_clean_kid" ]]; then
                         local _stripped="${_clean_fp%$_clean_kid}"
                         # Reject coincidental earlier-position match.

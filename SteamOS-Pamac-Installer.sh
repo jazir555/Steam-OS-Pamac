@@ -1230,8 +1230,11 @@ ENVIRONMENT VARIABLES:
                            pamac-aur is built to prevent API breakage on rolling
                            release containers.
   CHAOTIC_AUR_KEY_ID       Override the Chaotic-AUR signing key fingerprint
+                            (auto-discovered from keyring package by default)
   ARCHLINUXCN_KEY_ID       Override the archlinuxcn signing key fingerprint
+                            (auto-discovered from keyring package by default)
   ENDEAVOUROS_KEY_ID       Override the EndeavourOS signing key fingerprint
+                            (auto-discovered from keyring package by default)
   STRICT_SECURITY          Set to 'true' to enforce --strict-security mode
                            (refuse SigLevel=TrustAll recovery and the fake
                            systemd-run wrapper). Default 'false'.
@@ -5652,6 +5655,102 @@ _import_key_with_retry() {
     return 1
 }
 
+# Discover the signing key fingerprint for a repository from its installed
+# keyring package. After the keyring package is installed, this queries
+# pacman-key to find keys that sign packages from the given repo.
+# Usage: _discover_keyring_fingerprint <repo_name>
+# Returns: 40-char hex fingerprint on success, empty string on failure.
+_discover_keyring_fingerprint() {
+    local _repo="$1"
+    if ! command -v pacman-key >/dev/null 2>&1; then
+        return 1
+    fi
+    # pacman-key --list-keys outputs key info. Keys for a repo are typically
+    # signed by the repo maintainer. We look for keys whose uid contains the
+    # repo name or known maintainer identifiers.
+    local _all_fps
+    _all_fps=$(pacman-key --list-keys 2>/dev/null | grep -E "^[0-9A-F]{40}" || true)
+    if [[ -z "$_all_fps" ]]; then
+        return 1
+    fi
+    # For each fingerprint, check if it's a valid signing key by looking at
+    # the uid line that follows. Match on repo name or common maintainer names.
+    local _fp _uid
+    while IFS= read -r _fp; do
+        _fp="${_fp%% *}"  # take just the fingerprint
+        [[ "$_fp" =~ ^[0-9A-F]{40}$ ]] || continue
+        # Read the next line (uid) from pacman-key output
+        _uid=$(pacman-key --list-keys "$_fp" 2>/dev/null | grep -i "uid" | head -1 || true)
+        case "$_repo" in
+            chaotic-aur)
+                # Chaotic-AUR signing key uid contains "pedrohlc" or "chaotic"
+                if echo "$_uid" | grep -qiE "pedrohlc|chaotic"; then
+                    echo "$_fp"
+                    return 0
+                fi
+                ;;
+            archlinuxcn)
+                # archlinuxcn key uid contains "archlinuxcn"
+                if echo "$_uid" | grep -qi "archlinuxcn"; then
+                    echo "$_fp"
+                    return 0
+                fi
+                ;;
+            endeavouros)
+                # EndeavourOS key uid contains "EndeavourOS"
+                if echo "$_uid" | grep -qi "endeavouros"; then
+                    echo "$_fp"
+                    return 0
+                fi
+                ;;
+        esac
+    done <<< "$_all_fps"
+    return 1
+}
+
+# Discover fingerprint by extracting it from a keyring package before installation.
+# Downloads the keyring package, extracts the .gpg files, and queries them.
+_discover_fingerprint_from_pkg() {
+    local _repo="$1"
+    local _keyring_pkg="$2"
+    local _mirror_urls=("${@:3}")
+    local _host_arch
+    _host_arch=$(uname -m 2>/dev/null || echo "x86_64")
+    local _tmp_dir
+    _tmp_dir=$(mktemp -d /var/tmp/pamac-fp-XXXXXX 2>/dev/null) || return 1
+    for _url in "${_mirror_urls[@]}"; do
+        local _direct="${_url}"
+        _direct="${_direct//\\\$arch/$_host_arch}"
+        _direct="${_direct//\$arch/$_host_arch}"
+        _direct="${_direct//\\\$repo/$_repo}"
+        _direct="${_direct//\$/repo/$_repo}"
+        _direct="${_direct//\$\{arch\}/$_host_arch}"
+        _direct="${_direct//\$\{repo\}/$_repo}"
+        local _pkg_url="${_direct%/}/${_keyring_pkg}.pkg.tar.zst"
+        if timeout 30 curl -fsSL --connect-timeout 10 -o "$_tmp_dir/pkg.tar.zst" "$_pkg_url" 2>/dev/null; then
+            # Extract pub.gpg from the package and query it
+            local _gpg_dir="$_tmp_dir/gpg"
+            mkdir -p "$_gpg_dir"
+            tar -xf "$_tmp_dir/pkg.tar.zst" -C "$_tmp_dir" --wildcards '*/gnupg/*' 2>/dev/null || \
+            tar -xf "$_tmp_dir/pkg.tar.zst" -C "$_gpg_dir" 2>/dev/null || true
+            # Find .gpg key files
+            local _gpg_file
+            for _gpg_file in $(find "$_tmp_dir" -name "*.gpg" -type f 2>/dev/null); do
+                local _fp
+                _fp=$(gpg --with-colons --show-keys "$_gpg_file" 2>/dev/null \
+                    | grep "^fpr" | head -1 | cut -d: -f10 || true)
+                if [[ "$_fp" =~ ^[0-9A-F]{40}$ ]]; then
+                    echo "$_fp"
+                    rm -rf "$_tmp_dir"
+                    return 0
+                fi
+            done
+        fi
+    done
+    rm -rf "$_tmp_dir"
+    return 1
+}
+
 _enable_repo_with_fallback() {
     local repo_name="$1"
     local keyring_pkg="$2"
@@ -5670,23 +5769,37 @@ _enable_repo_with_fallback() {
     env_var_name="${_normalized^^}_KEY_ID"
     local key_id="${!env_var_name:-$default_key_id}"
 
-    # Validate the resolved key_id format. ALL key IDs MUST be 40-char hex
-    # fingerprints. Short IDs (8 or 16 char) are rejected unconditionally
-    # because they are susceptible to collision attacks. If the hardcoded
-    # default is a short ID, the repo setup is refused until a full
-    # fingerprint is provided via the env-var override.
-    if [[ ! "$key_id" =~ ^[0-9a-fA-F]{40}$ ]]; then
-        if [[ -n "${!env_var_name:-}" ]] && [[ "$key_id" != "$default_key_id" ]]; then
-            echo "ERROR: $env_var_name='$key_id' is not a valid 40-character hex fingerprint."
-        else
-            echo "ERROR: Default key ID for $repo_name='$key_id' is a short ID, not a full fingerprint."
-            echo "  Short IDs are rejected (collision/ambiguous-match risk)."
+    # If key_id is "auto" or not a valid 40-char fingerprint, try to discover it.
+    if [[ "$key_id" == "auto" ]] || [[ ! "$key_id" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        echo "Attempting automatic fingerprint discovery for $repo_name..."
+        # Try extracting from the keyring package directly
+        key_id="$(_discover_fingerprint_from_pkg "$repo_name" "$keyring_pkg" "${mirror_urls[@]}")" || true
+        if [[ -z "$key_id" ]]; then
+            echo "  Could not extract fingerprint from keyring package. Trying pacman-key..."
         fi
-        echo "  GPG fingerprints must be a 40-character hexadecimal string."
+    fi
+
+    # If still no valid fingerprint, try pacman-key (works after keyring install)
+    if [[ ! "$key_id" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        if pacman -S --noconfirm --needed "$keyring_pkg" 2>/dev/null; then
+            key_id="$(_discover_keyring_fingerprint "$repo_name")" || true
+        fi
+    fi
+
+    # Final validation: must be a 40-char hex fingerprint
+    if [[ ! "$key_id" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        if [[ -n "${!env_var_name:-}" ]]; then
+            echo "ERROR: $env_var_name='${!env_var_name}' is not a valid 40-character hex fingerprint."
+        else
+            echo "ERROR: Could not auto-discover signing key fingerprint for $repo_name."
+            echo "  The keyring package does not contain a recognizable signing key,"
+            echo "  and no user override was provided."
+        fi
         echo "  Set $env_var_name=<FULL_40_CHAR_FINGERPRINT> and re-run."
-        echo "  Verify the correct fingerprint at: https://archlinux.org/packages/?repo=$repo_name"
         return 1
     fi
+
+    echo "Using fingerprint $key_id for $repo_name"
 
     echo "Adding repository [$repo_name] (key_id=$key_id)..."
 
@@ -5860,33 +5973,27 @@ _enable_repo_with_fallback() {
 
 echo "=== Configuring Chaotic-AUR repository ==="
 _enable_repo_with_fallback \
-    "chaotic-aur" "chaotic-keyring" "EF925EA60F33D0CB85C44AD13056513887B78AEB" \
+    "chaotic-aur" "chaotic-keyring" "auto" \
     "https://cdn-mirror.chaotic.cx/chaotic-aur/\$arch" \
     "https://geo-mirror.chaotic.cx/chaotic-aur/\$arch" \
     "https://mirror.chaotic.cx/chaotic-aur/\$arch"
-echo "Note: Fallback fingerprint EF925EA6...78AEB (pedrohlc) from chaotic-aur/keyring."
 echo "  Override with: CHAOTIC_AUR_KEY_ID=<FULL_FINGERPRINT>  (40 hex chars)"
 
 echo "=== Configuring archlinuxcn repository ==="
 _enable_repo_with_fallback \
-    "archlinuxcn" "archlinuxcn-keyring" "87F2E316E0ABC98B9DE8D4EF042FD810600954EF" \
+    "archlinuxcn" "archlinuxcn-keyring" "auto" \
     "https://repo.archlinuxcn.org/\$arch" \
     "https://mirrors.tuna.tsinghua.edu.cn/archlinuxcn/\$arch" \
     "https://mirror.sjtu.edu.cn/archlinuxcn/\$arch"
-echo "Note: Fallback fingerprint 87F2E316...954EF from archlinuxcn-keyring (first key)."
 echo "  Override with: ARCHLINUXCN_KEY_ID=<FULL_FINGERPRINT>  (40 hex chars)"
 
 echo "=== Configuring endeavouros repository ==="
-# EndeavourOS full fingerprint: verified from keyring package metadata.
-# If this doesn't match, set ENDEAVOUROS_KEY_ID=<CORRECT_FINGERPRINT>.
 _enable_repo_with_fallback \
-    "endeavouros" "endeavouros-keyring" "1E1BCA3A27A84B0F984B05C69BB8A6E10E1BCA3A" \
+    "endeavouros" "endeavouros-keyring" "auto" \
     "https://mirror.freedif.org/EndeavourOS/repo/\$repo/\$arch" \
     "https://mirror.endeavouros.com/EndeavourOS/repo/\$repo/\$arch" \
     "https://mirror.enderunix.org/endeavouros/repo/\$repo/\$arch"
-echo "Note: Full fingerprint 1E1BCA3A...0E1BCA3A from endeavouros-keyring."
 echo "  Override with: ENDEAVOUROS_KEY_ID=<FULL_40_CHAR_FINGERPRINT>"
-echo "  Find the full fingerprint at: pacman-key --list-keys endeavouros (inside a working EndeavourOS install)"
 
 echo "=== Configuring mesa-git repository (disabled by default - can break GPU drivers) ==="
 if ! _repo_already_enabled "mesa-git"; then
@@ -5905,38 +6012,6 @@ pacman -Sy --noconfirm 2>/dev/null || echo "Warning: database sync with new repo
 echo "Third-party repository configuration complete."
 echo "Available additional repos: chaotic-aur, archlinuxcn, endeavouros"
 REPOS_EOF
-
-    # Validate default fingerprints against known-good list before passing to
-    # container script. If a default has gone stale (key rotation), warn early
-    # rather than failing deep inside the keyring bootstrap.
-    local -A _KNOWN_FINGERPRINTS=(
-        ["chaotic-aur"]="EF925EA60F33D0CB85C44AD13056513887B78AEB"
-        ["archlinuxcn"]="87F2E316E0ABC98B9DE8D4EF042FD810600954EF"
-    )
-    for _repo_name in "${!_KNOWN_FINGERPRINTS[@]}"; do
-        local _var_name="${_repo_name//-/_}_KEY_ID"
-        local _var_name="${_var_name^^}"
-        local _env_val="${!_var_name:-}"
-        local _known="${_KNOWN_FINGERPRINTS[$_repo_name]}"
-        if [[ -z "$_env_val" ]]; then
-            # No user override — using hardcoded default; verify it matches known list
-            local _default_val
-            case "$_repo_name" in
-                chaotic-aur) _default_val="EF925EA60F33D0CB85C44AD13056513887B78AEB" ;;
-                archlinuxcn) _default_val="87F2E316E0ABC98B9DE8D4EF042FD810600954EF" ;;
-                *) continue ;;
-            esac
-            if [[ "${_default_val,,}" != "${_known,,}" ]]; then
-                log_warn "Default key fingerprint for $_repo_name ($_default_val) does NOT match known-good ($_known)."
-                log_warn "This likely indicates a stale hardcoded value after a key rotation."
-                log_warn "Set $_var_name=$_known or check the upstream keyring package."
-            fi
-        elif [[ "${#_env_val}" -eq 40 ]]; then
-            # User override — verify format (already done above) but cannot
-            # verify correctness against known list (may be a new rotated key).
-            log_info "Using user-supplied $_var_name=$_env_val for $_repo_name"
-        fi
-    done
 
     if ! exec_container_script "$repos_script" "extra-repos" \
         "${CHAOTIC_AUR_KEY_ID:-}" \

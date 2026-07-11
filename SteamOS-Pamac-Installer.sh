@@ -2787,8 +2787,14 @@ if [[ "$_safe_recovered" != "true" ]]; then
 if [[ "$_STRICT_SECURITY_MODE" == "true" ]]; then
     echo "Method F: SKIPPED (--strict-security: refusing SigLevel=TrustAll relaxation)."
     echo "  All prior safe methods (A-E) failed to bootstrap the keyring."
-    echo "  Re-run without --strict-security to allow this last-resort recovery,"
-    echo "  or manually import the archlinux-keyring inside the container."
+    echo "  Options:"
+    echo "    a. Manually import the keyring inside the container, then re-run:"
+    echo "         distrobox enter <container-name> -- pacman -Sy --noconfirm archlinux-keyring gnupg"
+    echo "       (or: pacman-key --init && pacman-key --populate archlinux)"
+    echo "    b. Re-run the installer WITHOUT --strict-security to let Method F"
+    echo "       attempt the throwaway-config TrustAll bootstrap as a last resort."
+    echo "  Failure here is by design (--strict-security fails safe rather than"
+    echo "  degrade to an unverified keyring state)."
 else
     echo "Method F: Attempting controlled SigLevel relaxation bootstrap..."
     echo "  WARNING: Temporarily disabling signature verification (in a throwaway config only) to bootstrap keyring."
@@ -2892,6 +2898,25 @@ else
     echo "  6. Install archlinux-keyring from a trusted USB/external source."
     echo ""
     echo "TrustAll is NOT used as it would disable all signature verification."
+    if [[ "$_STRICT_SECURITY_MODE" == "true" ]]; then
+        echo ""
+        echo "=== --strict-security guidance ==="
+        echo "  Method F (controlled SigLevel=TrustAll throwaway-config bootstrap) was"
+        echo "  SKIPPED in this run because --strict-security refuses to relax signature"
+        echo "  verification. All cryptographic recovery (Methods A-E) failed."
+        echo "  Options:"
+        echo "    a. Manually import the keyring INSIDE the container, then re-run the"
+        echo "       installer:"
+        echo "         distrobox enter <container-name> --"
+        echo "         pacman -Sy --noconfirm archlinux-keyring gnupg"
+        echo "         (or: pacman-key --init && pacman-key --populate archlinux)"
+        echo "    b. Download archlinux-keyring from a trusted mirror on another host,"
+        echo "       copy it into the container, and install it with pacman -U."
+        echo "    c. Re-run the installer WITHOUT --strict-security to let Method F"
+        echo "       attempt the throwaway-config TrustAll bootstrap as a last resort."
+        echo "  Failure here is by design (--strict-security fails safe rather than"
+        echo "  degrade to an unverified keyring state)."
+    fi
     exit 100
 fi
 
@@ -3769,6 +3794,8 @@ if [[ "$_STRICT_SECURITY_MODE" == "true" ]]; then
     echo "SKIPPED fake systemd-run wrapper (--strict-security: refuses DynamicUser shim)."
     echo "  AUR builds that need systemd-run --property=DynamicUser=yes will fail in"
     echo "  non-systemd containers instead of running with dropped sandbox properties."
+    echo "  This is by design: --strict-security prioritizes correctness over"
+    echo "  compatibility with DynamicUser outside of systemd."
 elif ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/dev/null 2>&1; then
 cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE'
 #!/bin/bash
@@ -4532,6 +4559,9 @@ if [[ ! -x /usr/local/sbin/systemd-run ]]; then
 echo "Repairing: fake systemd-run wrapper..."
 if [[ "$_STRICT_SECURITY_MODE" == "true" ]]; then
     echo "SKIPPED fake systemd-run wrapper repair (--strict-security: refuses DynamicUser shim)."
+    echo "  AUR builds that need DynamicUser will fail in non-systemd containers"
+    echo "  instead of running with dropped sandbox properties (by design under"
+    echo "  --strict-security)."
 elif ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/dev/null 2>&1; then
 mkdir -p /usr/local/sbin
 cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE'
@@ -7641,7 +7671,7 @@ ${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" rm -rf /var/lib/pacman/syn
 _export_dir="\$HOME/.local/share/applications"
 for _desktop in \$(${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" bash -c "pacman -Qeq | while read p; do pacman -Qql \\\$p 2>/dev/null; done" 2>/dev/null | grep '\.desktop$'); do
     _base=\$(basename "\$_desktop")
-    _host_file="\$_export_dir/arch-pamac-\$_base"
+    _host_file="\$_export_dir/${CONTAINER_NAME}-\$_base"
     if [[ ! -f "\$_host_file" ]]; then
         ${CONTAINER_MANAGER:-podman} cp "${CONTAINER_NAME}:\$_desktop" "\$_host_file" 2>/dev/null || continue
         _pkg_name=\$(basename "\$_desktop" .desktop)
@@ -8106,7 +8136,7 @@ if command -v kdialog >/dev/null 2>&1; then
         exit 0
     fi
 fi
-    nohup bash -c "podman exec -u 0 arch-pamac bash -c 'rm -f /var/lib/pacman/db.lck; pacman -R --noconfirm \$_pkg_name' 2>&1 && rm -f \$HOME/.local/share/applications/arch-pamac-\$_pkg_name.desktop && touch \$HOME/.local/share/applications && notify-send -i edit-delete 'Uninstalled' '\$_pkg_name has been removed.' 2>/dev/null || notify-send -i dialog-error 'Uninstall Failed' 'Could not remove \$_pkg_name' 2>/dev/null" &>/dev/null &
+    nohup bash -c "${CONTAINER_MANAGER:-podman} exec -u 0 ${CONTAINER_NAME} bash -c 'rm -f /var/lib/pacman/db.lck; pacman -R --noconfirm \$_pkg_name' 2>&1 && rm -f \$HOME/.local/share/applications/${CONTAINER_NAME}-\$_pkg_name.desktop && touch \$HOME/.local/share/applications && notify-send -i edit-delete 'Uninstalled' '\$_pkg_name has been removed.' 2>/dev/null || notify-send -i dialog-error 'Uninstall Failed' 'Could not remove \$_pkg_name' 2>/dev/null" &>/dev/null &
     disown
     exit 0
 fi
@@ -8355,17 +8385,27 @@ cat > /usr/local/bin/cleanup-desktops << 'CLEANUP_DESKTOP'
 #!/bin/bash
 # Only remove stale desktop files exported by distrobox-export whose
 # source package is no longer installed in the container.
+# Reads the X-SteamOS-Pamac-Container marker from each file to scope cleanup
+# to THIS container only (supports custom container names via --container-name).
+# container_name is baked in below at install time (literal substitution by
+# the installer) since this script runs later as a pacman hook without access
+# to installer environment variables.
+container_name=__CONTAINER_NAME_BAKED_IN__
 for user_dir in /home/*/; do
     app_dir="${user_dir}.local/share/applications"
     [ -d "$app_dir" ] || continue
-    for f in "$app_dir"/arch-pamac-*.desktop; do
+    for f in "$app_dir"/*.desktop; do
         [ -f "$f" ] || continue
         if ! grep -q '^X-SteamOS-Pamac-SourceDesktop=' "$f" 2>/dev/null; then
             continue
         fi
+        file_container=$(grep '^X-SteamOS-Pamac-Container=' "$f" 2>/dev/null | cut -d= -f2-)
+        if [ -n "$file_container" ] && [ -n "$container_name" ] && [ "$file_container" != "$container_name" ]; then
+            continue
+        fi
         pkg_name=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$f" 2>/dev/null | cut -d= -f2)
         if [ -n "$pkg_name" ]; then
-            if ! podman exec arch-pamac pacman -Qi "$pkg_name" >/dev/null 2>&1; then
+            if ! pacman -Qi "$pkg_name" >/dev/null 2>&1; then
                 rm -f "$f"
             fi
         fi
@@ -8905,6 +8945,13 @@ fi
 echo "Post-install hook configured."
 HOOK_EOF
 
+    # Bake the container name into the generated cleanup-desktops hook script.
+    # The cleanup-desktops file is written via a single-quoted heredoc so its
+    # body is not expanded when generated; it runs later as a standalone pacman
+    # hook without access to installer variables. Substitute the literal here
+    # so per-container scoping works even when the user passes --container-name.
+    hook_script="${hook_script//__CONTAINER_NAME_BAKED_IN__/${CONTAINER_NAME}}"
+
     if ! echo "$hook_script" | exec_container_pipe "post-install-hooks" "$CURRENT_USER" "$CONTAINER_NAME"; then
         log_warn "Failed to set up post-install hooks. Newly installed apps may not auto-appear in menu."
     fi
@@ -9003,7 +9050,11 @@ fi
 if [[ "$_STRICT_SECURITY_MODE" == "true" ]]; then
     echo "Strategy 4 SKIPPED (--strict-security: refusing SigLevel=TrustAll recovery in keyring refresh)."
     echo "  Strategies 1-3 failed; re-run the installer without --strict-security or"
-    echo "  manually import archlinux-keyring inside the container."
+    echo "  manually import archlinux-keyring inside the container:"
+    echo "    distrobox enter <container-name> -- pacman -Sy --noconfirm archlinux-keyring gnupg"
+    echo "  or: pacman-key --init && pacman-key --populate archlinux"
+    echo "  (Failure here is by design: --strict-security fails safe rather than"
+    echo "   degrade to an unverified keyring state.)"
 else
 echo "Attempting controlled SigLevel relaxation (throwaway config)..."
 _orig_siglevel=$(grep '^SigLevel' /etc/pacman.conf 2>/dev/null | head -1 || echo "Required DatabaseOptional")
@@ -9095,17 +9146,29 @@ DESKTOP_HOOK
 
 cat > /usr/local/bin/cleanup-desktops << 'CLEANUP_DESKTOP'
 #!/bin/bash
+# Reads the X-SteamOS-Pamac-Container marker from each exported desktop file
+# to scope cleanup to a specific container (supports custom --container-name).
+# Since this hook runs inside the container as part of pacman transactions, it
+# queries the local pacman database directly — no nested container exec needed.
+# container_name is baked in below at install time (literal substitution by
+# the installer) so per-container scoping works when this hook runs later
+# without access to installer environment variables.
+container_name=__CONTAINER_NAME_BAKED_IN__
 for user_dir in /home/*/; do
     app_dir="${user_dir}.local/share/applications"
     [ -d "$app_dir" ] || continue
-    for f in "$app_dir"/arch-pamac-*.desktop; do
+    for f in "$app_dir"/*.desktop; do
         [ -f "$f" ] || continue
         if ! grep -q '^X-SteamOS-Pamac-SourceDesktop=' "$f" 2>/dev/null; then
             continue
         fi
+        file_container=$(grep '^X-SteamOS-Pamac-Container=' "$f" 2>/dev/null | cut -d= -f2-)
+        if [ -n "$file_container" ] && [ -n "$container_name" ] && [ "$file_container" != "$container_name" ]; then
+            continue
+        fi
         pkg_name=$(grep '^X-SteamOS-Pamac-SourcePackage=' "$f" 2>/dev/null | cut -d= -f2)
         if [ -n "$pkg_name" ]; then
-            if ! podman exec arch-pamac pacman -Qi "$pkg_name" >/dev/null 2>&1; then
+            if ! pacman -Qi "$pkg_name" >/dev/null 2>&1; then
                 rm -f "$f"
             fi
         fi
@@ -9173,6 +9236,10 @@ KEYRING_REFRESH_EOF
     # later (via timer/hook) without the installer's variables, so the flag
     # must be embedded now rather than read at refresh time.
     keyring_script="${keyring_script//_STRICT_SECURITY_BAKED_IN_/${STRICT_SECURITY:-false}}"
+    # Bake the container name into the generated cleanup-desktops hook script
+    # (same sentinel-substitution approach as setup_post_install_hooks) so the
+    # per-container scoping works when the file runs later as a pacman hook.
+    keyring_script="${keyring_script//__CONTAINER_NAME_BAKED_IN__/${CONTAINER_NAME}}"
 
     if ! exec_container_script "$keyring_script" "keyring-refresh-setup"; then
         log_warn "Keyring refresh setup had issues. Continuing..."

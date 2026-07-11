@@ -863,13 +863,11 @@ check_network_connectivity() {
     _http_code=$(timeout ${NETWORK_PROBE_TIMEOUT} curl -sI --connect-timeout ${NETWORK_PROBE_CONNECT_TIMEOUT} --max-time ${NETWORK_PROBE_TIMEOUT} -o /dev/null -w "%{http_code}" "$_probe_url" 2>/dev/null || echo "000")
     case "$_http_code" in
         000)
-            log_warn "No outbound network connectivity detected (cannot reach $_probe_url)."
-            log_warn "The keyring bootstrap (Methods A-E in the container) requires HTTPS access to Arch mirrors/keyservers."
-            log_info "If you know the host is offline, install cached packages instead, or:"
+            log_warn "Network probe could not reach $_probe_url (this is a heuristic — mirrors may still work)."
+            log_info "The keyring bootstrap will attempt recovery and report failures at runtime if needed."
+            log_info "If you know the host is offline, install cached packages instead."
             log_info "  - Verify DNS: getent hosts archlinux.org"
-            log_info "  - Test direct: curl -I $_probe_url"
             log_info "  - Behind captive portal/proxy? export https_proxy=http://host:port"
-            log_info "Proceeding anyway — the script will attempt keyring recovery and report failures at runtime if needed."
             ;;
         2*|3*)
             log_success "Network connectivity OK (HTTP $_http_code from $_probe_url)."
@@ -2657,8 +2655,8 @@ case "$arg" in
 --property=TimeoutStopFailureMode=*) continue ;;
 --property=RuntimeMaxSec=*) continue ;;
 --property=RuntimeRandomizedExtraSec=*) continue ;;
-# Unrecognized properties - log and warn visibly
---property=*) UNRECOGNIZED_PROPS+=("$arg"); _warn_dsr "Unrecognized --property: $arg"; continue ;;
+# Unrecognized properties — collect silently, warn once in summary below.
+--property=*) UNRECOGNIZED_PROPS+=("$arg"); continue ;;
 --property) SKIP_NEXT=true; continue ;;
 --user|--uid=*|--gid=*|--setenv=*) continue ;;
 --setenv) SKIP_NEXT=true; continue ;;
@@ -2671,15 +2669,12 @@ if [[ ${#CMD_ARGS[@]} -eq 0 ]]; then
     exit 1
 fi
 if [[ ${#UNRECOGNIZED_PROPS[@]} -gt 0 ]]; then
-    _warn_dsr "=========================================="
-    _warn_dsr "UNRECOGNIZED PROPERTIES DETECTED (${#UNRECOGNIZED_PROPS[@]} total):"
+    _warn_dsr "systemd-run(fake): ${#UNRECOGNIZED_PROPS[@]} unrecognized property/ies (ignored):"
     for _up in "${UNRECOGNIZED_PROPS[@]}"; do
-        _warn_dsr "  - $_up"
+        _warn_dsr "  $_up"
     done
-    _warn_dsr "These properties were IGNORED. If AUR builds fail, check $_DSR_LOG"
-    _warn_dsr "for which properties Pamac/makepkg now expects."
-    _warn_dsr "You may need to update this fake systemd-run wrapper."
-    _warn_dsr "=========================================="
+    _warn_dsr "These are silently dropped. Normal when Pamac/makepkg adds new systemd"
+    _warn_dsr "options not yet in this wrapper. Only investigate if AUR builds fail."
 fi
 if [[ -n "$WORK_DIR" ]]; then
 mkdir -p "$WORK_DIR" 2>/dev/null || true
@@ -7356,7 +7351,17 @@ ${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" rm -rf /var/lib/pacman/syn
 # Ensure desktop files are exported from container to host
 # Copy .desktop files directly from container, patch Exec, and annotate
 # with pamac markers + uninstall action.
+# Fast path: skip the expensive per-package file enumeration if the
+# container's explicitly-installed package count hasn't changed since
+# the last export. This avoids iterating hundreds of packages on every
+# GUI launch (1-3s on large containers).
 _export_dir="\$HOME/.local/share/applications"
+_pkg_count_cache="\$HOME/.local/state/steamos-pamac-${CONTAINER_NAME}.pkgcount"
+_current_pkg_count=\$(${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" pacman -Qeq 2>/dev/null | wc -l)
+if [[ -f "\$_pkg_count_cache" ]] && [[ "\$(cat "\$_pkg_count_cache" 2>/dev/null)" == "\${_current_pkg_count}" ]]; then
+    # Count unchanged — desktop files already exported, skip slow enumeration
+    true
+else
 for _desktop in \$(${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" bash -c "pacman -Qeq | while read p; do pacman -Qql \\\$p 2>/dev/null; done" 2>/dev/null | grep '\.desktop$'); do
     _base=\$(basename "\$_desktop")
     _host_file="\$_export_dir/${CONTAINER_NAME}-\$_base"
@@ -7390,6 +7395,10 @@ ACTION_EOF
         chmod 644 "\$_host_file" 2>/dev/null
     fi
 done
+# Save package count for fast-path cache on next launch
+mkdir -p "\$(dirname "\$_pkg_count_cache")" 2>/dev/null
+echo "\${_current_pkg_count}" > "\$_pkg_count_cache" 2>/dev/null
+fi
 
 # Re-suppress the KDE Discover notifier on every launch: the autostart unit is
 # masked (set during install) but a surviving notifier process keeps the KDE

@@ -109,6 +109,21 @@ STRICT_SECURITY="${STRICT_SECURITY:-false}"
 # Old log is moved to ${LOG_FILE}.1 and overwritten if it already exists.
 LOG_ROTATION_MAX_SIZE="${LOG_ROTATION_MAX_SIZE:-5242880}"  # 5 MiB
 
+# Tunable constants: extracted from scattered magic numbers so timeouts,
+# thresholds, and UID ranges live in one place and can be overridden via
+# environment variables if needed.
+readonly CONTAINER_NAME_MAX_LEN="${CONTAINER_NAME_MAX_LEN:-63}"
+readonly DISK_SPACE_MIN_KB="${DISK_SPACE_MIN_KB:-2097152}"      # 2 GiB
+readonly MAKEPKG_RAM_PER_JOB_KB="${MAKEPKG_RAM_PER_JOB_KB:-768000}"
+readonly SUBUID_START="${SUBUID_START:-100000}"
+readonly SUBUID_COUNT="${SUBUID_COUNT:-65536}"
+readonly UPLOAD_CONNECT_TIMEOUT="${UPLOAD_CONNECT_TIMEOUT:-10}"
+readonly UPLOAD_MAX_TIME="${UPLOAD_MAX_TIME:-60}"
+readonly PACMAN_LOCK_WAIT_MAX="${PACMAN_LOCK_WAIT_MAX:-30}"
+readonly NETWORK_PROBE_TIMEOUT="${NETWORK_PROBE_TIMEOUT:-5}"
+readonly NETWORK_PROBE_CONNECT_TIMEOUT="${NETWORK_PROBE_CONNECT_TIMEOUT:-3}"
+readonly CONTAINER_PROBE_TIMEOUT="${CONTAINER_PROBE_TIMEOUT:-15}"
+
 # Exit code used when the user declines an interactive prompt (e.g. low battery).
 # 130 is the conventional shell exit for "terminated by SIGINT" — distinct from a
 # genuine success (0) so wrapper scripts can tell an abort from a clean run.
@@ -150,6 +165,9 @@ initialize_logging() {
         fi
     fi
 
+    local _desktop_env
+    _desktop_env=$(detect_desktop_environment)
+
     local dry_run_header=""
     if [[ "$DRY_RUN" == "true" ]]; then
         if [[ "$DRY_RUN_VERBOSE" == "true" ]]; then
@@ -164,6 +182,7 @@ initialize_logging() {
         echo "User: $CURRENT_USER"
         echo "OS: $os_version"
         echo "Container: $CONTAINER_NAME"
+        echo "Desktop environment: $_desktop_env"
         echo "Features: MULTILIB=$ENABLE_MULTILIB GAMING=$ENABLE_GAMING_PACKAGES EXTRA_REPOS=$ENABLE_EXTRA_REPOS BUILD_CACHE=$ENABLE_BUILD_CACHE OPTIMIZE_MIRRORS=$OPTIMIZE_MIRRORS NON_INTERACTIVE=$NON_INTERACTIVE PIN_ALPM=$PIN_ALPM"
         echo "=========================================="
     } > "$LOG_FILE"
@@ -236,13 +255,13 @@ sanitize_and_upload_log() {
 
     local upload_url=""
     log_info "Uploading sanitized log to transfer.sh..."
-    upload_url=$(curl -sf --connect-timeout 10 --max-time 60 \
-        --upload-file "$sanitized_log" \
+    upload_url=$(curl -sf --connect-timeout ${UPLOAD_CONNECT_TIMEOUT} --max-time ${UPLOAD_MAX_TIME} \
+        --data-binary "@${sanitized_log}" \
         "https://transfer.sh/steamos-pamac-$(date +%Y%m%d-%H%M%S).log" 2>/dev/null || echo "")
 
     if [[ -z "$upload_url" ]]; then
         log_info "transfer.sh unavailable, trying 0x0.st..."
-        upload_url=$(curl -sf --connect-timeout 10 --max-time 60 \
+        upload_url=$(curl -sf --connect-timeout ${UPLOAD_CONNECT_TIMEOUT} --max-time ${UPLOAD_MAX_TIME} \
             -F "file=@${sanitized_log}" \
             "https://0x0.st" 2>/dev/null || echo "")
     fi
@@ -270,7 +289,9 @@ _filter_verbose_output() {
     # code change or package hook that emits a similar prefix could suppress a
     # genuinely important prompt — better to show them (they are harmless under
     # --noconfirm) than to risk hiding something that requires user attention.
-    grep -v -E '^\s*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database)|^::(synchronizing|debug:|warning:|info:)' || true
+    # Additional noise suppressed: plain "downloading" progress lines without
+    # errors, "Nothing to do." churn, and "up to date" confirmations.
+    grep -v -E '^\s*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database)|^downloading\s|^::(synchronizing|debug:|warning:|info:)|^Nothing to do\.| is up to date$' || true
 }
 
 run_command() {
@@ -375,7 +396,7 @@ container_get_status() {
 container_is_usable() {
   container_start 2>/dev/null || true
   local _output
-  _output=$(timeout 15 container_runtime_privileged exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" bash -c "echo ok" </dev/null 2>/dev/null || echo "")
+  _output=$(timeout ${CONTAINER_PROBE_TIMEOUT} container_runtime_privileged exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" bash -c "echo ok" </dev/null 2>/dev/null || echo "")
   [[ "$_output" == *"ok"* ]]
 }
 
@@ -617,8 +638,8 @@ validate_container_name() {
         return 1
     fi
 
-    if [[ ${#CONTAINER_NAME} -gt 63 ]]; then
-        log_error "Container name too long (max 63 characters): $CONTAINER_NAME"
+    if [[ ${#CONTAINER_NAME} -gt ${CONTAINER_NAME_MAX_LEN} ]]; then
+        log_error "Container name too long (max ${CONTAINER_NAME_MAX_LEN} characters): $CONTAINER_NAME"
         return 1
     fi
 
@@ -776,12 +797,12 @@ check_system_requirements() {
         local subuid_ok=true
         if ! grep -q "^$(whoami):" /etc/subuid 2>/dev/null; then
             log_warn "No subuid mapping for $(whoami). Rootless podman may fail."
-            log_info "Fix: sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(whoami)"
+            log_info "Fix: sudo usermod --add-subuids ${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1)) --add-subgids ${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1)) $(whoami)"
             subuid_ok=false
         fi
         if ! grep -q "^$(whoami):" /etc/subgid 2>/dev/null; then
             log_warn "No subgid mapping for $(whoami). Rootless podman may fail."
-            log_info "Fix: sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(whoami)"
+            log_info "Fix: sudo usermod --add-subuids ${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1)) --add-subgids ${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1)) $(whoami)"
             subuid_ok=false
         fi
         if [[ "$subuid_ok" == "true" ]]; then
@@ -805,8 +826,8 @@ check_system_requirements() {
 
     local available_space
     if available_space=$(df -k "$HOME" 2>/dev/null | awk 'NR==2{print $4}'); then
-        if [[ -n "$available_space" ]] && [[ $available_space -lt 2097152 ]]; then
-            log_warn "Low disk space detected. At least 2GB is recommended."
+    if [[ -n "$available_space" ]] && [[ $available_space -lt ${DISK_SPACE_MIN_KB} ]]; then
+        log_warn "Low disk space detected. At least $(( DISK_SPACE_MIN_KB / 1024 / 1024 ))GB is recommended."
             log_info "Available space: $(( available_space / 1024 ))MB"
             all_ok=false
         elif [[ -n "$available_space" ]]; then
@@ -839,7 +860,7 @@ check_network_connectivity() {
     log_step "Checking outbound network connectivity..."
     local _probe_url="https://archlinux.org"
     local _http_code
-    _http_code=$(timeout 5 curl -sI --connect-timeout 3 --max-time 5 -o /dev/null -w "%{http_code}" "$_probe_url" 2>/dev/null || echo "000")
+    _http_code=$(timeout ${NETWORK_PROBE_TIMEOUT} curl -sI --connect-timeout ${NETWORK_PROBE_CONNECT_TIMEOUT} --max-time ${NETWORK_PROBE_TIMEOUT} -o /dev/null -w "%{http_code}" "$_probe_url" 2>/dev/null || echo "000")
     case "$_http_code" in
         000)
             log_warn "No outbound network connectivity detected (cannot reach $_probe_url)."
@@ -855,6 +876,36 @@ check_network_connectivity() {
             ;;
         *)
             log_debug "Reachable probe (HTTP $_http_code) — common redirect/maintenance code, treating as reachable."
+            ;;
+    esac
+}
+
+# Detect the host desktop environment in a lowercased, normalized form.
+# Returns one of: kde, gnome, xfce, lxqt, mate, cinnamon, budgie, sway, hyprland,
+# i3, generic-wayland, generic-x11, or unknown. Used to skip DE-specific tweaks
+# (e.g. Discover notifier suppression) when the session is not KDE/Plasma.
+detect_desktop_environment() {
+    local de="${XDG_CURRENT_DESKTOP:-}${XDG_SESSION_DESKTOP:-}"
+    de="${de,,}"  # lowercase
+    case "$de" in
+        *kde*|*plasma*) echo "kde" ;;
+        *gnome*) echo "gnome" ;;
+        *xfce*) echo "xfce" ;;
+        *lxqt*) echo "lxqt" ;;
+        *mate*) echo "mate" ;;
+        *cinnamon*) echo "cinnamon" ;;
+        *budgie*) echo "budgie" ;;
+        *sway*) echo "sway" ;;
+        *hypr*) echo "hyprland" ;;
+        *i3*) echo "i3" ;;
+        *)
+            if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+                echo "generic-wayland"
+            elif [[ -n "${DISPLAY:-}" ]]; then
+                echo "generic-x11"
+            else
+                echo "unknown"
+            fi
             ;;
     esac
 }
@@ -950,11 +1001,11 @@ repair_podman() {
     if [[ -z "$subuid_entry" ]]; then
         log_warn "No subuid mapping found for $(whoami) in /etc/subuid."
         log_info "Rootless podman needs subuid/subgid mappings to run containers."
-        log_info "To fix: add to /etc/subuid:  $(whoami):100000:65536"
-        log_info "And:     to /etc/subgid:  $(whoami):100000:65536"
-        log_info "Then run: podman system reset --force && podman pull $ARCHLINUX_IMAGE"
+        log_info "To fix: add to /etc/subuid:  $(whoami):${SUBUID_START}:${SUBUID_COUNT}"
+        log_info "And:     to /etc/subgid:  $(whoami):${SUBUID_START}:${SUBUID_COUNT}"
+
         log_info "On SteamOS, subuid/subgid are usually created automatically when podman is installed."
-        log_info "If missing, try: sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(whoami)"
+        log_info "If missing, try: sudo usermod --add-subuids ${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1)) --add-subgids ${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1)) $(whoami)"
     else
         log_debug "subuid entry: $subuid_entry"
         log_debug "subgid entry: $subgid_entry"
@@ -1094,7 +1145,7 @@ repair_podman() {
     log_error ""
     log_error "Common causes and manual fixes:"
     log_error "  1. Missing subuid/subgid mappings:"
-    log_error "     sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(whoami)"
+    log_error "     sudo usermod --add-subuids ${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1)) --add-subgids ${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1)) $(whoami)"
     log_error "     Then log out and back in."
     log_error "  2. Corrupted podman storage (nuclear option — destroys ALL podman data):"
     log_error "     podman system reset --force"
@@ -2283,7 +2334,7 @@ exec_container_script() {
     # covers early exits. Both paths are gated by the guard and exit-code check.
     printf '\n[ $? -eq 0 ] && echo "%s"\ntrap - EXIT\n' "$_marker" >> "$_script_file"
 
-  if _exec_dry_run_verbose "$_desc" "$_script_file"; then
+  if _exec_dry_run_check "$_desc" "$_script_file"; then
     rm -f "$_script_file"
     return 0
   fi
@@ -2344,7 +2395,7 @@ exec_container_pipe() {
     # EXIT trap covers early `exit 0` cases. Both gated by pamac_script_marked.
     printf '\n[ $? -eq 0 ] && echo "%s"\ntrap - EXIT\n' "$_marker" >> "$_script_file"
 
-    if _exec_dry_run_verbose "$_desc" "$_script_file"; then
+    if _exec_dry_run_check "$_desc" "$_script_file"; then
         rm -f "$_script_file"
         return 0
     fi
@@ -2391,23 +2442,31 @@ _exec_install_marker_trap() {
     } >> "$_file"
 }
 
-# Shared helper: dry-run-verbose short-circuit. When --dry-run-verbose (which
-# implies --dry-run) is active, print the assembled container script that WOULD
-# have executed inside the container and return true (1) so the caller returns
-# 0 without executing. Returns false (0) when dry-run-verbose is off so the
-# caller proceeds with the normal container exec. Moves both call sites
-# (exec_container_script and exec_container_pipe) behind one implementation.
+# Shared helper: dry-run short-circuit for container scripts. When
+# --dry-run-verbose is active, print the assembled container script that WOULD
+# have executed inside the container. When --dry-run (without --verbose) is
+# active, just log that the script is being skipped. In both cases return true
+# (0) so the caller returns 0 without exec'ing into the container. Returns
+# false (1) when dry-run is off so the caller proceeds with the normal container
+# exec. Consolidates all three container exec paths behind one implementation.
 # Args: $1=description, $2=script file path. Caller removes $_script_file on true.
-_exec_dry_run_verbose() {
-    if [[ "${DRY_RUN_VERBOSE:-}" != "true" ]]; then
-        return 1
-    fi
+_exec_dry_run_check() {
     local _desc="$1" _file="$2"
-    log_warn "[DRY RUN VERBOSE] Container script '$_desc' — script that would execute inside the container:"
-    printf '%s\n' "----- BEGIN CONTAINER SCRIPT: $_desc -----"
-    cat "$_file"
-    printf '%s\n' "----- END CONTAINER SCRIPT: $_desc -----"
-    return 0
+
+    if [[ "${DRY_RUN_VERBOSE:-}" == "true" ]]; then
+        log_warn "[DRY RUN VERBOSE] Container script '$_desc' — script that would execute inside the container:"
+        printf '%s\n' "----- BEGIN CONTAINER SCRIPT: $_desc -----"
+        cat "$_file"
+        printf '%s\n' "----- END CONTAINER SCRIPT: $_desc -----"
+        return 0
+    fi
+
+    if [[ "${DRY_RUN:-}" == "true" ]]; then
+        log_warn "[DRY RUN] Skipping container script '$_desc' (use --dry-run-verbose to audit its contents)."
+        return 0
+    fi
+
+    return 1
 }
 
 # Shared helper: post-run recovery + error reporting for container scripts.
@@ -6317,7 +6376,7 @@ COMPAT_EOF
     _compat_marker="COMPAT_CHECK_$(head -c 8 /dev/urandom 2>/dev/null | base64 2>/dev/null || echo "$$")"
     printf '\necho "%s"\n' "$_compat_marker" >> "$_compat_script_file"
 
-    if _exec_dry_run_verbose "pamac-aur compatibility check" "$_compat_script_file"; then
+    if _exec_dry_run_check "pamac-aur compatibility check" "$_compat_script_file"; then
         rm -f "$_compat_script_file"
         return 0
     fi
@@ -8347,7 +8406,16 @@ XDGCONF
         touch "$HOME/.local/share/applications" 2>/dev/null || true
         log_info "DiscoverNotifier masked and running instance killed"
     }
-    _suppress_discover_notifier
+
+    # Only run the KDE-specific suppression on KDE/Plasma sessions or when the
+    # DE cannot be detected; skip on other DEs to avoid unnecessary pkill scans.
+    local _desktop_env
+    _desktop_env=$(detect_desktop_environment)
+    if [[ "$_desktop_env" == "kde" || "$_desktop_env" == "unknown" || "$_desktop_env" == generic-* ]]; then
+        _suppress_discover_notifier
+    else
+        log_info "Skipping KDE Discover notifier suppression (detected DE: $_desktop_env)."
+    fi
 
     # Verify critical files were created
     local _export_ok=true

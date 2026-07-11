@@ -4090,7 +4090,9 @@ chmod 0440 /etc/sudoers.d/99-pamac-nopasswd
 # operations. Each sudo invocation requires a fresh (passwordless) auth check.
 cat > /etc/sudoers.d/98-pamac-timeout <<'TIMEOUT_SUDOERS'
 # Reset sudo timestamp after each Pamac operation to minimize escalation window.
-Defaults timestamp_timeout=0
+# Scoped to %wheel group (Pamac's NOPASSWD users) instead of system-wide defaults,
+# so non-Pamac sudo sessions can still cache credentials normally.
+Defaults:%wheel timestamp_timeout=0
 TIMEOUT_SUDOERS
 chmod 0440 /etc/sudoers.d/98-pamac-timeout
 
@@ -7849,9 +7851,29 @@ if flatpak list --app --columns=application 2>/dev/null | grep -q "^\$COMPONENT_
     log_msg "Flatpak app found for component: \$COMPONENT_ID, passing to Discover"
     exec plasma-discover "\$@"
 fi
-# System/pacman app — uninstall directly via container
-log_msg "Uninstalling pacman app: \$COMPONENT_ID"
+
+# System/pacman app — check if actually installed before attempting uninstall
 _pkg_name="\$(echo "\$COMPONENT_ID" | sed 's/\.desktop$//')"
+_pkg_installed=false
+if ${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" bash -c "pacman -Qi \$_pkg_name" >/dev/null 2>&1; then
+    _pkg_installed=true
+fi
+
+if [[ "\$_pkg_installed" == "false" ]]; then
+    log_msg "Package \$_pkg_name not installed in container — forwarding to Discover"
+    # Not installed in container and not a Flatpak — hand off to host store
+    if command -v plasma-discover >/dev/null 2>&1; then
+        exec plasma-discover "\$@"
+    else
+        log_msg "No host store available to handle appstream:// for uninstalled package \$_pkg_name"
+        if command -v notify-send >/dev/null 2>&1; then
+            notify-send -i dialog-information "App not installed" "\$_pkg_name is not installed in the Pamac container." 2>/dev/null || true
+        fi
+        exit 0
+    fi
+fi
+
+log_msg "Uninstalling pacman app: \$COMPONENT_ID"
 if command -v kdialog >/dev/null 2>&1; then
     CONFIRM=\$(kdialog --yesno "Remove \$_pkg_name? This was installed via Pamac." --title "Uninstall" 2>/dev/null)
     if [[ \$? -ne 0 ]]; then
@@ -8291,7 +8313,7 @@ X-SteamOS-Pamac-SourcePackage=pamac-aur
 
 [Desktop Action uninstall]
 Name=Uninstall Packages
-Exec=bash -c '$(command -v podman || command -v docker || echo podman) exec -u 0 ${container_name} pacman -R --noconfirm pamac-aur 2>/dev/null && rm -f /home/${current_user}/.local/share/applications/${container_name}-org.manjaro.pamac.manager.desktop && touch /home/${current_user}/.local/share/applications && notify-send -i edit-delete "Uninstalled" "pamac-aur removed" 2>/dev/null'
+Exec=bash -c '\\$(command -v podman || command -v docker || echo podman) exec -u 0 ${container_name} pacman -R --noconfirm pamac-aur 2>/dev/null && rm -f /home/${current_user}/.local/share/applications/${container_name}-org.manjaro.pamac.manager.desktop && touch /home/${current_user}/.local/share/applications && notify-send -i edit-delete "Uninstalled" "pamac-aur removed" 2>/dev/null'
 Icon=edit-delete
 PAMAC_DESKTOP
     _fix_desktop_permissions "\$desktop_file"
@@ -8368,7 +8390,7 @@ PAMAC_DESKTOP
         _desktop_bn=app_name ".desktop"
         _host_file="/home/" user "/.local/share/applications/" container "-" _desktop_bn
         _apps_dir="/home/" user "/.local/share/applications"
-        printf "Exec=bash -c '$(command -v podman || command -v docker || echo podman) exec -u 0 %s pacman -R --noconfirm %s 2>/dev/null && rm -f %s && touch %s && notify-send -i edit-delete \"Uninstalled\" \"%s removed\" 2>/dev/null'\n", container, owner_pkg, _host_file, _apps_dir, owner_pkg
+        printf "Exec=bash -c '\\$(command -v podman || command -v docker || echo podman) exec -u 0 %s pacman -R --noconfirm %s 2>/dev/null && rm -f %s && touch %s && notify-send -i edit-delete \"Uninstalled\" \"%s removed\" 2>/dev/null'\n", container, owner_pkg, _host_file, _apps_dir, owner_pkg
         print "Icon=edit-delete"
     }
     { print }
@@ -8469,7 +8491,7 @@ _apps_dir = f'/home/{current_user}/.local/share/applications'
 lines.append('')
 lines.append('[Desktop Action uninstall]')
 lines.append(f'Name=Uninstall {owner_pkg}')
-lines.append(f"Exec=bash -c '$(command -v podman || command -v docker || echo podman) exec -u 0 {container_name} pacman -R --noconfirm {owner_pkg} 2>/dev/null && rm -f {_host_desktop_path} && touch {_apps_dir} && notify-send -i edit-delete \"Uninstalled\" \"{owner_pkg} removed\" 2>/dev/null'")
+lines.append(f"Exec=bash -c '\\$(command -v podman || command -v docker || echo podman) exec -u 0 {container_name} pacman -R --noconfirm {owner_pkg} 2>/dev/null && rm -f {_host_desktop_path} && touch {_apps_dir} && notify-send -i edit-delete \"Uninstalled\" \"{owner_pkg} removed\" 2>/dev/null'")
 lines.append('Icon=edit-delete')
 
 for section, items in other_sections.items():

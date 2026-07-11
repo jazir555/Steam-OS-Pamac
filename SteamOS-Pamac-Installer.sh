@@ -398,11 +398,17 @@ container_root_exec() {
       log_warn "Container not usable before root exec. Attempting anyway..."
     fi
   fi
+  local _rc=0
   if command -v distrobox-enter >/dev/null 2>&1; then
     distrobox-enter "$CONTAINER_NAME" --root -- "$@" 2>/dev/null && return 0
-    log_debug "distrobox-enter --root failed, falling back to direct container exec"
+    _rc=$?
+    _LAST_USABLE_CHECK_TS=0  # invalidate cache on failure
+    log_debug "distrobox-enter --root failed (exit $_rc), falling back to direct container exec"
   fi
   container_runtime_for_ops exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" "$@"
+  _rc=$?
+  [[ $_rc -ne 0 ]] && _LAST_USABLE_CHECK_TS=0  # invalidate cache on failure
+  return $_rc
 }
 
 container_user_exec() {
@@ -3238,6 +3244,15 @@ _apply_sandbox() {
     fi
 
     # ── CapabilityBoundingSet: drop capabilities via setpriv ──
+    # NOTE: setpriv --inh-caps only modifies the inheritable capability set,
+    # NOT the bounding set. A sandboxed process can still regain capabilities
+    # via execve() of a setuid binary. To truly drop bounding-set caps, use
+    # capsh --drop=... (libcap) or prctl(PR_CAPBSET_DROP). The inheritable
+    # set restriction prevents ambient-capability escalation, which covers
+    # the primary AUR build threat model (no ambient caps = no capability
+    # inheritance through exec). Full bounding-set enforcement would require
+    # a C helper (capsh or prctl), adding complexity beyond our gcc-based
+    # seccomp helper. This is a known limitation documented in the security model.
     if [[ -n "$CAP_BOUNDING_SET" ]]; then
         _log_dsr "Applying CapabilityBoundingSet=$CAP_BOUNDING_SET"
         # Convert systemd format to setpriv --inh-caps format.
@@ -3253,7 +3268,7 @@ _apply_sandbox() {
             elif [[ "$_cap_str" == "all" ]]; then
                 # Keep all (no-op)
                 _cap_args=""
-            elif [[ "$_cap_str" == ~\~* ]]; then
+            elif [[ "$_cap_str" == \~* ]]; then
                 # Drop specific capabilities: ~CAP1:CAP2 → -cap1,-cap2
                 local _dropped="${_cap_str#\~}"
                 _dropped="${_dropped//:/ }"
@@ -3392,20 +3407,36 @@ static void apply_filters(int mdwx) {
         struct sock_fprog p = { .len=sizeof(f)/sizeof(f[0]), .filter=f };
         prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &p);
     }
-    /* MemoryDenyWriteExecute: block mprotect with PROT_EXEC|PROT_WRITE together */
+    /* MemoryDenyWriteExecute: block mprotect with PROT_WRITE and PROT_EXEC
+       both set. This matches systemd semantics: only W^X violations blocked.
+       PROT_EXEC alone is allowed, preserving dlopen and JIT compatibility. */
     if (mdwx) {
         struct sock_filter f[] = {
+            /* Load syscall number */
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
-            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_mprotect, 0, 4),
+            /* Check mprotect (index 1 → index 2 if true, index 7 if false) */
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_mprotect, 0, 5),
+            /* Load mprotect args[2] (prot flags) */
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,args[2])),
-            BPF_JUMP(BPF_JMP|BPF_JSET|BPF_K, 0x6, 0, 2),
+            /* If PROT_WRITE (0x2) not set → ALLOW (skip 2 to index 6) */
+            BPF_JUMP(BPF_JMP|BPF_JSET|BPF_K, 0x2, 0, 2),
+            /* If PROT_EXEC (0x4) not set → ALLOW (skip 1 to index 6) */
+            BPF_JUMP(BPF_JMP|BPF_JSET|BPF_K, 0x4, 0, 1),
+            /* Both PROT_WRITE and PROT_EXEC set → block */
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            /* ALLOW: only W, only X, or neither */
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+            /* Check pkey_mprotect (index 7 → index 8 if true, index 12 if false) */
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_pkey_mprotect, 0, 4),
+            /* Load pkey_mprotect args[2] (prot flags) */
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,args[2])),
-            BPF_JUMP(BPF_JMP|BPF_JSET|BPF_K, 0x6, 0, 2),
+            /* If PROT_WRITE (0x2) not set → ALLOW (skip 2 to index 12) */
+            BPF_JUMP(BPF_JMP|BPF_JSET|BPF_K, 0x2, 0, 2),
+            /* If PROT_EXEC (0x4) not set → ALLOW (skip 1 to index 12) */
+            BPF_JUMP(BPF_JMP|BPF_JSET|BPF_K, 0x4, 0, 1),
+            /* Both PROT_WRITE and PROT_EXEC set → block */
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+            /* ALLOW for pkey_mprotect path */
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
         };
         struct sock_fprog p = { .len=sizeof(f)/sizeof(f[0]), .filter=f };
@@ -3541,7 +3572,7 @@ fi
 # Construct the inner command (everything the sandbox wrapper will execute).
 if [[ -n "$WORK_DIR" ]]; then
     _log_dsr "EXEC: sudo -u $BUILD_USER -- cd $WORK_DIR; ${CMD_ARGS[*]}"
-    _INNER_CMD="cd '${WORK_DIR}' 2>/dev/null || true; ${_BUILD_WRAPPER}exec \"\${@}\"" _
+    _INNER_CMD="cd '${WORK_DIR}' 2>/dev/null || true; ${_BUILD_WRAPPER}exec \"\${@}\""
 else
     _log_dsr "EXEC: sudo -u $BUILD_USER -- ${CMD_ARGS[*]}"
     _INNER_CMD="${_BUILD_WRAPPER}exec \"\${@}\""
@@ -4944,13 +4975,21 @@ else
 fi
 
 if [[ "\$_use_wheel_group" == "true" ]]; then
-    echo "SECURITY: wheel-group NOPASSWD package management is enabled."
-    echo "          A malicious AUR PKGBUILD run via makepkg can escalate to root."
-    echo "          Remove /etc/sudoers.d/99-pamac-nopasswd if you do not accept this risk."
+    echo ""
+    echo "*** SECURITY WARNING: wheel-group NOPASSWD package management ***"
+    echo "  A malicious AUR PKGBUILD can invoke 'sudo pacman install' during"
+    echo "  build() and escalate to root without any authentication."
+    echo "  This is acceptable ONLY on single-user personal devices."
+    echo "  To remove: sudo rm /etc/sudoers.d/99-pamac-nopasswd"
+    echo ""
 else
-    echo "SECURITY: Per-user NOPASSWD package management is enabled for '$current_user'."
-    echo "          Only this user can run package commands without password."
-    echo "          A malicious AUR PKGBUILD can still escalate as '$current_user' inside the container."
+    echo ""
+    echo "*** SECURITY NOTE: Per-user NOPASSWD package management ***"
+    echo "  Only '$current_user' can run package commands without password."
+    echo "  A malicious AUR PKGBUILD can still invoke 'sudo pacman' as"
+    echo "  '$current_user' during build() — limited to this user only."
+    echo "  This is the recommended setting for shared workstations."
+    echo ""
 fi
 USER_EOF
 
@@ -8075,7 +8114,23 @@ if [[ -z "\${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
         export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$(id -u)/bus"
     else
         # Fallback: check /tmp/dbus-* for non-systemd or alternative hosts
+        # Also check user socket patterns used by minimal Wayland compositors
+        # (e.g., sway, river, hyprland) that may place sockets under
+        # $XDG_RUNTIME_DIR instead of /run/user/<uid>/.
         _dbus_sock=\$(ls /tmp/dbus-* 2>/dev/null | head -1)
+        if [[ -z "\$_dbus_sock" || ! -S "\$_dbus_sock" ]]; then
+            _dbus_sock="\$XDG_RUNTIME_DIR/bus-\$(id -u)"
+            [[ -S "\$_dbus_sock" ]] || _dbus_sock=""
+        fi
+        if [[ -z "\$_dbus_sock" ]]; then
+            # Last resort: try common alternative socket names
+            for _candidate in "\$XDG_RUNTIME_DIR/dbus-session" "/run/user/\$(id -u)/dbus-session" "\$XDG_RUNTIME_DIR/.bus-session"; do
+                if [[ -S "\$_candidate" ]]; then
+                    _dbus_sock="\$_candidate"
+                    break
+                fi
+            done
+        fi
         if [[ -n "\$_dbus_sock" && -S "\$_dbus_sock" ]]; then
             export DBUS_SESSION_BUS_ADDRESS="unix:path=\$_dbus_sock"
         else
@@ -10356,18 +10411,21 @@ main() {
         echo -e "\e[91mPlease run as the regular user (e.g., 'deck' on Steam Deck).\e[0m" >&2
         exit 1
     fi
-    initialize_logging
-
-    # Prevent concurrent execution with file locking
+    # Prevent concurrent execution with file locking.
+    # Acquire the lock BEFORE initialize_logging to prevent two instances from
+    # racing on log rotation. Without this, both could read the same file size,
+    # both decide to rotate, and one rotation overwrites the other's backup.
     local _lock_dir="${XDG_RUNTIME_DIR:-$HOME/.local/state}"
     mkdir -p "$_lock_dir" 2>/dev/null || _lock_dir="/tmp"
     local _lock_file="$_lock_dir/steamos-pamac-setup.lock"
     exec 9>"$_lock_file"
     if ! flock -n 9; then
-        log_error "Another instance of this script is already running (lock file: $_lock_file)."
-        log_error "If no other instance is running, remove the lock file and try again."
+        echo "ERROR: Another instance of this script is already running (lock file: $_lock_file)." >&2
+        echo "If no other instance is running, remove the lock file and try again." >&2
         exit 1
     fi
+
+    initialize_logging
 
     if [[ "$UNINSTALL" == "true" ]]; then
         uninstall_setup

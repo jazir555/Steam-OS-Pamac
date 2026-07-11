@@ -27,6 +27,7 @@ trap '_err_trap $LINENO "$BASH_COMMAND"' ERR
 #   <<EOF    — host variables expand at write-time; use \$ for literal $
 
 readonly SCRIPT_VERSION="5.3.0"
+readonly GITHUB_REPO="your-org/Steam-OS-Pamac"
 readonly DEFAULT_CONTAINER_NAME="arch-pamac"
 # Default log file (used until CONTAINER_NAME is known). init_log_file() in
 # main reassigns it to a per-container path so concurrent runs with different
@@ -4111,6 +4112,8 @@ local polkit_dbus_script
 read -r -d '' polkit_dbus_script <<'POLKIT_DBUS_EOF' || true
 set -uo pipefail
 
+current_user="$1"
+
 echo "Installing polkit..."
 if pacman -S --noconfirm --needed polkit; then
 polkit_dir="/etc/polkit-1/rules.d"
@@ -4128,7 +4131,7 @@ if [[ "$_human_users" -le 1 ]]; then
     '});' > "$polkit_dir/10-pamac-nopasswd.rules"
     echo "polkit passwordless rule created for pamac operations (wheel group — single-user host)."
 else
-    _current_user=$(whoami)
+    _current_user="$current_user"
     printf '%s\n' 'polkit.addRule(function(action, subject) {' \
     ' if (action.id.indexOf("org.manjaro.pamac.") == 0 &&' \
     "   subject.user == \"$_current_user\") {" \
@@ -4184,12 +4187,12 @@ fi
 echo "Polkit and D-Bus setup finished."
 POLKIT_DBUS_EOF
 
-if ! exec_container_script "$polkit_dbus_script" "polkit-dbus-setup"; then
+if ! exec_container_script "$polkit_dbus_script" "polkit-dbus-setup" "$CURRENT_USER"; then
 log_warn "Polkit/dbus setup had issues, retrying..."
 container_start 2>/dev/null || true
 sleep 3
 if container_is_usable; then
-if ! exec_container_script "$polkit_dbus_script" "polkit-dbus-setup-retry"; then
+if ! exec_container_script "$polkit_dbus_script" "polkit-dbus-setup-retry" "$CURRENT_USER"; then
 log_warn "Polkit/dbus setup retry also failed. Will attempt repair later."
 _ok=false
 fi
@@ -5084,19 +5087,22 @@ _enable_repo_with_fallback() {
     env_var_name="${_normalized^^}_KEY_ID"
     local key_id="${!env_var_name:-$default_key_id}"
 
-    # Validate the resolved key_id is a 40-char hex fingerprint OR empty/informative
-    # short prefix (the bootstrap chain below probes keyservers + mirror paths and
-    # confirms a live fingerprint before trusting it — but if the USER-supplied
-    # override is malformed, fail fast with an actionable error instead of
-    # attempting to import garbage and producing confusing keyserver failures.
+    # Validate the resolved key_id format. User-supplied overrides MUST be
+    # 40-char hex fingerprints (fail fast). The hardcoded default may be a
+    # short ID (e.g. EndeavourOS F52611D11AFD4556) when the full fingerprint
+    # is unavailable — log a warning but continue, since the keyring bootstrap
+    # validates the actual imported key at runtime.
     if [[ -n "${!env_var_name:-}" ]] && [[ "$key_id" != "$default_key_id" ]]; then
         if [[ ! "$key_id" =~ ^[0-9a-fA-F]{40}$ ]]; then
             echo "ERROR: $env_var_name='$key_id' is not a valid 40-character hex fingerprint."
-            echo "       GPG fingerprints must be a 40-character hexadecimal string (e.g. 30565AC3868033CA...)."
+            echo "       GPG fingerprints must be a 40-character hexadecimal string."
             echo "       Short IDs (16-char or 8-char) are rejected for security (collision/ambiguous-match)."
             echo "       Clear $env_var_name or set it to the full fingerprint and re-run."
             return 1
         fi
+    elif [[ -n "$key_id" ]] && [[ ! "$key_id" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        echo "Warning: Default $env_var_name='$key_id' is a short ID, not a full fingerprint."
+        echo "  Override with: $env_var_name=<FULL_40_CHAR_FINGERPRINT>"
     fi
 
     echo "Adding repository [$repo_name] (key_id=$key_id)..."

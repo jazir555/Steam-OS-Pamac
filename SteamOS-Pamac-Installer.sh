@@ -1210,6 +1210,9 @@ OPTIONS:
   --quiet                   Only show errors
   --no-color                Disable ANSI color output (useful for piping, cron,
                             CI/CD, and non-terminal environments)
+  --low-memory              Reduce build parallelism on constrained systems
+                            (e.g., 8GB RAM or less). Doubles per-job RAM
+                            requirement to prevent OOM during AUR builds.
   --version                 Show version information
   --version-check           Compare installed version against latest GitHub release
   --verify                  Print SHA-256 hash of this script for integrity verification
@@ -1244,6 +1247,9 @@ ENVIRONMENT VARIABLES:
                            Default 'false'.
   NO_COLOR                 Set to 'true' to disable ANSI color output (same
                            as --no-color flag). Useful for piping, cron, CI/CD.
+  LOW_MEMORY               Set to 'true' to reduce build parallelism (same as
+                           --low-memory flag). Doubles per-job RAM for AUR
+                           builds on constrained systems (<8GB available).
   DRY_RUN_VERBOSE          Set to 'true' to audit container scripts without
                            executing them (implies DRY_RUN=true). Default 'false'.
   LOG_ROTATION_MAX_SIZE    Rotate the per-container log on startup when it
@@ -1251,19 +1257,29 @@ ENVIRONMENT VARIABLES:
                            One backup (.1) is kept; older backups are overwritten.
 
 SECURITY NOTE — fake systemd-run wrapper:
-  In non-systemd containers (the common case), this script installs a
-  fake /usr/local/sbin/systemd-run that ENFORCES systemd sandboxing
-  properties using real Linux kernel primitives:
-  - Mount namespaces (unshare --mount) + bind mounts for filesystem
-    isolation (ProtectSystem, ProtectHome, PrivateTmp, PrivateDevices,
-    ReadWritePaths, ReadOnlyPaths, InaccessiblePaths)
-  - Capability dropping (setpriv --inh-caps) for CapabilityBoundingSet
-  - Seccomp-BPF (compiled in-container via gcc) for MemoryDenyWriteExecute,
-    RestrictSUIDSGID, ProtectKernelModules
-  - Runtime verification that mount namespace is actually private
-  The seccomp helper is a small C program compiled on-the-fly (requires
-  gcc, always present in base-devel containers). Use --strict-security
-  to disable the wrapper entirely and refuse DynamicUser-based builds.
+  EXPERIMENTAL: This is a custom compatibility shim, NOT systemd. It
+  enforces sandboxing via Linux kernel primitives (mount namespaces,
+  seccomp-BPF, capability dropping) but does not provide full systemd
+  parity. If AUR builds fail inside the container, try:
+    (1) Install base-devel for seccomp compilation
+    (2) Use --strict-security to disable the wrapper
+    (3) Use real systemd (e.g., distrobox --init flag)
+
+SECURITY NOTE — --allow-wheel-nopasswd:
+  Grants NOPASSWD to the entire wheel group. On multi-user hosts, any
+  user in the wheel group (and any AUR package built via makepkg) can
+  perform administrative package operations without authentication.
+  Default is per-user NOPASSWD (limits escalation to one user).
+
+SECURITY NOTE — Polkit rules:
+  The script sets allow_active=yes (local active sessions only) for
+  Pamac polkit actions. allow_any=no, allow_inactive=no. This prevents
+  unauthenticated remote or inactive-session access. Any process in the
+  container with an active local session can still perform admin ops.
+
+POST-INSTALL:
+  To upgrade Pamac after installation: yay -Syu
+  To upgrade the container: yay -Syu && exit; distrobox upgrade CONTAINER
 
 EXAMPLES:
   $0                                       # Basic setup
@@ -1320,6 +1336,7 @@ parse_arguments() {
             --verbose) LOG_LEVEL="verbose"; shift ;;
             --quiet) LOG_LEVEL="quiet"; shift ;;
             --no-color) NO_COLOR="true"; shift ;;
+            --low-memory) LOW_MEMORY="true"; shift ;;
             --version) echo "Steam Deck Pamac Setup v${SCRIPT_VERSION}"; exit 0 ;;
             --verify) _verify_script_hash; exit 0 ;;
             --version-check)
@@ -1444,7 +1461,33 @@ uninstall_setup() {
         local _discover_svc="$HOME/.config/systemd/user/app-org.kde.discover.notifier@autostart.service"
         [[ -L "$_discover_svc" || -f "$_discover_svc" ]] && { log_info "Unmasking Discover notifier: $_discover_svc"; systemctl --user unmask "app-org.kde.discover.notifier@autostart.service" 2>/dev/null || rm -f "$_discover_svc"; }
 
-        [[ -f "$HOME/.ssh/environment" ]] && { log_info "Note: ~/.ssh/environment may contain Pamac PATH entries; review manually."; }
+        # Clean SSH environment file (created by --enable-ssh-env)
+        [[ -f "$HOME/.ssh/environment" ]] && {
+            if grep -q "pamac\|steamos-pamac" "$HOME/.ssh/environment" 2>/dev/null; then
+                log_info "Removing Pamac entries from ~/.ssh/environment"
+                grep -v "pamac\|steamos-pamac" "$HOME/.ssh/environment" > "$HOME/.ssh/environment.tmp" 2>/dev/null
+                if [[ -s "$HOME/.ssh/environment.tmp" ]]; then
+                    mv "$HOME/.ssh/environment.tmp" "$HOME/.ssh/environment"
+                else
+                    rm -f "$HOME/.ssh/environment" "$HOME/.ssh/environment.tmp"
+                fi
+            fi
+        }
+
+        # Clean container image (archlinux:latest) — offer to remove since it
+        # may be shared with other containers.
+        local _image="${ARCHLINUX_IMAGE:-archlinux:latest}"
+        if command -v podman >/dev/null 2>&1; then
+            if podman image exists "$_image" 2>/dev/null; then
+                log_info "Container image '$_image' is still on disk."
+                log_info "  To remove: podman rmi $_image"
+            fi
+        elif command -v docker >/dev/null 2>&1; then
+            if docker image inspect "$_image" >/dev/null 2>&1; then
+                log_info "Container image '$_image' is still on disk."
+                log_info "  To remove: docker rmi $_image"
+            fi
+        fi
     fi
 
     log_success "Uninstallation completed."
@@ -2310,6 +2353,12 @@ _sed_escape_pattern() {
 }
 _calc_makepkg_jobs() {
     local ram_per_job_kb=768000
+    # In low-memory mode, double the per-job RAM requirement to reduce
+    # parallelism on constrained systems (e.g., Steam Deck with 16GB shared
+    # with GPU, or older laptops with 8GB).
+    if [[ "${LOW_MEMORY:-false}" == "true" ]]; then
+        ram_per_job_kb=$(( ram_per_job_kb * 2 ))
+    fi
     local mem_avail_kb=0
     local ncpu
     ncpu=$(nproc 2>/dev/null || echo "1")
@@ -2485,6 +2534,14 @@ install_base_devel_batched() {
 # RestrictSUIDSGID, ProtectKernelModules, and more. Runtime verification
 # confirms the mount namespace is actually private. Use --strict-security
 # to disable this wrapper entirely and refuse DynamicUser-based builds.
+#
+# EXPERIMENTAL: This wrapper is a custom compatibility shim, NOT systemd.
+# It does not provide full systemd parity. Sandboxing properties are enforced
+# via Linux kernel primitives (mount namespaces, seccomp, capabilities) but
+# some edge cases may differ from real systemd-run. If builds fail inside the
+# container, try: (1) installing gcc/base-devel for seccomp compilation,
+# (2) using --strict-security to disable the wrapper, or (3) using real
+# systemd (e.g., distrobox with --init flag).
 _write_fake_systemd_run_wrapper() {
     mkdir -p /usr/local/sbin
     cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE_HEREDOC'
@@ -5637,6 +5694,19 @@ configure_extra_repos() {
     read -r -d '' repos_script <<'REPOS_EOF' || true
 set -uo pipefail
 
+# Ensure curl is available — required for keyring package downloads and
+# mirror probing. Install it if missing (coreutils curl may not be in
+# minimal base images).
+if ! command -v curl >/dev/null 2>&1; then
+    echo "curl not found — installing (required for keyring bootstrap)..."
+    pacman -S --noconfirm --needed curl 2>/dev/null || true
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "ERROR: curl is required for keyring package downloads but could not be installed."
+        echo "  Install manually: pacman -S curl"
+        exit 1
+    fi
+fi
+
 # Import host environment variable overrides passed as positional args.
 # Single-quoted heredocs prevent host-side variable expansion, so the caller
 # passes these as arguments to exec_container_script and we read them here.
@@ -8187,14 +8257,14 @@ ${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" rm -rf /var/lib/pacman/syn
 # Copy .desktop files directly from container, patch Exec, and annotate
 # with pamac markers + uninstall action.
 # Fast path: skip the expensive per-package file enumeration if the
-# container's explicitly-installed package count hasn't changed since
-# the last export. This avoids iterating hundreds of packages on every
-# GUI launch (1-3s on large containers).
+# container's explicitly-installed package list hasn't changed since
+# the last export. Uses md5sum of the package list (not count) so that
+# a package swap (remove A + install B) is still detected.
 _export_dir="\$HOME/.local/share/applications"
-_pkg_count_cache="\$HOME/.local/state/steamos-pamac-${CONTAINER_NAME}.pkgcount"
-_current_pkg_count=\$(${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" pacman -Qeq 2>/dev/null | wc -l)
-if [[ -f "\$_pkg_count_cache" ]] && [[ "\$(cat "\$_pkg_count_cache" 2>/dev/null)" == "\${_current_pkg_count}" ]]; then
-    # Count unchanged — desktop files already exported, skip slow enumeration
+_pkg_hash_cache="\$HOME/.local/state/steamos-pamac-${CONTAINER_NAME}.pkghash"
+_current_pkg_hash=\$(${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" pacman -Qeq 2>/dev/null | md5sum | awk '{print \$1}')
+if [[ -f "\$_pkg_hash_cache" ]] && [[ "\$(cat "\$_pkg_hash_cache" 2>/dev/null)" == "\${_current_pkg_hash}" ]]; then
+    # Package list unchanged — desktop files already exported, skip slow enumeration
     true
 else
 # Iterate desktop files directly (O(M)) instead of per-package enumeration (O(N*M)).
@@ -8240,8 +8310,8 @@ ACTION_EOF
     fi
 done
 # Save package count for fast-path cache on next launch
-mkdir -p "\$(dirname "\$_pkg_count_cache")" 2>/dev/null
-echo "\${_current_pkg_count}" > "\$_pkg_count_cache" 2>/dev/null
+mkdir -p "\$(dirname "\$_pkg_hash_cache")" 2>/dev/null
+echo "\${_current_pkg_hash}" > "\$_pkg_hash_cache" 2>/dev/null
 fi
 
 # Re-suppress the KDE Discover notifier on every launch: the autostart unit is

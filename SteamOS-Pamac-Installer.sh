@@ -2301,6 +2301,480 @@ install_base_devel_batched() {
         echo "Warning: base-devel group meta-package could not be installed (individual packages verified above)."
     fi
 }
+# Write the fake systemd-run wrapper script. Idempotent: caller should
+# check whether /usr/local/sbin/systemd-run exists first if needed. The
+# wrapper content is byte-identical between install and repair paths;
+# this function is shared so the two call sites do not diverge.
+# NOTE: the heredoc closing delimiter MUST be at column 0 (no leading
+# whitespace) — bash's << 'WORD' closer cannot be indented, only <<- can
+# strip TABS (not spaces). The 4-space indentation of every other line
+# is preserved when the function is called at runtime; the bash parser
+# special-cases the heredoc opener/closer relative to leading indentation.
+_write_fake_systemd_run_wrapper() {
+    mkdir -p /usr/local/sbin
+    cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE_HEREDOC'
+    #!/bin/bash
+    # Fake systemd-run for non-systemd containers (Distrobox).
+    # Mimics the subset of systemd-run used by Pamac/makepkg for DynamicUser builds.
+    # Logs unrecognized arguments to /tmp/systemd-run-fake.log for diagnostics.
+    # Prints visible warnings to stderr when unrecognized properties are detected.
+    _DSR_LOG="/tmp/systemd-run-fake.log"
+    DSR_VERSION="2.0"
+    _log_dsr() { echo "[$(date '\''+%H:%M:%S'\'')] $*" >> "$_DSR_LOG" 2>/dev/null; }
+    _warn_dsr() { echo "systemd-run(fake): WARNING: $*" >> "$_DSR_LOG" 2>/dev/null; echo "systemd-run(fake): WARNING: $*" >&2 2>/dev/null || true; }
+    
+    # Pre-flight: clean up orphaned ad-hoc build users and temp home directories
+    # left behind by interrupted builds. Ad-hoc users are named _brecover* and
+    # own /var/tmp/builduser-home-* directories.
+    _cleanup_orphaned_buildusers() {
+        local _orphan_users=""
+        _orphan_users=$(getent passwd 2>/dev/null | awk -F: '\''$1 ~ /^_brecover/ { print $1 }'\'' || true)
+        for _ou in $_orphan_users; do
+            _warn_dsr "Cleaning up orphaned build user: $_ou"
+            userdel -r "$_ou" 2>/dev/null || userdel "$_ou" 2>/dev/null || true
+        done
+        for _dir in /var/tmp/builduser-home-*; do
+            [[ -d "$_dir" ]] || continue
+            # Only remove if owned by root (build users run as non-root, so a
+            # non-root-owned directory might be an active build'\''s workspace).
+            if [[ "$(stat -c '\''%U'\'' "$_dir" 2>/dev/null || echo root)" == "root" ]]; then
+                _warn_dsr "Removing orphaned build-user home: $_dir"
+                rm -rf "$_dir" 2>/dev/null || true
+            fi
+        done
+    }
+    _cleanup_orphaned_buildusers
+    
+    # Passthrough: --help and --version are not meaningful here
+    for _a in "$@"; do
+        case "$_a" in
+            --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo "Recognized options: --property=DynamicUser=yes, --property=CacheDirectory=*, --property=WorkingDirectory=*, --property=StateDirectory=*, --property=LogsDirectory=*, --property=RuntimeDirectory=*, --property=TemporaryFileSystem=*, --property=BindPaths=*, --property=BindReadOnlyPaths=*, --property=ProtectSystem=*, --property=ProtectHome=*, --property=PrivateTmp=*, --property=NoNewPrivileges=*, --property=MemoryDenyWriteExecute=*, --property=SystemCallFilter=*, --property=CapabilityBoundingSet=*, --property=User=*, --property=Group=*, --property=SupplementaryGroups=*, --property=AmbientCapabilities=*, --property=EnvironmentFile=*, --property=Type=*, --property=RemainAfterExit=*, --property=Ephemeral=*, --property=Slice=*, --property=IOSchedulingClass=*, --property=CPUSchedulingPolicy=*, --property=RestrictNamespaces=*, --property=RestrictSUIDSGID=*, --property=LockPersonality=*, --property=RestrictRealtime=*, --property=RestrictAddressFamilies=*, --property=RemoveIPC=*, --property=UMask=*, --property=KeyringMode=*, --property=ProtectClock=*, --property=ProtectKernelTunables=*, --property=ProtectKernelModules=*, --property=ProtectKernelLogs=*, --property=ProtectControlGroups=*, --property=ProtectHostname=*, --property=ProtectProc=*, --property=ProcSubset=*, --property=MemorySwapMax=*, --property=CPUQuota=*, --property=DeviceAllow=*, --property=DevicePolicy=*, --property=RestrictFileSystems=*, --property=SocketBindDeny=*, --property=SocketBindAllow=*, --property=IPAddressAllow=*, --property=IPAddressDeny=*, and all other systemd.exec(5)/resource-control(5)/service(5) --property= sandboxing (Private*, Protect*, ReadWritePaths, RootDirectory, ...), resource (Limit*, *Accounting, *Max, *Weight, IO*, Memory*, CPU*), logging (StandardIO, Syslog*, LogLevel*), Condition*, Assert*, and Timeout*/Restart* options (recognized and dropped in this non-systemd env; sandboxing drops are logged to /tmp/systemd-run-fake.log), --pipe, --wait, --quiet, --no-block, --description=*, --unit=*, --service-type=*, --user, --uid=*, --gid=*, --setenv=*, --"; exit 0 ;;
+            --version) echo "systemd-run (fake) v${DSR_VERSION} (SteamOS-Pamac)"; exit 0 ;;
+        esac
+    done
+    
+    DYNAMIC_USER=false
+    CACHE_DIR=""
+    WORK_DIR=""
+    SKIP_NEXT=false
+    PIPE_MODE=false
+    WAIT_MODE=false
+    DESCRIPTION=""
+    UNRECOGNIZED_PROPS=()
+    CMD_ARGS=()
+    for arg in "$@"; do
+    if $SKIP_NEXT; then
+    SKIP_NEXT=false
+    continue
+    fi
+    case "$arg" in
+    --service-type=*) continue ;;
+    --service-type) SKIP_NEXT=true; continue ;;
+    --pipe) PIPE_MODE=true; continue ;;
+    --wait) WAIT_MODE=true; continue ;;
+    --pty|-q|--quiet|--no-block) continue ;;
+    --description=*) DESCRIPTION="${arg#--description=}"; continue ;;
+    --description) SKIP_NEXT=true; continue ;;
+    --unit=*) continue ;;
+    --unit) SKIP_NEXT=true; continue ;;
+    --property=DynamicUser=yes) DYNAMIC_USER=true; continue ;;
+    --property=CacheDirectory=*) CACHE_DIR="${arg#--property=CacheDirectory=}"; continue ;;
+    --property=WorkingDirectory=*) WORK_DIR="${arg#--property=WorkingDirectory=}"; continue ;;
+    # Recognized but currently unimplemented properties in this fake systemd-run.
+    # Security-hardening properties (Protect*, SystemCallFilter, ...) are DROPPED
+    # in the non-systemd container — they cannot be enforced outside a unit. We log
+    # every dropped property to /tmp/systemd-run-fake.log so a build that depended
+    # on a property'\''s behavior (not just its presence) is debuggable. Resource and
+    # metadata properties that have no sandboxing impact stay silent for brevity.
+    --property=StateDirectory=*) continue ;;
+    --property=LogsDirectory=*) continue ;;
+    --property=RuntimeDirectory=*) continue ;;
+    --property=Type=*) continue ;;
+    --property=RemainAfterExit=*) continue ;;
+    --property=TemporaryFileSystem=*) continue ;;
+    --property=BindPaths=*) continue ;;
+    --property=BindReadOnlyPaths=*) continue ;;
+    --property=ProtectSystem=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=ProtectHome=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=PrivateTmp=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=NoNewPrivileges=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=MemoryDenyWriteExecute=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=SystemCallFilter=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=CapabilityBoundingSet=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=User=*) continue ;;
+    --property=Group=*) continue ;;
+    --property=SupplementaryGroups=*) continue ;;
+    --property=AmbientCapabilities=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=EnvironmentFile=*) continue ;;
+    --property=Ephemeral=*) continue ;;
+    --property=Slice=*) continue ;;
+    --property=IOSchedulingClass=*) continue ;;
+    --property=CPUSchedulingPolicy=*) continue ;;
+    --property=RestrictNamespaces=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=RestrictSUIDSGID=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=LockPersonality=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=RestrictRealtime=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=RestrictAddressFamilies=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=RemoveIPC=*) continue ;;
+    --property=UMask=*) continue ;;
+    --property=KeyringMode=*) continue ;;
+    --property=ProtectClock=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=ProtectKernelTunables=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=ProtectKernelModules=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=ProtectKernelLogs=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=ProtectControlGroups=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=ProtectHostname=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=ProtectProc=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=ProcSubset=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=MemorySwapMax=*) continue ;;
+    --property=CPUQuota=*) continue ;;
+    --property=DeviceAllow=*) continue ;;
+    --property=DevicePolicy=*) continue ;;
+    --property=RestrictFileSystems=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=SocketBindDeny=*) continue ;;
+    --property=SocketBindAllow=*) continue ;;
+    --property=IPAddressAllow=*) continue ;;
+    --property=IPAddressDeny=*) continue ;;
+    # Additional recognized systemd-run properties (not previously handled).
+    # Grouped per systemd.exec(5)/systemd.resource-control(5). Security/sandboxing
+    # properties are logged via _warn_dsr when dropped (same convention as above);
+    # resource/accounting/metadata/IO/log properties stay silent.
+    # --- Filesystem / namespace sandboxing ---
+    --property=PrivateDevices=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=PrivateMounts=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=PrivateNetwork=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=PrivateUsers=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=MountFlags=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=MountAPIVFS=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=ReadWritePaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=ReadOnlyPaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=InaccessiblePaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=ExecPaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=NoExecPaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=ConfigurationDirectory=*) continue ;;
+    --property=RootDirectory=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=RootImage=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=RootHash=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=RootVerity=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=MountImages=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=ExtensionImages=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=NamespacePath=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=NetworkNamespacePath=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=LogNamespace=*) continue ;;
+    # --- Capabilities / privileges ---
+    --property=InheritDescriptors=*) continue ;;
+    --property=SecureBits=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    # --- Environment ---
+    --property=Environment=*) continue ;;
+    --property=PassEnvironment=*) continue ;;
+    --property=UnsetEnvironment=*) continue ;;
+    # --- Personality / arch ---
+    --property=Personality=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=SystemCallArchitectures=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=SystemCallErrorNumber=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=SystemCallLog=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    # --- IPC / time / misc ---
+    --property=TimerSlackNSec=*) continue ;;
+    --property=SetLoginEnvironment=*) continue ;;
+    --property=Delegate=*) continue ;;
+    --property=DisableExtraFileDescriptors=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=CoredumpReceive=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
+    --property=DynamicUser=*) continue ;;
+    # --- Standard I/O / logging ---
+    --property=StandardInput=*) continue ;;
+    --property=StandardOutput=*) continue ;;
+    --property=StandardError=*) continue ;;
+    --property=StandardInputText=*) continue ;;
+    --property=StandardInputFileDescriptor=*) continue ;;
+    --property=StandardInputData=*) continue ;;
+    --property=StandardOutputFileDescriptor=*) continue ;;
+    --property=StandardErrorFileDescriptor=*) continue ;;
+    --property=TTYPath=*) continue ;;
+    --property=TTYReset=*) continue ;;
+    --property=TTYVHangup=*) continue ;;
+    --property=TTYVTDisallocate=*) continue ;;
+    --property=SyslogIdentifier=*) continue ;;
+    --property=SyslogFacility=*) continue ;;
+    --property=SyslogLevel=*) continue ;;
+    --property=SyslogLevelPrefix=*) continue ;;
+    --property=LogLevelMax=*) continue ;;
+    --property=LogRateLimitIntervalSec=*) continue ;;
+    --property=LogRateLimitBurst=*) continue ;;
+    --property=LogExtraFields=*) continue ;;
+    --property=LogFilterPatterns=*) continue ;;
+    --property=LogFilterAllow=*) continue ;;
+    --property=LogFilterDeny=*) continue ;;
+    --property=LogLevelOverride=*) continue ;;
+    # --- Resource limits (RLIMIT_*) and accounting ---
+    --property=LimitCPU=*) continue ;;
+    --property=LimitCPUSoft=*) continue ;;
+    --property=LimitFSIZE=*) continue ;;
+    --property=LimitFIZESoft=*) continue ;;
+    --property=LimitDATA=*) continue ;;
+    --property=LimitDATASoft=*) continue ;;
+    --property=LimitSTACK=*) continue ;;
+    --property=LimitSTACKSoft=*) continue ;;
+    --property=LimitCORE=*) continue ;;
+    --property=LimitCORESoft=*) continue ;;
+    --property=LimitRSS=*) continue ;;
+    --property=LimitRSSSoft=*) continue ;;
+    --property=LimitNOFILE=*) continue ;;
+    --property=LimitNOFILESoft=*) continue ;;
+    --property=LimitAS=*) continue ;;
+    --property=LimitASSoft=*) continue ;;
+    --property=LimitNPROC=*) continue ;;
+    --property=LimitNPROCSoft=*) continue ;;
+    --property=LimitMEMLOCK=*) continue ;;
+    --property=LimitMEMLOCKSoft=*) continue ;;
+    --property=LimitLOCKS=*) continue ;;
+    --property=LimitLOCKSSoft=*) continue ;;
+    --property=LimitSIGPENDING=*) continue ;;
+    --property=LimitSIGPENDINGSoft=*) continue ;;
+    --property=LimitMSGQUEUE=*) continue ;;
+    --property=LimitMSGQUEUESoft=*) continue ;;
+    --property=LimitNICE=*) continue ;;
+    --property=LimitNICESoft=*) continue ;;
+    --property=LimitRTPRIO=*) continue ;;
+    --property=LimitRTPRIOSoft=*) continue ;;
+    --property=LimitRTTIME=*) continue ;;
+    --property=LimitRTTIMESoft=*) continue ;;
+    --property=LimitNFILEVSZ=*) continue ;;
+    --property=TasksMax=*) continue ;;
+    --property=TasksAccounting=*) continue ;;
+    --property=CPUAccounting=*) continue ;;
+    --property=MemoryAccounting=*) continue ;;
+    --property=IOAccounting=*) continue ;;
+    --property=IPAccounting=*) continue ;;
+    --property=TasksMaxScalePercent=*) continue ;;
+    --property=TasksMaxInhibitPercent=*) continue ;;
+    # --- CPU / scheduling control ---
+    --property=CPUWeight=*) continue ;;
+    --property=StartupCPUWeight=*) continue ;;
+    --property=CPUWeightPerWeight=*) continue ;;
+    --property=AllowedCPUs=*) continue ;;
+    --property=StartupAllowedCPUs=*) continue ;;
+    --property=AllowedMemoryNodes=*) continue ;;
+    --property=StartupAllowedMemoryNodes=*) continue ;;
+    --property=CPUQuotaPeriodSec=*) continue ;;
+    --property=AllowedMemoryNodesPerWeight=*) continue ;;
+    --property=DisableControllers=*) continue ;;
+    --property=ManagedOOMSwap=*) continue ;;
+    --property=ManagedOOMMemoryPressure=*) continue ;;
+    --property=ManagedOOMMemoryPressureLimit=*) continue ;;
+    --property=ManagedOOMPreference=*) continue ;;
+    # --- IO / block control ---
+    --property=IOWeight=*) continue ;;
+    --property=StartupIOWeight=*) continue ;;
+    --property=IODeviceWeight=*) continue ;;
+    --property=IODeviceLatencyTargetSec=*) continue ;;
+    --property=IOReadBandwidthMax=*) continue ;;
+    --property=IOWriteBandwidthMax=*) continue ;;
+    --property=IOReadIOPSMax=*) continue ;;
+    --property=IOWriteIOPSMax=*) continue ;;
+    --property=IODeviceWriteLatencyTargetSec=*) continue ;;
+    --property=IODeviceReadIOPSMax=*) continue ;;
+    --property=IODeviceWriteIOPSMax=*) continue ;;
+    --property=IODeviceWeightPerWeight=*) continue ;;
+    --property=IODeviceWeightPerWeightForWrites=*) continue ;;
+    --property=BlockIOWeight=*|--property=BlockIODeviceWeight=*|--property=BlockIOReadBandwidth=*|--property=BlockIOWriteBandwidth=*) continue ;;
+    # --- Memory control ---
+    --property=MemoryLow=*) continue ;;
+    --property=MemoryMin=*) continue ;;
+    --property=MemoryHigh=*) continue ;;
+    --property=MemoryMax=*) continue ;;
+    --property=MemoryZswapMax=*) continue ;;
+    --property=MemoryZswapWriteback=*) continue ;;
+    --property=MemoryZswapCompression=*) continue ;;
+    --property=MemoryZswapAcceptPercent=*) continue ;;
+    --property=DisableMemoryMax=*) continue ;;
+    --property=MemoryHighWriteback=*) continue ;;
+    # --- OOM / pressure / cachettl ---
+    --property=OOMScoreAdjust=*) continue ;;
+    --property=OOMPolicy=*) continue ;;
+    --property=OOMScoreAdjustPerWeight=*) continue ;;
+    --property=MemoryPressureWatch=*) continue ;;
+    --property=MemoryPressureThresholdSec=*) continue ;;
+    # --- Slices / delegation / unit metadata ---
+    --property=RequiresMountsFor=*) continue ;;
+    --property=CollectMode=*) continue ;;
+    --property=ConditionCPUFeature=*) continue ;;
+    --property=ConditionCPUs=*) continue ;;
+    --property=ConditionMemory=*) continue ;;
+    --property=ConditionCPUPressure=*) continue ;;
+    --property=ConditionMemoryPressure=*) continue ;;
+    --property=ConditionPathIsMountPoint=*) continue ;;
+    --property=ConditionDirectoryNotEmpty=*) continue ;;
+    --property=ConditionFileNotEmpty=*) continue ;;
+    --property=ConditionFileIsExecutable=*) continue ;;
+    --property=ConditionPathIsReadWrite=*) continue ;;
+    --property=ConditionPathIsSymbolicLink=*) continue ;;
+    --property=ConditionUser=*) continue ;;
+    --property=ConditionGroup=*) continue ;;
+    --property=ConditionVirtualization=*) continue ;;
+    --property=ConditionArchitecture=*) continue ;;
+    --property=ConditionFirmware=*) continue ;;
+    --property=ConditionFirstBoot=*) continue ;;
+    --property=ConditionKernelCommandLine=*) continue ;;
+    --property=ConditionKernelVersion=*) continue ;;
+    --property=ConditionSecurity=*) continue ;;
+    --property=ConditionControlGroupController=*) continue ;;
+    --property=ConditionCapability=*) continue ;;
+    --property=ConditionACPower=*) continue ;;
+    --property=ConditionNeedsUpdate=*) continue ;;
+    --property=ConditionNull=*) continue ;;
+    --property=AssertUser=*) continue ;;
+    --property=AssertDirectoryNotEmpty=*) continue ;;
+    --property=AssertFileNotEmpty=*) continue ;;
+    --property=AssertFileIsExecutable=*) continue ;;
+    --property=AssertPathExists=*) continue ;;
+    --property=AssertPathIsDirectory=*) continue ;;
+    --property=AssertPathIsSymbolicLink=*) continue ;;
+    --property=AssertPathIsMountPoint=*) continue ;;
+    --property=AssertPathIsReadWrite=*) continue ;;
+    --property=AssertPathIsEncrypted=*) continue ;;
+    --property=AssertVirtualization=*) continue ;;
+    --property=AssertArchitecture=*) continue ;;
+    --property=AssertFirstBoot=*) continue ;;
+    --property=AssertKernelVersion=*) continue ;;
+    --property=AssertKernelCommandLine=*) continue ;;
+    --property=AssertSecurity=*) continue ;;
+    --property=AssertControlGroupController=*) continue ;;
+    --property=AssertCapability=*) continue ;;
+    --property=AssertCPUFeature=*) continue ;;
+    --property=AssertCPUs=*) continue ;;
+    --property=AssertMemory=*) continue ;;
+    --property=AssertACPower=*) continue ;;
+    --property=AssertNeedsUpdate=*) continue ;;
+    --property=AssertNull=*) continue ;;
+    # --- Misc unit ---
+    --property=OnFailure=*) continue ;;
+    --property=SuccessAction=*) continue ;;
+    --property=FailureAction=*) continue ;;
+    --property=Restart=*) continue ;;
+    --property=RestartSec=*) continue ;;
+    --property=RestartPreventExitStatus=*) continue ;;
+    --property=RestartForceExitStatus=*) continue ;;
+    --property=WatchdogSec=*) continue ;;
+    --property=TimeoutStartSec=*) continue ;;
+    --property=TimeoutStopSec=*) continue ;;
+    --property=TimeoutAbortSec=*) continue ;;
+    --property=TimeoutCleanSec=*) continue ;;
+    --property=TimeoutStartFailureMode=*) continue ;;
+    --property=TimeoutStopFailureMode=*) continue ;;
+    --property=RuntimeMaxSec=*) continue ;;
+    --property=RuntimeRandomizedExtraSec=*) continue ;;
+    # Unrecognized properties - log and warn visibly
+    --property=*) UNRECOGNIZED_PROPS+=("$arg"); _warn_dsr "Unrecognized --property: $arg"; continue ;;
+    --property) SKIP_NEXT=true; continue ;;
+    --user|--uid=*|--gid=*|--setenv=*) continue ;;
+    --setenv) SKIP_NEXT=true; continue ;;
+    --) shift; CMD_ARGS+=("$@"); break ;;
+    *) CMD_ARGS+=("$arg") ;;
+    esac
+    done
+    if [[ ${#CMD_ARGS[@]} -eq 0 ]]; then
+        _log_dsr "ERROR: No command arguments found after parsing. Raw args: $*"
+        exit 1
+    fi
+    if [[ ${#UNRECOGNIZED_PROPS[@]} -gt 0 ]]; then
+        _warn_dsr "=========================================="
+        _warn_dsr "UNRECOGNIZED PROPERTIES DETECTED (${#UNRECOGNIZED_PROPS[@]} total):"
+        for _up in "${UNRECOGNIZED_PROPS[@]}"; do
+            _warn_dsr "  - $_up"
+        done
+        _warn_dsr "These properties were IGNORED. If AUR builds fail, check $_DSR_LOG"
+        _warn_dsr "for which properties Pamac/makepkg now expects."
+        _warn_dsr "You may need to update this fake systemd-run wrapper."
+        _warn_dsr "=========================================="
+    fi
+    if [[ -n "$WORK_DIR" ]]; then
+    mkdir -p "$WORK_DIR" 2>/dev/null || true
+    if $DYNAMIC_USER; then chown HOST_USER_PLACEHOLDER:HOST_USER_PLACEHOLDER "$WORK_DIR" 2>/dev/null || true; fi
+    fi
+    if [[ -n "$CACHE_DIR" ]]; then
+    CACHE_FULL="/var/cache/$CACHE_DIR"
+    mkdir -p "$CACHE_FULL" 2>/dev/null || true
+    if $DYNAMIC_USER; then chown -R HOST_USER_PLACEHOLDER:HOST_USER_PLACEHOLDER "$CACHE_FULL" 2>/dev/null || true; fi
+    fi
+    if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
+    # Use a dedicated build user to isolate AUR builds from the host user'\''s
+    # home directory. A malicious AUR package gains only build-user access.
+    BUILD_USER="_builduser"
+    _BL_TMP_HOME=""
+    if ! id "$BUILD_USER" >/dev/null 2>&1; then
+        if ! useradd -r -d /var/lib/builduser -s /usr/bin/nologin "$BUILD_USER" 2>/dev/null; then
+            _warn_dsr "useradd -r failed — trying ad-hoc non-root build user as fallback"
+            # Ensure /var/tmp has the sticky bit so only directory owners can delete
+            # within it. /var/tmp is container-internal (not a host mount in Distrobox),
+            # so temporary homes placed here stay isolated from the host'\''s /home.
+            chmod +t /var/tmp 2>/dev/null || true
+            _bl_tmp=$(mktemp -d /var/tmp/builduser-home-XXXXXX) || _bl_tmp=""
+            if [[ -n "$_bl_tmp" ]]; then
+                # Validate: temp home must NOT be under /home (host mount overlap risk)
+                case "$_bl_tmp" in
+                    /home/*)
+                        _warn_dsr "REFUSING temp home under /home (host mount overlap): $_bl_tmp"
+                        rmdir "$_bl_tmp" 2>/dev/null || true
+                        _bl_tmp=""
+                        ;;
+                    *)
+                        chmod 0700 "$_bl_tmp" 2>/dev/null || true
+                        ;;
+                esac
+            fi
+            if [[ -n "$_bl_tmp" ]]; then
+                BUILD_USER="_brecover$(date +%s|tail -c7)"
+                if ! useradd -M -d "$_bl_tmp" -s /bin/bash "$BUILD_USER" 2>/dev/null; then
+                    rmdir "$_bl_tmp" 2>/dev/null || true
+                    BUILD_USER=""
+                else
+                    _BL_TMP_HOME="$_bl_tmp"
+                    _log_dsr "Ad-hoc build user $_BL_TMP_HOME created (isolated from host mounts)"
+                fi
+            fi
+            if [[ -z "$BUILD_USER" ]] || ! id "$BUILD_USER" >/dev/null 2>&1; then
+                _warn_dsr "FATAL: Cannot create a dedicated build user (useradd -r and ad-hoc user both failed)."
+                _warn_dsr "Refusing to drop privileges to '\''nobody'\'' — it lacks a writable home and is unsafe for AUR builds."
+                _warn_dsr "Aborting DynamicUser build to avoid running a potentially untrusted package with no isolation."
+                echo "systemd-run(fake): FATAL: no build user available, refusing to run as nobody" >&2
+                exit 127
+            fi
+        fi
+        mkdir -p /var/lib/builduser 2>/dev/null || true
+        chown "$BUILD_USER:$BUILD_USER" /var/lib/builduser 2>/dev/null || true
+    fi
+    if [[ -n "$WORK_DIR" ]]; then
+    _log_dsr "EXEC: sudo -u $BUILD_USER -- cd $WORK_DIR; ${CMD_ARGS[*]}"
+    if [[ -n "$_BL_TMP_HOME" ]]; then
+        sudo -u "$BUILD_USER" -H -- bash -c '\''cd "$1" 2>/dev/null; shift; exec "$@"'\'' _ "$WORK_DIR" "${CMD_ARGS[@]}"
+        _user_cmd_exit=$?
+        userdel -r "$BUILD_USER" 2>/dev/null || true
+        rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
+        exit $_user_cmd_exit
+    else
+        exec sudo -u "$BUILD_USER" -H -- bash -c '\''cd "$1" 2>/dev/null; shift; exec "$@"'\'' _ "$WORK_DIR" "${CMD_ARGS[@]}"
+    fi
+    else
+    _log_dsr "EXEC: sudo -u $BUILD_USER -- ${CMD_ARGS[*]}"
+    if [[ -n "$_BL_TMP_HOME" ]]; then
+        sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
+        _user_cmd_exit=$?
+        userdel -r "$BUILD_USER" 2>/dev/null || true
+        rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
+        exit $_user_cmd_exit
+    else
+        exec sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
+    fi
+    fi
+    else
+    if [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR" ]]; then cd "$WORK_DIR" 2>/dev/null || true; fi
+    _log_dsr "EXEC: ${CMD_ARGS[*]}"
+    exec "${CMD_ARGS[@]}"
+    fi
+SYSTEMD_RUN_FAKE_HEREDOC
+    chmod +x /usr/local/sbin/systemd-run
+    _atomic_sed_inplace /usr/local/sbin/systemd-run "s/HOST_USER_PLACEHOLDER/$HOST_USER/g"
+}
 '
 
 exec_container_script() {
@@ -3916,468 +4390,7 @@ if [[ "$_STRICT_SECURITY_MODE" == "true" ]]; then
     echo "  This is by design: --strict-security prioritizes correctness over"
     echo "  compatibility with DynamicUser outside of systemd."
 elif ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/dev/null 2>&1; then
-cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE'
-#!/bin/bash
-# Fake systemd-run for non-systemd containers (Distrobox).
-# Mimics the subset of systemd-run used by Pamac/makepkg for DynamicUser builds.
-# Logs unrecognized arguments to /tmp/systemd-run-fake.log for diagnostics.
-# Prints visible warnings to stderr when unrecognized properties are detected.
-_DSR_LOG="/tmp/systemd-run-fake.log"
-DSR_VERSION="2.0"
-_log_dsr() { echo "[$(date '+%H:%M:%S')] $*" >> "$_DSR_LOG" 2>/dev/null; }
-_warn_dsr() { echo "systemd-run(fake): WARNING: $*" >> "$_DSR_LOG" 2>/dev/null; echo "systemd-run(fake): WARNING: $*" >&2 2>/dev/null || true; }
-
-# Pre-flight: clean up orphaned ad-hoc build users and temp home directories
-# left behind by interrupted builds. Ad-hoc users are named _brecover* and
-# own /var/tmp/builduser-home-* directories.
-_cleanup_orphaned_buildusers() {
-    local _orphan_users=""
-    _orphan_users=$(getent passwd 2>/dev/null | awk -F: '$1 ~ /^_brecover/ { print $1 }' || true)
-    for _ou in $_orphan_users; do
-        _warn_dsr "Cleaning up orphaned build user: $_ou"
-        userdel -r "$_ou" 2>/dev/null || userdel "$_ou" 2>/dev/null || true
-    done
-    for _dir in /var/tmp/builduser-home-*; do
-        [[ -d "$_dir" ]] || continue
-        # Only remove if owned by root (build users run as non-root, so a
-        # non-root-owned directory might be an active build's workspace).
-        if [[ "$(stat -c '%U' "$_dir" 2>/dev/null || echo root)" == "root" ]]; then
-            _warn_dsr "Removing orphaned build-user home: $_dir"
-            rm -rf "$_dir" 2>/dev/null || true
-        fi
-    done
-}
-_cleanup_orphaned_buildusers
-
-# Passthrough: --help and --version are not meaningful here
-for _a in "$@"; do
-    case "$_a" in
-        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo "Recognized options: --property=DynamicUser=yes, --property=CacheDirectory=*, --property=WorkingDirectory=*, --property=StateDirectory=*, --property=LogsDirectory=*, --property=RuntimeDirectory=*, --property=TemporaryFileSystem=*, --property=BindPaths=*, --property=BindReadOnlyPaths=*, --property=ProtectSystem=*, --property=ProtectHome=*, --property=PrivateTmp=*, --property=NoNewPrivileges=*, --property=MemoryDenyWriteExecute=*, --property=SystemCallFilter=*, --property=CapabilityBoundingSet=*, --property=User=*, --property=Group=*, --property=SupplementaryGroups=*, --property=AmbientCapabilities=*, --property=EnvironmentFile=*, --property=Type=*, --property=RemainAfterExit=*, --property=Ephemeral=*, --property=Slice=*, --property=IOSchedulingClass=*, --property=CPUSchedulingPolicy=*, --property=RestrictNamespaces=*, --property=RestrictSUIDSGID=*, --property=LockPersonality=*, --property=RestrictRealtime=*, --property=RestrictAddressFamilies=*, --property=RemoveIPC=*, --property=UMask=*, --property=KeyringMode=*, --property=ProtectClock=*, --property=ProtectKernelTunables=*, --property=ProtectKernelModules=*, --property=ProtectKernelLogs=*, --property=ProtectControlGroups=*, --property=ProtectHostname=*, --property=ProtectProc=*, --property=ProcSubset=*, --property=MemorySwapMax=*, --property=CPUQuota=*, --property=DeviceAllow=*, --property=DevicePolicy=*, --property=RestrictFileSystems=*, --property=SocketBindDeny=*, --property=SocketBindAllow=*, --property=IPAddressAllow=*, --property=IPAddressDeny=*, and all other systemd.exec(5)/resource-control(5)/service(5) --property= sandboxing (Private*, Protect*, ReadWritePaths, RootDirectory, ...), resource (Limit*, *Accounting, *Max, *Weight, IO*, Memory*, CPU*), logging (StandardIO, Syslog*, LogLevel*), Condition*, Assert*, and Timeout*/Restart* options (recognized and dropped in this non-systemd env; sandboxing drops are logged to /tmp/systemd-run-fake.log), --pipe, --wait, --quiet, --no-block, --description=*, --unit=*, --service-type=*, --user, --uid=*, --gid=*, --setenv=*, --"; exit 0 ;;
-        --version) echo "systemd-run (fake) v${DSR_VERSION} (SteamOS-Pamac)"; exit 0 ;;
-    esac
-done
-
-DYNAMIC_USER=false
-CACHE_DIR=""
-WORK_DIR=""
-SKIP_NEXT=false
-PIPE_MODE=false
-WAIT_MODE=false
-DESCRIPTION=""
-UNRECOGNIZED_PROPS=()
-CMD_ARGS=()
-for arg in "$@"; do
-if $SKIP_NEXT; then
-SKIP_NEXT=false
-continue
-fi
-case "$arg" in
---service-type=*) continue ;;
---service-type) SKIP_NEXT=true; continue ;;
---pipe) PIPE_MODE=true; continue ;;
---wait) WAIT_MODE=true; continue ;;
---pty|-q|--quiet|--no-block) continue ;;
---description=*) DESCRIPTION="${arg#--description=}"; continue ;;
---description) SKIP_NEXT=true; continue ;;
---unit=*) continue ;;
---unit) SKIP_NEXT=true; continue ;;
---property=DynamicUser=yes) DYNAMIC_USER=true; continue ;;
---property=CacheDirectory=*) CACHE_DIR="${arg#--property=CacheDirectory=}"; continue ;;
---property=WorkingDirectory=*) WORK_DIR="${arg#--property=WorkingDirectory=}"; continue ;;
-# Recognized but currently unimplemented properties in this fake systemd-run.
-# Security-hardening properties (Protect*, SystemCallFilter, ...) are DROPPED
-# in the non-systemd container — they cannot be enforced outside a unit. We log
-# every dropped property to /tmp/systemd-run-fake.log so a build that depended
-# on a property's behavior (not just its presence) is debuggable. Resource and
-# metadata properties that have no sandboxing impact stay silent for brevity.
---property=StateDirectory=*) continue ;;
---property=LogsDirectory=*) continue ;;
---property=RuntimeDirectory=*) continue ;;
---property=Type=*) continue ;;
---property=RemainAfterExit=*) continue ;;
---property=TemporaryFileSystem=*) continue ;;
---property=BindPaths=*) continue ;;
---property=BindReadOnlyPaths=*) continue ;;
---property=ProtectSystem=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectHome=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=PrivateTmp=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=NoNewPrivileges=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=MemoryDenyWriteExecute=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=SystemCallFilter=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=CapabilityBoundingSet=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=User=*) continue ;;
---property=Group=*) continue ;;
---property=SupplementaryGroups=*) continue ;;
---property=AmbientCapabilities=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=EnvironmentFile=*) continue ;;
---property=Ephemeral=*) continue ;;
---property=Slice=*) continue ;;
---property=IOSchedulingClass=*) continue ;;
---property=CPUSchedulingPolicy=*) continue ;;
---property=RestrictNamespaces=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RestrictSUIDSGID=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=LockPersonality=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RestrictRealtime=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RestrictAddressFamilies=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RemoveIPC=*) continue ;;
---property=UMask=*) continue ;;
---property=KeyringMode=*) continue ;;
---property=ProtectClock=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectKernelTunables=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectKernelModules=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectKernelLogs=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectControlGroups=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectHostname=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectProc=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProcSubset=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=MemorySwapMax=*) continue ;;
---property=CPUQuota=*) continue ;;
---property=DeviceAllow=*) continue ;;
---property=DevicePolicy=*) continue ;;
---property=RestrictFileSystems=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=SocketBindDeny=*) continue ;;
---property=SocketBindAllow=*) continue ;;
---property=IPAddressAllow=*) continue ;;
---property=IPAddressDeny=*) continue ;;
-# Additional recognized systemd-run properties (not previously handled).
-# Grouped per systemd.exec(5)/systemd.resource-control(5). Security/sandboxing
-# properties are logged via _warn_dsr when dropped (same convention as above);
-# resource/accounting/metadata/IO/log properties stay silent.
-# --- Filesystem / namespace sandboxing ---
---property=PrivateDevices=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=PrivateMounts=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=PrivateNetwork=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=PrivateUsers=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=MountFlags=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=MountAPIVFS=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ReadWritePaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ReadOnlyPaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=InaccessiblePaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ExecPaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=NoExecPaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ConfigurationDirectory=*) continue ;;
---property=RootDirectory=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RootImage=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RootHash=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RootVerity=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=MountImages=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ExtensionImages=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=NamespacePath=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=NetworkNamespacePath=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=LogNamespace=*) continue ;;
-# --- Capabilities / privileges ---
---property=InheritDescriptors=*) continue ;;
---property=SecureBits=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
-# --- Environment ---
---property=Environment=*) continue ;;
---property=PassEnvironment=*) continue ;;
---property=UnsetEnvironment=*) continue ;;
-# --- Personality / arch ---
---property=Personality=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=SystemCallArchitectures=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=SystemCallErrorNumber=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=SystemCallLog=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
-# --- IPC / time / misc ---
---property=TimerSlackNSec=*) continue ;;
---property=SetLoginEnvironment=*) continue ;;
---property=Delegate=*) continue ;;
---property=DisableExtraFileDescriptors=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=CoredumpReceive=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=DynamicUser=*) continue ;;
-# --- Standard I/O / logging ---
---property=StandardInput=*) continue ;;
---property=StandardOutput=*) continue ;;
---property=StandardError=*) continue ;;
---property=StandardInputText=*) continue ;;
---property=StandardInputFileDescriptor=*) continue ;;
---property=StandardInputData=*) continue ;;
---property=StandardOutputFileDescriptor=*) continue ;;
---property=StandardErrorFileDescriptor=*) continue ;;
---property=TTYPath=*) continue ;;
---property=TTYReset=*) continue ;;
---property=TTYVHangup=*) continue ;;
---property=TTYVTDisallocate=*) continue ;;
---property=SyslogIdentifier=*) continue ;;
---property=SyslogFacility=*) continue ;;
---property=SyslogLevel=*) continue ;;
---property=SyslogLevelPrefix=*) continue ;;
---property=LogLevelMax=*) continue ;;
---property=LogRateLimitIntervalSec=*) continue ;;
---property=LogRateLimitBurst=*) continue ;;
---property=LogExtraFields=*) continue ;;
---property=LogFilterPatterns=*) continue ;;
---property=LogFilterAllow=*) continue ;;
---property=LogFilterDeny=*) continue ;;
---property=LogLevelOverride=*) continue ;;
-# --- Resource limits (RLIMIT_*) and accounting ---
---property=LimitCPU=*) continue ;;
---property=LimitCPUSoft=*) continue ;;
---property=LimitFSIZE=*) continue ;;
---property=LimitFIZESoft=*) continue ;;
---property=LimitDATA=*) continue ;;
---property=LimitDATASoft=*) continue ;;
---property=LimitSTACK=*) continue ;;
---property=LimitSTACKSoft=*) continue ;;
---property=LimitCORE=*) continue ;;
---property=LimitCORESoft=*) continue ;;
---property=LimitRSS=*) continue ;;
---property=LimitRSSSoft=*) continue ;;
---property=LimitNOFILE=*) continue ;;
---property=LimitNOFILESoft=*) continue ;;
---property=LimitAS=*) continue ;;
---property=LimitASSoft=*) continue ;;
---property=LimitNPROC=*) continue ;;
---property=LimitNPROCSoft=*) continue ;;
---property=LimitMEMLOCK=*) continue ;;
---property=LimitMEMLOCKSoft=*) continue ;;
---property=LimitLOCKS=*) continue ;;
---property=LimitLOCKSSoft=*) continue ;;
---property=LimitSIGPENDING=*) continue ;;
---property=LimitSIGPENDINGSoft=*) continue ;;
---property=LimitMSGQUEUE=*) continue ;;
---property=LimitMSGQUEUESoft=*) continue ;;
---property=LimitNICE=*) continue ;;
---property=LimitNICESoft=*) continue ;;
---property=LimitRTPRIO=*) continue ;;
---property=LimitRTPRIOSoft=*) continue ;;
---property=LimitRTTIME=*) continue ;;
---property=LimitRTTIMESoft=*) continue ;;
---property=LimitNFILEVSZ=*) continue ;;
---property=TasksMax=*) continue ;;
---property=TasksAccounting=*) continue ;;
---property=CPUAccounting=*) continue ;;
---property=MemoryAccounting=*) continue ;;
---property=IOAccounting=*) continue ;;
---property=IPAccounting=*) continue ;;
---property=TasksMaxScalePercent=*) continue ;;
---property=TasksMaxInhibitPercent=*) continue ;;
-# --- CPU / scheduling control ---
---property=CPUWeight=*) continue ;;
---property=StartupCPUWeight=*) continue ;;
---property=CPUWeightPerWeight=*) continue ;;
---property=AllowedCPUs=*) continue ;;
---property=StartupAllowedCPUs=*) continue ;;
---property=AllowedMemoryNodes=*) continue ;;
---property=StartupAllowedMemoryNodes=*) continue ;;
---property=CPUQuotaPeriodSec=*) continue ;;
---property=AllowedMemoryNodesPerWeight=*) continue ;;
---property=DisableControllers=*) continue ;;
---property=ManagedOOMSwap=*) continue ;;
---property=ManagedOOMMemoryPressure=*) continue ;;
---property=ManagedOOMMemoryPressureLimit=*) continue ;;
---property=ManagedOOMPreference=*) continue ;;
-# --- IO / block control ---
---property=IOWeight=*) continue ;;
---property=StartupIOWeight=*) continue ;;
---property=IODeviceWeight=*) continue ;;
---property=IODeviceLatencyTargetSec=*) continue ;;
---property=IOReadBandwidthMax=*) continue ;;
---property=IOWriteBandwidthMax=*) continue ;;
---property=IOReadIOPSMax=*) continue ;;
---property=IOWriteIOPSMax=*) continue ;;
---property=IODeviceWriteLatencyTargetSec=*) continue ;;
---property=IODeviceReadIOPSMax=*) continue ;;
---property=IODeviceWriteIOPSMax=*) continue ;;
---property=IODeviceWeightPerWeight=*) continue ;;
---property=IODeviceWeightPerWeightForWrites=*) continue ;;
---property=BlockIOWeight=*|--property=BlockIODeviceWeight=*|--property=BlockIOReadBandwidth=*|--property=BlockIOWriteBandwidth=*) continue ;;
-# --- Memory control ---
---property=MemoryLow=*) continue ;;
---property=MemoryMin=*) continue ;;
---property=MemoryHigh=*) continue ;;
---property=MemoryMax=*) continue ;;
---property=MemoryZswapMax=*) continue ;;
---property=MemoryZswapWriteback=*) continue ;;
---property=MemoryZswapCompression=*) continue ;;
---property=MemoryZswapAcceptPercent=*) continue ;;
---property=DisableMemoryMax=*) continue ;;
---property=MemoryHighWriteback=*) continue ;;
-# --- OOM / pressure / cachettl ---
---property=OOMScoreAdjust=*) continue ;;
---property=OOMPolicy=*) continue ;;
---property=OOMScoreAdjustPerWeight=*) continue ;;
---property=MemoryPressureWatch=*) continue ;;
---property=MemoryPressureThresholdSec=*) continue ;;
-# --- Slices / delegation / unit metadata ---
---property=RequiresMountsFor=*) continue ;;
---property=CollectMode=*) continue ;;
---property=ConditionCPUFeature=*) continue ;;
---property=ConditionCPUs=*) continue ;;
---property=ConditionMemory=*) continue ;;
---property=ConditionCPUPressure=*) continue ;;
---property=ConditionMemoryPressure=*) continue ;;
---property=ConditionPathIsMountPoint=*) continue ;;
---property=ConditionDirectoryNotEmpty=*) continue ;;
---property=ConditionFileNotEmpty=*) continue ;;
---property=ConditionFileIsExecutable=*) continue ;;
---property=ConditionPathIsReadWrite=*) continue ;;
---property=ConditionPathIsSymbolicLink=*) continue ;;
---property=ConditionUser=*) continue ;;
---property=ConditionGroup=*) continue ;;
---property=ConditionVirtualization=*) continue ;;
---property=ConditionArchitecture=*) continue ;;
---property=ConditionFirmware=*) continue ;;
---property=ConditionFirstBoot=*) continue ;;
---property=ConditionKernelCommandLine=*) continue ;;
---property=ConditionKernelVersion=*) continue ;;
---property=ConditionSecurity=*) continue ;;
---property=ConditionControlGroupController=*) continue ;;
---property=ConditionCapability=*) continue ;;
---property=ConditionACPower=*) continue ;;
---property=ConditionNeedsUpdate=*) continue ;;
---property=ConditionNull=*) continue ;;
---property=AssertUser=*) continue ;;
---property=AssertDirectoryNotEmpty=*) continue ;;
---property=AssertFileNotEmpty=*) continue ;;
---property=AssertFileIsExecutable=*) continue ;;
---property=AssertPathExists=*) continue ;;
---property=AssertPathIsDirectory=*) continue ;;
---property=AssertPathIsSymbolicLink=*) continue ;;
---property=AssertPathIsMountPoint=*) continue ;;
---property=AssertPathIsReadWrite=*) continue ;;
---property=AssertPathIsEncrypted=*) continue ;;
---property=AssertVirtualization=*) continue ;;
---property=AssertArchitecture=*) continue ;;
---property=AssertFirstBoot=*) continue ;;
---property=AssertKernelVersion=*) continue ;;
---property=AssertKernelCommandLine=*) continue ;;
---property=AssertSecurity=*) continue ;;
---property=AssertControlGroupController=*) continue ;;
---property=AssertCapability=*) continue ;;
---property=AssertCPUFeature=*) continue ;;
---property=AssertCPUs=*) continue ;;
---property=AssertMemory=*) continue ;;
---property=AssertACPower=*) continue ;;
---property=AssertNeedsUpdate=*) continue ;;
---property=AssertNull=*) continue ;;
-# --- Misc unit ---
---property=OnFailure=*) continue ;;
---property=SuccessAction=*) continue ;;
---property=FailureAction=*) continue ;;
---property=Restart=*) continue ;;
---property=RestartSec=*) continue ;;
---property=RestartPreventExitStatus=*) continue ;;
---property=RestartForceExitStatus=*) continue ;;
---property=WatchdogSec=*) continue ;;
---property=TimeoutStartSec=*) continue ;;
---property=TimeoutStopSec=*) continue ;;
---property=TimeoutAbortSec=*) continue ;;
---property=TimeoutCleanSec=*) continue ;;
---property=TimeoutStartFailureMode=*) continue ;;
---property=TimeoutStopFailureMode=*) continue ;;
---property=RuntimeMaxSec=*) continue ;;
---property=RuntimeRandomizedExtraSec=*) continue ;;
-# Unrecognized properties - log and warn visibly
---property=*) UNRECOGNIZED_PROPS+=("$arg"); _warn_dsr "Unrecognized --property: $arg"; continue ;;
---property) SKIP_NEXT=true; continue ;;
---user|--uid=*|--gid=*|--setenv=*) continue ;;
---setenv) SKIP_NEXT=true; continue ;;
---) shift; CMD_ARGS+=("$@"); break ;;
-*) CMD_ARGS+=("$arg") ;;
-esac
-done
-if [[ ${#CMD_ARGS[@]} -eq 0 ]]; then
-    _log_dsr "ERROR: No command arguments found after parsing. Raw args: $*"
-    exit 1
-fi
-if [[ ${#UNRECOGNIZED_PROPS[@]} -gt 0 ]]; then
-    _warn_dsr "=========================================="
-    _warn_dsr "UNRECOGNIZED PROPERTIES DETECTED (${#UNRECOGNIZED_PROPS[@]} total):"
-    for _up in "${UNRECOGNIZED_PROPS[@]}"; do
-        _warn_dsr "  - $_up"
-    done
-    _warn_dsr "These properties were IGNORED. If AUR builds fail, check $_DSR_LOG"
-    _warn_dsr "for which properties Pamac/makepkg now expects."
-    _warn_dsr "You may need to update this fake systemd-run wrapper."
-    _warn_dsr "=========================================="
-fi
-if [[ -n "$WORK_DIR" ]]; then
-mkdir -p "$WORK_DIR" 2>/dev/null || true
-if $DYNAMIC_USER; then chown HOST_USER_PLACEHOLDER:HOST_USER_PLACEHOLDER "$WORK_DIR" 2>/dev/null || true; fi
-fi
-if [[ -n "$CACHE_DIR" ]]; then
-CACHE_FULL="/var/cache/$CACHE_DIR"
-mkdir -p "$CACHE_FULL" 2>/dev/null || true
-if $DYNAMIC_USER; then chown -R HOST_USER_PLACEHOLDER:HOST_USER_PLACEHOLDER "$CACHE_FULL" 2>/dev/null || true; fi
-fi
-if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
-# Use a dedicated build user to isolate AUR builds from the host user's
-# home directory. A malicious AUR package gains only build-user access.
-BUILD_USER="_builduser"
-_BL_TMP_HOME=""
-if ! id "$BUILD_USER" >/dev/null 2>&1; then
-    if ! useradd -r -d /var/lib/builduser -s /usr/bin/nologin "$BUILD_USER" 2>/dev/null; then
-        _warn_dsr "useradd -r failed — trying ad-hoc non-root build user as fallback"
-        # Ensure /var/tmp has the sticky bit so only directory owners can delete
-        # within it. /var/tmp is container-internal (not a host mount in Distrobox),
-        # so temporary homes placed here stay isolated from the host's /home.
-        chmod +t /var/tmp 2>/dev/null || true
-        _bl_tmp=$(mktemp -d /var/tmp/builduser-home-XXXXXX) || _bl_tmp=""
-        if [[ -n "$_bl_tmp" ]]; then
-            # Validate: temp home must NOT be under /home (host mount overlap risk)
-            case "$_bl_tmp" in
-                /home/*)
-                    _warn_dsr "REFUSING temp home under /home (host mount overlap): $_bl_tmp"
-                    rmdir "$_bl_tmp" 2>/dev/null || true
-                    _bl_tmp=""
-                    ;;
-                *)
-                    chmod 0700 "$_bl_tmp" 2>/dev/null || true
-                    ;;
-            esac
-        fi
-        if [[ -n "$_bl_tmp" ]]; then
-            BUILD_USER="_brecover$(date +%s|tail -c7)"
-            if ! useradd -M -d "$_bl_tmp" -s /bin/bash "$BUILD_USER" 2>/dev/null; then
-                rmdir "$_bl_tmp" 2>/dev/null || true
-                BUILD_USER=""
-            else
-                _BL_TMP_HOME="$_bl_tmp"
-                _log_dsr "Ad-hoc build user $_BL_TMP_HOME created (isolated from host mounts)"
-            fi
-        fi
-        if [[ -z "$BUILD_USER" ]] || ! id "$BUILD_USER" >/dev/null 2>&1; then
-            _warn_dsr "FATAL: Cannot create a dedicated build user (useradd -r and ad-hoc user both failed)."
-            _warn_dsr "Refusing to drop privileges to 'nobody' — it lacks a writable home and is unsafe for AUR builds."
-            _warn_dsr "Aborting DynamicUser build to avoid running a potentially untrusted package with no isolation."
-            echo "systemd-run(fake): FATAL: no build user available, refusing to run as nobody" >&2
-            exit 127
-        fi
-    fi
-    mkdir -p /var/lib/builduser 2>/dev/null || true
-    chown "$BUILD_USER:$BUILD_USER" /var/lib/builduser 2>/dev/null || true
-fi
-if [[ -n "$WORK_DIR" ]]; then
-_log_dsr "EXEC: sudo -u $BUILD_USER -- cd $WORK_DIR; ${CMD_ARGS[*]}"
-if [[ -n "$_BL_TMP_HOME" ]]; then
-    sudo -u "$BUILD_USER" -H -- bash -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$WORK_DIR" "${CMD_ARGS[@]}"
-    _user_cmd_exit=$?
-    userdel -r "$BUILD_USER" 2>/dev/null || true
-    rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
-    exit $_user_cmd_exit
-else
-    exec sudo -u "$BUILD_USER" -H -- bash -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$WORK_DIR" "${CMD_ARGS[@]}"
-fi
-else
-_log_dsr "EXEC: sudo -u $BUILD_USER -- ${CMD_ARGS[*]}"
-if [[ -n "$_BL_TMP_HOME" ]]; then
-    sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
-    _user_cmd_exit=$?
-    userdel -r "$BUILD_USER" 2>/dev/null || true
-    rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
-    exit $_user_cmd_exit
-else
-    exec sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
-fi
-fi
-else
-if [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR" ]]; then cd "$WORK_DIR" 2>/dev/null || true; fi
-_log_dsr "EXEC: ${CMD_ARGS[*]}"
-exec "${CMD_ARGS[@]}"
-fi
-SYSTEMD_RUN_FAKE
-chmod +x /usr/local/sbin/systemd-run
-_atomic_sed_inplace /usr/local/sbin/systemd-run "s/HOST_USER_PLACEHOLDER/$HOST_USER/g"
+_write_fake_systemd_run_wrapper
 echo "Fake systemd-run installed at /usr/local/sbin/systemd-run (with ad-hoc build-user cleanup)."
 echo "Unrecognized arguments will be logged to /tmp/systemd-run-fake.log for debugging."
 
@@ -4684,463 +4697,7 @@ if [[ "$_STRICT_SECURITY_MODE" == "true" ]]; then
     echo "  instead of running with dropped sandbox properties (by design under"
     echo "  --strict-security)."
 elif ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/dev/null 2>&1; then
-mkdir -p /usr/local/sbin
-cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE'
-#!/bin/bash
-# Fake systemd-run for non-systemd containers (Distrobox).
-# Mimics the subset of systemd-run used by Pamac/makepkg for DynamicUser builds.
-# Logs unrecognized arguments to /tmp/systemd-run-fake.log for diagnostics.
-# Prints visible warnings to stderr when unrecognized properties are detected.
-_DSR_LOG="/tmp/systemd-run-fake.log"
-DSR_VERSION="2.0"
-_log_dsr() { echo "[$(date '+%H:%M:%S')] $*" >> "$_DSR_LOG" 2>/dev/null; }
-_warn_dsr() { echo "systemd-run(fake): WARNING: $*" >> "$_DSR_LOG" 2>/dev/null; echo "systemd-run(fake): WARNING: $*" >&2 2>/dev/null || true; }
-
-# Pre-flight: clean up orphaned ad-hoc build users and temp home directories
-# left behind by interrupted builds. Ad-hoc users are named _brecover* and
-# own /var/tmp/builduser-home-* directories.
-_cleanup_orphaned_buildusers() {
-    local _orphan_users=""
-    _orphan_users=$(getent passwd 2>/dev/null | awk -F: '$1 ~ /^_brecover/ { print $1 }' || true)
-    for _ou in $_orphan_users; do
-        _warn_dsr "Cleaning up orphaned build user: $_ou"
-        userdel -r "$_ou" 2>/dev/null || userdel "$_ou" 2>/dev/null || true
-    done
-    for _dir in /var/tmp/builduser-home-*; do
-        [[ -d "$_dir" ]] || continue
-        if [[ "$(stat -c '%U' "$_dir" 2>/dev/null || echo root)" == "root" ]]; then
-            _warn_dsr "Removing orphaned build-user home: $_dir"
-            rm -rf "$_dir" 2>/dev/null || true
-        fi
-    done
-}
-_cleanup_orphaned_buildusers
-
-# Passthrough: --help and --version are not meaningful here
-for _a in "$@"; do
-    case "$_a" in
-        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo "Recognized options: --property=DynamicUser=yes, --property=CacheDirectory=*, --property=WorkingDirectory=*, --property=StateDirectory=*, --property=LogsDirectory=*, --property=RuntimeDirectory=*, --property=TemporaryFileSystem=*, --property=BindPaths=*, --property=BindReadOnlyPaths=*, --property=ProtectSystem=*, --property=ProtectHome=*, --property=PrivateTmp=*, --property=NoNewPrivileges=*, --property=MemoryDenyWriteExecute=*, --property=SystemCallFilter=*, --property=CapabilityBoundingSet=*, --property=User=*, --property=Group=*, --property=SupplementaryGroups=*, --property=AmbientCapabilities=*, --property=EnvironmentFile=*, --property=Type=*, --property=RemainAfterExit=*, --property=Ephemeral=*, --property=Slice=*, --property=IOSchedulingClass=*, --property=CPUSchedulingPolicy=*, --property=RestrictNamespaces=*, --property=RestrictSUIDSGID=*, --property=LockPersonality=*, --property=RestrictRealtime=*, --property=RestrictAddressFamilies=*, --property=RemoveIPC=*, --property=UMask=*, --property=KeyringMode=*, --property=ProtectClock=*, --property=ProtectKernelTunables=*, --property=ProtectKernelModules=*, --property=ProtectKernelLogs=*, --property=ProtectControlGroups=*, --property=ProtectHostname=*, --property=ProtectProc=*, --property=ProcSubset=*, --property=MemorySwapMax=*, --property=CPUQuota=*, --property=DeviceAllow=*, --property=DevicePolicy=*, --property=RestrictFileSystems=*, --property=SocketBindDeny=*, --property=SocketBindAllow=*, --property=IPAddressAllow=*, --property=IPAddressDeny=*, and all other systemd.exec(5)/resource-control(5)/service(5) --property= sandboxing (Private*, Protect*, ReadWritePaths, RootDirectory, ...), resource (Limit*, *Accounting, *Max, *Weight, IO*, Memory*, CPU*), logging (StandardIO, Syslog*, LogLevel*), Condition*, Assert*, and Timeout*/Restart* options (recognized and dropped in this non-systemd env; sandboxing drops are logged to /tmp/systemd-run-fake.log), --pipe, --wait, --quiet, --no-block, --description=*, --unit=*, --service-type=*, --user, --uid=*, --gid=*, --setenv=*, --"; exit 0 ;;
-        --version) echo "systemd-run (fake) v${DSR_VERSION} (SteamOS-Pamac)"; exit 0 ;;
-    esac
-done
-
-DYNAMIC_USER=false
-CACHE_DIR=""
-WORK_DIR=""
-SKIP_NEXT=false
-PIPE_MODE=false
-WAIT_MODE=false
-DESCRIPTION=""
-UNRECOGNIZED_PROPS=()
-CMD_ARGS=()
-for arg in "$@"; do
-if $SKIP_NEXT; then
-SKIP_NEXT=false
-continue
-fi
-case "$arg" in
---service-type=*) continue ;;
---service-type) SKIP_NEXT=true; continue ;;
---pipe) PIPE_MODE=true; continue ;;
---wait) WAIT_MODE=true; continue ;;
---pty|-q|--quiet|--no-block) continue ;;
---description=*) DESCRIPTION="${arg#--description=}"; continue ;;
---description) SKIP_NEXT=true; continue ;;
---unit=*) continue ;;
---unit) SKIP_NEXT=true; continue ;;
---property=DynamicUser=yes) DYNAMIC_USER=true; continue ;;
---property=CacheDirectory=*) CACHE_DIR="${arg#--property=CacheDirectory=}"; continue ;;
---property=WorkingDirectory=*) WORK_DIR="${arg#--property=WorkingDirectory=}"; continue ;;
-# Recognized but currently unimplemented properties in this fake systemd-run.
-# Security-hardening properties (Protect*, SystemCallFilter, ...) are DROPPED
-# in the non-systemd container — they cannot be enforced outside a unit. We log
-# every dropped property to /tmp/systemd-run-fake.log so a build that depended
-# on a property's behavior (not just its presence) is debuggable. Resource and
-# metadata properties that have no sandboxing impact stay silent for brevity.
---property=StateDirectory=*) continue ;;
---property=LogsDirectory=*) continue ;;
---property=RuntimeDirectory=*) continue ;;
---property=Type=*) continue ;;
---property=RemainAfterExit=*) continue ;;
---property=TemporaryFileSystem=*) continue ;;
---property=BindPaths=*) continue ;;
---property=BindReadOnlyPaths=*) continue ;;
---property=ProtectSystem=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectHome=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=PrivateTmp=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=NoNewPrivileges=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=MemoryDenyWriteExecute=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=SystemCallFilter=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=CapabilityBoundingSet=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=User=*) continue ;;
---property=Group=*) continue ;;
---property=SupplementaryGroups=*) continue ;;
---property=AmbientCapabilities=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=EnvironmentFile=*) continue ;;
---property=Ephemeral=*) continue ;;
---property=Slice=*) continue ;;
---property=IOSchedulingClass=*) continue ;;
---property=CPUSchedulingPolicy=*) continue ;;
---property=RestrictNamespaces=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RestrictSUIDSGID=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=LockPersonality=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RestrictRealtime=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RestrictAddressFamilies=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RemoveIPC=*) continue ;;
---property=UMask=*) continue ;;
---property=KeyringMode=*) continue ;;
---property=ProtectClock=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectKernelTunables=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectKernelModules=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectKernelLogs=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectControlGroups=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectHostname=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProtectProc=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ProcSubset=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=MemorySwapMax=*) continue ;;
---property=CPUQuota=*) continue ;;
---property=DeviceAllow=*) continue ;;
---property=DevicePolicy=*) continue ;;
---property=RestrictFileSystems=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=SocketBindDeny=*) continue ;;
---property=SocketBindAllow=*) continue ;;
---property=IPAddressAllow=*) continue ;;
---property=IPAddressDeny=*) continue ;;
-# Additional recognized systemd-run properties (not previously handled).
-# Grouped per systemd.exec(5)/systemd.resource-control(5). Security/sandboxing
-# properties are logged via _warn_dsr when dropped (same convention as above);
-# resource/accounting/metadata/IO/log properties stay silent.
-# --- Filesystem / namespace sandboxing ---
---property=PrivateDevices=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=PrivateMounts=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=PrivateNetwork=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=PrivateUsers=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=MountFlags=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=MountAPIVFS=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ReadWritePaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ReadOnlyPaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=InaccessiblePaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ExecPaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=NoExecPaths=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ConfigurationDirectory=*) continue ;;
---property=RootDirectory=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RootImage=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RootHash=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=RootVerity=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=MountImages=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=ExtensionImages=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=NamespacePath=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=NetworkNamespacePath=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=LogNamespace=*) continue ;;
-# --- Capabilities / privileges ---
---property=InheritDescriptors=*) continue ;;
---property=SecureBits=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
-# --- Environment ---
---property=Environment=*) continue ;;
---property=PassEnvironment=*) continue ;;
---property=UnsetEnvironment=*) continue ;;
-# --- Personality / arch ---
---property=Personality=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=SystemCallArchitectures=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=SystemCallErrorNumber=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=SystemCallLog=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
-# --- IPC / time / misc ---
---property=TimerSlackNSec=*) continue ;;
---property=SetLoginEnvironment=*) continue ;;
---property=Delegate=*) continue ;;
---property=DisableExtraFileDescriptors=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=CoredumpReceive=*) _warn_dsr "Dropped --property (non-systemd env, no sandboxing): $arg"; continue ;;
---property=DynamicUser=*) continue ;;
-# --- Standard I/O / logging ---
---property=StandardInput=*) continue ;;
---property=StandardOutput=*) continue ;;
---property=StandardError=*) continue ;;
---property=StandardInputText=*) continue ;;
---property=StandardInputFileDescriptor=*) continue ;;
---property=StandardInputData=*) continue ;;
---property=StandardOutputFileDescriptor=*) continue ;;
---property=StandardErrorFileDescriptor=*) continue ;;
---property=TTYPath=*) continue ;;
---property=TTYReset=*) continue ;;
---property=TTYVHangup=*) continue ;;
---property=TTYVTDisallocate=*) continue ;;
---property=SyslogIdentifier=*) continue ;;
---property=SyslogFacility=*) continue ;;
---property=SyslogLevel=*) continue ;;
---property=SyslogLevelPrefix=*) continue ;;
---property=LogLevelMax=*) continue ;;
---property=LogRateLimitIntervalSec=*) continue ;;
---property=LogRateLimitBurst=*) continue ;;
---property=LogExtraFields=*) continue ;;
---property=LogFilterPatterns=*) continue ;;
---property=LogFilterAllow=*) continue ;;
---property=LogFilterDeny=*) continue ;;
---property=LogLevelOverride=*) continue ;;
-# --- Resource limits (RLIMIT_*) and accounting ---
---property=LimitCPU=*) continue ;;
---property=LimitCPUSoft=*) continue ;;
---property=LimitFSIZE=*) continue ;;
---property=LimitFIZESoft=*) continue ;;
---property=LimitDATA=*) continue ;;
---property=LimitDATASoft=*) continue ;;
---property=LimitSTACK=*) continue ;;
---property=LimitSTACKSoft=*) continue ;;
---property=LimitCORE=*) continue ;;
---property=LimitCORESoft=*) continue ;;
---property=LimitRSS=*) continue ;;
---property=LimitRSSSoft=*) continue ;;
---property=LimitNOFILE=*) continue ;;
---property=LimitNOFILESoft=*) continue ;;
---property=LimitAS=*) continue ;;
---property=LimitASSoft=*) continue ;;
---property=LimitNPROC=*) continue ;;
---property=LimitNPROCSoft=*) continue ;;
---property=LimitMEMLOCK=*) continue ;;
---property=LimitMEMLOCKSoft=*) continue ;;
---property=LimitLOCKS=*) continue ;;
---property=LimitLOCKSSoft=*) continue ;;
---property=LimitSIGPENDING=*) continue ;;
---property=LimitSIGPENDINGSoft=*) continue ;;
---property=LimitMSGQUEUE=*) continue ;;
---property=LimitMSGQUEUESoft=*) continue ;;
---property=LimitNICE=*) continue ;;
---property=LimitNICESoft=*) continue ;;
---property=LimitRTPRIO=*) continue ;;
---property=LimitRTPRIOSoft=*) continue ;;
---property=LimitRTTIME=*) continue ;;
---property=LimitRTTIMESoft=*) continue ;;
---property=LimitNFILEVSZ=*) continue ;;
---property=TasksMax=*) continue ;;
---property=TasksAccounting=*) continue ;;
---property=CPUAccounting=*) continue ;;
---property=MemoryAccounting=*) continue ;;
---property=IOAccounting=*) continue ;;
---property=IPAccounting=*) continue ;;
---property=TasksMaxScalePercent=*) continue ;;
---property=TasksMaxInhibitPercent=*) continue ;;
-# --- CPU / scheduling control ---
---property=CPUWeight=*) continue ;;
---property=StartupCPUWeight=*) continue ;;
---property=CPUWeightPerWeight=*) continue ;;
---property=AllowedCPUs=*) continue ;;
---property=StartupAllowedCPUs=*) continue ;;
---property=AllowedMemoryNodes=*) continue ;;
---property=StartupAllowedMemoryNodes=*) continue ;;
---property=CPUQuotaPeriodSec=*) continue ;;
---property=AllowedMemoryNodesPerWeight=*) continue ;;
---property=DisableControllers=*) continue ;;
---property=ManagedOOMSwap=*) continue ;;
---property=ManagedOOMMemoryPressure=*) continue ;;
---property=ManagedOOMMemoryPressureLimit=*) continue ;;
---property=ManagedOOMPreference=*) continue ;;
-# --- IO / block control ---
---property=IOWeight=*) continue ;;
---property=StartupIOWeight=*) continue ;;
---property=IODeviceWeight=*) continue ;;
---property=IODeviceLatencyTargetSec=*) continue ;;
---property=IOReadBandwidthMax=*) continue ;;
---property=IOWriteBandwidthMax=*) continue ;;
---property=IOReadIOPSMax=*) continue ;;
---property=IOWriteIOPSMax=*) continue ;;
---property=IODeviceWriteLatencyTargetSec=*) continue ;;
---property=IODeviceReadIOPSMax=*) continue ;;
---property=IODeviceWriteIOPSMax=*) continue ;;
---property=IODeviceWeightPerWeight=*) continue ;;
---property=IODeviceWeightPerWeightForWrites=*) continue ;;
---property=BlockIOWeight=*|--property=BlockIODeviceWeight=*|--property=BlockIOReadBandwidth=*|--property=BlockIOWriteBandwidth=*) continue ;;
-# --- Memory control ---
---property=MemoryLow=*) continue ;;
---property=MemoryMin=*) continue ;;
---property=MemoryHigh=*) continue ;;
---property=MemoryMax=*) continue ;;
---property=MemoryZswapMax=*) continue ;;
---property=MemoryZswapWriteback=*) continue ;;
---property=MemoryZswapCompression=*) continue ;;
---property=MemoryZswapAcceptPercent=*) continue ;;
---property=DisableMemoryMax=*) continue ;;
---property=MemoryHighWriteback=*) continue ;;
-# --- OOM / pressure / cachettl ---
---property=OOMScoreAdjust=*) continue ;;
---property=OOMPolicy=*) continue ;;
---property=OOMScoreAdjustPerWeight=*) continue ;;
---property=MemoryPressureWatch=*) continue ;;
---property=MemoryPressureThresholdSec=*) continue ;;
-# --- Slices / delegation / unit metadata ---
---property=RequiresMountsFor=*) continue ;;
---property=CollectMode=*) continue ;;
---property=ConditionCPUFeature=*) continue ;;
---property=ConditionCPUs=*) continue ;;
---property=ConditionMemory=*) continue ;;
---property=ConditionCPUPressure=*) continue ;;
---property=ConditionMemoryPressure=*) continue ;;
---property=ConditionPathIsMountPoint=*) continue ;;
---property=ConditionDirectoryNotEmpty=*) continue ;;
---property=ConditionFileNotEmpty=*) continue ;;
---property=ConditionFileIsExecutable=*) continue ;;
---property=ConditionPathIsReadWrite=*) continue ;;
---property=ConditionPathIsSymbolicLink=*) continue ;;
---property=ConditionUser=*) continue ;;
---property=ConditionGroup=*) continue ;;
---property=ConditionVirtualization=*) continue ;;
---property=ConditionArchitecture=*) continue ;;
---property=ConditionFirmware=*) continue ;;
---property=ConditionFirstBoot=*) continue ;;
---property=ConditionKernelCommandLine=*) continue ;;
---property=ConditionKernelVersion=*) continue ;;
---property=ConditionSecurity=*) continue ;;
---property=ConditionControlGroupController=*) continue ;;
---property=ConditionCapability=*) continue ;;
---property=ConditionACPower=*) continue ;;
---property=ConditionNeedsUpdate=*) continue ;;
---property=ConditionNull=*) continue ;;
---property=AssertUser=*) continue ;;
---property=AssertDirectoryNotEmpty=*) continue ;;
---property=AssertFileNotEmpty=*) continue ;;
---property=AssertFileIsExecutable=*) continue ;;
---property=AssertPathExists=*) continue ;;
---property=AssertPathIsDirectory=*) continue ;;
---property=AssertPathIsSymbolicLink=*) continue ;;
---property=AssertPathIsMountPoint=*) continue ;;
---property=AssertPathIsReadWrite=*) continue ;;
---property=AssertPathIsEncrypted=*) continue ;;
---property=AssertVirtualization=*) continue ;;
---property=AssertArchitecture=*) continue ;;
---property=AssertFirstBoot=*) continue ;;
---property=AssertKernelVersion=*) continue ;;
---property=AssertKernelCommandLine=*) continue ;;
---property=AssertSecurity=*) continue ;;
---property=AssertControlGroupController=*) continue ;;
---property=AssertCapability=*) continue ;;
---property=AssertCPUFeature=*) continue ;;
---property=AssertCPUs=*) continue ;;
---property=AssertMemory=*) continue ;;
---property=AssertACPower=*) continue ;;
---property=AssertNeedsUpdate=*) continue ;;
---property=AssertNull=*) continue ;;
-# --- Misc unit ---
---property=OnFailure=*) continue ;;
---property=SuccessAction=*) continue ;;
---property=FailureAction=*) continue ;;
---property=Restart=*) continue ;;
---property=RestartSec=*) continue ;;
---property=RestartPreventExitStatus=*) continue ;;
---property=RestartForceExitStatus=*) continue ;;
---property=WatchdogSec=*) continue ;;
---property=TimeoutStartSec=*) continue ;;
---property=TimeoutStopSec=*) continue ;;
---property=TimeoutAbortSec=*) continue ;;
---property=TimeoutCleanSec=*) continue ;;
---property=TimeoutStartFailureMode=*) continue ;;
---property=TimeoutStopFailureMode=*) continue ;;
---property=RuntimeMaxSec=*) continue ;;
---property=RuntimeRandomizedExtraSec=*) continue ;;
-# Unrecognized properties - log and warn visibly
---property=*) UNRECOGNIZED_PROPS+=("$arg"); _warn_dsr "Unrecognized --property: $arg"; continue ;;
---property) SKIP_NEXT=true; continue ;;
---user|--uid=*|--gid=*|--setenv=*) continue ;;
---setenv) SKIP_NEXT=true; continue ;;
---) shift; CMD_ARGS+=("$@"); break ;;
-*) CMD_ARGS+=("$arg") ;;
-esac
-done
-if [[ ${#CMD_ARGS[@]} -eq 0 ]]; then
-    _log_dsr "ERROR: No command arguments found after parsing. Raw args: $*"
-    exit 1
-fi
-if [[ ${#UNRECOGNIZED_PROPS[@]} -gt 0 ]]; then
-    _warn_dsr "=========================================="
-    _warn_dsr "UNRECOGNIZED PROPERTIES DETECTED (${#UNRECOGNIZED_PROPS[@]} total):"
-    for _up in "${UNRECOGNIZED_PROPS[@]}"; do
-        _warn_dsr "  - $_up"
-    done
-    _warn_dsr "These properties were IGNORED. If AUR builds fail, check $_DSR_LOG"
-    _warn_dsr "for which properties Pamac/makepkg now expects."
-    _warn_dsr "You may need to update this fake systemd-run wrapper."
-    _warn_dsr "=========================================="
-fi
-if [[ -n "$WORK_DIR" ]]; then
-mkdir -p "$WORK_DIR" 2>/dev/null || true
-if $DYNAMIC_USER; then chown HOST_USER_PLACEHOLDER:HOST_USER_PLACEHOLDER "$WORK_DIR" 2>/dev/null || true; fi
-fi
-if [[ -n "$CACHE_DIR" ]]; then
-CACHE_FULL="/var/cache/$CACHE_DIR"
-mkdir -p "$CACHE_FULL" 2>/dev/null || true
-if $DYNAMIC_USER; then chown -R HOST_USER_PLACEHOLDER:HOST_USER_PLACEHOLDER "$CACHE_FULL" 2>/dev/null || true; fi
-fi
-if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
-# Use a dedicated build user to isolate AUR builds from the host user's
-# home directory. A malicious AUR package gains only build-user access.
-BUILD_USER="_builduser"
-_BL_TMP_HOME=""
-if ! id "$BUILD_USER" >/dev/null 2>&1; then
-    if ! useradd -r -d /var/lib/builduser -s /usr/bin/nologin "$BUILD_USER" 2>/dev/null; then
-        _warn_dsr "useradd -r failed — trying ad-hoc non-root build user as fallback"
-        chmod +t /var/tmp 2>/dev/null || true
-        _bl_tmp=$(mktemp -d /var/tmp/builduser-home-XXXXXX) || _bl_tmp=""
-        if [[ -n "$_bl_tmp" ]]; then
-            case "$_bl_tmp" in
-                /home/*)
-                    _warn_dsr "REFUSING temp home under /home (host mount overlap): $_bl_tmp"
-                    rmdir "$_bl_tmp" 2>/dev/null || true
-                    _bl_tmp=""
-                    ;;
-                *)
-                    chmod 0700 "$_bl_tmp" 2>/dev/null || true
-                    ;;
-            esac
-        fi
-        if [[ -n "$_bl_tmp" ]]; then
-            BUILD_USER="_brecover$(date +%s|tail -c7)"
-            if ! useradd -M -d "$_bl_tmp" -s /bin/bash "$BUILD_USER" 2>/dev/null; then
-                rmdir "$_bl_tmp" 2>/dev/null || true
-                BUILD_USER=""
-            else
-                _BL_TMP_HOME="$_bl_tmp"
-                _log_dsr "Ad-hoc build user $_BL_TMP_HOME created (isolated from host mounts)"
-            fi
-        fi
-        if [[ -z "$BUILD_USER" ]] || ! id "$BUILD_USER" >/dev/null 2>&1; then
-            _warn_dsr "FATAL: Cannot create a dedicated build user (useradd -r and ad-hoc user both failed)."
-            _warn_dsr "Refusing to drop privileges to 'nobody' — it lacks a writable home and is unsafe for AUR builds."
-            _warn_dsr "Aborting DynamicUser build to avoid running a potentially untrusted package with no isolation."
-            echo "systemd-run(fake): FATAL: no build user available, refusing to run as nobody" >&2
-            exit 127
-        fi
-    fi
-    mkdir -p /var/lib/builduser 2>/dev/null || true
-    chown "$BUILD_USER:$BUILD_USER" /var/lib/builduser 2>/dev/null || true
-fi
-if [[ -n "$WORK_DIR" ]]; then
-_log_dsr "EXEC: sudo -u $BUILD_USER -- cd $WORK_DIR; ${CMD_ARGS[*]}"
-if [[ -n "$_BL_TMP_HOME" ]]; then
-    sudo -u "$BUILD_USER" -H -- bash -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$WORK_DIR" "${CMD_ARGS[@]}"
-    _user_cmd_exit=$?
-    userdel -r "$BUILD_USER" 2>/dev/null || true
-    rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
-    exit $_user_cmd_exit
-else
-    exec sudo -u "$BUILD_USER" -H -- bash -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$WORK_DIR" "${CMD_ARGS[@]}"
-fi
-else
-_log_dsr "EXEC: sudo -u $BUILD_USER -- ${CMD_ARGS[*]}"
-if [[ -n "$_BL_TMP_HOME" ]]; then
-    sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
-    _user_cmd_exit=$?
-    userdel -r "$BUILD_USER" 2>/dev/null || true
-    rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
-    exit $_user_cmd_exit
-else
-    exec sudo -u "$BUILD_USER" -H -- "${CMD_ARGS[@]}"
-fi
-fi
-else
-if [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR" ]]; then cd "$WORK_DIR" 2>/dev/null || true; fi
-_log_dsr "EXEC: ${CMD_ARGS[*]}"
-exec "${CMD_ARGS[@]}"
-fi
-SYSTEMD_RUN_FAKE
-chmod +x /usr/local/sbin/systemd-run
-_atomic_sed_inplace /usr/local/sbin/systemd-run "s/HOST_USER_PLACEHOLDER/$HOST_USER/g"
+_write_fake_systemd_run_wrapper
 repaired=$((repaired + 1))
 echo "Fake systemd-run repaired (with ad-hoc build-user cleanup)."
 echo "Unrecognized arguments will be logged to /tmp/systemd-run-fake.log for debugging."

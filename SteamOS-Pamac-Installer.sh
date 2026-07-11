@@ -3262,7 +3262,7 @@ int main(int argc, char *argv[]) {
     return 127;
 }
 SECCOMP_C
-    if gcc -O2 -static -o "$_helper_bin" "$_helper_src" 2>/dev/null; then
+    if gcc -O2 -o "$_helper_bin" "$_helper_src" 2>/dev/null; then
         rm -f "$_helper_src"
         chmod 755 "$_helper_bin"
         echo "$_helper_bin"

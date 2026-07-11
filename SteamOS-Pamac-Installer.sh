@@ -114,6 +114,7 @@ PAMAC_VERSION="${PAMAC_VERSION:-}"
 NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
 SKIP_COMPAT_CHECK="${SKIP_COMPAT_CHECK:-false}"
 NO_COLOR="${NO_COLOR:-false}"
+LOW_MEMORY="${LOW_MEMORY:-false}"
 # SECURITY (default off): PermitUserEnvironment yes in sshd lets any
 # SSH-authenticated user inject arbitrary environment variables (LD_PRELOAD,
 # PATH...) via ~/.ssh/environment — a known privilege-escalation vector on
@@ -10335,6 +10336,15 @@ main() {
     # --version, so we never reach the EUID guard for those. Operational flags
     # (which require a writable container namespace) still hit the root guard.
     parse_arguments "$@"
+
+    # Auto-enable low-memory mode on SteamOS. The Steam Deck has 16GB RAM
+    # shared with the GPU (usable ~12GB), and AUR builds (especially C++
+    # projects like pamac-aur) can OOM during compilation. Auto-detect SteamOS
+    # unless the user explicitly passed --low-memory or set LOW_MEMORY=true.
+    if [[ "${LOW_MEMORY:-false}" != "true" ]] && grep -q "ID=steamos" /etc/os-release 2>/dev/null; then
+        LOW_MEMORY="true"
+        log_info "SteamOS detected — auto-enabling low-memory mode for AUR builds."
+    fi
 
     # Finalize the per-container log path now that CONTAINER_NAME is resolved.
     # Without this, runs with different --container-name overwrite one shared

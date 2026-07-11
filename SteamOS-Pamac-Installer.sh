@@ -3147,12 +3147,20 @@ _keyring_checksum() {
     local _size
     _size=$(wc -c < "$_PUBRING_FILE" 2>/dev/null | awk '{print $1}' || echo "0")
     local _sum=""
+    # Try sha256sum/sha256/shasum (coreutils), then fall back to Python hashlib
+    # (guaranteed present in base containers). This avoids the chicken-and-egg
+    # where we need coreutils to verify the keyring, but need a valid keyring
+    # to install coreutils via pacman.
     if command -v sha256sum >/dev/null 2>&1; then
         _sum=$(sha256sum "$_PUBRING_FILE" 2>/dev/null | awk '{print $1}')
     elif command -v sha256 >/dev/null 2>&1; then
         _sum=$(sha256 -q "$_PUBRING_FILE" 2>/dev/null)
     elif command -v shasum >/dev/null 2>&1; then
         _sum=$(shasum -a 256 "$_PUBRING_FILE" 2>/dev/null | awk '{print $1}')
+    elif command -v python3 >/dev/null 2>&1; then
+        _sum=$(python3 -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$_PUBRING_FILE" 2>/dev/null)
+    elif command -v python >/dev/null 2>&1; then
+        _sum=$(python -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$_PUBRING_FILE" 2>/dev/null)
     fi
     echo "${_size}:${_sum}"
 }
@@ -3170,18 +3178,14 @@ if [[ -f "$_KEYRING_SENTINEL" ]]; then
         _safe_recovered=true
         rm -f "$_KEYRING_SENTINEL" 2>/dev/null || true
     elif [[ -z "$_sentinel_current" || "$_sentinel_current" == *":*" && "${_sentinel_current##*:}" == "" ]]; then
-        # No checksum tool available — try installing coreutils (provides
-        # sha256sum) so the sentinel can be validated next time AND so the
-        # rest of this recovery run has the tool available. If pacman is not
-        # usable yet, fall back to presence-only trust so recovery is not
-        # blocked purely because sha256 is missing.
-        echo "Found keyring recovery sentinel, but no checksum tool is available to validate pubring.gpg. Attempting to install coreutils..."
-        if command -v pacman >/dev/null 2>&1 && pacman -S --noconfirm --needed coreutils 2>/dev/null; then
-            echo "coreutils installed; re-checking checksum tool availability."
-            _sentinel_current=$(_keyring_checksum)
-        fi
+        # No checksum tool available — try Python hashlib first (guaranteed
+        # present, no pacman needed). Only fall back to pacman -S coreutils
+        # if Python is also missing, but skip that if the keyring is broken
+        # (pacman -S would fail with signature errors — chicken-and-egg).
+        echo "Found keyring recovery sentinel, but no checksum tool is available to validate pubring.gpg."
+        _sentinel_current=$(_keyring_checksum)
         if [[ -z "$_sentinel_current" || "$_sentinel_current" == *":*" && "${_sentinel_current##*:}" == "" ]]; then
-            echo "WARNING: No checksum tool available even after coreutils install. Trusting sentinel (presence-only) so recovery is not blocked. If you suspect keyring corruption, delete /etc/pacman.d/gnupg/.keyring-recovery-pending or /etc/pacman.d/gnupg manually and re-run."
+            echo "WARNING: No checksum tool available (sha256sum/sha256/shasum/python3 all missing). Trusting sentinel (presence-only) so recovery is not blocked."
             _safe_recovered=true
             rm -f "$_KEYRING_SENTINEL" 2>/dev/null || true
         elif [[ -n "$_sentinel_stored" && "$_sentinel_stored" == "$_sentinel_current" ]]; then
@@ -8287,7 +8291,7 @@ X-SteamOS-Pamac-SourcePackage=pamac-aur
 
 [Desktop Action uninstall]
 Name=Uninstall Packages
-Exec=bash -c 'podman exec -u 0 ${container_name} pacman -R --noconfirm pamac-aur 2>/dev/null && rm -f /home/${current_user}/.local/share/applications/${container_name}-org.manjaro.pamac.manager.desktop && touch /home/${current_user}/.local/share/applications && notify-send -i edit-delete "Uninstalled" "pamac-aur removed" 2>/dev/null'
+Exec=bash -c '$(command -v podman || command -v docker || echo podman) exec -u 0 ${container_name} pacman -R --noconfirm pamac-aur 2>/dev/null && rm -f /home/${current_user}/.local/share/applications/${container_name}-org.manjaro.pamac.manager.desktop && touch /home/${current_user}/.local/share/applications && notify-send -i edit-delete "Uninstalled" "pamac-aur removed" 2>/dev/null'
 Icon=edit-delete
 PAMAC_DESKTOP
     _fix_desktop_permissions "\$desktop_file"
@@ -8364,7 +8368,7 @@ PAMAC_DESKTOP
         _desktop_bn=app_name ".desktop"
         _host_file="/home/" user "/.local/share/applications/" container "-" _desktop_bn
         _apps_dir="/home/" user "/.local/share/applications"
-        printf "Exec=bash -c 'podman exec -u 0 %s pacman -R --noconfirm %s 2>/dev/null && rm -f %s && touch %s && notify-send -i edit-delete \"Uninstalled\" \"%s removed\" 2>/dev/null'\n", container, owner_pkg, _host_file, _apps_dir, owner_pkg
+        printf "Exec=bash -c '$(command -v podman || command -v docker || echo podman) exec -u 0 %s pacman -R --noconfirm %s 2>/dev/null && rm -f %s && touch %s && notify-send -i edit-delete \"Uninstalled\" \"%s removed\" 2>/dev/null'\n", container, owner_pkg, _host_file, _apps_dir, owner_pkg
         print "Icon=edit-delete"
     }
     { print }
@@ -8465,7 +8469,7 @@ _apps_dir = f'/home/{current_user}/.local/share/applications'
 lines.append('')
 lines.append('[Desktop Action uninstall]')
 lines.append(f'Name=Uninstall {owner_pkg}')
-lines.append(f"Exec=bash -c 'podman exec -u 0 {container_name} pacman -R --noconfirm {owner_pkg} 2>/dev/null && rm -f {_host_desktop_path} && touch {_apps_dir} && notify-send -i edit-delete \"Uninstalled\" \"{owner_pkg} removed\" 2>/dev/null'")
+lines.append(f"Exec=bash -c '$(command -v podman || command -v docker || echo podman) exec -u 0 {container_name} pacman -R --noconfirm {owner_pkg} 2>/dev/null && rm -f {_host_desktop_path} && touch {_apps_dir} && notify-send -i edit-delete \"Uninstalled\" \"{owner_pkg} removed\" 2>/dev/null'")
 lines.append('Icon=edit-delete')
 
 for section, items in other_sections.items():

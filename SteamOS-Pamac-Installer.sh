@@ -2849,6 +2849,17 @@ SYSTEMD_RUN_FAKE_HEREDOC
     _safe=${HOST_USER//\\/\\\\}; _safe=${_safe//&/\\&}; _safe=${_safe//\//\\/}
     _atomic_sed_inplace /usr/local/sbin/systemd-run "s/HOST_USER_PLACEHOLDER/$_safe/g"
 }
+_atomic_write_pacman_conf() {
+    local target="/etc/pacman.conf"
+    local new_siglevel="$1"
+    local tmp
+    tmp=$(mktemp "${target}.atomic.XXXXXX") || { echo "FATAL: mktemp failed"; return 1; }
+    cp -f "$target" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = ${new_siglevel}/" "$tmp"
+    grep -q '^SigLevel' "$tmp" || printf 'SigLevel = %s\n' "$new_siglevel" >> "$tmp"
+    sync "$tmp" 2>/dev/null || sync 2>/dev/null || true
+    mv -f "$tmp" "$target"
+}
 '
 
 exec_container_script() {
@@ -3137,21 +3148,7 @@ _STRICT_SECURITY_MODE="${1:-}"
 
 _remove_stale_lock
 
-# Atomic pacman.conf writer: avoids sed -i which is non-atomic and can corrupt
-# the file if the process is killed mid-write (power loss, SIGKILL).
-# Writes to a temp file, fsyncs, then atomically renames over the target.
-_atomic_write_pacman_conf() {
-    local target="/etc/pacman.conf"
-    local new_siglevel="$1"
-    local tmp
-    tmp=$(mktemp "${target}.atomic.XXXXXX") || { echo "FATAL: mktemp failed"; return 1; }
-    cp -f "$target" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
-    sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = ${new_siglevel}/" "$tmp"
-    grep -q '^SigLevel' "$tmp" || printf 'SigLevel = %s\n' "$new_siglevel" >> "$tmp"
-    sync "$tmp" 2>/dev/null || sync 2>/dev/null || true
-    mv -f "$tmp" "$target"
-}
-
+# _atomic_write_pacman_conf is defined in _CONTAINER_PREAMBLE (shared).
 echo "Step 1/5: Cleaning up stale GPG state..."
 pkill -9 gpg-agent 2>/dev/null || true
 pkill -9 dirmngr 2>/dev/null || true
@@ -7414,7 +7411,12 @@ if [[ -f "\$_pkg_count_cache" ]] && [[ "\$(cat "\$_pkg_count_cache" 2>/dev/null)
     # Count unchanged — desktop files already exported, skip slow enumeration
     true
 else
-for _desktop in \$(${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" bash -c "pacman -Qeq | while read p; do pacman -Qql \\\$p 2>/dev/null; done" 2>/dev/null | grep '\.desktop$'); do
+# Iterate desktop files directly (O(M)) instead of per-package enumeration (O(N*M)).
+# Each desktop file is checked against explicit packages via pacman -Qoq.
+for _desktop in \$(${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" find /usr/share/applications /usr/local/share/applications -name '*.desktop' -type f 2>/dev/null); do
+    _pkg_name=\$(${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" pacman -Qoq "\$_desktop" 2>/dev/null) || continue
+    # Only process explicitly-installed packages (not dependencies)
+    ${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" pacman -Qeq "\$_pkg_name" >/dev/null 2>&1 || continue
     _base=\$(basename "\$_desktop")
     _host_file="\$_export_dir/${CONTAINER_NAME}-\$_base"
     if [[ ! -f "\$_host_file" ]]; then
@@ -7431,11 +7433,15 @@ for _desktop in \$(${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" bash -c
         fi
         # Add pamac markers and uninstall action
         if ! grep -q '^Actions=uninstall;' "\$_host_file"; then
-            sed -i '/^StartupWMClass=/a Actions=uninstall;' "\$_host_file" 2>/dev/null
-            sed -i '/^StartupWMClass=/a X-SteamOS-Pamac-Managed=true' "\$_host_file" 2>/dev/null
-            sed -i '/^StartupWMClass=/a X-SteamOS-Pamac-Container=${CONTAINER_NAME}' "\$_host_file" 2>/dev/null
-            sed -i "/^StartupWMClass=/a X-SteamOS-Pamac-SourceDesktop=\$_base" "\$_host_file" 2>/dev/null
-            sed -i "/^StartupWMClass=/a X-SteamOS-Pamac-SourcePackage=\$_pkg_name" "\$_host_file" 2>/dev/null
+            # Insert markers after StartupWMClass, or Name=, or append to [Desktop Entry]
+            _anchor="^StartupWMClass="
+            grep -q "\${_anchor}" "\$_host_file" 2>/dev/null || _anchor="^Name="
+            grep -q "\${_anchor}" "\$_host_file" 2>/dev/null || _anchor="^Type="
+            sed -i "/\${_anchor}/a Actions=uninstall;" "\$_host_file" 2>/dev/null
+            sed -i "/\${_anchor}/a X-SteamOS-Pamac-Managed=true" "\$_host_file" 2>/dev/null
+            sed -i "/\${_anchor}/a X-SteamOS-Pamac-Container=${CONTAINER_NAME}" "\$_host_file" 2>/dev/null
+            sed -i "/\${_anchor}/a X-SteamOS-Pamac-SourceDesktop=\$_base" "\$_host_file" 2>/dev/null
+            sed -i "/\${_anchor}/a X-SteamOS-Pamac-SourcePackage=\$_pkg_name" "\$_host_file" 2>/dev/null
             cat >> "\$_host_file" << ACTION_EOF
 
 [Desktop Action uninstall]

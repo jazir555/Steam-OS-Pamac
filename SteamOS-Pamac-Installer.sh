@@ -3274,6 +3274,35 @@ int main(int argc, char *argv[]) {
     return 127;
 }
 SECCOMP_C
+    # Validate toolchain before attempting compilation. During partial upgrades,
+    # gcc may be present but its standard library headers may be mismatched
+    # (e.g., updated compiler with old glibc headers). Test with a minimal
+    # program that includes the headers we need (seccomp + prctl).
+    local _test_src="/tmp/.dsr-toolchain-test.c"
+    local _test_bin="/tmp/.dsr-toolchain-test"
+    cat > "$_test_src" << 'TOOLCHAIN_TEST'
+#include <stdio.h>
+#include <stddef.h>
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+int main() {
+    struct sock_filter f[] = { BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW) };
+    struct sock_fprog p = { .len = 1, .filter = f };
+    (void)f; (void)p;
+    return 0;
+}
+TOOLCHAIN_TEST
+    if ! gcc -O2 -o "$_test_bin" "$_test_src" 2>/dev/null; then
+        _warn_dsr "Toolchain validation failed: gcc cannot compile a minimal seccomp test program."
+        _warn_dsr "This may indicate a partial upgrade (compiler vs. headers mismatch)."
+        _warn_dsr "Try: pacman -S --noconfirm --needed base-devel gcc glibc"
+        rm -f "$_test_src" "$_test_bin"
+        return 1
+    fi
+    rm -f "$_test_src" "$_test_bin"
+
     if gcc -O2 -o "$_helper_bin" "$_helper_src" 2>/dev/null; then
         rm -f "$_helper_src"
         chmod 755 "$_helper_bin"
@@ -4834,18 +4863,19 @@ fi
 echo "Setting pamac polkit policy for passwordless operation..."
 pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
 if [[ -f "$pamac_policy" ]]; then
-    # Blanket-set allow_any / allow_active / allow_inactive to "yes" across
-    # EVERY <action> in the policy, regardless of the upstream default value.
-    # The host root is read-only (SteamOS immutable) so these in-container
-    # rules/policy are the ONLY authority: the container runs its own private
-    # system bus + polkitd (not the host's). Any remaining auth_admin* value
-    # would trigger a password prompt with no polkit-agent inside the
-    # container to handle it, freezing the GUI. Safe on a single-user Deck.
+    # Set allow_active=yes for package management actions only (install,
+    # remove, update, build). Keep allow_any=no and allow_inactive=no
+    # to prevent unauthenticated remote access or inactive-session abuse.
+    # The container runs its own private system bus + polkitd (not the host's),
+    # so these in-container values are authoritative. Any remaining auth_admin
+    # value would trigger a password prompt with no polkit-agent inside the
+    # container to handle it, freezing the GUI.
     _atomic_sed_inplace "$pamac_policy" \
-        's|<allow_any>[^<]*</allow_any>|<allow_any>yes</allow_any>|g' \
+        's|<allow_any>[^<]*</allow_any>|<allow_any>no</allow_any>|g' \
         's|<allow_active>[^<]*</allow_active>|<allow_active>yes</allow_active>|g' \
-        's|<allow_inactive>[^<]*</allow_inactive>|<allow_inactive>yes</allow_inactive>|g'
-    echo "Polkit policy set to allow_any=allow_active=allow_inactive=yes for ALL pamac actions."
+        's|<allow_inactive>[^<]*</allow_inactive>|<allow_inactive>no</allow_inactive>|g'
+    echo "Polkit policy set to allow_active=yes (local active sessions only)."
+    echo "  allow_any=no, allow_inactive=no (remote/inactive sessions blocked)."
 else
     echo "Note: pamac polkit policy not yet installed (defaults are least-privilege)."
 fi
@@ -7281,15 +7311,13 @@ echo "BuildDirectory set to /home/$current_user/.pamac-build"
 echo "Setting pamac polkit policy for passwordless operation..."
 pamac_policy="/usr/share/polkit-1/actions/org.manjaro.pamac.policy"
 if [[ -f "$pamac_policy" ]]; then
-    # Blanket-set allow_* to "yes" across every <action> (host root is
-    # read-only; container's own system bus + polkitd is the only authority,
-    # so these in-container values must be authoritative — see comment in
-    # the stage-6a block).
+    # Set allow_active=yes for local active sessions only.
+    # allow_any=no, allow_inactive=no prevents remote/inactive abuse.
     _atomic_sed_inplace "$pamac_policy" \
-        's|<allow_any>[^<]*</allow_any>|<allow_any>yes</allow_any>|g' \
+        's|<allow_any>[^<]*</allow_any>|<allow_any>no</allow_any>|g' \
         's|<allow_active>[^<]*</allow_active>|<allow_active>yes</allow_active>|g' \
-        's|<allow_inactive>[^<]*</allow_inactive>|<allow_inactive>yes</allow_inactive>|g'
-    echo "Polkit policy set to allow_any=allow_active=allow_inactive=yes for ALL pamac actions."
+        's|<allow_inactive>[^<]*</allow_inactive>|<allow_inactive>no</allow_inactive>|g'
+    echo "Polkit policy set to allow_active=yes (local active sessions only)."
 else
     echo "Warning: pamac polkit policy file not found at $pamac_policy"
 fi

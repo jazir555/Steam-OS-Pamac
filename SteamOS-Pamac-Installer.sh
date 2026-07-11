@@ -1914,7 +1914,7 @@ fi
 echo ""
 echo "=== Strategy 6: Rebuild DB from package cache ==="
 if [[ -d /var/cache/pacman/pkg ]]; then
-    _cache_count=$(ls /var/cache/pacman/pkg/*.pkg.tar.* 2>/dev/null | wc -l || echo "0")
+    _cache_count=$(find /var/cache/pacman/pkg -maxdepth 1 -name '*.pkg.tar.*' 2>/dev/null | wc -l || echo "0")
     if [[ "$_cache_count" -gt 0 ]]; then
         echo "  Found $_cache_count cached packages."
         _inner_remove_stale_lock
@@ -2075,6 +2075,9 @@ echo "the system is otherwise working. Not every -Dk warning requires action."
 
 # shellcheck disable=SC2016,SC1078,SC1079
 _CONTAINER_PREAMBLE='_safe_sleep() {
+# CANONICAL DEFINITION — keep in sync with the two copies in
+# pamac-session-bootstrap.sh (critical_script and repair_script).
+# All three must be functionally identical.
 local _d="$1"
 # Sanitize argument to a positive INTEGER (default 1s) before passing to
 # timers. Floats are NOT allowed: bash arithmetic ($(( ... ))) cannot handle
@@ -3552,7 +3555,7 @@ for attempt in 1 2 3; do
         if ls /etc/pacman.d/gnupg/archlinux* >/dev/null 2>&1; then
             _saved_keys_dir=$(mktemp -d /var/tmp/pamac-kr-save-XXXXXX) && chmod 700 "$_saved_keys_dir" 2>/dev/null || _saved_keys_dir=$(mktemp -d)
             cp -f /etc/pacman.d/gnupg/archlinux* "$_saved_keys_dir/" 2>/dev/null || true
-            echo "  Preserved $(ls "$_saved_keys_dir"/archlinux* 2>/dev/null | wc -l) keyring file(s) before reset."
+            echo "  Preserved $(find "$_saved_keys_dir" -maxdepth 1 -name 'archlinux*' 2>/dev/null | wc -l) keyring file(s) before reset."
         fi
         rm -rf /etc/pacman.d/gnupg 2>/dev/null || true
         mkdir -p /etc/pacman.d/gnupg 2>/dev/null || true
@@ -4188,6 +4191,7 @@ chmod 1777 /var/log 2>/dev/null || true
 touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
 
 _safe_sleep() {
+# COPY #1 of 3 — keep in sync with _CONTAINER_PREAMBLE and repair_script copy.
 local _d="$1"
 case "$_d" in ''|*[!0-9]*) _d=1 ;; esac
 if sleep "$_d" 2>/dev/null; then return 0; fi
@@ -4521,6 +4525,7 @@ chmod 1777 /var/log 2>/dev/null || true
 touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
 
 _safe_sleep() {
+# COPY #1 of 3 — keep in sync with _CONTAINER_PREAMBLE and repair_script copy.
 local _d="$1"
 case "$_d" in ''|*[!0-9]*) _d=1 ;; esac
 if sleep "$_d" 2>/dev/null; then return 0; fi

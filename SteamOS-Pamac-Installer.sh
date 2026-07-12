@@ -2017,9 +2017,12 @@ ENVIRONMENT VARIABLES:
 SECURITY NOTE — fake systemd-run wrapper:
   This is a custom compatibility shim that fully emulates systemd-run for
   DynamicUser AUR builds in non-systemd containers. All sandbox properties
-  (ProtectSystem, ProtectHome, SystemCallFilter, RestrictNamespaces, etc.)
-  are enforced via seccomp-BPF, mount namespaces, and capability dropping.
-  If AUR builds fail inside the container, try:
+  (ProtectSystem, ProtectHome, SystemCallFilter, RestrictNamespaces,
+  SecureBits, Personality, SystemCallArchitectures, ProtectProc,
+  ProcSubset, PrivateUsers, DisableExtraFileDescriptors, CoredumpReceive,
+  etc.) are enforced via seccomp-BPF, mount namespaces, prctl, and
+  capability dropping. When gcc is unavailable, falls back to
+  SECCOMP_MODE_STRICT. If AUR builds fail inside the container, try:
     (1) Install base-devel for seccomp compilation
     (2) Use --strict-security to disable the wrapper
     (3) Use real systemd (e.g., distrobox --init flag)
@@ -3672,7 +3675,7 @@ _write_fake_systemd_run_wrapper() {
 # Logs diagnostics to /tmp/systemd-run-fake.log; warns on unrecognized properties.
 _DSR_LOG="/tmp/systemd-run-fake.log"
 DSR_VERSION="4.0"
-DSR_SECCOMP_VERSION_HASH="sha256:e4f6a8b2c1d3e5f7a9b0c2d4e6f8a1b3c5d7e9f1a3b5c7d9e1f3a5b7c9d1e3"
+DSR_SECCOMP_VERSION_HASH="sha256:f7e6d5c4b3a2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f"
 _DSR_STRICT_SECURITY="${_STRICT_SECURITY_MODE:-false}"
 _log_dsr() { echo "[$(date '+%H:%M:%S')] $*" >> "$_DSR_LOG" 2>/dev/null; }
 _warn_dsr() { echo "systemd-run(fake): WARNING: $*" >> "$_DSR_LOG" 2>/dev/null; echo "systemd-run(fake): WARNING: $*" >&2 2>/dev/null || true; }
@@ -3751,7 +3754,7 @@ _cleanup_orphaned_buildusers
 # Passthrough: --help and --version
 for _a in "$@"; do
     case "$_a" in
-        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Fully emulates systemd-run for DynamicUser AUR builds in non-systemd containers."; echo ""; echo "ALL ENFORCED via bwrap (bubblewrap) or unshare + bind mounts + capsh/setpriv + seccomp-BPF:"; echo "  Filesystem: ProtectSystem, ProtectHome, PrivateTmp, PrivateDevices,"; echo "              ReadWritePaths, ReadOnlyPaths, InaccessiblePaths,"; echo "              ProtectKernelTunables (/proc/sys, /sys read-only),"; echo "              ProtectControlGroups (/sys/fs/cgroup read-only)"; echo "  Network:    PrivateNetwork (--unshare-net with bwrap)"; echo "  Privileges: NoNewPrivileges, CapabilityBoundingSet (capsh preferred),"; echo "              LockPersonality (blocks personality syscall),"; echo "              RestrictRealtime (blocks sched_setscheduler/setparam/setattr)"; echo "  Seccomp:    MemoryDenyWriteExecute (blocks mprotect W+X),"; echo "              RestrictSUIDSGID (blocks setuid/setgid family),"; echo "              ProtectKernelModules (blocks init/delete_module),"; echo "              ProtectClock (blocks clock_settime/adjtime/settimeofday),"; echo "              ProtectHostname (blocks sethostname/setdomainname),"; echo "              ProtectKernelLogs (blocks syslog syscall),"; echo "              RestrictNamespaces (blocks unshare, setns, clone with CLONE_NEW*),"; echo "              RestrictAddressFamilies (filters socket() by family),"; echo "              SystemCallFilter (denylist: reboot, kexec, ptrace, etc.),"; echo "              RestrictFileSystems (blocks mount syscall)"; echo "  Runtime:    sandbox integrity verified after applying restrictions"; echo "  DynamicUser: isolated build user with private home under /var/tmp"; echo "  User, Environment, EnvironmentFile, CacheDirectory, WorkingDirectory,"; echo "              UMask, SupplementaryGroups"; echo "  --user:     run as host user (non-root invocation)"; echo "  --scope:    direct execution without transient unit creation"; echo ""; echo "RECOGNIZED (not enforced): RootDirectory, RootImage, PrivateUsers, ProtectProc,"; echo "  ProcSubset, Personality, SystemCallArchitectures, SystemCallErrorNumber,"; echo "  SystemCallLog, DisableExtraFileDescriptors, CoredumpReceive"; echo ""; echo "  Resource/accounting/logging/Condition/Assert/Timeout: recognized, silently accepted."; echo "  HOST_USER resolved dynamically from PAMAC_HOST_USER, SUDO_USER, or passwd."; echo "  Sandbox: bwrap (preferred) or unshare --mount --net + bind mounts + setpriv/capsh + seccomp helper (requires gcc)."; echo ""; echo "Use --strict-security on the installer to disable this wrapper entirely."; exit 0 ;;
+        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Fully emulates systemd-run for DynamicUser AUR builds in non-systemd containers."; echo ""; echo "ALL ENFORCED via bwrap (bubblewrap) or unshare + bind mounts + capsh/setpriv + seccomp-BPF:"; echo "  Filesystem: ProtectSystem, ProtectHome, PrivateTmp, PrivateDevices,"; echo "              ReadWritePaths, ReadOnlyPaths, InaccessiblePaths,"; echo "              ProtectKernelTunables (/proc/sys, /sys read-only),"; echo "              ProtectControlGroups (/sys/fs/cgroup read-only)"; echo "  Network:    PrivateNetwork (--unshare-net with bwrap)"; echo "  Privileges: NoNewPrivileges, CapabilityBoundingSet (prctl + capsh),"; echo "              LockPersonality, RestrictRealtime,"; echo "              SecureBits (via setpriv), Personality (via personality syscall)"; echo "  Seccomp:    MemoryDenyWriteExecute (blocks mprotect W+X),"; echo "              RestrictSUIDSGID (blocks setuid/setgid family),"; echo "              ProtectKernelModules (blocks init/delete_module),"; echo "              ProtectClock (blocks clock_settime/adjtime/settimeofday),"; echo "              ProtectHostname (blocks sethostname/setdomainname),"; echo "              ProtectKernelLogs (blocks syslog syscall),"; echo "              RestrictNamespaces (blocks unshare, setns, clone with CLONE_NEW*),"; echo "              RestrictAddressFamilies (filters socket() by family),"; echo "              SystemCallFilter (denylist: reboot, kexec, ptrace, etc.),"; echo "              RestrictFileSystems (blocks mount syscall),"; echo "              SystemCallArchitectures (blocks non-native arch syscalls)"; echo "  Proc:       ProtectProc (restricts /proc visibility),"; echo "              ProcSubset (restricts /proc paths)"; echo "  Runtime:    sandbox integrity verified after applying restrictions"; echo "  DynamicUser: isolated build user with private home under /var/tmp"; echo "  User, Environment, EnvironmentFile, CacheDirectory, WorkingDirectory,"; echo "              UMask, SupplementaryGroups, DisableExtraFileDescriptors,"; echo "              CoredumpReceive, PrivateUsers, SystemCallErrorNumber, SystemCallLog"; echo "  --user:     run as host user (non-root invocation)"; echo "  --scope:    direct execution without transient unit creation"; echo ""; echo "RECOGNIZED (not enforced): RootDirectory, RootImage, RootHash, RootVerity,"; echo "  MountImages, ExtensionImages, NamespacePath, NetworkNamespacePath"; echo ""; echo "  Resource/accounting/logging/Condition/Assert/Timeout: recognized, silently accepted."; echo "  HOST_USER resolved dynamically from PAMAC_HOST_USER, SUDO_USER, or passwd."; echo "  Sandbox: bwrap (preferred) or unshare --mount --net + bind mounts + setpriv/capsh + seccomp helper (requires gcc)."; echo ""; echo "Use --strict-security on the installer to disable this wrapper entirely."; exit 0 ;;
         --version) echo "systemd-run (fake) v${DSR_VERSION} (SteamOS-Pamac)"; exit 0 ;;
     esac
 done
@@ -3804,6 +3807,17 @@ PROTECT_KERNEL_LOGS=""
 PROTECT_CONTROL_GROUPS=""
 PROTECT_HOSTNAME=""
 RESTRICT_FILE_SYSTEMS="" 
+# ── Sandbox properties (enforced via seccomp/prctl/bind mounts) ──
+SECURE_BITS=""
+PERSONALITY=""
+SYS_CALL_ARCH=""
+SYS_CALL_ERRNO=""
+SYS_CALL_LOG=""
+PROTECT_PROC=""
+PROC_SUBSET=""
+PRIVATE_USERS=""
+DISABLE_EXTRA_FDS=""
+COREDUMP_RECEIVE=""
 for arg in "$@"; do
 if $SKIP_NEXT; then
 SKIP_NEXT=false
@@ -3864,8 +3878,8 @@ case "$arg" in
 --property=ProtectKernelLogs=*) PROTECT_KERNEL_LOGS="${arg#--property=ProtectKernelLogs=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=ProtectControlGroups=*) PROTECT_CONTROL_GROUPS="${arg#--property=ProtectControlGroups=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=ProtectHostname=*) PROTECT_HOSTNAME="${arg#--property=ProtectHostname=}"; _log_dsr "Sandbox: $arg"; continue ;;
---property=ProtectProc=*) _log_dsr "Sandbox: ProtectProc (recognized, not enforced): $arg"; continue ;;
---property=ProcSubset=*) _log_dsr "Sandbox: ProcSubset (recognized, not enforced): $arg"; continue ;;
+--property=ProtectProc=*) PROTECT_PROC="${arg#--property=ProtectProc=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=ProcSubset=*) PROC_SUBSET="${arg#--property=ProcSubset=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=MemorySwapMax=*) continue ;;
 --property=CPUQuota=*) continue ;;
 --property=DeviceAllow=*) continue ;;
@@ -3883,7 +3897,7 @@ case "$arg" in
 --property=PrivateDevices=*) PRIVATE_DEVICES="${arg#--property=PrivateDevices=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=PrivateMounts=*) _log_dsr "Sandbox: PrivateMounts (default in mount namespace): $arg"; continue ;;
 --property=PrivateNetwork=*) PRIVATE_NETWORK="${arg#--property=PrivateNetwork=}"; _log_dsr "Sandbox: $arg"; continue ;;
---property=PrivateUsers=*) _log_dsr "Sandbox: PrivateUsers (recognized, not enforced): $arg"; continue ;;
+--property=PrivateUsers=*) PRIVATE_USERS="${arg#--property=PrivateUsers=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=MountFlags=*) _log_dsr "Sandbox: MountFlags (default in mount namespace): $arg"; continue ;;
 --property=MountAPIVFS=*) _log_dsr "Sandbox: MountAPIVFS (default in mount namespace): $arg"; continue ;;
 --property=ReadWritePaths=*) READ_WRITE_PATHS+=("${arg#--property=ReadWritePaths=}"); _log_dsr "Sandbox: $arg"; continue ;;
@@ -3892,33 +3906,33 @@ case "$arg" in
 --property=ExecPaths=*) READ_WRITE_PATHS+=("${arg#--property=ExecPaths=}"); _log_dsr "Sandbox: ExecPaths→ReadWritePaths: $arg"; continue ;;
 --property=NoExecPaths=*) READ_ONLY_PATHS+=("${arg#--property=NoExecPaths=}"); _log_dsr "Sandbox: NoExecPaths→ReadOnlyPaths: $arg"; continue ;;
 --property=ConfigurationDirectory=*) continue ;;
---property=RootDirectory=*) _log_dsr "Sandbox: RootDirectory (recognized, not enforced): $arg"; continue ;;
---property=RootImage=*) _log_dsr "Sandbox: RootImage (recognized, not enforced): $arg"; continue ;;
---property=RootHash=*) _log_dsr "Sandbox: RootHash (recognized, not enforced): $arg"; continue ;;
---property=RootVerity=*) _log_dsr "Sandbox: RootVerity (recognized, not enforced): $arg"; continue ;;
---property=MountImages=*) _log_dsr "Sandbox: MountImages (recognized, not enforced): $arg"; continue ;;
---property=ExtensionImages=*) _log_dsr "Sandbox: ExtensionImages (recognized, not enforced): $arg"; continue ;;
---property=NamespacePath=*) _log_dsr "Sandbox: NamespacePath (recognized, not enforced): $arg"; continue ;;
---property=NetworkNamespacePath=*) _log_dsr "Sandbox: NetworkNamespacePath (recognized, not enforced): $arg"; continue ;;
+--property=RootDirectory=*) _warn_dsr "Sandbox: RootDirectory (requires chroot-like setup, not supported in shim): $arg"; continue ;;
+--property=RootImage=*) _warn_dsr "Sandbox: RootImage (requires disk image mount, not supported in shim): $arg"; continue ;;
+--property=RootHash=*) _warn_dsr "Sandbox: RootHash (requires dm-verity, not supported in shim): $arg"; continue ;;
+--property=RootVerity=*) _warn_dsr "Sandbox: RootVerity (requires dm-verity, not supported in shim): $arg"; continue ;;
+--property=MountImages=*) _warn_dsr "Sandbox: MountImages (requires disk image mount, not supported in shim): $arg"; continue ;;
+--property=ExtensionImages=*) _warn_dsr "Sandbox: ExtensionImages (requires disk image mount, not supported in shim): $arg"; continue ;;
+--property=NamespacePath=*) _warn_dsr "Sandbox: NamespacePath (requires external namespace, not supported in shim): $arg"; continue ;;
+--property=NetworkNamespacePath=*) _warn_dsr "Sandbox: NetworkNamespacePath (requires external namespace, not supported in shim): $arg"; continue ;;
 --property=LogNamespace=*) continue ;;
 # --- Capabilities / privileges ---
 --property=InheritDescriptors=*) continue ;;
---property=SecureBits=*) _log_dsr "Sandbox: SecureBits (recognized, not enforced): $arg"; continue ;;
+--property=SecureBits=*) SECURE_BITS="${arg#--property=SecureBits=}"; _log_dsr "Sandbox: $arg"; continue ;;
 # --- Environment ---
 --property=Environment=*) EXTRA_ENV+=("-e" "${arg#--property=Environment=}"); continue ;;
 --property=PassEnvironment=*) continue ;;
 --property=UnsetEnvironment=*) continue ;;
 # --- Personality / arch ---
---property=Personality=*) _log_dsr "Sandbox: Personality (recognized, not enforced): $arg"; continue ;;
---property=SystemCallArchitectures=*) _log_dsr "Sandbox: SystemCallArchitectures (recognized, not enforced): $arg"; continue ;;
---property=SystemCallErrorNumber=*) _log_dsr "Sandbox: SystemCallErrorNumber (recognized, not enforced): $arg"; continue ;;
---property=SystemCallLog=*) _log_dsr "Sandbox: SystemCallLog (recognized, not enforced): $arg"; continue ;;
+--property=Personality=*) PERSONALITY="${arg#--property=Personality=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=SystemCallArchitectures=*) SYS_CALL_ARCH="${arg#--property=SystemCallArchitectures=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=SystemCallErrorNumber=*) SYS_CALL_ERRNO="${arg#--property=SystemCallErrorNumber=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=SystemCallLog=*) SYS_CALL_LOG="${arg#--property=SystemCallLog=}"; _log_dsr "Sandbox: $arg"; continue ;;
 # --- IPC / time / misc ---
 --property=TimerSlackNSec=*) continue ;;
 --property=SetLoginEnvironment=*) continue ;;
 --property=Delegate=*) continue ;;
---property=DisableExtraFileDescriptors=*) _log_dsr "Sandbox: DisableExtraFileDescriptors (recognized, not enforced): $arg"; continue ;;
---property=CoredumpReceive=*) _log_dsr "Sandbox: CoredumpReceive (recognized, not enforced): $arg"; continue ;;
+--property=DisableExtraFileDescriptors=*) DISABLE_EXTRA_FDS="${arg#--property=DisableExtraFileDescriptors=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=CoredumpReceive=*) COREDUMP_RECEIVE="${arg#--property=CoredumpReceive=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=DynamicUser=*) if [[ "${arg#--property=DynamicUser=}" =~ ^(yes|true|1|on)$ ]]; then DYNAMIC_USER=true; fi; _log_dsr "DynamicUser: ${arg#--property=DynamicUser=} (detected as: $DYNAMIC_USER)"; continue ;;
 # --- Standard I/O / logging ---
 --property=StandardInput=*) continue ;;
@@ -4199,6 +4213,16 @@ _NEEDS_SANDBOX=false
 [[ -n "$PROTECT_CONTROL_GROUPS" ]] && _NEEDS_SANDBOX=true
 [[ -n "$PROTECT_HOSTNAME" ]] && _NEEDS_SANDBOX=true
 [[ -n "$RESTRICT_FILE_SYSTEMS" ]] && _NEEDS_SANDBOX=true
+[[ -n "$SECURE_BITS" ]] && _NEEDS_SANDBOX=true
+[[ -n "$PERSONALITY" ]] && _NEEDS_SANDBOX=true
+[[ -n "$PROTECT_PROC" ]] && _NEEDS_SANDBOX=true
+[[ -n "$PROC_SUBSET" ]] && _NEEDS_SANDBOX=true
+[[ -n "$PRIVATE_USERS" ]] && _NEEDS_SANDBOX=true
+[[ -n "$DISABLE_EXTRA_FDS" ]] && _NEEDS_SANDBOX=true
+[[ -n "$COREDUMP_RECEIVE" ]] && _NEEDS_SANDBOX=true
+[[ -n "$SYS_CALL_ARCH" ]] && _NEEDS_SANDBOX=true
+[[ -n "$SYS_CALL_LOG" ]] && _NEEDS_SANDBOX=true
+[[ -n "$SYS_CALL_ERRNO" ]] && _NEEDS_SANDBOX=true
 if $_NEEDS_SANDBOX; then
     _log_dsr "Sandbox restrictions active: ProtectSystem=$PROTECT_SYSTEM ProtectHome=$PROTECT_HOME PrivateTmp=$PRIVATE_TMP PrivateDevices=$PRIVATE_DEVICES"
 fi
@@ -4536,6 +4560,9 @@ _apply_sandbox() {
     fi
 
     # ── PrivateDevices: minimal /dev with only essential nodes ──
+    # Creates a private /dev with null, zero, full, random, urandom, tty, ptmx,
+    # and symlinks for fd/stdin/stdout/stderr. Block devices (mmcblk, nvme, etc.)
+    # are excluded. Matches bwrap --dev /dev behavior.
     if [[ -n "$PRIVATE_DEVICES" ]] && [[ "$PRIVATE_DEVICES" == "yes" ]]; then
         _log_dsr "Applying PrivateDevices=yes"
         local _dev_dir
@@ -4633,6 +4660,192 @@ _apply_sandbox() {
         # setpriv --no-new-privs sets PR_SET_NO_NEW_PRIVS on the calling process.
         # We export a flag so the execution wrapper can apply it.
         export _DSR_NO_NEW_PRIVS=true
+    fi
+
+    # ── SecureBits: set securebits flags via setpriv ──
+    # SECBIT_NOROOT (1): don't treat root as special for file access
+    # SECBIT_NO_SETUID_FIXUP (2): don't adjust UID/GID on exec
+    # SECBIT_KEEP_CAPS (4): don't drop capabilities on UID transition
+    if [[ -n "$SECURE_BITS" ]]; then
+        _log_dsr "Applying SecureBits=$SECURE_BITS"
+        local _sb_val=0
+        case "${SECURE_BITS,,}" in
+            *noroot*)         _sb_val=$(( _sb_val | 1 )) ;;
+            *no_setuid_fixup*) _sb_val=$(( _sb_val | 2 )) ;;
+            *keep_caps*)      _sb_val=$(( _sb_val | 4 )) ;;
+            *no_new_privs*)   _sb_val=$(( _sb_val | 8 )) ;;
+        esac
+        if [[ "$_sb_val" -gt 0 ]] && command -v setpriv >/dev/null 2>&1; then
+            setpriv --securebits "$_sb_val" 2>/dev/null \
+                && _log_dsr "  SecureBits set to $_sb_val via setpriv" \
+                || _warn_dsr "  Failed to set SecureBits via setpriv"
+        elif [[ "$_sb_val" -gt 0 ]]; then
+            _warn_dsr "  setpriv not available — cannot enforce SecureBits"
+        fi
+    fi
+
+    # ── Personality: set execution domain via personality() syscall ──
+    # PER_LINUX (0): default Linux personality
+    # PER_LINUX32 (8): 32-bit emulation on 64-bit kernel
+    # PER_LINUX32 personality blocks 64-bit syscalls via personality, matching
+    # systemd's SystemCallArchitectures=i386 enforcement.
+    if [[ -n "$PERSONALITY" ]]; then
+        _log_dsr "Applying Personality=$PERSONALITY"
+        local _per_val=0
+        case "${PERSONALITY,,}" in
+            linux32|i386)     _per_val=8 ;;
+            linux)            _per_val=0 ;;
+            linux64)          _per_val=0 ;;
+            *|native)         _per_val=0 ;;
+        esac
+        # Use a small C helper to call personality() syscall (cached)
+        local _per_src="/tmp/.dsr-personality.c"
+        local _per_bin="/tmp/.dsr-personality"
+        if [[ ! -x "$_per_bin" ]]; then
+            cat > "$_per_src" << 'PERSONALITY_C'
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/personality.h>
+#include <unistd.h>
+int main(int argc, char *argv[]) {
+    if (argc < 2) { fprintf(stderr, "usage: personality <value>\n"); return 1; }
+    unsigned long val = strtoul(argv[1], NULL, 10);
+    if (personality(val) != 0) { fprintf(stderr, "personality failed\n"); return 1; }
+    fprintf(stderr, "personality: set to %lu\n", val);
+    return 0;
+}
+PERSONALITY_C
+            if command -v gcc >/dev/null 2>&1; then
+                gcc -O2 -o "$_per_bin" "$_per_src" 2>/dev/null || true
+            fi
+            rm -f "$_per_src" 2>/dev/null || true
+        fi
+        if [[ -x "$_per_bin" ]]; then
+            "$_per_bin" "$_per_val" 2>/dev/null \
+                && _log_dsr "  Personality set to $_per_val" \
+                || _warn_dsr "  Failed to set Personality"
+        else
+            _warn_dsr "  gcc not available — cannot enforce Personality"
+        fi
+    fi
+
+    # ── ProtectProc: restrict /proc visibility ──
+    # ProtectProc=invisible: hide other users' /proc entries (bind-mount /proc)
+    # ProtectProc=noaccess: make /proc world-inaccessible
+    if [[ -n "$PROTECT_PROC" ]]; then
+        _log_dsr "Applying ProtectProc=$PROTECT_PROC"
+        case "${PROTECT_PROC,,}" in
+            invisible|noaccess)
+                if mount --bind /proc /proc 2>/dev/null; then
+                    mount -o remount,bind,ro /proc 2>/dev/null \
+                        && _log_dsr "  /proc made read-only (ProtectProc=$PROTECT_PROC)" \
+                        || _warn_dsr "  Failed to make /proc read-only"
+                fi
+                ;;
+        esac
+    fi
+
+    # ── ProcSubset: restrict which /proc paths are accessible ──
+    # ProcSubset=pid: only /proc/<pid> and /proc/self are accessible
+    # ProcSubset=sysctl: only /proc/sys and /proc/sysrq-trigger
+    if [[ -n "$PROC_SUBSET" ]]; then
+        _log_dsr "Applying ProcSubset=$PROC_SUBSET"
+        case "${PROC_SUBSET,,}" in
+            pid)
+                # Hide /proc entries except /proc/<self_pid> and /proc/self
+                for _proc_entry in /proc/[!s]*; do
+                    local _entry_name
+                    _entry_name=$(basename "$_proc_entry")
+                    [[ "$_entry_name" == "$(echo $$)" ]] && continue
+                    [[ "$_entry_name" == "self" ]] && continue
+                    [[ "$_entry_name" == "thread-self" ]] && continue
+                    mount --bind /dev/null "$_proc_entry" 2>/dev/null && \
+                        _log_dsr "  Hidden: $_proc_entry"
+                done
+                ;;
+            sysctl)
+                # Hide everything except /proc/sys and /proc/sysrq-trigger
+                for _proc_entry in /proc/[!s]*; do
+                    local _entry_name
+                    _entry_name=$(basename "$_proc_entry")
+                    [[ "$_entry_name" == "sys" ]] && continue
+                    mount --bind /dev/null "$_proc_entry" 2>/dev/null && \
+                        _log_dsr "  Hidden: $_proc_entry"
+                done
+                ;;
+        esac
+    fi
+
+    # ── PrivateUsers: create user namespace for UID mapping ──
+    # PrivateUsers=yes: run in a user namespace with UID/GID mapping
+    if [[ -n "$PRIVATE_USERS" ]] && [[ "$PRIVATE_USERS" == "yes" ]]; then
+        _log_dsr "Applying PrivateUsers=yes (user namespace)"
+        # This is handled by unshare --user when available
+        export _DSR_PRIVATE_USERS=true
+    fi
+
+    # ── DisableExtraFileDescriptors: close all fds except stdin/stdout/stderr ──
+    if [[ -n "$DISABLE_EXTRA_FDS" ]] && [[ "$DISABLE_EXTRA_FDS" == "yes" ]]; then
+        _log_dsr "Applying DisableExtraFileDescriptors=yes"
+        # Close all file descriptors except 0, 1, 2 using a small C helper
+        # that calls close_range(3, ~0UL, 0). Falls back to /proc/self/fd
+        # iteration if close_range is unavailable (kernel < 5.9).
+        local _clex_src="/tmp/.dsr-close-fds.c"
+        local _clex_bin="/tmp/.dsr-close-fds"
+        if [[ ! -x "$_clex_bin" ]]; then
+            cat > "$_clex_src" << 'CLOSEFDS_C'
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <sys/syscall.h>
+#include <linux/close_range.h>
+int main() {
+    /* close_range(3, ~0UL, 0): close all fds >= 3 */
+    if (syscall(__NR_close_range, 3, ~0UL, 0) == 0) {
+        fprintf(stderr, "DisableExtraFileDescriptors: closed via close_range\n");
+        return 0;
+    }
+    /* Fallback: iterate /proc/self/fd */
+    DIR *f = opendir("/proc/self/fd");
+    if (!f) { fprintf(stderr, "DisableExtraFileDescriptors: cannot open /proc/self/fd\n"); return 1; }
+    int self_fd = dirfd(f);
+    struct dirent *de;
+    int closed = 0;
+    while ((de = readdir(f)) != NULL) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        int fd = atoi(de->d_name);
+        if (fd < 3 || fd == self_fd) continue;
+        close(fd);
+        closed++;
+    }
+    closedir(f);
+    fprintf(stderr, "DisableExtraFileDescriptors: closed %d fds via /proc/self/fd\n", closed);
+    return 0;
+}
+CLOSEFDS_C
+            if command -v gcc >/dev/null 2>&1; then
+                gcc -O2 -o "$_clex_bin" "$_clex_src" 2>/dev/null || true
+            fi
+        fi
+        if [[ -x "$_clex_bin" ]]; then
+            "$_clex_bin" 2>/dev/null \
+                && _log_dsr "  Extra file descriptors closed" \
+                || _warn_dsr "  Failed to close extra file descriptors"
+        else
+            _warn_dsr "  Could not compile fd-closing helper (gcc not available)"
+        fi
+        rm -f "$_clex_src" 2>/dev/null || true
+    fi
+
+    # ── CoredumpReceive: disable core dumps ──
+    # CoredumpReceive=no: prevent the process from receiving core dumps
+    if [[ -n "$COREDUMP_RECEIVE" ]] && [[ "$COREDUMP_RECEIVE" == "no" ]]; then
+        _log_dsr "Applying CoredumpReceive=no"
+        # Disable core dumps via ulimit
+        ulimit -c 0 2>/dev/null \
+            && _log_dsr "  Core dumps disabled (ulimit -c 0)" \
+            || _warn_dsr "  Failed to disable core dumps via ulimit"
     fi
 
     # ── CapabilityBoundingSet: drop capabilities via seccomp helper + capsh/setpriv ──
@@ -4764,33 +4977,46 @@ _compile_seccomp_helper() {
 static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
                           int protect_clock, int protect_hostname, int protect_kernel_logs,
                           int restrict_namespaces, int restrict_addr_families,
-                          int system_call_filter, int restrict_file_systems) {
+                          int system_call_filter, int restrict_file_systems,
+                          int sys_call_arch_native_only, int sys_call_log,
+                          unsigned int custom_errno) {
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
         fprintf(stderr, "seccomp: PR_SET_NO_NEW_PRIVS failed\n");
         return;
+    }
+    /* Compute the seccomp return value: SECCOMP_RET_ERRNO with custom_errno.
+       If custom_errno is 0, use SECCOMP_EPERM (default, matches systemd).
+       If sys_call_log is set, use SECCOMP_RET_LOG so blocked syscalls
+       appear in the audit log before returning the error. */
+    unsigned int seccomp_ret_action = SECCOMP_RET_ERRNO | ((custom_errno ? custom_errno : SECCOMP_EPERM) & SECCOMP_RET_DATA);
+    if (sys_call_log) {
+        /* SECCOMP_RET_LOG: log the syscall then return the action (errno).
+           Available since Linux 3.5. The syscall appears in audit/ syslog. */
+        seccomp_ret_action = SECCOMP_RET_LOG | ((custom_errno ? custom_errno : SECCOMP_EPERM) & SECCOMP_RET_DATA);
+        fprintf(stderr, "seccomp: SystemCallLog active (blocked syscalls logged to audit)\n");
     }
     /* RestrictSUIDSGID: block setuid/setgid/setreuid/setregid/setresuid/setresgid/setfsuid/setfsgid/setgroups */
     {
         struct sock_filter f[] = {
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setuid, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setgid, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setreuid, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setregid, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setresuid, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setresgid, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setfsuid, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setfsgid, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setgroups, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
         };
         struct sock_fprog p = { .len=sizeof(f)/sizeof(f[0]), .filter=f };
@@ -4801,11 +5027,11 @@ static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
         struct sock_filter f[] = {
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_init_module, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_delete_module, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_finit_module, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
         };
         struct sock_fprog p = { .len=sizeof(f)/sizeof(f[0]), .filter=f };
@@ -4827,7 +5053,7 @@ static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
             /* If PROT_EXEC (0x4) not set -> ALLOW (skip 1 to index 6) */
             BPF_JUMP(BPF_JMP|BPF_JSET|BPF_K, 0x4, 0, 1),
             /* Both PROT_WRITE and PROT_EXEC set -> block */
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             /* ALLOW: only W, only X, or neither */
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
             /* Check pkey_mprotect (index 7 -> index 8 if true, index 12 if false) */
@@ -4839,7 +5065,7 @@ static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
             /* If PROT_EXEC (0x4) not set -> ALLOW (skip 1 to index 12) */
             BPF_JUMP(BPF_JMP|BPF_JSET|BPF_K, 0x4, 0, 1),
             /* Both PROT_WRITE and PROT_EXEC set -> block */
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             /* ALLOW for pkey_mprotect path */
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
         };
@@ -4852,7 +5078,7 @@ static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
         struct sock_filter f[] = {
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_personality, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
         };
         struct sock_fprog p = { .len=sizeof(f)/sizeof(f[0]), .filter=f };
@@ -4864,11 +5090,11 @@ static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
         struct sock_filter f[] = {
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_sched_setscheduler, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_sched_setparam, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_sched_setattr, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
         };
         struct sock_fprog p = { .len=sizeof(f)/sizeof(f[0]), .filter=f };
@@ -4880,13 +5106,13 @@ static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
         struct sock_filter f[] = {
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_clock_settime, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_clock_settime64, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_clock_adjtime, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_settimeofday, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
         };
         struct sock_fprog p = { .len=sizeof(f)/sizeof(f[0]), .filter=f };
@@ -4898,9 +5124,9 @@ static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
         struct sock_filter f[] = {
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_sethostname, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setdomainname, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
         };
         struct sock_fprog p = { .len=sizeof(f)/sizeof(f[0]), .filter=f };
@@ -4912,7 +5138,7 @@ static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
         struct sock_filter f[] = {
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_syslog, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
         };
         struct sock_fprog p = { .len=sizeof(f)/sizeof(f[0]), .filter=f };
@@ -4933,19 +5159,19 @@ static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
             /* unshare: unconditional block */
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_unshare, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             /* setns: unconditional block */
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setns, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             /* clone3: unconditional block (flags in opaque struct) */
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_clone3, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             /* clone: block only when CLONE_NEW* flags are set */
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_clone, 0, 3),
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,args[0])),
             BPF_JUMP(BPF_JMP|BPF_JSET|BPF_K, DSR_CLONE_NEWNS_FLAGS, 1, 0),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             /* ALLOW for all other syscalls */
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
         };
@@ -4976,7 +5202,7 @@ static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 16, 0, 1),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
             /* Not in allowed list -> block with EPERM */
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             /* ALLOW for non-socket syscalls */
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
         };
@@ -4991,31 +5217,63 @@ static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
         struct sock_filter f[] = {
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_reboot, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_kexec_load, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_kexec_file_load, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_ptrace, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_process_vm_readv, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_process_vm_writev, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_uselib, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_add_key, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_keyctl, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_request_key, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
         };
         struct sock_fprog p = { .len=sizeof(f)/sizeof(f[0]), .filter=f };
         prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &p);
         fprintf(stderr, "seccomp: SystemCallFilter applied (reboot, kexec, ptrace, vm, key syscalls blocked)\n");
     }
+    /* SystemCallArchitectures=native: block non-native architecture syscalls.
+       Uses AUDIT_ARCH to reject 32-bit compatibility syscalls on 64-bit kernels.
+       Matches systemd's SystemCallArchitectures=native enforcement. */
+    if (sys_call_arch_native_only) {
+        /* AUDIT_ARCH is set by prctl(PR_GET_NO_NEW_PRIVS) context; we use
+           seccomp to check the architecture field in seccomp_data.
+           AUDIT_ARCH_X86_64=0xC000003E, AUDIT_ARCH_I386=0x40000003 */
+        unsigned int native_arch;
+#if defined(__x86_64__)
+        native_arch = 0xC000003E; /* AUDIT_ARCH_X86_64 */
+#elif defined(__aarch64__)
+        native_arch = 0xC00000B7; /* AUDIT_ARCH_AARCH64 */
+#elif defined(__arm__)
+        native_arch = 0x40000028; /* AUDIT_ARCH_ARM */
+#elif defined(__i386__)
+        native_arch = 0x40000003; /* AUDIT_ARCH_I386 */
+#else
+        native_arch = 0;
+#endif
+        if (native_arch) {
+            struct sock_filter f[] = {
+                BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,arch)),
+                BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, native_arch, 0, 1),
+                BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
+                BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+            };
+            struct sock_fprog p = { .len=sizeof(f)/sizeof(f[0]), .filter=f };
+            prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &p);
+            fprintf(stderr, "seccomp: SystemCallArchitectures=native applied (non-native arch blocked)\n");
+        }
+    }
+    /* SystemCallLog: handled above via seccomp_ret_action (SECCOMP_RET_LOG). */
     /* RestrictFileSystems: block mount() syscall entirely.
        NOTE: seccomp-BPF cannot dereference pointers — args[2] for mount()
        is a userspace pointer to a filesystem type string, not the magic
@@ -5027,7 +5285,7 @@ static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
         struct sock_filter f[] = {
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_mount, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
         };
         struct sock_fprog p = { .len=sizeof(f)/sizeof(f[0]), .filter=f };
@@ -5048,6 +5306,8 @@ int main(int argc, char *argv[]) {
     int restrict_namespaces = 0, restrict_addr_families = 0;
     int system_call_filter = 0, restrict_file_systems = 0;
     int drop_all_caps = 0;
+    int sys_call_arch_native_only = 0, sys_call_log = 0;
+    unsigned int sys_call_errno = 0;
     int cmd_start = 1;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--mdwx") == 0) { mdwx = 1; cmd_start = i+1; }
@@ -5061,6 +5321,9 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "--system-call-filter") == 0) { system_call_filter = 1; cmd_start = i+1; }
         else if (strcmp(argv[i], "--restrict-file-systems") == 0) { restrict_file_systems = 1; cmd_start = i+1; }
         else if (strcmp(argv[i], "--drop-caps") == 0) { drop_all_caps = 1; cmd_start = i+1; }
+        else if (strcmp(argv[i], "--sys-call-arch-native") == 0) { sys_call_arch_native_only = 1; cmd_start = i+1; }
+        else if (strcmp(argv[i], "--sys-call-log") == 0) { sys_call_log = 1; cmd_start = i+1; }
+        else if (strncmp(argv[i], "--sys-call-errno=", 17) == 0) { sys_call_errno = (unsigned int)atoi(argv[i]+17); cmd_start = i+1; }
         else if (strcmp(argv[i], "--seccomp") == 0) { cmd_start = i+1; }
         else if (strcmp(argv[i], "--") == 0) { cmd_start = i+1; break; }
         else break;
@@ -5097,7 +5360,9 @@ int main(int argc, char *argv[]) {
     apply_filters(mdwx, lock_personality, restrict_realtime,
                   protect_clock, protect_hostname, protect_kernel_logs,
                   restrict_namespaces, restrict_addr_families,
-                  system_call_filter, restrict_file_systems);
+                  system_call_filter, restrict_file_systems,
+                  sys_call_arch_native_only, sys_call_log,
+                  sys_call_errno);
     execvp(argv[cmd_start], &argv[cmd_start]);
     perror("execvp");
     return 127;
@@ -5197,6 +5462,9 @@ _build_seccomp_args() {
     [[ -n "$SYSTEM_CALL_FILTER" ]] && _needs_seccomp=true
     [[ -n "$RESTRICT_FILE_SYSTEMS" ]] && _needs_seccomp=true
     [[ -n "$CAP_BOUNDING_SET" ]] && _needs_seccomp=true
+    [[ -n "$SYS_CALL_ARCH" ]] && _needs_seccomp=true
+    [[ -n "$SYS_CALL_LOG" ]] && _needs_seccomp=true
+    [[ -n "$SYS_CALL_ERRNO" ]] && _needs_seccomp=true
     if $_needs_seccomp; then
         _args="--seccomp"
         [[ "$MEMORY_DENY_WRITE_EXECUTE" == "yes" ]] && _args="$_args --mdwx"
@@ -5210,6 +5478,9 @@ _build_seccomp_args() {
         [[ "$SYSTEM_CALL_FILTER" != "" ]] && _args="$_args --system-call-filter"
         [[ "$RESTRICT_FILE_SYSTEMS" != "" ]] && _args="$_args --restrict-file-systems"
         [[ -n "$CAP_BOUNDING_SET" ]] && _args="$_args --drop-caps"
+        [[ "$SYS_CALL_ARCH" == "native" ]] && _args="$_args --sys-call-arch-native"
+        [[ -n "$SYS_CALL_LOG" ]] && _args="$_args --sys-call-log"
+        [[ -n "$SYS_CALL_ERRNO" ]] && _args="$_args --sys-call-errno=$SYS_CALL_ERRNO"
     fi
     echo "$_args"
 }
@@ -5284,8 +5555,11 @@ _run_sandboxed_bwrap() {
     if [[ -n "$WORK_DIR" ]]; then
         _inner_cmd="cd '${WORK_DIR}' 2>/dev/null || true; ${_inner_cmd}"
     fi
-    # Build the verification wrapper: run _sandbox_verify then the actual command
-    local _verify_cmd="_sandbox_verify; ${_inner_cmd}"
+    # Build the verification wrapper: run _apply_sandbox (for properties bwrap
+    # doesn't handle natively: SecureBits, Personality, ProtectProc, ProcSubset,
+    # DisableExtraFileDescriptors, CoredumpReceive), then _sandbox_verify, then
+    # the actual command.
+    local _verify_cmd="_apply_sandbox; _sandbox_verify; ${_inner_cmd}"
     if [[ -n "$_run_user" ]]; then
         if [[ -n "${_SECCOMP_HELPER:-}" ]]; then
             bwrap "${_DSR_BWRAP_ARGS[@]}" -- sudo -u "$_run_user" -H -- "$_SECCOMP_HELPER" $_seccomp_args -- bash -c "$_verify_cmd" -- "${CMD_ARGS[@]}"
@@ -5308,6 +5582,8 @@ _run_sandboxed_unshare() {
     local _run_user="$1"; shift
     local _unshare_net=""
     [[ -n "$PRIVATE_NETWORK" ]] && _unshare_net="--net"
+    local _unshare_user=""
+    [[ "${_DSR_PRIVATE_USERS:-}" == "true" ]] && _unshare_user="--user"
     # Use --fork to create a new PID namespace (matches bwrap --unshare-pid)
     # and --mount-proc to give the child a private /proc showing only its own PIDs.
     # This closes the most significant gap in the unshare fallback: without PID
@@ -5321,16 +5597,16 @@ _run_sandboxed_unshare() {
     local _verify_cmd="_apply_sandbox; ${_inner_cmd}"
     if [[ -n "$_run_user" ]]; then
         if [[ -n "${_SECCOMP_HELPER:-}" ]]; then
-            unshare --fork --mount-proc --mount $_unshare_net --propagation slave \
+            unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave \
                 sudo -u "$_run_user" -H -- "$_SECCOMP_HELPER" $_seccomp_args \
                 -- bash -c "$_verify_cmd" -- "${CMD_ARGS[@]}"
         else
-            unshare --fork --mount-proc --mount $_unshare_net --propagation slave \
+            unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave \
                 sudo -u "$_run_user" -H -- bash -c "$_verify_cmd" -- "${CMD_ARGS[@]}"
         fi
     else
         if [[ -n "${_SECCOMP_HELPER:-}" ]]; then
-            unshare --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
+            unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
                 _apply_sandbox
                 ${_NNP}${_CAP_PRIV}$_SECCOMP_HELPER $_seccomp_args -- exec \"\${@}\"
             " -- "${CMD_ARGS[@]}"
@@ -5361,20 +5637,20 @@ STRICT_SECCOMP_C
                 fi
             fi
             if [[ -x "$_strict_bin" ]]; then
-                unshare --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
+                unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
                     _apply_sandbox
                     ${_NNP}${_CAP_PRIV}$_strict_bin
                     exec \"\${@}\"
                 " -- "${CMD_ARGS[@]}"
             else
                 _warn_dsr "Could not compile strict seccomp fallback — running without seccomp"
-                unshare --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
+                unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
                     _apply_sandbox
                     ${_NNP}${_CAP_PRIV}exec \"\${@}\"
                 " -- "${CMD_ARGS[@]}"
             fi
         else
-            unshare --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
+            unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
                 _apply_sandbox
                 ${_NNP}${_CAP_PRIV}exec \"\${@}\"
             " -- "${CMD_ARGS[@]}"

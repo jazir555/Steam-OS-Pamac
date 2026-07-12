@@ -56,12 +56,24 @@ _verify_script_hash() {
         if [[ -n "$_caller_src" && -f "$_caller_src" ]]; then
             cp -- "$_caller_src" "$_tmp_hash_src"
         else
-            # Last resort: use /proc/self/fd trick to re-read our own stdin
-            # (works when invoked via bash -c "$(curl ...)" because bash keeps
-            # the script text in its argument buffer).
-            echo "ERROR: Cannot locate the running script body for hashing." >&2
-            rm -f "$_tmp_hash_src"
-            return 1
+            # Last resort: Read the command string from the process argument
+            # buffer via /proc/self/cmdline (works on Linux/SteamOS when
+            # executed via bash -c "string"). The command string is the third
+            # NUL-separated argument (index 2) after "bash" and "-c".
+            local _recovered=false
+            if [[ -f /proc/self/cmdline ]] && command -v mapfile >/dev/null 2>&1; then
+                local -a _cmd_args=()
+                mapfile -d '' _cmd_args < /proc/self/cmdline 2>/dev/null || true
+                if [[ "${_cmd_args[1]:-}" == "-c" && -n "${_cmd_args[2]:-}" ]]; then
+                    printf '%s' "${_cmd_args[2]}" > "$_tmp_hash_src"
+                    _recovered=true
+                fi
+            fi
+            if [[ "$_recovered" != "true" ]]; then
+                echo "ERROR: Cannot locate the running script body for hashing." >&2
+                rm -f "$_tmp_hash_src"
+                return 1
+            fi
         fi
         echo "Hash of downloaded script ($_tmp_hash_src):" >&2
         if command -v sha256sum >/dev/null 2>&1; then
@@ -9403,7 +9415,15 @@ export_pamac_to_host() {
         _tmp=$(mktemp "${_target}.tmp.XXXXXX") || { log_warn "mktemp failed for $_target"; return 1; }
         printf '%s\n' "$_content" > "$_tmp"
         if [[ -s "$_tmp" ]]; then
+            # Sync the temp file to disk before rename so metadata and data are
+            # committed. Without this, a power cut after rename could leave the
+            # filesystem pointing at unwritten sectors (corrupted/zero-byte file).
+            sync "$_tmp" 2>/dev/null || sync 2>/dev/null || true
             mv -f "$_tmp" "$_target"
+            # Sync the parent directory so the rename entry is durable too.
+            local _parent
+            _parent=$(dirname "$_target")
+            sync "$_parent" 2>/dev/null || true
         else
             rm -f "$_tmp"
             log_warn "Atomic write produced empty file for $_target"
@@ -11102,7 +11122,7 @@ PAMAC_DESKTOP
   desktop_basename="\$(basename "\$desktop_file")"
 
   python3 - "\$desktop_file" "\$desktop_basename" "${container_name}" "${current_user}" "\$export_name" "\$app_name" "\$owner_pkg" "\$_cm" << 'PYTHON_DESKTOP_REWRITE'
-import sys, configparser, io
+import sys, configparser, io, os, tempfile
 
 desktop_path = sys.argv[1]
 desktop_basename = sys.argv[2]
@@ -11202,8 +11222,18 @@ for section, items in other_sections.items():
     for k, v in items.items():
         lines.append(f'{k}={v}')
 
-with open(desktop_path, 'w') as f:
-    f.write('\n'.join(lines) + '\n')
+# Atomic Write: write to temporary file on same filesystem, then replace.
+# Prevents truncation if interrupted mid-write (kernel panic, power cut).
+desktop_dir = os.path.dirname(desktop_path)
+with tempfile.NamedTemporaryFile('w', dir=desktop_dir, delete=False) as tf:
+    tf.write('\n'.join(lines) + '\n')
+    temp_name = tf.name
+try:
+    os.replace(temp_name, desktop_path)
+except Exception as e:
+    if os.path.exists(temp_name):
+        os.unlink(temp_name)
+    raise e
 PYTHON_DESKTOP_REWRITE
   local _py_rc=$?
   if [[ \$_py_rc -ne 0 ]]; then

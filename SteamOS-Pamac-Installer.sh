@@ -282,7 +282,7 @@ sanitize_and_upload_log() {
         -e 's/-----END [A-Z ]*KEY-----//g' \
         -e 's/(Bearer |Authorization:)[^ ]*/\1<REDACTED>/gi' \
         -e 's/password[=: ].*$/password=<REDACTED>/gi' \
-        -e 's/token[=: ].*$/token=<REDACTED>/gi' \
+        -e 's/\btoken[=: ].*$/token=<REDACTED>/gi' \
         -e 's/secret[=: ].*$/secret=<REDACTED>/gi' \
         -e 's/api[_-]?key[=: ].*$/api_key=<REDACTED>/gi' \
         -e 's/access[_-]?key[=: ].*$/access_key=<REDACTED>/gi' \
@@ -365,7 +365,7 @@ _filter_verbose_output() {
     # The safety grep runs first so such lines escape the exclusion filter.
     local _noise='^[[:space:]]*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database)|^downloading[[:space:]]|^::[[:space:]]+(Synchronizing|debug:)|^Nothing to do\.| is up to date$'
     local _keep='error|fail|warning|cannot|denied|corrupt|invalid|unexpected|refus'
-    grep -E -i "$_keep" || grep -v -E "$_noise" || true
+    awk -v k="$_keep" -v n="$_noise" 'BEGIN{IGNORECASE=1} $0~k{print;next} $0!~n{print}'
 }
 
 run_command() {
@@ -1047,7 +1047,7 @@ check_multi_user_warning() {
             [[ -n "$u" ]] && log_warn "  - $u"
         done
         log_warn "--allow-wheel-nopasswd grants passwordless sudo to the entire wheel group."
-        log_warn"Any user in the wheel group (including those listed above) can perform"
+        log_warn "Any user in the wheel group (including those listed above) can perform"
         log_warn "administrative operations inside the container without authentication."
         log_warn "Consider omitting --allow-wheel-nopasswd for per-user sudo restriction."
         log_warn "If you need wheel-wide access, audit all wheel-group members first."
@@ -1830,9 +1830,9 @@ wait_for_container() {
     trap - RETURN INT TERM HUP
   }
   trap '_wfc_cleanup' RETURN
-  trap '_wfc_cleanup; return 130' INT
-  trap '_wfc_cleanup; return 143' TERM
-  trap '_wfc_cleanup; return 129' HUP
+  trap '_wfc_cleanup; exit 130' INT
+  trap '_wfc_cleanup; exit 143' TERM
+  trap '_wfc_cleanup; exit 129' HUP
 
   while true; do
     attempt=$((attempt + 1))
@@ -3427,71 +3427,68 @@ fi
 # bwrap (bubblewrap) is the preferred sandbox engine. It handles user namespaces,
 # mount namespaces, /dev isolation, tmpfs, ro/rw bind mounts, and network
 # unsharing natively — avoiding fragile manual mount trickery inside unshare.
-# Returns 0 and echoes the bwrap arg array (space-separated, for eval) if bwrap
-# is available and sandbox is needed. Returns 1 if bwrap unavailable.
+# Populates the global array _DSR_BWRAP_ARGS. Returns 0 if bwrap is available
+# and sandbox is needed, 1 if bwrap is unavailable.
 _build_bwrap_args() {
     command -v bwrap >/dev/null 2>&1 || return 1
-    local _bwrap_args=""
+    _DSR_BWRAP_ARGS=()
     # ── Base: create a new mount namespace and proc/dev ──
-    _bwrap_args="--unshare-pid --dev /dev --proc /proc --tmpfs /tmp"
+    _DSR_BWRAP_ARGS+=(--unshare-pid --dev /dev --proc /proc --tmpfs /tmp)
     # PrivateTmp: bwrap already provides a fresh /tmp via --tmpfs /tmp
     if [[ "$PRIVATE_TMP" == "yes" ]]; then
-        _bwrap_args="$_bwrap_args --tmpfs /var/tmp"
+        _DSR_BWRAP_ARGS+=(--tmpfs /var/tmp)
         _log_dsr "bwrap: PrivateTmp (fresh /tmp and /var/tmp)"
     else
-        _bwrap_args="$_bwrap_args --bind /var/tmp /var/tmp"
+        _DSR_BWRAP_ARGS+=(--bind /var/tmp /var/tmp)
     fi
     # PrivateDevices: minimal /dev is already created via --dev /dev
     if [[ "$PRIVATE_DEVICES" == "yes" ]]; then
-        _bwrap_args="$_bwrap_args --dev /dev"
+        _DSR_BWRAP_ARGS+=(--dev /dev)
         _log_dsr "bwrap: PrivateDevices (minimal /dev)"
     fi
     # ── ProtectHome: replace /home with empty tmpfs or bind RO ──
     if [[ "$PROTECT_HOME" == "yes" ]]; then
-        _bwrap_args="$_bwrap_args --tmpfs /home"
+        _DSR_BWRAP_ARGS+=(--tmpfs /home)
         _log_dsr "bwrap: ProtectHome=yes (/home→tmpfs)"
     elif [[ "$PROTECT_HOME" == "read-only" ]]; then
-        _bwrap_args="$_bwrap_args --ro-bind /home /home"
+        _DSR_BWRAP_ARGS+=(--ro-bind /home /home)
         _log_dsr "bwrap: ProtectHome=read-only"
     else
-        _bwrap_args="$_bwrap_args --bind /home /home"
+        _DSR_BWRAP_ARGS+=(--bind /home /home)
     fi
     # ── ProtectSystem: make / readonly, carve writable exceptions ──
     if [[ "$PROTECT_SYSTEM" == "strict" ]]; then
-        # Strict: /usr /boot /etc are RO, everything else (including /var) is RO
-        _bwrap_args="$_bwrap_args --ro-bind /usr /usr --ro-bind /boot /boot --ro-bind /etc /etc --ro-bind / /"
+        _DSR_BWRAP_ARGS+=(--ro-bind /usr /usr --ro-bind /boot /boot --ro-bind /etc /etc --ro-bind / /)
         _log_dsr "bwrap: ProtectSystem=strict"
     elif [[ "$PROTECT_SYSTEM" == "full" ]]; then
-        # Full: /usr /boot /etc are RO, / (root) is RO but /var is writable
-        _bwrap_args="$_bwrap_args --ro-bind /usr /usr --ro-bind /boot /boot --ro-bind /etc /etc --bind /var /var --ro-bind / /"
+        _DSR_BWRAP_ARGS+=(--ro-bind /usr /usr --ro-bind /boot /boot --ro-bind /etc /etc --bind /var /var --ro-bind / /)
         _log_dsr "bwrap: ProtectSystem=full"
     elif [[ "$PROTECT_SYSTEM" == "yes" ]] || [[ "$PROTECT_SYSTEM" == "true" ]]; then
-        # yes/true: /usr /boot /etc RO, / (root) is RO, /var /var/tmp writable
-        _bwrap_args="$_bwrap_args --ro-bind /usr /usr --ro-bind /boot /boot --ro-bind /etc /etc --bind /var /var --ro-bind / /"
+        _DSR_BWRAP_ARGS+=(--ro-bind /usr /usr --ro-bind /boot /boot --ro-bind /etc /etc --bind /var /var --ro-bind / /)
         _log_dsr "bwrap: ProtectSystem=$PROTECT_SYSTEM"
     else
-        _bwrap_args="$_bwrap_args --bind / /"
+        _DSR_BWRAP_ARGS+=(--bind / /)
     fi
     # ── Writable paths needed by builds ──
     for _wp in /run /var/cache; do
-        _bwrap_args="$_bwrap_args --bind $_wp $_wp"
+        _DSR_BWRAP_ARGS+=(--bind "$_wp" "$_wp")
     done
-    [[ -n "$WORK_DIR" ]] && { mkdir -p "$WORK_DIR" 2>/dev/null || true; _bwrap_args="$_bwrap_args --bind $WORK_DIR $WORK_DIR"; }
-    [[ -n "$CACHE_DIR" ]] && { _bwrap_args="$_bwrap_args --bind /var/cache/$CACHE_DIR /var/cache/$CACHE_DIR"; }
+    [[ -n "$WORK_DIR" ]] && { mkdir -p "$WORK_DIR" 2>/dev/null || true; _DSR_BWRAP_ARGS+=(--bind "$WORK_DIR" "$WORK_DIR"); }
+    [[ -n "$CACHE_DIR" ]] && { _DSR_BWRAP_ARGS+=(--bind "/var/cache/$CACHE_DIR" "/var/cache/$CACHE_DIR"); }
     # ── ReadWritePaths ──
     for _rwp in "${READ_WRITE_PATHS[@]}"; do
         [[ -z "$_rwp" ]] && continue
         mkdir -p "$_rwp" 2>/dev/null || true
-        _bwrap_args="$_bwrap_args --bind $_rwp $_rwp"
+        _DSR_BWRAP_ARGS+=(--bind "$_rwp" "$_rwp")
         _log_dsr "bwrap: ReadWritePaths: $_rwp"
     done
     # ── ReadOnlyPaths ──
     for _rop in "${READ_ONLY_PATHS[@]}"; do
         [[ -z "$_rop" ]] && continue
         if [[ -e "$_rop" ]]; then
-            _bwrap_args="$_bwrap_args --ro-bind $_rop $_rop"
+            _DSR_BWRAP_ARGS+=(--ro-bind "$_rop" "$_rop")
         else
-            _bwrap_args="$_bwrap_args --ro-bind /var/empty $_rop"
+            _DSR_BWRAP_ARGS+=(--ro-bind /var/empty "$_rop")
             mkdir -p /var/empty 2>/dev/null || true
         fi
         _log_dsr "bwrap: ReadOnlyPaths: $_rop"
@@ -3500,9 +3497,9 @@ _build_bwrap_args() {
     for _iap in "${INACCESSIBLE_PATHS[@]}"; do
         [[ -z "$_iap" ]] && continue
         if [[ -d "$_iap" ]]; then
-            _bwrap_args="$_bwrap_args --bind /var/empty $_iap"
+            _DSR_BWRAP_ARGS+=(--bind /var/empty "$_iap")
         else
-            _bwrap_args="$_bwrap_args --bind /dev/null $_iap"
+            _DSR_BWRAP_ARGS+=(--bind /dev/null "$_iap")
         fi
         mkdir -p /var/empty 2>/dev/null || true
         _log_dsr "bwrap: InaccessiblePaths: $_iap"
@@ -3512,14 +3509,14 @@ _build_bwrap_args() {
         [[ -z "$_sd" ]] && continue
         mkdir -p "/var/lib/$_sd" 2>/dev/null || true
         chown "${BUILD_USER:-$_DSR_HOST_USER}:${BUILD_USER:-$_DSR_HOST_USER}" "/var/lib/$_sd" 2>/dev/null || true
-        _bwrap_args="$_bwrap_args --bind /var/lib/$_sd /var/lib/$_sd"
+        _DSR_BWRAP_ARGS+=(--bind "/var/lib/$_sd" "/var/lib/$_sd")
         _log_dsr "bwrap: StateDirectory: /var/lib/$_sd"
     done
     for _ld in "${LOGS_DIRECTORIES[@]}"; do
         [[ -z "$_ld" ]] && continue
         mkdir -p "/var/log/$_ld" 2>/dev/null || true
         chown "${BUILD_USER:-$_DSR_HOST_USER}:${BUILD_USER:-$_DSR_HOST_USER}" "/var/log/$_ld" 2>/dev/null || true
-        _bwrap_args="$_bwrap_args --bind /var/log/$_ld /var/log/$_ld"
+        _DSR_BWRAP_ARGS+=(--bind "/var/log/$_ld" "/var/log/$_ld")
         _log_dsr "bwrap: LogsDirectory: /var/log/$_ld"
     done
     for _rd in "${RUNTIME_DIRECTORIES[@]}"; do
@@ -3527,7 +3524,7 @@ _build_bwrap_args() {
         mkdir -p "/run/$_rd" 2>/dev/null || true
         chown "${BUILD_USER:-$_DSR_HOST_USER}:${BUILD_USER:-$_DSR_HOST_USER}" "/run/$_rd" 2>/dev/null || true
         chmod 0755 "/run/$_rd" 2>/dev/null || true
-        _bwrap_args="$_bwrap_args --bind /run/$_rd /run/$_rd"
+        _DSR_BWRAP_ARGS+=(--bind "/run/$_rd" "/run/$_rd")
         _log_dsr "bwrap: RuntimeDirectory: /run/$_rd"
     done
     # ── TemporaryFileSystem: mount tmpfs ──
@@ -3537,11 +3534,10 @@ _build_bwrap_args() {
         local _tfs_opts="${_tfs#*:}"
         [[ -z "$_tfs_path" ]] && continue
         [[ "$_tfs_opts" == "$_tfs_path" ]] && _tfs_opts=""
+        _DSR_BWRAP_ARGS+=(--tmpfs "$_tfs_path")
         if [[ -n "$_tfs_opts" ]]; then
-            _bwrap_args="$_bwrap_args --tmpfs $_tfs_path"
             _log_dsr "bwrap: TemporaryFileSystem: $_tfs_path (opts: $_tfs_opts)"
         else
-            _bwrap_args="$_bwrap_args --tmpfs $_tfs_path"
             _log_dsr "bwrap: TemporaryFileSystem: $_tfs_path"
         fi
     done
@@ -3553,7 +3549,7 @@ _build_bwrap_args() {
         [[ "$_dst" == "$_src" ]] && _dst="$_src"
         [[ -z "$_src" || -z "$_dst" ]] && continue
         mkdir -p "$_src" "$_dst" 2>/dev/null || true
-        _bwrap_args="$_bwrap_args --bind $_src $_dst"
+        _DSR_BWRAP_ARGS+=(--bind "$_src" "$_dst")
         _log_dsr "bwrap: BindPaths: $_src → $_dst"
     done
     # ── BindReadOnlyPaths: read-only bind mounts ──
@@ -3564,20 +3560,19 @@ _build_bwrap_args() {
         [[ "$_dst" == "$_src" ]] && _dst="$_src"
         [[ -z "$_src" || -z "$_dst" ]] && continue
         mkdir -p "$_src" "$_dst" 2>/dev/null || true
-        _bwrap_args="$_bwrap_args --ro-bind $_src $_dst"
+        _DSR_BWRAP_ARGS+=(--ro-bind "$_src" "$_dst")
         _log_dsr "bwrap: BindReadOnlyPaths: $_src → $_dst"
     done
     # ── PrivateNetwork: unshare network namespace ──
     if [[ "$PRIVATE_NETWORK" == "yes" ]]; then
-        _bwrap_args="$_bwrap_args --unshare-net"
+        _DSR_BWRAP_ARGS+=(--unshare-net)
         _log_dsr "bwrap: PrivateNetwork (network namespace unshared)"
     fi
     # ── NoNewPrivileges: bwrap natively supports --new-session ──
     if [[ "$NO_NEW_PRIVS" == "yes" ]]; then
-        _bwrap_args="$_bwrap_args --new-session"
+        _DSR_BWRAP_ARGS+=(--new-session)
         _log_dsr "bwrap: NoNewPrivileges (--new-session)"
     fi
-    echo "$_bwrap_args"
     return 0
 }
 
@@ -4123,8 +4118,7 @@ _prepare_cap_priv() {
 # Returns the exit code of the inner command.
 _run_sandboxed_bwrap() {
     local _run_user="$1"; shift
-    local _bwrap_args
-    _bwrap_args=$(_build_bwrap_args) || return 1
+    _build_bwrap_args || return 1
     _log_dsr "Using bwrap as sandbox engine"
     local _inner_cmd
     _inner_cmd="${_BUILD_WRAPPER:-}exec \"\${@}\""
@@ -4135,15 +4129,15 @@ _run_sandboxed_bwrap() {
     local _verify_cmd="_sandbox_verify; ${_inner_cmd}"
     if [[ -n "$_run_user" ]]; then
         if [[ -n "${_SECCOMP_HELPER:-}" ]]; then
-            eval bwrap $_bwrap_args -- sudo -u \"$_run_user\" -H -- \"\$_SECCOMP_HELPER\" \$_seccomp_args -- bash -c \"\$_verify_cmd\" -- $(printf '%q ' "${CMD_ARGS[@]}")
+            bwrap "${_DSR_BWRAP_ARGS[@]}" -- sudo -u "$_run_user" -H -- "$_SECCOMP_HELPER" $_seccomp_args -- bash -c "$_verify_cmd" -- "${CMD_ARGS[@]}"
         else
-            eval bwrap $_bwrap_args -- sudo -u \"$_run_user\" -H -- bash -c \"\$_verify_cmd\" -- $(printf '%q ' "${CMD_ARGS[@]}")
+            bwrap "${_DSR_BWRAP_ARGS[@]}" -- sudo -u "$_run_user" -H -- bash -c "$_verify_cmd" -- "${CMD_ARGS[@]}"
         fi
     else
         if [[ -n "${_SECCOMP_HELPER:-}" ]]; then
-            eval bwrap $_bwrap_args -- \"\$_SECCOMP_HELPER\" \$_seccomp_args -- bash -c \"\$_verify_cmd\" -- $(printf '%q ' "${CMD_ARGS[@]}")
+            bwrap "${_DSR_BWRAP_ARGS[@]}" -- "$_SECCOMP_HELPER" $_seccomp_args -- bash -c "$_verify_cmd" -- "${CMD_ARGS[@]}"
         else
-            eval bwrap $_bwrap_args -- bash -c \"\$_verify_cmd\" -- $(printf '%q ' "${CMD_ARGS[@]}")
+            bwrap "${_DSR_BWRAP_ARGS[@]}" -- bash -c "$_verify_cmd" -- "${CMD_ARGS[@]}"
         fi
     fi
 }
@@ -4188,7 +4182,7 @@ _run_sandboxed_unshare() {
 # $1 = user to run as (empty = current user)
 _run_sandboxed() {
     local _run_user="$1"
-    if _bwrap_args=$(_build_bwrap_args) 2>/dev/null; then
+    if _build_bwrap_args 2>/dev/null; then
         _run_sandboxed_bwrap "$_run_user"
         return $?
     else
@@ -4215,7 +4209,6 @@ if $USER_MODE || [[ "$(id -u)" -ne 0 ]]; then
     if $_NEEDS_SANDBOX; then
         _prepare_cap_priv
         _prepare_seccomp
-        _DSR_HOST_USER "$_DSR_HOST_USER"
         _run_sandboxed ""
         exit $?
     else
@@ -5418,8 +5411,8 @@ set -uo pipefail
 
 _remove_stale_lock
 
-echo "Installing core packages (sudo, shadow, gnupg, jq, python, bubblewrap, libcap)..."
-if ! safe_install sudo shadow gnupg jq python bubblewrap libcap; then
+echo "Installing core packages (sudo, shadow, gnupg, jq, python, bubblewrap, libcap, pacman-contrib)..."
+if ! safe_install sudo shadow gnupg jq python bubblewrap libcap pacman-contrib; then
     echo "ERROR: Failed to install core packages after retries."
     exit 1
 fi
@@ -7434,6 +7427,10 @@ version_meets_requirement() {
 
     # Fallback: manual major.minor.patch comparison (when vercmp is unavailable)
     # Compares major, then minor, then patch to handle three-component versions.
+    # This is fragile for complex version strings (e.g. "6.0.2rc1", "1:5.2.0-3")
+    # but works for the simple major.minor.patch format used by pamac-aur.
+    # Install pacman-contrib (provides vercmp) to avoid this fallback.
+    echo "WARNING: vercmp unavailable — using manual version comparison fallback." >&2
     case "$op" in
         ">="|"="|"==")
             if [[ "$cur_major" -gt "$rq_major" ]]; then return 0; fi

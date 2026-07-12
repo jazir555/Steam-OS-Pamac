@@ -30,7 +30,8 @@ for pkg in $explicit_pkgs; do
                 # Annotate with uninstall action and markers
                 if [[ "$name" == "org.manjaro.pamac.manager" ]]; then
                     sed -i 's|^Name=.*|Name=Pamac|' "$host_file"
-                    sed -i '/^Name\[/d' "$host_file"
+                    # Update (don't delete) localized Name keys to preserve locale display
+                    sed -i '/^Name\[/s|=.*|=Pamac|' "$host_file"
                     sed -i "s|^Exec=.*|Exec=/home/deck/.local/bin/pamac-manager-wrapper-host %U|" "$host_file"
                 else
                     sed -i "s|^Exec=.*|Exec=distrobox-enter -n arch-pamac -- $pkg %f|" "$host_file"

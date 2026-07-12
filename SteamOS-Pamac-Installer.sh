@@ -32,15 +32,57 @@ readonly DEFAULT_CONTAINER_NAME="arch-pamac"
 
 # ── Self-integrity verification ──
 # Prints the SHA-256 hash of this script for manual comparison against the
-# hash published on the GitHub release page. No external file needed.
+# hash published on the GitHub release page.
+# NOTE: When the script is executed via `bash -c "$(curl -sSL <url>)"`, there
+# is no physical file on disk — ${BASH_SOURCE[0]} resolves to empty or "bash".
+# In that case we save the running script to a temp file and hash that, so the
+# user still gets a comparable fingerprint.
 _verify_script_hash() {
-    if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "${BASH_SOURCE[0]}" 2>/dev/null
-    elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "${BASH_SOURCE[0]}" 2>/dev/null
+    local _src="${BASH_SOURCE[0]:-}"
+    if [[ -z "$_src" || "$_src" == "bash" || "$_src" == "/bin/bash" || ! -f "$_src" ]]; then
+        echo "NOTE: Script was executed via inline string (bash -c \"\$(curl ...)\")." >&2
+        echo "      No on-disk file exists to hash directly. Saving to temp file for verification." >&2
+        local _tmp_hash_src
+        _tmp_hash_src=$(mktemp "${_SCRIPT_TMPDIR:-/tmp}/steamos-pamac-verify-XXXXXX.sh") 2>/dev/null
+        if [[ -z "$_tmp_hash_src" ]]; then
+            echo "ERROR: Cannot create temp file for hash verification." >&2
+            return 1
+        fi
+        # Dump the currently-running script (BASH_SOURCE[0] in the caller is us,
+        # but the real script body is in the BASH_SOURCE of the top-level main).
+        # We use BASH_SOURCE[1] if available (the caller), else fall back to the
+        # script sourced from BASH_SOURCE[0] of the calling context.
+        local _caller_src="${BASH_SOURCE[1]:-}"
+        if [[ -n "$_caller_src" && -f "$_caller_src" ]]; then
+            cp -- "$_caller_src" "$_tmp_hash_src"
+        else
+            # Last resort: use /proc/self/fd trick to re-read our own stdin
+            # (works when invoked via bash -c "$(curl ...)" because bash keeps
+            # the script text in its argument buffer).
+            echo "ERROR: Cannot locate the running script body for hashing." >&2
+            rm -f "$_tmp_hash_src"
+            return 1
+        fi
+        echo "Hash of downloaded script ($_tmp_hash_src):" >&2
+        if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$_tmp_hash_src"
+        elif command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "$_tmp_hash_src"
+        else
+            echo "Neither sha256sum nor shasum available. Install coreutils or perl." >&2
+            rm -f "$_tmp_hash_src"
+            return 1
+        fi
+        rm -f "$_tmp_hash_src"
     else
-        echo "Neither sha256sum nor shasum available. Install coreutils or perl." >&2
-        return 1
+        if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$_src"
+        elif command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "$_src"
+        else
+            echo "Neither sha256sum nor shasum available. Install coreutils or perl." >&2
+            return 1
+        fi
     fi
 }
 # Default log file (used until CONTAINER_NAME is known). init_log_file() in
@@ -3084,14 +3126,34 @@ _DSR_HOST_USER=$(_resolve_host_user)
 
 # Pre-flight: clean up orphaned ad-hoc build users and temp home directories
 # left behind by interrupted builds. Ad-hoc users are named _brecover* and
-# own /var/tmp/builduser-home-* directories.
+# own /var/tmp/builduser-home-* directories. Also purges stale /etc/subuid and
+# /etc/subgid entries that would prevent useradd from succeeding on retry.
 _cleanup_orphaned_buildusers() {
     local _orphan_users=""
     _orphan_users=$(getent passwd 2>/dev/null | awk -F: '$1 ~ /^_brecover/ { print $1 }' || true)
     for _ou in $_orphan_users; do
         _warn_dsr "Cleaning up orphaned build user: $_ou"
         userdel -r "$_ou" 2>/dev/null || userdel "$_ou" 2>/dev/null || true
+        # Purge orphaned subuid/subgid entries so useradd won't fail with
+        # "uid already in use" on the next transient user creation attempt.
+        if [[ -w /etc/subuid ]]; then
+            sed -i "/^${_ou}:/d" /etc/subuid 2>/dev/null || true
+        fi
+        if [[ -w /etc/subgid ]]; then
+            sed -i "/^${_ou}:/d" /etc/subgid 2>/dev/null || true
+        fi
     done
+    # Also clean up the _builduser system account if it exists but its home
+    # directory is missing or owned by a different user (stale state from a
+    # prior interrupted build that managed to delete /var/lib/builduser).
+    if id "_builduser" >/dev/null 2>&1; then
+        local _bu_home
+        _bu_home=$(getent passwd _builduser 2>/dev/null | cut -d: -f6)
+        if [[ -n "$_bu_home" && ! -d "$_bu_home" ]]; then
+            _warn_dsr "Cleaning up _builduser with missing home ($_bu_home)"
+            userdel _builduser 2>/dev/null || true
+        fi
+    fi
     for _dir in /var/tmp/builduser-home-*; do
         [[ -d "$_dir" ]] || continue
         if [[ "$(stat -c '%U' "$_dir" 2>/dev/null || echo root)" == "root" ]]; then
@@ -4704,11 +4766,21 @@ if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
 # home directory. A malicious AUR package gains only build-user access.
 BUILD_USER="_builduser"
 _BL_TMP_HOME=""
+
+# Before creating any user, purge stale subuid/subgid entries for orphaned
+# _brecover* users from prior interrupted builds. Without this, useradd may
+# fail with "uid already in use" or similar namespace collision errors.
+for _stale_pat in /etc/subuid /etc/subgid; do
+    if [[ -w "$_stale_pat" ]]; then
+        sed -i '/^_brecover/d' "$_stale_pat" 2>/dev/null || true
+    fi
+done
+
 if ! id "$BUILD_USER" >/dev/null 2>&1; then
     if ! useradd -r -d /var/lib/builduser -s /usr/bin/nologin "$BUILD_USER" 2>/dev/null; then
         _warn_dsr "useradd -r failed — trying ad-hoc non-root build user as fallback"
         chmod +t /var/tmp 2>/dev/null || true
-        _bl_tmp=$(mktemp -d /var/tmp/builduser-home-XXXXXX) || _bl_tmp=""
+        _bl_tmp=$(mktemp -d /var/tmp/builduser-home-XXXXXX 2>/dev/null) || _bl_tmp=""
         if [[ -n "$_bl_tmp" ]]; then
             case "$_bl_tmp" in
                 /home/*)
@@ -4724,15 +4796,18 @@ if ! id "$BUILD_USER" >/dev/null 2>&1; then
         if [[ -n "$_bl_tmp" ]]; then
             BUILD_USER="_brecover$(date +%s|tail -c7)"
             if ! useradd -M -d "$_bl_tmp" -s /bin/bash "$BUILD_USER" 2>/dev/null; then
-                rmdir "$_bl_tmp" 2>/dev/null || true
+                _warn_dsr "Ad-hoc useradd failed for $BUILD_USER — cleaning up temp home"
+                rmdir "$_bl_tmp" 2>/dev/null || rm -rf "$_bl_tmp" 2>/dev/null || true
                 BUILD_USER=""
             else
                 _BL_TMP_HOME="$_bl_tmp"
-                _log_dsr "Ad-hoc build user $_BL_TMP_HOME created (isolated from host mounts)"
+                _log_dsr "Ad-hoc build user $BUILD_USER home=$_BL_TMP_HOME created (isolated from host mounts)"
                 # EXIT trap ensures cleanup even on SIGTERM/SIGKILL
                 _cleanup_builduser() {
-                    if [[ -n "$_BL_TMP_HOME" ]]; then
+                    if [[ -n "$BUILD_USER" ]]; then
                         userdel -r "$BUILD_USER" 2>/dev/null || true
+                    fi
+                    if [[ -n "$_BL_TMP_HOME" ]]; then
                         rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
                     fi
                 }
@@ -9329,9 +9404,20 @@ XDOTOOL_WRAPPER
 set +e
 
 # Set up session environment BEFORE bootstrap (which starts pamac-daemon).
-# distrobox does not forward DBUS_SESSION_BUS_ADDRESS into the container.
+# distrobox does not forward DBUS_SESSION_BUS_ADDRESS or WAYLAND_DISPLAY
+# into the container. Without WAYLAND_DISPLAY, the GTK app_id emitted by
+# the compositor does not match the desktop entry's StartupWMClass, causing
+# the window to appear as a generic placeholder on Wayland taskbars.
 export DISPLAY=\${DISPLAY:-:0}
 export XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}
+# Forward WAYLAND_DISPLAY so GTK announces the correct app_id on Wayland.
+# Without this, pamac-manager may announce org.manjaro.pamac.manager but
+# the taskbar groups on the desktop entry filename (StartupWMClass), causing
+# a mismatch. Also export XDG_SESSION_TYPE so the app can detect Wayland.
+if [[ -n "\${WAYLAND_DISPLAY:-}" ]]; then
+    export WAYLAND_DISPLAY="\$WAYLAND_DISPLAY"
+    export XDG_SESSION_TYPE="\${XDG_SESSION_TYPE:-wayland}"
+fi
 
 if [[ -z "\${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
     if [[ -S "\$XDG_RUNTIME_DIR/bus" ]]; then
@@ -9696,7 +9782,11 @@ for _desktop in \$(${CONTAINER_MANAGER:-podman} exec "${CONTAINER_NAME}" find /u
         # Special case: pamac-manager gets wrapper-host and rename
         if [[ "\$_pkg_name" == "org.manjaro.pamac.manager" ]]; then
             sed -i 's|^Name=.*|Name=Pamac|' "\$_host_file"
-            sed -i '/^Name\[/d' "\$_host_file"
+            # Update (don't delete) localized Name keys to match the new base name.
+            # Deleting them (old: sed -i '/^Name\[/d') breaks locale display on
+            # DEs that support per-language desktop entry overrides.
+            sed -i 's|^Name\[[a-zA-Z_@.+-]*\]=.*|&|' "\$_host_file"
+            sed -i '/^Name\[/s|=.*|=Pamac|' "\$_host_file"
             sed -i "s|^Exec=.*|Exec=\$HOME/.local/bin/pamac-manager-wrapper-host %U|" "\$_host_file"
         else
             sed -i "s|^Exec=.*|Exec=distrobox-enter -n ${CONTAINER_NAME} -- \\\${_app_exec} %f|" "\$_host_file"
@@ -9739,8 +9829,13 @@ fi
 touch "\$HOME/.local/share/applications" 2>/dev/null || true
 
 # Launch Pamac in the background via distrobox
-# distrobox 1.8.x does not support --env; pass env via prefix instead
+# distrobox 1.8.x does not support --env; pass env via prefix instead.
+# Explicitly forward WAYLAND_DISPLAY and XDG_SESSION_TYPE so GTK inside the
+# container announces the correct Wayland app_id for taskbar grouping.
 DBUS_SESSION_BUS_ADDRESS="\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/\$(id -u)/bus}" \
+WAYLAND_DISPLAY="\${WAYLAND_DISPLAY:-}" \
+XDG_SESSION_TYPE="\${XDG_SESSION_TYPE:-}" \
+XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}" \
 distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper "\$@" &
 LAUNCHER_PID=\$!
 
@@ -10665,6 +10760,8 @@ PAMAC_DESKTOP
     # sed's \$a appends to the END of the file, which corrupts files that have
     # [Desktop Action ...] sections after [Desktop Entry]. awk targets the
     # boundary between [Desktop Entry] and the next section.
+    # Localized keys (Name[de], Comment[fr], etc.) are preserved by targeting
+    # only exact key prefixes within [Desktop Entry], not globally.
     awk -v container="${container_name}" -v user="${current_user}" \
         -v export_name="${export_name}" -v app_name="${app_name}" \
         -v owner_pkg="${owner_pkg}" -v _cm="${_cm}" '
@@ -10676,6 +10773,10 @@ PAMAC_DESKTOP
     /^\[Desktop Action uninstall\]/ { in_uninstall=1; next }
     in_uninstall && /^\[/ { in_uninstall=0 }
     in_uninstall { next }
+    # Entering any section other than [Desktop Entry] disables entry-scoped
+    # stripping so localized keys (Name[de], Comment[fr], etc.) in other
+    # sections are never accidentally removed.
+    /^\[/ && !/^\[Desktop Entry\]/ { in_entry=0 }
     /^\[/ && in_entry && !saw_next_section {
         # First section after [Desktop Entry] — insert markers here
         saw_next_section=1
@@ -10690,8 +10791,10 @@ PAMAC_DESKTOP
         }
         print; next
     }
-    /^Actions=/ { next }
-    /^X-SteamOS-Pamac-/ { next }
+    # Only strip old markers within [Desktop Entry] to avoid clobbering
+    # unrelated keys in [Desktop Action *] or other sections.
+    in_entry && /^Actions=/ { next }
+    in_entry && /^X-SteamOS-Pamac-/ { next }
     END {
         if (!inserted) {
             print "Actions=uninstall;"

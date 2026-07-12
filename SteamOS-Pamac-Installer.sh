@@ -105,7 +105,15 @@ LOG_FILE="$HOME/distrobox-pamac-setup.log"
 readonly REQUIRED_TOOLS=("distrobox")
 CONTAINER_HAS_INIT="unknown"
 
-readonly ARCHLINUX_IMAGE="${ARCHLINUX_IMAGE:-archlinux:latest}"
+readonly ARCHLINUX_IMAGE="${ARCHLINUX_IMAGE:-archlinux:base}"
+
+# Rolling release mode: when false (default), uses the pinned stable image
+# (archlinux:base). When true, uses archlinux:latest for the latest packages.
+ROLLING_RELEASE="${ROLLING_RELEASE:-false}"
+
+# Resolved container image (may be overridden by --rolling-release).
+# ARCHLINUX_IMAGE is readonly; CONTAINER_IMAGE is the actual image used.
+CONTAINER_IMAGE="${ARCHLINUX_IMAGE}"
 
 # Global temp directory for all script temp files. Using a single directory
 # instead of tracking individual files in an array avoids race conditions where
@@ -276,8 +284,9 @@ initialize_logging() {
         echo "User: $CURRENT_USER"
         echo "OS: $os_version"
         echo "Container: $CONTAINER_NAME"
+        echo "Image: $CONTAINER_IMAGE (rolling=$ROLLING_RELEASE)"
         echo "Desktop environment: $_desktop_env"
-        echo "Features: MULTILIB=$ENABLE_MULTILIB GAMING=$ENABLE_GAMING_PACKAGES EXTRA_REPOS=$ENABLE_EXTRA_REPOS BUILD_CACHE=$ENABLE_BUILD_CACHE OPTIMIZE_MIRRORS=$OPTIMIZE_MIRRORS NON_INTERACTIVE=$NON_INTERACTIVE PIN_ALPM=$PIN_ALPM"
+        echo "Features: MULTILIB=$ENABLE_MULTILIB GAMING=$ENABLE_GAMING_PACKAGES EXTRA_REPOS=$ENABLE_EXTRA_REPOS BUILD_CACHE=$ENABLE_BUILD_CACHE OPTIMIZE_MIRRORS=$OPTIMIZE_MIRRORS NON_INTERACTIVE=$NON_INTERACTIVE PIN_ALPM=$PIN_ALPM ROLLING=$ROLLING_RELEASE"
         echo "=========================================="
     } > "$LOG_FILE"
 
@@ -1540,8 +1549,13 @@ OPTIONS:
   --force-rebuild           Rebuild existing container if it exists
   --enable-multilib         Enable 32-bit package support (default)
   --disable-multilib        Explicitly disable 32-bit package support
+  --rolling-release         Use archlinux:latest (rolling release) instead of
+                            the pinned stable image (archlinux:base). Packages
+                            update frequently; may break on major upstream changes.
+  --pin-release             Use the pinned stable image (archlinux:base, default).
+                            Less frequent breakage; recommended for most users.
   --pamac-version VERSION    Pin pamac-aur to a specific AUR version/commit
-                             (default: latest; use "latest" for automatic)
+                            (default: latest; use "latest" for automatic)
   --skip-compat-check        Skip pamac-aur AUR compatibility check (avoids
                              AUR RPC dependency; for users who know their
                              pacman version is compatible)
@@ -1594,8 +1608,9 @@ OPTIONS:
 
 ENVIRONMENT VARIABLES:
   CONTAINER_NAME            Override default container name (default: arch-pamac)
-  ARCHLINUX_IMAGE           Container base image (default: archlinux:latest)
+  ARCHLINUX_IMAGE           Container base image (default: archlinux:base)
                             Override with any valid tag for different versions.
+                            Use --rolling-release for archlinux:latest.
   FORCE_REBUILD            Set to 'true' to force-rebuild existing container
   ENABLE_GAMING_PACKAGES   Set to 'true' to install gaming packages
   PAMAC_VERSION            Specific pamac-aur version/commit to install (AUR fallback)
@@ -1779,8 +1794,9 @@ POST-INSTALL:
   To upgrade the container: yay -Syu && exit; distrobox upgrade CONTAINER
 
 EXAMPLES:
-  $0                                       # Basic setup
+  $0                                       # Basic setup (stable archlinux:base)
   $0 --quick-start                          # Minimal safe defaults (new users)
+  $0 --rolling-release                      # Use latest packages (rolling release)
   $0 --enable-gaming --no-optimize-mirrors # Gaming setup, skip mirror optimization
   $0 --pamac-version v11.0.2              # Pin pamac-aur to a specific release tag
   $0 --container-name my-arch              # Custom container name
@@ -1808,6 +1824,8 @@ parse_arguments() {
             --disable-build-cache) ENABLE_BUILD_CACHE="false"; shift ;;
             --optimize-mirrors) OPTIMIZE_MIRRORS="true"; shift ;;
             --no-optimize-mirrors) OPTIMIZE_MIRRORS="false"; shift ;;
+            --rolling-release) ROLLING_RELEASE="true"; shift ;;
+            --pin-release) ROLLING_RELEASE="false"; shift ;;
             --pamac-version)
                 [[ -z "${2:-}" ]] && { log_error "pamac-version cannot be empty"; exit 1; }
                 if [[ ! "$2" =~ ^[a-zA-Z0-9._-]+$ ]]; then
@@ -1982,9 +2000,9 @@ uninstall_setup() {
             fi
         }
 
-        # Clean container image (archlinux:latest) — offer to remove since it
-        # may be shared with other containers.
-        local _image="${ARCHLINUX_IMAGE:-archlinux:latest}"
+        # Clean container image — offer to remove since it may be shared
+        # with other containers.
+        local _image="${CONTAINER_IMAGE:-archlinux:base}"
         if command -v podman >/dev/null 2>&1; then
             if podman image exists "$_image" 2>/dev/null; then
                 log_info "Container image '$_image' is still on disk."
@@ -2214,14 +2232,14 @@ create_container() {
 
     local -a create_args=(
         --name "$CONTAINER_NAME"
-        --image "$ARCHLINUX_IMAGE"
+        --image "$CONTAINER_IMAGE"
         --yes
     )
 
-    log_info "Pulling ${ARCHLINUX_IMAGE} image..."
+    log_info "Pulling ${CONTAINER_IMAGE} image..."
     local _pull_ok=false
     for _pull_attempt in 1 2 3; do
-        if run_command container_runtime pull "$ARCHLINUX_IMAGE"; then
+        if run_command container_runtime pull "$CONTAINER_IMAGE"; then
             _pull_ok=true
             break
         fi
@@ -12171,6 +12189,7 @@ apply_quick_start_preset() {
     OPTIMIZE_MIRRORS="${OPTIMIZE_MIRRORS:-true}"
     PIN_ALPM="${PIN_ALPM:-true}"
     ENABLE_GAMING_PACKAGES="${ENABLE_GAMING_PACKAGES:-false}"
+    ROLLING_RELEASE="${ROLLING_RELEASE:-false}"
 
     # Quick-start explicitly recommends keeping the AUR compat check ON so an
     # incompatible pamac-aur doesn't silently fail the build later. Only honor
@@ -12201,6 +12220,16 @@ main() {
     # over the preset defaults. Order matters: parse first, then layer the
     # preset only for values that the user did not touch.
     apply_quick_start_preset
+
+    # Apply rolling release flag: overrides the container image to archlinux:latest
+    # when --rolling-release is set. The default is archlinux:base (pinned stable).
+    if [[ "${ROLLING_RELEASE:-false}" == "true" ]]; then
+        CONTAINER_IMAGE="archlinux:latest"
+        log_info "Rolling release mode: using ${CONTAINER_IMAGE} (latest packages, may break on major upgrades)."
+    else
+        log_info "Stable release mode: using ${CONTAINER_IMAGE} (pinned, less frequent breakage)."
+        log_info "  Use --rolling-release to switch to archlinux:latest."
+    fi
 
     # Auto-enable low-memory mode on SteamOS. The Steam Deck has 16GB RAM
     # shared with the GPU (usable ~12GB), and AUR builds (especially C++

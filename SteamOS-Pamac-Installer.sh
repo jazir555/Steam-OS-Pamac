@@ -2384,7 +2384,7 @@ _inner_remove_stale_lock() {
 }
 
 _inner_db_is_healthy() {
-    _    _pacman -Dk 2>/dev/null | grep -q "No database errors"
+    pacman -Dk 2>/dev/null | grep -q "No database errors"
 }
 
 # ── Quick exit: if DB is healthy, do nothing ──
@@ -2491,7 +2491,7 @@ while IFS= read -r line; do
     # "package-version: is installed but should not be" — wrong DB state
     _pkg=$(echo "$line" | awk -F: "{print \$1}" | sed "s/ is installed but should not be//" || true)
     [[ -n "$_pkg" ]] && _broken_pkgs="$_broken_pkgs $_pkg"
-done < <(_pacman -Dk 2>&1 | grep -E "is installed but should not be|missing file" || true)
+done < <(pacman -Dk 2>&1 | grep -E "is installed but should not be|missing file" || true)
 
 # Deduplicate
 _broken_pkgs=$(echo "$_broken_pkgs" | tr " " "\n" | sort -u | tr "\n" " ")
@@ -2611,7 +2611,7 @@ if [[ $_corrupted_removed -gt 0 ]]; then
     # Reinstall any removed packages that are still available.
     # Batch into groups of 50 to avoid command-line length limits and reduce
     # per-invocation overhead (each pacman -S invocation is expensive).
-    _pkg_list=$(_pacman -Qn 2>/dev/null | awk "{print \$1}" || true)
+    _pkg_list=$(pacman -Qn 2>/dev/null | awk "{print \$1}" || true)
     if [[ -n "$_pkg_list" ]]; then
         _batch=""
         _count=0
@@ -2762,7 +2762,7 @@ fi
 echo ""
 echo "=== Strategy 11: pacman --debug deep inspection ==="
 _inner_remove_stale_lock
-_debug_output=$(_pacman --debug 2>&1 || true)
+_debug_output=$(pacman --debug 2>&1 || true)
 _debug_issues=$(echo "$_debug_output" | grep -iE "warning|error|missing|corrupt|invalid" | head -20 || true)
 if [[ -n "$_debug_issues" ]]; then
     echo "  Found issues from pacman --debug:"
@@ -5362,8 +5362,9 @@ _exec_handle_result() {
         fi
         # ── Pre-repair: aggressive cleanup before calling full DB repair ──
         # Kill any stale pacman/yay processes that may hold locks
-        container_root_exec bash -c '
+    container_root_exec bash -c '
 set +e
+export LC_ALL=C
 # Remove stale lock file (with wait for running pacman)
 if [[ -f /var/lib/pacman/db.lck ]]; then
     _p=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo "")
@@ -5937,7 +5938,7 @@ echo "Step 5/5: Verifying keyring and restoring security settings..."
 
 if [[ "$keyring_ok" == "true" ]]; then
     # Verify the keyring has actual Arch Linux signing keys (not just empty)
-    _sig_count=$(_pacman-key --list-sigs 2>/dev/null | grep -c "archlinux" || echo "0")
+    _sig_count=$(LC_ALL=C pacman-key --list-sigs 2>/dev/null | grep -c "archlinux" || echo "0")
     if [[ "$_sig_count" -gt 0 ]]; then
         echo "Keyring contains $_sig_count archlinux signature(s)."
     else
@@ -5950,7 +5951,7 @@ if [[ "$keyring_ok" == "true" ]]; then
                 [[ -f "$_kf" ]] && cp -f "$_kf" /etc/pacman.d/gnupg/ 2>/dev/null || true
             done
             timeout 60 pacman-key --populate archlinux 2>/dev/null || true
-            _sig_count=$(_pacman-key --list-sigs 2>/dev/null | grep -c "archlinux" || echo "0")
+            _sig_count=$(LC_ALL=C pacman-key --list-sigs 2>/dev/null | grep -c "archlinux" || echo "0")
             if [[ "$_sig_count" -gt 0 ]]; then
                 echo "  Final populate succeeded with $_sig_count signature(s)."
             else
@@ -6158,7 +6159,7 @@ if [[ -f /tmp/pre-upgrade-critical.list ]]; then
 fi
 
 # Verify database consistency
-if     _pacman -Dk 2>/dev/null | grep -q "No database errors"; then
+if pacman -Dk 2>/dev/null | grep -q "No database errors"; then
     echo "Database: consistent"
 else
     echo "WARNING: Database inconsistencies detected after upgrade."
@@ -6641,7 +6642,7 @@ _ensure_keyring() {
 if [[ -f /etc/pacman.d/gnupg/pubring.gpg ]] && pacman-key --list-keys >/dev/null 2>&1; then
     # Keyring exists — verify all repo keyrings are populated
     local _populated
-    _populated=$(_pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
+    _populated=$(pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
     if [[ "$_populated" -gt 10 ]]; then
         return 0
     fi
@@ -6669,7 +6670,7 @@ for _kr in /usr/share/pacman/keyrings/*.gpg; do
     fi
 done
 local _count
-_count=$(_pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
+_count=$(pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
 log_bootstrap "Keyring initialized: $_count keys"
 }
 
@@ -6951,7 +6952,7 @@ _ensure_keyring() {
 if [[ -f /etc/pacman.d/gnupg/pubring.gpg ]] && pacman-key --list-keys >/dev/null 2>&1; then
     # Keyring exists — verify all repo keyrings are populated
     local _populated
-    _populated=$(_pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
+    _populated=$(pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
     if [[ "$_populated" -gt 10 ]]; then
         return 0
     fi
@@ -6979,7 +6980,7 @@ for _kr in /usr/share/pacman/keyrings/*.gpg; do
     fi
 done
 local _count
-_count=$(_pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
+_count=$(pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
 log_bootstrap "Keyring initialized: $_count keys"
 }
 
@@ -7468,7 +7469,7 @@ _discover_keyring_fingerprint() {
     # signed by the repo maintainer. We look for keys whose uid contains the
     # repo name or known maintainer identifiers.
     local _all_fps
-    _all_fps=$(_pacman-key --list-keys 2>/dev/null | grep -E "^[0-9A-F]{40}" || true)
+    _all_fps=$(pacman-key --list-keys 2>/dev/null | grep -E "^[0-9A-F]{40}" || true)
     if [[ -z "$_all_fps" ]]; then
         return 1
     fi
@@ -7479,7 +7480,7 @@ _discover_keyring_fingerprint() {
         _fp="${_fp%% *}"  # take just the fingerprint
         [[ "$_fp" =~ ^[0-9A-F]{40}$ ]] || continue
         # Read the next line (uid) from pacman-key output
-        _uid=$(_pacman-key --list-keys "$_fp" 2>/dev/null | grep -i "uid" | head -1 || true)
+        _uid=$(pacman-key --list-keys "$_fp" 2>/dev/null | grep -i "uid" | head -1 || true)
         case "$_repo" in
             chaotic-aur)
                 # Chaotic-AUR signing key uid contains "pedrohlc" or "chaotic"
@@ -8007,7 +8008,7 @@ echo "=== pamac-aur AUR Compatibility Auto-Remediation ==="
 
 installed_pacman_ver=""
 if command -v pacman >/dev/null 2>&1; then
-    installed_pacman_ver=$(_pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
+    installed_pacman_ver=$(pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
 fi
 echo "Installed pacman version: ${installed_pacman_ver:-unknown}"
 
@@ -8383,7 +8384,7 @@ if [[ "$can_upgrade_pacman" == "true" ]]; then
         echo "Database synced. Upgrading pacman and dependencies..."
         _remove_stale_lock
         if pacman -S --noconfirm --needed pacman 2>&1 | tail -10; then
-            new_ver=$(_pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
+            new_ver=$(pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
             echo "Upgraded pacman to: $new_ver"
             new_major=$(echo "$new_ver" | sanitize_version_component)
             _new_ver_stripped=$(echo "$new_ver" | sed 's/^[^:]*://')
@@ -8410,7 +8411,7 @@ if [[ "$can_upgrade_pacman" == "true" ]]; then
             echo "Attempting full system upgrade to pull in all dependencies..."
             _remove_stale_lock
             pacman -Syu --noconfirm 2>&1 | tail -20 || true
-            new_ver=$(_pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
+            new_ver=$(pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
             echo "After full upgrade, pacman version: $new_ver"
             new_major=$(echo "$new_ver" | sanitize_version_component)
             _new_ver_stripped2=$(echo "$new_ver" | sed 's/^[^:]*://')
@@ -12144,7 +12145,7 @@ run_update() {
     container_root_exec bash -c '
 set +e
 # Check for database inconsistencies
-if !     _pacman -Dk 2>/dev/null | grep -q "No database errors"; then
+if ! pacman -Dk 2>/dev/null | grep -q "No database errors"; then
     echo "WARNING: Database inconsistencies detected after upgrade."
     pacman -Dk 2>&1 | head -10 || true
 fi

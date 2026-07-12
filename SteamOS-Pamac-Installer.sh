@@ -4505,9 +4505,12 @@ SECCOMP_C
     # Validate toolchain before attempting compilation. During partial upgrades,
     # gcc may be present but its standard library headers may be mismatched
     # (e.g., updated compiler with old glibc headers). Test with a minimal
-    # program that includes the headers we need (seccomp + prctl).
+    # program that includes ALL headers the seccomp helper needs.
+    # Capture gcc error output for diagnostics so we can distinguish between
+    # "missing headers" vs "linker errors" vs "gcc version mismatch".
     local _test_src="/tmp/.dsr-toolchain-test.c"
     local _test_bin="/tmp/.dsr-toolchain-test"
+    local _gcc_err="/tmp/.dsr-gcc-err.log"
     cat > "$_test_src" << 'TOOLCHAIN_TEST'
 #include <stdio.h>
 #include <stddef.h>
@@ -4515,6 +4518,8 @@ SECCOMP_C
 #include <linux/filter.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
+#include <sys/socket.h>
+#include <linux/if.h>
 int main() {
     struct sock_filter f[] = { BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW) };
     struct sock_fprog p = { .len = 1, .filter = f };
@@ -4522,23 +4527,51 @@ int main() {
     return 0;
 }
 TOOLCHAIN_TEST
-    if ! gcc -O2 -o "$_test_bin" "$_test_src" 2>/dev/null; then
-        _warn_dsr "Toolchain validation failed: gcc cannot compile a minimal seccomp test program."
-        _warn_dsr "This may indicate a partial upgrade (compiler vs. headers mismatch)."
-        _warn_dsr "Try: pacman -S --noconfirm --needed base-devel gcc glibc"
-        rm -f "$_test_src" "$_test_bin"
+    if ! gcc -O2 -o "$_test_bin" "$_test_src" 2>"$_gcc_err"; then
+        local _gcc_output
+        _gcc_output=$(cat "$_gcc_err" 2>/dev/null || echo "unknown error")
+        _warn_dsr "Toolchain validation FAILED: gcc cannot compile a minimal seccomp test program."
+        _warn_dsr "gcc error output: $_gcc_output"
+        # Diagnose the specific failure mode
+        if echo "$_gcc_output" | grep -qi "seccomp.h\|filter.h\|No such file"; then
+            _warn_dsr "CAUSE: Missing Linux kernel headers (linux/seccomp.h, linux/filter.h)."
+            _warn_dsr "FIX: pacman -S --noconfirm --needed linux-api-headers"
+        elif echo "$_gcc_output" | grep -qi "prctl\|sys/prctl.h"; then
+            _warn_dsr "CAUSE: Missing glibc headers (sys/prctl.h)."
+            _warn_dsr "FIX: pacman -S --noconfirm --needed glibc"
+        elif echo "$_gcc_output" | grep -qi "socket.h\|if.h"; then
+            _warn_dsr "CAUSE: Missing network/kernel headers (sys/socket.h, linux/if.h)."
+            _warn_dsr "FIX: pacman -S --noconfirm --needed linux-api-headers glibc"
+        else
+            _warn_dsr "This may indicate a partial upgrade (gcc vs. headers mismatch)."
+            _warn_dsr "FIX: pacman -S --noconfirm --needed base-devel gcc glibc linux-api-headers"
+        fi
+        # Log gcc version for debugging partial upgrade scenarios
+        local _gcc_ver
+        _gcc_ver=$(gcc --version 2>/dev/null | head -1 || echo "unknown")
+        _warn_dsr "gcc version: $_gcc_ver"
+        rm -f "$_test_src" "$_test_bin" "$_gcc_err"
         return 1
     fi
-    rm -f "$_test_src" "$_test_bin"
+    rm -f "$_test_src" "$_test_bin" "$_gcc_err"
 
-    if gcc -O2 -o "$_helper_bin" "$_helper_src" 2>/dev/null; then
-        rm -f "$_helper_src"
+    # Attempt full compilation. Capture error output for diagnostics.
+    local _compile_err="/tmp/.dsr-compile-err.log"
+    if gcc -O2 -o "$_helper_bin" "$_helper_src" 2>"$_compile_err"; then
+        rm -f "$_helper_src" "$_compile_err"
         chmod 755 "$_helper_bin"
         echo "$_helper_bin"
         return 0
     else
-        _warn_dsr "Failed to compile seccomp helper (gcc -O2 -static failed)"
-        rm -f "$_helper_src" "$_helper_bin"
+        local _compile_output
+        _compile_output=$(cat "$_compile_err" 2>/dev/null || echo "unknown error")
+        _warn_dsr "Failed to compile seccomp helper (gcc -O2). Full error:"
+        _warn_dsr "$_compile_output"
+        _warn_dsr "Toolchain validation passed but full compilation failed — this suggests"
+        _warn_dsr "a larger source file exposed a linker or optimization issue."
+        _warn_dsr "FIX: pacman -S --noconfirm --needed base-devel gcc glibc linux-api-headers"
+        _warn_dsr "  Or use --strict-security to abort instead of silently degrading."
+        rm -f "$_helper_src" "$_helper_bin" "$_compile_err"
         return 1
     fi
 }
@@ -4587,18 +4620,34 @@ _build_seccomp_args() {
 # ── _prepare_seccomp: shared seccomp helper preparation (used by all paths) ──
 _prepare_seccomp() {
     _SECCOMP_HELPER=""
+    _SECCOMP_DEGRADED=false
     _seccomp_args="$(_build_seccomp_args)"
     if [[ -n "$_seccomp_args" ]]; then
         _SECCOMP_HELPER="$(_compile_seccomp_helper)" || _SECCOMP_HELPER=""
         if [[ -z "$_SECCOMP_HELPER" ]] && [[ "$_DSR_STRICT_SECURITY" == "true" ]]; then
             echo "systemd-run(fake): FATAL: seccomp helper compilation failed under --strict-security." >&2
-            echo "  Sandboxing properties (MemoryDenyWriteExecute, RestrictSUIDSGID, etc.)" >&2
+            echo "  Sandboxing properties (MemoryDenyWriteExecute, RestrictSUIDSGID, ProtectKernelModules)" >&2
             echo "  cannot be enforced without the seccomp helper. Aborting to avoid" >&2
             echo "  running with degraded security." >&2
             exit 1
         elif [[ -z "$_SECCOMP_HELPER" ]]; then
-            _warn_dsr "WARNING: seccomp helper compilation failed — seccomp-based sandboxing (MemoryDenyWriteExecute, RestrictSUIDSGID, ProtectKernelModules) will NOT be enforced for this build."
-            _warn_dsr "  The build will still run, but without syscall filtering. Install base-devel inside the container to enable seccomp sandboxing."
+            _SECCOMP_DEGRADED=true
+            _warn_dsr "╔══════════════════════════════════════════════════════════════╗"
+            _warn_dsr "║  SECCOMP SANDBOXING DEGRADED — reduced syscall filtering   ║"
+            _warn_dsr "╚══════════════════════════════════════════════════════════════╝"
+            _warn_dsr "Seccomp helper compilation failed. The following protections"
+            _warn_dsr "will NOT be enforced for this AUR build:"
+            _warn_dsr "  - MemoryDenyWriteExecute  (blocks W+X memory mapping)"
+            _warn_dsr "  - RestrictSUIDSGID         (blocks setuid/setgid family)"
+            _warn_dsr "  - ProtectKernelModules     (blocks module loading)"
+            _warn_dsr "  - ProtectClock             (blocks clock manipulation)"
+            _warn_dsr "  - RestrictNamespaces       (blocks unshare/setns/clone)"
+            _warn_dsr "  - RestrictAddressFamilies  (filters socket() families)"
+            _warn_dsr "  - SystemCallFilter         (blocks reboot/ptrace/etc.)"
+            _warn_dsr ""
+            _warn_dsr "The build will run with mount namespace isolation only."
+            _warn_dsr "To restore full sandboxing, install base-devel inside the container:"
+            _warn_dsr "  pacman -S --noconfirm --needed base-devel gcc linux-api-headers glibc"
         fi
     fi
 }
@@ -9420,34 +9469,116 @@ if [[ -n "\${WAYLAND_DISPLAY:-}" ]]; then
 fi
 
 if [[ -z "\${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
-    if [[ -S "\$XDG_RUNTIME_DIR/bus" ]]; then
-        export DBUS_SESSION_BUS_ADDRESS="unix:path=\$XDG_RUNTIME_DIR/bus"
-    elif [[ -S "/run/user/\$(id -u)/bus" ]]; then
-        export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$(id -u)/bus"
-    else
-        # Fallback: check /tmp/dbus-* for non-systemd or alternative hosts
-        # Also check user socket patterns used by minimal Wayland compositors
-        # (e.g., sway, river, hyprland) that may place sockets under
-        # $XDG_RUNTIME_DIR instead of /run/user/<uid>/.
-        _dbus_sock=\$(ls /tmp/dbus-* 2>/dev/null | head -1)
-        if [[ -z "\$_dbus_sock" || ! -S "\$_dbus_sock" ]]; then
-            _dbus_sock="\$XDG_RUNTIME_DIR/bus-\$(id -u)"
-            [[ -S "\$_dbus_sock" ]] || _dbus_sock=""
+    # Helper: validate that a D-Bus socket is actually alive by attempting
+    # a connection. Socket file existence is not sufficient — the bus daemon
+    # may have crashed or been killed, leaving a stale socket behind.
+    _validate_dbus_socket() {
+        local _addr="\$1"
+        # Use socat if available, otherwise fall back to bash /dev/tcp
+        if command -v socat >/dev/null 2>&1; then
+            echo "EXIT" | timeout 2 socat - "UNIX-CONNECT:\${_addr#unix:path=}" 2>/dev/null | grep -q "OK" && return 0
+            return 1
         fi
-        if [[ -z "\$_dbus_sock" ]]; then
-            # Last resort: try common alternative socket names
-            for _candidate in "\$XDG_RUNTIME_DIR/dbus-session" "/run/user/\$(id -u)/dbus-session" "\$XDG_RUNTIME_DIR/.bus-session"; do
-                if [[ -S "\$_candidate" ]]; then
-                    _dbus_sock="\$_candidate"
+        # Lightweight check: try to stat the socket and verify it's a socket type
+        local _sock_path="\${_addr#unix:path=}"
+        [[ -S "\$_sock_path" ]] || return 1
+        # Additional check: verify the socket directory is accessible and recent
+        local _sock_dir
+        _sock_dir=\$(dirname "\$_sock_path")
+        [[ -d "\$_sock_dir" && -w "\$_sock_dir" ]] || return 1
+        return 0
+    }
+
+    _dbus_found=false
+
+    # Priority 1: XDG_RUNTIME_DIR/bus (standard systemd user session)
+    if [[ -S "\$XDG_RUNTIME_DIR/bus" ]]; then
+        if _validate_dbus_socket "unix:path=\$XDG_RUNTIME_DIR/bus"; then
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=\$XDG_RUNTIME_DIR/bus"
+            _dbus_found=true
+        fi
+    fi
+
+    # Priority 2: /run/user/<uid>/bus (alternate path)
+    if [[ "\$_dbus_found" == "false" ]] && [[ -S "/run/user/\$(id -u)/bus" ]]; then
+        if _validate_dbus_socket "unix:path=/run/user/\$(id -u)/bus"; then
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$(id -u)/bus"
+            _dbus_found=true
+        fi
+    fi
+
+    # Priority 3: /tmp/dbus-* (non-systemd or alternative hosts)
+    if [[ "\$_dbus_found" == "false" ]]; then
+        _dbus_sock=\$(ls /tmp/dbus-* 2>/dev/null | head -1)
+        if [[ -n "\$_dbus_sock" ]] && [[ -S "\$_dbus_sock" ]]; then
+            if _validate_dbus_socket "unix:path=\$_dbus_sock"; then
+                export DBUS_SESSION_BUS_ADDRESS="unix:path=\$_dbus_sock"
+                _dbus_found=true
+            fi
+        fi
+    fi
+
+    # Priority 4: Common alternative socket names (Wayland compositors)
+    if [[ "\$_dbus_found" == "false" ]]; then
+        for _candidate in "\$XDG_RUNTIME_DIR/bus-\$(id -u)" "\$XDG_RUNTIME_DIR/dbus-session" "/run/user/\$(id -u)/dbus-session" "\$XDG_RUNTIME_DIR/.bus-session"; do
+            if [[ -S "\$_candidate" ]]; then
+                if _validate_dbus_socket "unix:path=\$_candidate"; then
+                    export DBUS_SESSION_BUS_ADDRESS="unix:path=\$_candidate"
+                    _dbus_found=true
                     break
                 fi
-            done
+            fi
+        done
+    fi
+
+    # Priority 5: Start a private dbus-daemon session as last resort.
+    # This handles cases where SteamOS modifies session lifecycle, the host
+    # session bus is dead, or XDG_RUNTIME_DIR is missing/empty.
+    if [[ "\$_dbus_found" == "false" ]]; then
+        if command -v dbus-daemon >/dev/null 2>&1; then
+            _private_bus_dir="\$XDG_RUNTIME_DIR"
+            [[ -d "\$_private_bus_dir" ]] || _private_bus_dir="/tmp/dbus-session-\$(id -u)"
+            mkdir -p "\$_private_bus_dir" 2>/dev/null || true
+            _private_bus_addr="unix:path=\$_private_bus_dir/bus-session-private"
+            if dbus-daemon --session --fork --address="\$_private_bus_addr" \
+                --print-pid 2>/dev/null | head -1 > /tmp/.dsr-private-bus-pid; then
+                export DBUS_SESSION_BUS_ADDRESS="\$_private_bus_addr"
+                _dbus_found=true
+            fi
         fi
-        if [[ -n "\$_dbus_sock" && -S "\$_dbus_sock" ]]; then
-            export DBUS_SESSION_BUS_ADDRESS="unix:path=\$_dbus_sock"
-        else
-            export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$(id -u)/bus"
+    fi
+
+    # Final fallback: use the standard path even if we couldn't validate it.
+    # The container's session bootstrap may still work if the bus comes up later.
+    if [[ "\$_dbus_found" == "false" ]]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$(id -u)/bus"
+    fi
+
+    unset -f _validate_dbus_socket 2>/dev/null || true
+fi
+
+# Post-setup validation: verify the D-Bus session bus is actually reachable.
+# If the socket was stale (bus daemon died), warn the user so they know
+# pamac-daemon may fail to register on the session bus.
+if [[ -n "\${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+    _bus_path="\${DBUS_SESSION_BUS_ADDRESS#unix:path=}"
+    if [[ -S "\$_bus_path" ]]; then
+        # Quick liveness check via dbus-send if available
+        if command -v dbus-send >/dev/null 2>&1; then
+            if ! dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
+                echo "D-Bus WARNING: Session bus socket exists at \$_bus_path but daemon may be unresponsive." >&2
+                echo "  pamac-daemon may fail to register. If the UI doesn't appear, try:" >&2
+                echo "    systemctl --user restart dbus  (on the host)" >&2
+                echo "  Or log out and back in to restart the user session." >&2
+            fi
         fi
+    else
+        echo "D-Bus WARNING: No valid session bus socket found. pamac-daemon may fail." >&2
+        echo "  Searched: XDG_RUNTIME_DIR/bus, /run/user/\$(id -u)/bus, /tmp/dbus-*," >&2
+        echo "  alternative socket names, and attempted private dbus-daemon start." >&2
+        echo "  Ensure a D-Bus session is running on the host:" >&2
+        echo "    systemctl --user start dbus  (systemd hosts)" >&2
+        echo "    Or: dbus-daemon --session --fork (non-systemd hosts)" >&2
     fi
 fi
 
@@ -9678,10 +9809,29 @@ cat > "$gui_wrapper" << GUI_WRAPPER_EOF
 export HOME="/home/${current_user}"
 export DISPLAY=\${DISPLAY:-:0}
 
-# Ensure session bus is available for pamac-daemon inside the container
+# Ensure session bus is available for pamac-daemon inside the container.
+# Validate socket liveness — a stale socket (bus daemon crashed) will cause
+# pamac-daemon to fail silently on D-Bus registration.
 if [[ -z "\${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
     _uid=\$(id -u)
-    if [[ -S "/run/user/\$_uid/bus" ]]; then
+    _dbus_tried=false
+    for _bus_candidate in "\$XDG_RUNTIME_DIR/bus" "/run/user/\$_uid/bus" \$(ls /tmp/dbus-* 2>/dev/null | head -1); do
+        [[ -n "\$_bus_candidate" && -S "\$_bus_candidate" ]] || continue
+        # Quick liveness check via dbus-send
+        if command -v dbus-send >/dev/null 2>&1; then
+            if dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
+                export DBUS_SESSION_BUS_ADDRESS="unix:path=\$_bus_candidate"
+                _dbus_tried=true
+                break
+            fi
+        else
+            # No dbus-send: trust socket existence (best effort)
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=\$_bus_candidate"
+            _dbus_tried=true
+            break
+        fi
+    done
+    if [[ "\$_dbus_tried" == "false" ]]; then
         export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$_uid/bus"
     fi
 fi

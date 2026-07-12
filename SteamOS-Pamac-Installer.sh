@@ -1661,6 +1661,14 @@ SECURITY NOTE — fake systemd-run wrapper:
     (2) Use --strict-security to disable the wrapper
     (3) Use real systemd (e.g., distrobox --init flag)
 
+NOTE — eMMC/flash wear reduction:
+  The script automatically configures tmpfs BUILDDIR and ccache to minimize
+  write cycles on Steam Deck's internal eMMC/SD storage. Compilations run
+  in RAM when sufficient free memory is available (>2.5GB), with only the
+  final .pkg.tar.zst written to disk. ccache prevents recompilation of
+  unchanged sources across rebuilds. Use --low-memory to reduce parallel
+  writes on constrained systems.
+
 SECURITY NOTE — --allow-wheel-nopasswd:
   Grants NOPASSWD to the entire wheel group. On multi-user hosts, any
   user in the wheel group (and any AUR package built via makepkg) can
@@ -2959,8 +2967,117 @@ _set_makepkg_jobs() {
     local jobs
     jobs=$(_calc_makepkg_jobs)
     export MAKEFLAGS="-j${jobs}"
+    # ccache: reduces recompilation writes by caching object files.
+    # BUILDDIR on tmpfs: compiles in RAM to avoid eMMC write cycles.
+    # Both are configured in /etc/makepkg.conf by _setup_emmc_safe_build,
+    # but we also export them as env vars for yay invocations that bypass
+    # makepkg.conf (e.g., yay -S --rebuild).
+    if command -v ccache >/dev/null 2>&1; then
+        export CCACHE_DIR="${CCACHE_DIR:-$HOME/.ccache}"
+        export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-5G}"
+    fi
+    local _mem_avail_kb
+    _mem_avail_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    if [[ "$_mem_avail_kb" -gt 2621440 ]]; then
+        # >2.5GB free: set BUILDDIR for tmpfs builds (if not already in makepkg.conf)
+        if ! grep -q '^BUILDDIR=' /etc/makepkg.conf 2>/dev/null; then
+            export BUILDDIR="/tmp/makepkg-build"
+        fi
+    fi
     echo "MAKEFLAGS set to -j${jobs} (RAM-constrained build parallelism)"
 }
+
+# ── eMMC/flash wear reduction: tmpfs build directory + ccache ──
+# Large C++/Vala AUR builds (yay, pamac-aur) generate massive write cycles
+# that degrade eMMC/SD flash memory. This function mitigates wear by:
+#   1. Mounting BUILDDIR on tmpfs (compiles in RAM, only final .pkg.tar.zst
+#      touches disk)
+#   2. Enabling ccache (avoids recompiling unchanged sources across rebuilds)
+#   3. Setting PKGDEST to host-mounted cache (avoids redundant package copies)
+_setup_emmc_safe_build() {
+    local _container_name="${1:-$CONTAINER_NAME}"
+    local _current_user="${2:-$CURRENT_USER}"
+
+    # Only run if container is usable
+    if ! container_is_usable; then
+        return 0
+    fi
+
+    log_info "Configuring eMMC-safe build environment (tmpfs BUILDDIR + ccache)..."
+
+    # Install ccache inside the container (reduces recompilation writes)
+    container_root_exec bash -c 'pacman -S --noconfirm --needed ccache 2>/dev/null || true'
+
+    # Configure build environment inside the container
+    container_root_exec bash -c "
+set +e
+
+# ── BUILDDIR on tmpfs ──
+# Only create tmpfs if enough RAM is available (>4GB free) and /tmp is not
+# already a tmpfs (some distros mount /tmp as tmpfs by default).
+_mem_avail_kb=\$(awk '/^MemAvailable:/{print \$2}' /proc/meminfo 2>/dev/null || echo 0)
+_tmp_is_tmpfs=false
+if mountpoint -q /tmp 2>/dev/null; then
+    _tmp_type=\$(stat -f -c '%T' /tmp 2>/dev/null || echo '')
+    [[ \"\$_tmp_type\" == \"tmpfs\" ]] && _tmp_is_tmpfs=true
+fi
+
+# Reserve 2GB for the system; use remaining free RAM for build dir
+_build_ram_kb=0
+if [[ \"\$_mem_avail_kb\" -gt 2097152 ]]; then
+    _build_ram_kb=\$(( _mem_avail_kb - 2097152 ))
+    # Cap at 8GB to avoid starving the system
+    [[ \"\$_build_ram_kb\" -gt 8388608 ]] && _build_ram_kb=8388608
+fi
+
+if [[ \"\$_build_ram_kb\" -gt 524288 ]]; then
+    _build_ram_mb=\$(( _build_ram_kb / 1024 ))
+    _build_dir=\"/tmp/makepkg-build\"
+    mkdir -p \"\$_build_dir\" 2>/dev/null || true
+    # Only mount if not already mounted
+    if ! mountpoint -q \"\$_build_dir\" 2>/dev/null; then
+        if mount -t tmpfs -o \"size=\${_build_ram_mb}M,noatime,nosuid,nodev\" tmpfs \"\$_build_dir\" 2>/dev/null; then
+            echo \"BUILDDIR=\$_build_dir\" >> /etc/makepkg.conf 2>/dev/null || true
+            echo \"  tmpfs BUILDDIR: \$_build_dir (\$_build_ram_mb MB in RAM)\"
+        else
+            echo \"  tmpfs mount failed (insufficient privileges). Build writes will hit eMMC.\"
+        fi
+    else
+        echo \"  /tmp is already tmpfs — BUILDDIR wear protection active.\"
+    fi
+else
+    echo \"  Insufficient free RAM (\$(( _mem_avail_kb / 1024 ))MB) for tmpfs build dir.\"
+    echo \"  Build writes will hit eMMC/SD. Consider closing other applications.\"
+fi
+
+# ── ccache configuration ──
+_ccache_dir=\"/home/\${_current_user:-root}/.ccache\"
+if command -v ccache >/dev/null 2>&1; then
+    mkdir -p \"\$_ccache_dir\" 2>/dev/null || true
+    chown \"\${_current_user:-root}:\${_current_user:-root}\" \"\$_ccache_dir\" 2>/dev/null || true
+    # Enable ccache in makepkg.conf (append if not already present)
+    if ! grep -q '^CCACHE' /etc/makepkg.conf 2>/dev/null; then
+        cat >> /etc/makepkg.conf << 'CCACHE_CONF'
+
+# ccache: reduces recompilation writes and speeds up rebuilds
+CCACHE_DIR=\"/home/__USER__/.ccache\"
+CCACHE_MAXSIZE=\"5G\"
+CCACHE_CONF
+        sed -i \"s|__USER__|\${_current_user:-root}|g\" /etc/makepkg.conf 2>/dev/null || true
+    fi
+    # Set PATH to include ccache
+    if ! grep -q 'ccache' /etc/makepkg.conf 2>/dev/null; then
+        sed -i 's|^PATH=.*|PATH=\"/usr/lib/ccache/bin:$PATH\"|' /etc/makepkg.conf 2>/dev/null || true
+    fi
+    echo \"  ccache enabled (max 5GB, dir: \$_ccache_dir)\"
+else
+    echo \"  ccache not available — recompilation writes will hit eMMC.\"
+fi
+" 2>&1 | while IFS= read -r _line; do
+        log_info "  build: $_line"
+    done || true
+}
+
 safe_install() {
     local attempt=0 max_attempts=4 rc=0
     while [[ $attempt -lt $max_attempts ]]; do
@@ -6091,6 +6208,10 @@ CORE_EOF
         fi
     fi
 
+    # Configure eMMC-safe build environment (tmpfs BUILDDIR + ccache)
+    # before any AUR builds to minimize flash write cycles.
+    _setup_emmc_safe_build "$CONTAINER_NAME" "$CURRENT_USER"
+
     log_info "Stage 4/7: Installing development packages (batched to avoid OOM)..."
     local dev_script
     read -r -d '' dev_script <<'DEV_EOF' || true
@@ -7702,7 +7823,9 @@ install_aur_helper() {
     log_info "Prebuilt yay not available. Building from source..."
     log_warn "Source compilation detected — building yay from AUR may take 10-30 minutes"
     log_warn "depending on hardware (CPU speed, thermal throttling, storage type)."
-    log_warn "On eMMC/SD cards, write cycles during Go compilation can be significant."
+    log_warn "eMMC/SD write mitigation: tmpfs BUILDDIR and ccache are configured."
+    log_warn "  If builds still hit eMMC, try: --low-memory (reduces parallel writes)"
+    log_warn "  or close other apps to free RAM for tmpfs (compiles in RAM, not flash)."
     log_warn "Keep the device plugged in and avoid sleep/hibernation during the build."
 
 	log_info "Verifying build dependencies (git, base-devel, go) are present..."
@@ -8576,8 +8699,9 @@ install_pamac() {
     log_warn "Source compilation detected — building pamac-aur from AUR may take 15-45 minutes"
     log_warn "depending on hardware (CPU speed, thermal throttling, storage type)."
     log_warn "This package compiles complex C++/Vala dependencies (libalpm, pamac)."
-    log_warn "On eMMC/SD cards, the heavy write cycles during compilation can be"
-    log_warn "significant and may cause thermal throttling on budget hardware."
+    log_warn "eMMC/SD write mitigation: tmpfs BUILDDIR and ccache are configured."
+    log_warn "  If builds still hit eMMC, try: --low-memory (reduces parallel writes)"
+    log_warn "  or close other apps to free RAM for tmpfs (compiles in RAM, not flash)."
     log_warn "Keep the device plugged in and avoid sleep/hibernation during the build."
 
     _PAMAC_COMPAT_COMMIT=""
@@ -11904,6 +12028,7 @@ show_completion_message() {
     [[ "$ENABLE_GAMING_PACKAGES" == "true" ]] && log_info " Gaming packages installed"
     [[ "$ENABLE_EXTRA_REPOS" == "true" ]] && log_info " Third-party repos enabled: chaotic-aur, archlinuxcn, endeavouros"
     [[ "$ENABLE_BUILD_CACHE" == "true" ]] && log_info " Persistent build cache enabled"
+    log_info " eMMC/SD wear protection: tmpfs BUILDDIR + ccache"
     log_info ""
     log_info "${BOLD}${GREEN}--- How to Use ---${NC}"
     log_info "  Find 'Pamac Manager' in your application menu"

@@ -89,6 +89,14 @@ FORCE_REBUILD="${FORCE_REBUILD:-false}"
 OPTIMIZE_MIRRORS="${OPTIMIZE_MIRRORS:-true}"
 : "${DISTROBOX_CONTAINER_MANAGER:=podman}"
 
+# Quick-start mode: applies a minimal, safe preset for less experienced users.
+# When enabled (via --quick-start or QUICK_START=true), it forces a known-good
+# set of conservative defaults and suppresses the most advanced/experimental
+# options unless the user explicitly overrides them on the command line AFTER
+# --quick-start. The preset is applied in apply_quick_start_preset(), which
+# runs after parse_arguments() so explicit flags still win.
+QUICK_START="${QUICK_START:-false}"
+
 # Trusted GPG fingerprints for third-party repos.
 # Priority order:
 #   1. archlinux-keyring + WKD/mirror dynamic discovery (preferred)
@@ -599,6 +607,70 @@ ensure_container_healthy() {
 
 _RECREATE_COUNT=0
 _MAX_RECREATES=2
+_RECREATE_CONFIRMED=""
+_RECREATE_ABORTED=""
+
+# Prompt the user before destroying and recreating a container. Warns about
+# data loss (build cache, installed AUR packages, any data in the container's
+# writable layer). The decision is cached for the lifetime of the process:
+# once the user approves or declines, subsequent recreation attempts reuse the
+# same answer to avoid repeated prompts. In --non-interactive mode, the
+# prompt is skipped and the recreation is assumed approved (the user opted
+# into automated behaviour). Returns 0 to proceed, 1 to abort.
+confirm_container_recreation() {
+    # Reuse cached answer from a prior prompt in this run.
+    if [[ "$_RECREATE_CONFIRMED" == "yes" ]]; then
+        return 0
+    fi
+    if [[ "$_RECREATE_ABORTED" == "yes" ]]; then
+        return 1
+    fi
+
+    if [[ "${NON_INTERACTIVE:-false}" == "true" ]]; then
+        log_info "Non-interactive mode — proceeding with container recreation."
+        _RECREATE_CONFIRMED="yes"
+        return 0
+    fi
+
+    # DRY_RUN never touches the filesystem, so no prompt is needed.
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        _RECREATE_CONFIRMED="yes"
+        return 0
+    fi
+
+    log_warn ""
+    log_warn "The container '$CONTAINER_NAME' needs to be removed and recreated."
+    log_warn ""
+    log_warn "THIS IS DESTRUCTIVE — the following data will be lost:"
+    log_warn "  - Installed packages and AUR build cache in the container"
+    log_warn "  - Any files or configuration stored inside the container"
+    log_warn "  - Exported application launchers will need to be re-created"
+    log_warn ""
+    log_warn "The persistent yay build cache on the host (${HOME}/.cache/yay-${CONTAINER_NAME})"
+    log_warn "will NOT be removed by this operation."
+    log_warn ""
+
+    if [[ -t 0 ]]; then
+        echo -ne "${YELLOW}${BOLD}Recreate container '$CONTAINER_NAME' and lose container data? (y/N): ${NC}" >&2
+        local _answer
+        read -r _answer
+        if [[ "$_answer" == "y" || "$_answer" == "Y" ]]; then
+            _RECREATE_CONFIRMED="yes"
+            return 0
+        else
+            _RECREATE_ABORTED="yes"
+            log_error "Container recreation declined by user."
+            return 1
+        fi
+    else
+        # Non-terminal stdin (e.g. piped input, cron) — refuse destructive
+        # action rather than silently wiping data.
+        log_error "Cannot prompt for container recreation (no terminal)."
+        log_error "Re-run with --non-interactive to auto-approve, or attach a terminal."
+        _RECREATE_ABORTED="yes"
+        return 1
+    fi
+}
 
 _ensure_healthy_or_recreate() {
     local desc="${1:-container operation}"
@@ -614,7 +686,11 @@ _ensure_healthy_or_recreate() {
             return 1
         fi
         _RECREATE_COUNT=$((_RECREATE_COUNT + 1))
-        log_info "Container signaled for recreation ($desc), attempt $_RECREATE_COUNT/$_MAX_RECREATES. Recreating..."
+        log_info "Container signaled for recreation ($desc), attempt $_RECREATE_COUNT/$_MAX_RECREATES."
+        if ! confirm_container_recreation; then
+            return 1
+        fi
+        log_info "Recreating..."
         if ! force_remove_container "$CONTAINER_NAME"; then
             log_warn "force_remove_container returned non-zero. Container may still exist."
             if container_runtime_for_ops inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
@@ -884,6 +960,21 @@ check_system_requirements() {
         log_info "Then restart your terminal or run: source ~/.bashrc"
     else
         log_success "All required tools are present."
+    fi
+
+    # Bubblewrap (bwrap) advisory: not required, but strongly recommended for
+    # the fake systemd-run wrapper's sandbox. Without bwrap, the wrapper falls
+    # back to unshare --mount which lacks PID namespace isolation and device-node
+    # filtering. The build will still succeed but runs with weaker isolation.
+    if [[ "${STRICT_SECURITY:-false}" != "true" ]]; then
+        if command -v bwrap >/dev/null 2>&1; then
+            log_success "bubblewrap (bwrap) found — full DynamicUser sandbox available."
+        else
+            log_warn "bubblewrap (bwrap) not found — AUR sandbox will use unshare fallback."
+            log_info "  The unshare fallback does NOT provide PID namespace isolation"
+            log_info "  or device-node filtering. For stronger AUR build isolation:"
+            log_info "    sudo pacman -S bubblewrap"
+        fi
     fi
 
     local available_space
@@ -1366,6 +1457,11 @@ OPTIONS:
                              AUR RPC dependency; for users who know their
                              pacman version is compatible)
   --non-interactive          Skip all interactive prompts (safe for automation)
+  --quick-start          Apply a minimal, safe preset of defaults for less
+                             experienced users (multilib+build-cache+extra-repos
+                             ON, gaming OFF, compat-check ON). Any option passed
+                             AFTER --quick-start overrides the preset. Intended
+                             to reduce option confusion on a first run.
   --disable-pin-alpm        Do NOT defer libalpm/pacman upgrade (risky on
                              rolling release containers; not recommended)
   --enable-ssh-env           ENABLE SSH PermitUserEnvironment (INSECURE on multi-user hosts; opt-in only)
@@ -1416,10 +1512,17 @@ ENVIRONMENT VARIABLES:
   PAMAC_VERSION            Specific pamac-aur version/commit to install (AUR fallback)
   NON_INTERACTIVE          Set to 'true' to skip all interactive prompts (safe for
                            background tools, automated installers, and cron jobs)
+  QUICK_START             Set to 'true' to apply the quick-start preset (same as
+                           --quick-start). See --help for the preset values.
+                           Explicit env vars / CLI flags still override the preset.
   PIN_ALPM                 Set to 'false' to skip deferring libalpm/pacman upgrade.
                            Default is 'true' — pacman/libalpm are upgraded after
                            pamac-aur is built to prevent API breakage on rolling
                            release containers.
+  PAMAC_AUR_COMMIT_CACHE_TTL  How long (seconds) a known-good pamac-aur commit
+                           is reused to skip the AUR history scan during the
+                           compatibility check. Default 1209600 (14 days). Set to
+                           0 to force a fresh scan every run.
   CHAOTIC_AUR_KEY_ID       Override the Chaotic-AUR signing key fingerprint
                             (auto-discovered from keyring package by default)
   ARCHLINUXCN_KEY_ID       Override the archlinuxcn signing key fingerprint
@@ -1588,6 +1691,7 @@ POST-INSTALL:
 
 EXAMPLES:
   $0                                       # Basic setup
+  $0 --quick-start                          # Minimal safe defaults (new users)
   $0 --enable-gaming --no-optimize-mirrors # Gaming setup, skip mirror optimization
   $0 --pamac-version v11.0.2              # Pin pamac-aur to a specific release tag
   $0 --container-name my-arch              # Custom container name
@@ -1630,6 +1734,7 @@ parse_arguments() {
             --update) UPDATE="true"; shift ;;
             --export-only) EXPORT_ONLY="true"; shift ;;
             --non-interactive) NON_INTERACTIVE="true"; shift ;;
+            --quick-start) QUICK_START="true"; shift ;;
             --disable-pin-alpm) PIN_ALPM="false"; shift ;;
             --enable-ssh-env) ENABLE_SSH_ENV="true"; shift ;;
             --allow-wheel-nopasswd) ALLOW_WHEEL_NOPASSWD="true"; shift ;;
@@ -4496,12 +4601,51 @@ _run_sandboxed_unshare() {
 
 # ── _run_sandboxed: Try bwrap first, fall back to unshare ──
 # $1 = user to run as (empty = current user)
+_DSR_BWRAP_AVAILABLE=""
 _run_sandboxed() {
     local _run_user="$1"
-    if _build_bwrap_args 2>/dev/null; then
+    # Cache bwrap availability: _build_bwrap_args itself checks `command -v bwrap`
+    # and _run_sandboxed_bwrap calls it again. Checking once avoids redundant
+    # filesystem lookups and produces a clear one-time warning when unshare is
+    # the fallback engine.
+    if [[ -z "$_DSR_BWRAP_AVAILABLE" ]]; then
+        if command -v bwrap >/dev/null 2>&1; then
+            _DSR_BWRAP_AVAILABLE=true
+        else
+            _DSR_BWRAP_AVAILABLE=false
+        fi
+    fi
+    if [[ "$_DSR_BWRAP_AVAILABLE" == "true" ]]; then
         _run_sandboxed_bwrap "$_run_user"
         return $?
     else
+        # unshare fallback: some sandbox properties are NOT fully emulated.
+        # List them explicitly so builds running under this path are auditable.
+        # Properties that ARE enforced in unshare mode:
+        #   ProtectSystem (bind mounts), ProtectHome (bind mounts),
+        #   ReadWritePaths/ReadOnlyPaths/InaccessiblePaths (bind mounts),
+        #   PrivateTmp (bind mount), PrivateNetwork (--net), NoNewPrivileges,
+        #   CapabilityBoundingSet (via capsh/setpriv), seccomp-BPF
+        # Properties that are NOT fully emulated or are degraded:
+        #   - PrivateDevices: unshare has no equivalent of bwrap --dev /dev;
+        #     only the host /dev is available (device nodes not filtered).
+        #   - PID namespace isolation: unshare --mount does not create a new
+        #     PID namespace; the process sees all host PIDs. bwrap --unshare-pid
+        #     provides this. Builds can enumerate other users' processes.
+        #   - RestrictNamespaces via seccomp: the seccomp filter blocks unshare(2)
+        #     after the outer unshare, but the outer unshare itself is still a
+        #     namespace operation. bwrap handles this natively.
+        #   - ProtectKernelTunables/ProtectControlGroups: bind-mounted read-only
+        #     in both modes, but without PID isolation a determined process could
+        #     walk /proc/<host-pid>/ns to reach the host namespace.
+        # The missing PID namespace is the most significant gap — it weakens
+        # information isolation but does not allow write escalation.
+        _warn_dsr "systemd-run(fake): bubblewrap (bwrap) is not installed — using unshare fallback."
+        _warn_dsr "  The unshare sandbox does NOT provide PID namespace isolation"
+        _warn_dsr "  (builds can see host PIDs) or device-node filtering (PrivateDevices"
+        _warn_dsr "  degraded). For stronger isolation, install bubblewrap:"
+        _warn_dsr "    sudo pacman -S bubblewrap"
+        _warn_dsr "  Or use a full init-mode container (distrobox --init)."
         _run_sandboxed_unshare "$_run_user"
         return $?
     fi
@@ -7869,9 +8013,81 @@ fi
 
 echo ">>> Strategy B: Finding older pamac-aur revision compatible with pacman $installed_pacman_ver..."
 
+# Known-good commit cache: A TSV file mapping "pacman major.minor" -> commit
+# SHA + epoch timestamp. Once we find a compatible commit for a given pacman
+# version, we record it so subsequent runs skip the expensive git clone +
+# per-commit PKGBUILD scan. This avoids repeated network scans on every run.
+#
+# Cache layout (TSV, tab-separated):
+#   <pacman_major>.<pacman_minor>\t<commit_sha>\t<cached_epoch>\t<reason>
+_KNOWN_GOOD_CACHE="$_AUR_CACHE_DIR/known-good-commits.tsv"
+_KNOWN_GOOD_TTL="${PAMAC_AUR_COMMIT_CACHE_TTL:-1209600}"  # 14 days
+
+_lookup_known_good_commit() {
+    local _want_key="$1"
+    [[ -f "$_KNOWN_GOOD_CACHE" ]] || return 1
+    local _now_ts _line _cached_ts _cached_commit _cached_key
+    _now_ts=$(date +%s 2>/dev/null || echo 0)
+    while IFS=$'\t' read -r _cached_key _cached_commit _cached_ts _cached_reason; do
+        [[ -z "$_cached_key" || -z "$_cached_commit" ]] && continue
+        [[ "$_cached_key" != "$_want_key" ]] && continue
+        # Validate the cached commit still exists and PKGBUILD is parseable.
+        # A stale or force-pushed commit would otherwise produce a broken build.
+        if [[ "$_cached_ts" =~ ^[0-9]+$ ]] && [[ $((_now_ts - _cached_ts)) -lt "$_KNOWN_GOOD_TTL" ]]; then
+            echo "$_cached_commit"
+            echo "$_cached_reason"
+            return 0
+        fi
+    done < "$_KNOWN_GOOD_CACHE" 2>/dev/null
+    return 1
+}
+
+_record_known_good_commit() {
+    local _key="$1" _commit="$2" _reason="${3:-unknown}"
+    [[ -z "$_key" || -z "$_commit" ]] && return 0
+    mkdir -p "$_AUR_CACHE_DIR" 2>/dev/null || return 0
+    local _now_ts
+    _now_ts=$(date +%s 2>/dev/null || echo 0)
+    # Append-replace: drop any stale entry for the same key, then re-add.
+    local _tmp_cache="$_KNOWN_GOOD_CACHE.tmp.$$"
+    if [[ -f "$_KNOWN_GOOD_CACHE" ]]; then
+        grep -v "^$_key$(printf '\t')" "$_KNOWN_GOOD_CACHE" 2>/dev/null > "$_tmp_cache" || true
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$_key" "$_commit" "$_now_ts" "$_reason" >> "$_tmp_cache"
+    mv -f "$_tmp_cache" "$_KNOWN_GOOD_CACHE" 2>/dev/null || cat "$_tmp_cache" > "$_KNOWN_GOOD_CACHE" 2>/dev/null || true
+    rm -f "$_tmp_cache" 2>/dev/null || true
+}
+
+_COMPAT_CACHE_KEY="${pacman_major}.${pacman_minor}"
+_AUR_GIT_URL="https://aur.archlinux.org/pamac-aur.git"
+
+# Fast path: a previously-recorded known-good commit for this pacman version.
+if _cache_hit=$(_lookup_known_good_commit "$_COMPAT_CACHE_KEY"); then
+    _cached_commit=$(echo "$_cache_hit" | head -1)
+    _cached_reason=$(echo "$_cache_hit" | tail -1)
+    if [[ -n "$_cached_commit" ]]; then
+        echo "Using cached known-good pamac-aur commit for pacman ${pacman_major}.${pacman_minor}: ${_cached_commit:0:12}"
+        echo "  Reason: $_cached_reason"
+        # Verify the commit is still fetchable before trusting it. If the AUR
+        # history was rewritten or the commit dropped, fall through to a fresh
+        # scan so the cache self-heals.
+        if _verify_tmp=$(mktemp -d /var/tmp/pamac-aur-verify-XXXXXX 2>/dev/null); then
+            chmod 700 "$_verify_tmp" 2>/dev/null || true
+            if git clone --depth=1 "$_AUR_GIT_URL" "$_verify_tmp/pamac-aur" 2>/dev/null \
+               && git -C "$_verify_tmp/pamac-aur" cat-file -e "${_cached_commit}^{commit}" 2>/dev/null; then
+                rm -rf "$_verify_tmp"
+                echo "FOUND_COMPATIBLE_COMMIT=$_cached_commit"
+                echo "FOUND_COMPATIBLE_REASON=$_cached_reason (cached)"
+                exit 2
+            fi
+            rm -rf "$_verify_tmp"
+            echo "WARN: cached commit ${_cached_commit:0:12} no longer fetchable — forcing a fresh scan."
+        fi
+    fi
+fi
+
 # Use git directly to iterate commits — this is frontend-agnostic and does not
 # depend on the AUR web interface (CGIT, GitLab, Gitea, etc.).
-_AUR_GIT_URL="https://aur.archlinux.org/pamac-aur.git"
 _AUR_WORK=$(mktemp -d /var/tmp/pamac-aur-history-XXXXXX) && chmod 700 "$_AUR_WORK" 2>/dev/null || _AUR_WORK=$(mktemp -d)
 rm -rf "$_AUR_WORK"
 
@@ -7910,6 +8126,7 @@ for try_commit in $_commits; do
         echo "  -> No pacman constraint in this revision (likely compatible)"
         commit_date=$(git -C "$_AUR_WORK" log -1 --format=%ai "$try_commit" 2>/dev/null || echo "unknown date")
         echo "  -> $commit_date"
+        _record_known_good_commit "$_COMPAT_CACHE_KEY" "$try_commit" "no explicit pacman constraint"
         rm -rf "$_AUR_WORK"
         echo "FOUND_COMPATIBLE_COMMIT=$try_commit"
         echo "FOUND_COMPATIBLE_REASON=no explicit pacman constraint"
@@ -7927,6 +8144,7 @@ for try_commit in $_commits; do
 
     if version_meets_requirement "$pacman_major" "$pacman_minor" "$old_req_op" "$old_req_major" "$old_req_minor" "$pacman_patch" "$old_req_patch"; then
         echo "  -> Compatible: requires pacman $old_dep (have $installed_pacman_ver)"
+        _record_known_good_commit "$_COMPAT_CACHE_KEY" "$try_commit" "requires pacman $old_dep"
         rm -rf "$_AUR_WORK"
         echo "FOUND_COMPATIBLE_COMMIT=$try_commit"
         echo "FOUND_COMPATIBLE_REASON=requires pacman $old_dep"
@@ -11478,6 +11696,52 @@ run_pre_flight_checks() {
     fi
 }
 
+apply_quick_start_preset() {
+    if [[ "${QUICK_START:-false}" != "true" ]]; then
+        return 0
+    fi
+
+    log_step "Quick-start mode — applying minimal safe defaults..."
+
+    # Preserve explicit user overrides from the command line / environment.
+    # We only set values that the user has NOT explicitly chosen. The defaults
+    # below favor a working, conservative install over performance/extras.
+    #
+    # Sensible defaults for a less experienced user:
+    #   - multilib ON (Steam/Proton 32-bit needs it)
+    #   - build cache ON (resume interrupted builds, avoid recompiling yay)
+    #   - extra repos ON (common dependencies)
+    #   - mirror optimization ON (faster downloads, good default)
+    #   - PACMAN pin-alpm ON (prevents API breakage on rolling containers)
+    #   - gaming packages OFF (opinionated bloat for a bare-minimum install)
+    #   - strict-security OFF (kept at default so AUR DynamicUser builds work)
+    #   - non-interactive OFF (a quick-start user still benefits from prompts
+    #     around dangerous operations; --non-interactive is a separate opt-in)
+    #
+    # Each line uses ${VAR:-default} so an explicit env var or CLI flag wins.
+    # We explicitly avoid forcing NON_INTERACTIVE here — quick-start should
+    # reduce option confusion, not remove safety prompts.
+    ENABLE_MULTILIB="${ENABLE_MULTILIB:-true}"
+    ENABLE_BUILD_CACHE="${ENABLE_BUILD_CACHE:-true}"
+    ENABLE_EXTRA_REPOS="${ENABLE_EXTRA_REPOS:-true}"
+    OPTIMIZE_MIRRORS="${OPTIMIZE_MIRRORS:-true}"
+    PIN_ALPM="${PIN_ALPM:-true}"
+    ENABLE_GAMING_PACKAGES="${ENABLE_GAMING_PACKAGES:-false}"
+
+    # Quick-start explicitly recommends keeping the AUR compat check ON so an
+    # incompatible pamac-aur doesn't silently fail the build later. Only honor
+    # an explicit --skip-compat-check.
+    if [[ "${SKIP_COMPAT_CHECK:-}" != "true" ]]; then
+        SKIP_COMPAT_CHECK="false"
+    fi
+
+    log_info "Quick-start preset applied:"
+    log_info "  multilib=$ENABLE_MULTILIB build-cache=$ENABLE_BUILD_CACHE extra-repos=$ENABLE_EXTRA_REPOS"
+    log_info "  optimize-mirrors=$OPTIMIZE_MIRRORS pin-alpm=$PIN_ALPM gaming=$ENABLE_GAMING_PACKAGES"
+    log_info "  AUR compat check: enabled (recommended for first-time installs)"
+    log_info "Advanced users can override any option by passing it after --quick-start."
+}
+
 main() {
     setup_colors
 
@@ -11487,6 +11751,12 @@ main() {
     # --version, so we never reach the EUID guard for those. Operational flags
     # (which require a writable container namespace) still hit the root guard.
     parse_arguments "$@"
+
+    # Apply quick-start preset AFTER argument parsing so that explicit CLI
+    # flags (which set the same variables in parse_arguments) take precedence
+    # over the preset defaults. Order matters: parse first, then layer the
+    # preset only for values that the user did not touch.
+    apply_quick_start_preset
 
     # Auto-enable low-memory mode on SteamOS. The Steam Deck has 16GB RAM
     # shared with the GPU (usable ~12GB), and AUR builds (especially C++
@@ -11599,7 +11869,11 @@ main() {
     }
 
   if [[ "$FORCE_REBUILD" == "true" ]] && distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
-    log_step "Force rebuild requested - removing existing container"
+    log_step "Force rebuild requested — container '$CONTAINER_NAME' will be removed and recreated."
+    if ! confirm_container_recreation; then
+        log_error "Force rebuild declined by user. Aborting."
+        exit "$EXIT_USER_ABORT"
+    fi
     CONTAINER_HAS_INIT="unknown"
     uninstall_setup  # already calls force_remove_container internally
     sleep 2
@@ -11621,6 +11895,10 @@ main() {
           log_success "Using existing running container: $CONTAINER_NAME"
         else
           log_warn "Container is running but not usable, rebuilding..."
+          if ! confirm_container_recreation; then
+            log_error "Container recreation declined by user. Aborting."
+            exit "$EXIT_USER_ABORT"
+          fi
           force_remove_container "$CONTAINER_NAME"
           sleep 2
           create_container || exit 1
@@ -11635,12 +11913,20 @@ main() {
                     log_success "Using existing container (restarted): $CONTAINER_NAME"
                 else
                     log_warn "Container not usable after restart, recreating..."
+                    if ! confirm_container_recreation; then
+                        log_error "Container recreation declined by user. Aborting."
+                        exit "$EXIT_USER_ABORT"
+                    fi
                     force_remove_container "$CONTAINER_NAME"
                     sleep 2
                     create_container || exit 1
                 fi
         else
           log_warn "Container in '$existing_status' state - removing and recreating"
+          if ! confirm_container_recreation; then
+            log_error "Container recreation declined by user. Aborting."
+            exit "$EXIT_USER_ABORT"
+          fi
           force_remove_container "$CONTAINER_NAME"
           sleep 2
           create_container || exit 1
@@ -11650,6 +11936,10 @@ main() {
         log_info "Container in 'created' state, starting..."
         container_start || {
           log_warn "Failed to start, recreating..."
+          if ! confirm_container_recreation; then
+            log_error "Container recreation declined by user. Aborting."
+            exit "$EXIT_USER_ABORT"
+          fi
           force_remove_container "$CONTAINER_NAME"
           sleep 2
           create_container || exit 1
@@ -11658,6 +11948,10 @@ main() {
         ;;
       *)
         log_warn "Container in unknown state '$existing_status' - removing and recreating"
+        if ! confirm_container_recreation; then
+          log_error "Container recreation declined by user. Aborting."
+          exit "$EXIT_USER_ABORT"
+        fi
         force_remove_container "$CONTAINER_NAME"
         sleep 2
         create_container || exit 1

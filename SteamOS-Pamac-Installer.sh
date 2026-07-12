@@ -4103,22 +4103,7 @@ if [[ -f /var/lib/pacman/db.lck ]]; then
     fi
     rm -f /var/lib/pacman/db.lck 2>/dev/null || true
 fi
-# Kill only stale pacman/yay processes that hold the db.lck
-# (avoid pkill -9 pacman which would kill ALL pacman processes including active builds)
-_stale_pids=$(pgrep -x pacman 2>/dev/null || true)
-for _spid in $_stale_pids; do
-    if [[ "$_spid" != "$$" ]] && [[ "$_spid" != "$PPID" ]]; then
-        echo "  Force-killing stale pacman PID $_spid"
-        kill -9 "$_spid" 2>/dev/null || true
-    fi
-done
-_stale_yay_pids=$(pgrep -x yay 2>/dev/null || true)
-for _ypid in $_stale_yay_pids; do
-    if [[ "$_ypid" != "$$" ]] && [[ "$_ypid" != "$PPID" ]]; then
-        echo "  Force-killing stale yay PID $_ypid"
-        kill -9 "$_ypid" 2>/dev/null || true
-    fi
-done
+# (pgrep -x pacman/yay loops removed — lock-file parsing above is sufficient)
 pkill -9 gpg-agent 2>/dev/null || true
 pkill -9 dirmngr 2>/dev/null || true
 sleep 1

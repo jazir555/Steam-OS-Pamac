@@ -355,7 +355,15 @@ _filter_verbose_output() {
     # :: prefix conventions, update the exclusion list accordingly.
     # Additional noise suppressed: plain "downloading" progress lines without
     # errors, "Nothing to do." churn, and "up to date" confirmations.
-    grep -v -E '^[[:space:]]*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database)|^downloading[[:space:]]|^::[[:space:]]+(Synchronizing|debug:)|^Nothing to do\.| is up to date$' || true
+    #
+    # SAFETY: A line containing any error/fail/warning indicator is always
+    # preserved, even if it matches a noise pattern like `^downloading`. This
+    # guards against masking legitimate download/operation failures if pacman
+    # changes its output format (e.g. emits `downloading: error retrieving ...`).
+    # The safety grep runs first so such lines escape the exclusion filter.
+    local _noise='^[[:space:]]*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database)|^downloading[[:space:]]|^::[[:space:]]+(Synchronizing|debug:)|^Nothing to do\.| is up to date$'
+    local _keep='error|fail|warning|cannot|denied|corrupt|invalid|unexpected|refus'
+    grep -E -i "$_keep" || grep -v -E "$_noise" || true
 }
 
 run_command() {
@@ -485,10 +493,15 @@ container_is_usable() {
   # This avoids spawning redundant "echo ok" probes when callers invoke
   # container_root_exec / container_user_exec / container_cp_from in rapid
   # succession (e.g., the install loop doing 20+ operations).
+  # The running-state check is O(1) and guards against external stops
+  # (podman stop from outside the script) that invalidate the exec cache.
   local _now
   _now=$(date +%s 2>/dev/null || echo 0)
   if [[ "${_LAST_USABLE_CHECK_TS:-0}" -gt 0 ]] && [[ $((_now - _LAST_USABLE_CHECK_TS)) -lt 5 ]]; then
-    return 0
+    if container_is_running; then
+      return 0
+    fi
+    _LAST_USABLE_CHECK_TS=0
   fi
   container_start 2>/dev/null || true
   local _output
@@ -604,7 +617,6 @@ _ensure_healthy_or_recreate() {
             log_warn "force_remove_container returned non-zero. Container may still exist."
             if container_runtime_for_ops inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
                 log_error "Container '$CONTAINER_NAME' still exists after force removal. Cannot recreate."
-                _RECREATE_COUNT=0
                 return 1
             fi
         fi
@@ -613,13 +625,11 @@ _ensure_healthy_or_recreate() {
         unset _CREATE_RECREATION_GUARD
         if ! create_container; then
             _CREATE_RECREATION_GUARD="$saved_guard"
-            _RECREATE_COUNT=0
             log_error "Failed to recreate container after '$desc' recovery."
             return 1
         fi
         _CREATE_RECREATION_GUARD="$saved_guard"
         if ! container_is_usable; then
-            _RECREATE_COUNT=0
             log_error "Container recreated but not usable after '$desc' recovery."
             return 1
         fi
@@ -627,7 +637,6 @@ _ensure_healthy_or_recreate() {
         _RECREATE_COUNT=0
         return 0
     else
-        _RECREATE_COUNT=0
         return 1
     fi
 }
@@ -1563,18 +1572,24 @@ wait_for_container() {
   log_info "Waiting for container '$CONTAINER_NAME' to become ready..."
 
   set +e
-  # Signal handlers restore errexit and re-raise so the script terminates
-  # cleanly rather than resuming the loop mid-signal.
+  # Signal handlers restore errexit and return with the conventional signal exit
+  # code (128+signum). Using `return` instead of `kill -s <sig> $$` ensures the
+  # function exits cleanly through bash's return mechanism, which triggers the
+  # RETURN trap for consistent cleanup. The old `kill -s <sig> $$` approach
+  # terminated the process before RETURN could fire, potentially leaving
+  # errexit disabled.
+  # NOTE: _wfc_cleanup clears all traps on first invocation, so the RETURN trap
+  # is a no-op after any signal handler has run.
   _wfc_cleanup() {
     if [[ "$_saved_errexit" == "on" ]]; then
       set -e
     fi
     trap - RETURN INT TERM HUP
   }
-  trap '_wfc_cleanup; return 1' RETURN
-  trap '_wfc_cleanup; trap - INT; kill -s INT $$ 2>/dev/null || exit 130' INT
-  trap '_wfc_cleanup; trap - TERM; kill -s TERM $$ 2>/dev/null || exit 143' TERM
-  trap '_wfc_cleanup; trap - HUP; kill -s HUP $$ 2>/dev/null || exit 129' HUP
+  trap '_wfc_cleanup' RETURN
+  trap '_wfc_cleanup; return 130' INT
+  trap '_wfc_cleanup; return 143' TERM
+  trap '_wfc_cleanup; return 129' HUP
 
   while true; do
     attempt=$((attempt + 1))
@@ -2334,9 +2349,16 @@ echo "the system is otherwise working. Not every -Dk warning requires action."
 # _safe_sleep is extracted to /usr/local/lib/pamac-common.sh (written once on
 # first container script execution). All container scripts source it instead of
 # defining inline. This eliminates the 3-copy maintenance burden.
-_CONTAINER_PREAMBLE='if [[ ! -f /usr/local/lib/pamac-common.sh ]]; then
-mkdir -p /usr/local/lib 2>/dev/null
-cat > /usr/local/lib/pamac-common.sh << '\''PAMAC_COMMON'\''
+# NOTE on quoting: _write_pamac_common uses a heredoc with a quoted delimiter
+# (<<'EOF' style) to write pamac-common.sh. The delimiter is embedded in the
+# outer single-quoted _CONTAINER_PREAMBLE via the '\''..'\'' escaping trick.
+# If this pattern is modified, verify the single-quote pairing is balanced:
+# the string must produce << '_PAMAC_EOF' (literal quotes around the delimiter)
+# in the container script. A mismatch silently produces a broken container
+# script that cannot source _safe_sleep.
+_CONTAINER_PREAMBLE='_write_pamac_common() {
+local _target="${1:-/usr/local/lib/pamac-common.sh}"
+cat > "$_target" << '\''_PAMAC_EOF'\''
 _safe_sleep() {
 local _d="$1"
 case "$_d" in ''|*[!0-9]*) _d=1 ;; esac
@@ -2355,7 +2377,12 @@ while (( SECONDS - _start < _target )); do
 done
 return 0
 }
-PAMAC_COMMON
+_PAMAC_EOF
+[[ -s "$_target" ]] || { echo "FATAL: _write_pamac_common produced empty file" >&2; return 1; }
+}
+if [[ ! -f /usr/local/lib/pamac-common.sh ]]; then
+mkdir -p /usr/local/lib 2>/dev/null
+_write_pamac_common
 fi
 . /usr/local/lib/pamac-common.sh
 # Integrity check: verify the sourced file defines the expected function.
@@ -2364,26 +2391,7 @@ fi
 if ! declare -f _safe_sleep >/dev/null 2>&1; then
     echo "WARNING: /usr/local/lib/pamac-common.sh is corrupted (missing _safe_sleep). Rewriting."
     rm -f /usr/local/lib/pamac-common.sh 2>/dev/null || true
-    cat > /usr/local/lib/pamac-common.sh << '\''PAMAC_COMMON'\''
-_safe_sleep() {
-local _d="$1"
-case "$_d" in ''|*[!0-9]*) _d=1 ;; esac
-if sleep "$_d" 2>/dev/null; then return 0; fi
-if command -v python3 >/dev/null 2>&1; then
-    python3 -c "import time,sys; time.sleep(float(sys.argv[1]))" "$_d" 2>/dev/null && return 0
-fi
-if command -v perl >/dev/null 2>&1; then
-    perl -e "select undef,undef,undef,\$ARGV[0]" "$_d" 2>/dev/null && return 0
-fi
-local _target=$(( _d + 0 ))
-[[ $_target -lt 1 ]] && _target=1
-local _start=$SECONDS
-while (( SECONDS - _start < _target )); do
-    read -t 1 _dummy </dev/null 2>/dev/null || true
-done
-return 0
-}
-PAMAC_COMMON
+    _write_pamac_common
     . /usr/local/lib/pamac-common.sh
 fi
 _remove_stale_lock() {
@@ -2516,8 +2524,10 @@ safe_install() {
                     ;;
                 1)
                 echo "  Exit 1: General error (dependency conflict, etc.)."
-                # Check for file conflicts
-                _conflict_output=$(pacman -S --noconfirm --needed "$@" 2>&1 | grep -i "conflicting files\|exists in filesystem" || true)
+                # Check for file conflicts — capture output first, then grep,
+                # to avoid pipefail truncating grep's input if pacman exits early.
+                _pacman_diag=$(pacman -S --noconfirm --needed "$@" 2>&1 || true)
+                _conflict_output=$(echo "$_pacman_diag" | grep -i "conflicting files\|exists in filesystem" || true)
                 if [[ -n "$_conflict_output" ]]; then
                     echo "  File conflicts detected. Trying with targeted --overwrite for /usr/lib and /usr/share..."
                     # Only overwrite files in standard package directories, not config dirs
@@ -3484,7 +3494,7 @@ static void apply_filters(int mdwx) {
         fprintf(stderr, "seccomp: PR_SET_NO_NEW_PRIVS failed\n");
         return;
     }
-    /* RestrictSUIDSGID: block setuid/setgid/setreuid/setregid/setresuid/setresgid/setfsuid/setfsgid */
+    /* RestrictSUIDSGID: block setuid/setgid/setreuid/setregid/setresuid/setresgid/setfsuid/setfsgid/setgroups */
     {
         struct sock_filter f[] = {
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
@@ -3503,6 +3513,8 @@ static void apply_filters(int mdwx) {
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setfsuid, 0, 1),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setfsgid, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setgroups, 0, 1),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
         };
@@ -5245,7 +5257,7 @@ cat > /usr/local/bin/pamac-session-bootstrap.sh << 'BOOTSTRAP'
 set +e
 BOOTSTRAP_LOG="/var/log/pamac-bootstrap.log"
 mkdir -p /var/log 2>/dev/null || true
-chmod 1777 /var/log 2>/dev/null || true
+chmod 0755 /var/log 2>/dev/null || true
 touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
 
 
@@ -5554,7 +5566,7 @@ cat > /usr/local/bin/pamac-session-bootstrap.sh << 'BOOTSTRAP'
 set +e
 BOOTSTRAP_LOG="/var/log/pamac-bootstrap.log"
 mkdir -p /var/log 2>/dev/null || true
-chmod 1777 /var/log 2>/dev/null || true
+chmod 0755 /var/log 2>/dev/null || true
 touch "$BOOTSTRAP_LOG" 2>/dev/null && chmod 644 "$BOOTSTRAP_LOG" 2>/dev/null
 
 
@@ -6234,10 +6246,14 @@ _discover_fingerprint_from_pkg() {
         _direct="${_direct//\$\{repo\}/$_repo}"
         local _pkg_url="${_direct%/}/${_keyring_pkg}.pkg.tar.zst"
         if timeout 30 curl -fsSL --connect-timeout 10 -o "$_tmp_dir/pkg.tar.zst" "$_pkg_url" 2>/dev/null; then
-            # Extract pub.gpg from the package and query it
+            # Extract pub.gpg from the package and query it.
+            # Try gnupg/ layout first (Arch standard), then keyrings/ layout
+            # (some distros use usr/share/pacman/keyrings/ instead of gnupg/).
+            # Fallback: full extract if wildcard patterns don't match.
             local _gpg_dir="$_tmp_dir/gpg"
             mkdir -p "$_gpg_dir"
             tar -xf "$_tmp_dir/pkg.tar.zst" -C "$_tmp_dir" --wildcards '*/gnupg/*' 2>/dev/null || \
+            tar -xf "$_tmp_dir/pkg.tar.zst" -C "$_tmp_dir" --wildcards '*/keyrings/*' 2>/dev/null || \
             tar -xf "$_tmp_dir/pkg.tar.zst" -C "$_gpg_dir" 2>/dev/null || true
             # Find .gpg key files
             local _gpg_file
@@ -8341,11 +8357,17 @@ fi
 # Clean stale pacman lock
 rm -f /var/lib/pacman/db.lck 2>/dev/null || true
 
-chmod 1777 /var/log 2>/dev/null || true
+chmod 0755 /var/log 2>/dev/null || true
 
 DESKTOP_FILE="__DESKTOP_PATH__"
 
 CRASH_LOG="/var/log/pamac-manager-crash.log"
+# Ensure the crash log is writable by the non-root user running this wrapper.
+# /var/log is 0755 (root-owned), so pre-create the log as group-writable.
+if [[ ! -e "\$CRASH_LOG" ]]; then
+    touch "\$CRASH_LOG" 2>/dev/null || true
+    chmod 0664 "\$CRASH_LOG" 2>/dev/null || true
+fi
 echo "=== Launch at \$(date) ===" >> "\$CRASH_LOG" 2>/dev/null
 pamac-manager "\$@" 2>>"\$CRASH_LOG" 1>>"\$CRASH_LOG" &
 PAMAC_PID=\$!

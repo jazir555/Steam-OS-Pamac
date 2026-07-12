@@ -1220,10 +1220,23 @@ check_multi_user_warning() {
 
 self_update() {
     log_step "Checking for updates..."
-    local _latest_tag
-    _latest_tag=$(curl -sf --connect-timeout 10 --max-time 30 \
-        "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null \
-        | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+    local _latest_tag=""
+    local _gh_resp=""
+    _gh_resp=$(curl -sf --connect-timeout 10 --max-time 30 \
+        "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null || echo "")
+    if [[ -n "$_gh_resp" ]]; then
+        # Prefer jq (structured JSON parsing) over fragile grep regex.
+        # GitHub API may return HTML error pages if rate-limited (403/429).
+        if echo "$_gh_resp" | head -1 | grep -qiE '<!DOCTYPE|<html|message.*rate'; then
+            log_warn "GitHub API rate-limited or returned HTML error. Cannot check for updates."
+            return 1
+        fi
+        if command -v jq >/dev/null 2>&1; then
+            _latest_tag=$(echo "$_gh_resp" | jq -r '.tag_name // empty' 2>/dev/null || echo "")
+        else
+            _latest_tag=$(echo "$_gh_resp" | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+        fi
+    fi
     if [[ -z "$_latest_tag" ]]; then
         log_error "Could not fetch latest release info from GitHub."
         log_info "Check your network connection or visit:"
@@ -1818,9 +1831,16 @@ parse_arguments() {
             --version-check)
                 echo "Installed version: v${SCRIPT_VERSION}"
                 local _latest=""
-                _latest=$(curl -sf --connect-timeout 5 --max-time 10 \
-                    "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null \
-                    | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+                local _gh_resp=""
+                _gh_resp=$(curl -sf --connect-timeout 5 --max-time 10 \
+                    "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null || echo "")
+                if [[ -n "$_gh_resp" ]]; then
+                    if command -v jq >/dev/null 2>&1; then
+                        _latest=$(echo "$_gh_resp" | jq -r '.tag_name // empty' 2>/dev/null || echo "")
+                    else
+                        _latest=$(echo "$_gh_resp" | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+                    fi
+                fi
                 if [[ -n "$_latest" ]]; then
                     echo "Latest release:    v${_latest#v}"
                     if [[ "$_latest#v" == "$SCRIPT_VERSION" ]]; then
@@ -7883,18 +7903,35 @@ mkdir -p "$_AUR_CACHE_DIR" 2>/dev/null || true
 
 _fetch_aur_pkgbuild() {
     local fetched=""
+    local _method_tried=""
+    local _method_succeeded=""
 
     # Method 1: AUR RPC v5 JSON API (most stable, no CGIT dependency)
     # Returns package metadata as JSON including Depends/MakeDepends arrays.
     # We format the output as PKGBUILD-like text so downstream grep parsing works.
     local _rpc_url="https://aur.archlinux.org/rpc/v5/info/pamac-aur"
-    local _rpc_resp
-    _rpc_resp=$(curl -sf --connect-timeout 10 --max-time 30 "$_rpc_url" 2>/dev/null || echo "")
+    local _rpc_resp=""
+    local _rpc_http_code=""
+    _method_tried="RPC"
+    _rpc_resp=$(curl -sSf --connect-timeout 10 --max-time 30 -w "\n%{http_code}" "$_rpc_url" 2>/dev/null) || true
+    _rpc_http_code=$(echo "$_rpc_resp" | tail -1)
+    _rpc_resp=$(echo "$_rpc_resp" | sed '$d')
     if [[ -n "$_rpc_resp" ]]; then
+        # Detect rate-limiting (Cloudflare or AUR)
+        if [[ "$_rpc_http_code" == "429" ]]; then
+            echo "# WARN: AUR RPC rate-limited (HTTP 429). Cloudflare or AUR throttling active." >&2
+        elif [[ "$_rpc_http_code" =~ ^4[0-9][0-9]$ ]]; then
+            echo "# WARN: AUR RPC returned HTTP $_rpc_http_code (client error)." >&2
+        elif [[ "$_rpc_http_code" =~ ^5[0-9][0-9]$ ]]; then
+            echo "# WARN: AUR RPC returned HTTP $_rpc_http_code (server error). AUR may be down." >&2
+        fi
         # Validate JSON response structure with jq (avoids regex fragility on
         # future API field renames or reordering).
-        local _resultcount
-        _resultcount=$(echo "$_rpc_resp" | jq -r '.resultcount // empty' 2>/dev/null || echo "")
+        local _resultcount=""
+        _resultcount=$(echo "$_rpc_resp" | jq -r '.resultcount // empty' 2>/dev/null) || {
+            echo "# WARN: AUR RPC response is not valid JSON (may be HTML error page from Cloudflare)." >&2
+            _resultcount=""
+        }
         if [[ "$_resultcount" == "1" ]]; then
             local _deps_formatted _makedeps_formatted
             _deps_formatted=$(echo "$_rpc_resp" | jq -r '.results[0].Depends // [] | join("\n")' 2>/dev/null || echo "")
@@ -7907,6 +7944,7 @@ _fetch_aur_pkgbuild() {
             fi
             if [[ -n "$_deps_formatted" || -n "$_makedeps_formatted" ]]; then
                 echo "# Generated from AUR RPC v5 API"
+                _method_succeeded="RPC"
                 return 0
             fi
         elif [[ -n "$_resultcount" ]]; then
@@ -7916,25 +7954,52 @@ _fetch_aur_pkgbuild() {
 
     # Method 2: CGIT web endpoint (may be rate-limited by Cloudflare)
     # Validate response is an actual PKGBUILD (not an HTML error page).
-    fetched=$(curl -sf --connect-timeout 10 --max-time 30 \
-        "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=pamac-aur" 2>/dev/null || echo "")
-    if [[ -n "$fetched" ]] && echo "$fetched" | grep -q "^pkgname="; then
-        echo "$fetched"
-        return 0
+    _method_tried="CGIT"
+    local _cgit_resp=""
+    local _cgit_http_code=""
+    _cgit_resp=$(curl -sSf --connect-timeout 10 --max-time 30 -w "\n%{http_code}" \
+        "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=pamac-aur" 2>/dev/null) || true
+    _cgit_http_code=$(echo "$_cgit_resp" | tail -1)
+    _cgit_resp=$(echo "$_cgit_resp" | sed '$d')
+    if [[ -n "$_cgit_resp" ]]; then
+        # Detect Cloudflare challenges, rate limits, and HTML error pages
+        if [[ "$_cgit_http_code" == "429" ]]; then
+            echo "# WARN: CGIT endpoint rate-limited (HTTP 429). Cloudflare throttling." >&2
+        elif echo "$_cgit_resp" | head -5 | grep -qiE '<!DOCTYPE|<html|<head|challenge-platform|cf-browser|Attention Required|Just a moment'; then
+            echo "# WARN: CGIT endpoint returned HTML (Cloudflare challenge/block, HTTP $_cgit_http_code)." >&2
+        elif echo "$_cgit_resp" | grep -q "^pkgname="; then
+            echo "$_cgit_resp"
+            _method_succeeded="CGIT"
+            return 0
+        fi
     fi
+
     # Method 3: git clone to read PKGBUILD directly (bypasses web frontend)
-    local _git_tmp
+    _method_tried="git-clone"
+    local _git_tmp=""
     _git_tmp=$(mktemp -d 2>/dev/null || echo "")
     if [[ -n "$_git_tmp" ]]; then
-        if git clone --depth 1 --single-branch https://aur.archlinux.org/pamac-aur.git "$_git_tmp/pamac-aur" 2>/dev/null; then
+        local _clone_err=""
+        _clone_err=$(mktemp 2>/dev/null || echo "/dev/null")
+        if git clone --depth 1 --single-branch https://aur.archlinux.org/pamac-aur.git "$_git_tmp/pamac-aur" 2>"$_clone_err"; then
             if [[ -f "$_git_tmp/pamac-aur/PKGBUILD" ]]; then
                 cat "$_git_tmp/pamac-aur/PKGBUILD"
-                rm -rf "$_git_tmp"
+                rm -rf "$_git_tmp" "$_clone_err"
+                _method_succeeded="git-clone"
                 return 0
             fi
+        else
+            local _clone_msg
+            _clone_msg=$(cat "$_clone_err" 2>/dev/null || echo "unknown")
+            echo "# WARN: git clone of pamac-aur failed: $_clone_msg" >&2
         fi
-        rm -rf "$_git_tmp"
+        rm -rf "$_git_tmp" "$_clone_err"
     fi
+
+    # All methods exhausted
+    echo "# WARN: All AUR fetch methods failed (tried: RPC v5, CGIT, git-clone)." >&2
+    echo "# WARN: AUR may be rate-limited, down, or network is unreachable." >&2
+    echo "# WARN: Proceeding without AUR PKGBUILD data — compatibility check will be skipped." >&2
     return 1
 }
 
@@ -7974,7 +8039,29 @@ fi
 
 if [[ -z "$aur_pkgbuild" ]]; then
     echo "WARN: Could not fetch pamac-aur PKGBUILD from AUR (network issue?). Skipping check."
+    echo "WARN: Installation will proceed — pamac-aur may fail to build if pacman API changed."
     exit 0
+fi
+
+# Validate that the fetched content is actually a PKGBUILD, not an HTML error
+# page (Cloudflare challenge, rate-limit block, or AUR maintenance page).
+if echo "$aur_pkgbuild" | head -5 | grep -qiE '<!DOCTYPE|<html|<head|challenge-platform|Attention Required|Just a moment|403 Forbidden|503 Service'; then
+    echo "WARN: Fetched content is not a valid PKGBUILD (HTML error page detected)."
+    echo "WARN: AUR/CGIT may be rate-limited or blocked by Cloudflare."
+    echo "WARN: If stale cache exists, it will be used; otherwise skipping compat check."
+    # Try to use stale cache as fallback
+    if [[ -f "$_AUR_CACHE_FILE" && "$_cache_age" -lt 2592000 ]]; then
+        aur_pkgbuild=$(cat "$_AUR_CACHE_FILE" 2>/dev/null || echo "")
+        if [[ -n "$aur_pkgbuild" ]] && echo "$aur_pkgbuild" | grep -q "^pkgname="; then
+            echo "Using stale cached PKGBUILD (${_cache_age}s old) as fallback."
+        else
+            echo "WARN: Stale cache also invalid. Skipping compat check."
+            exit 0
+        fi
+    else
+        echo "WARN: No valid cached PKGBUILD available. Skipping compat check."
+        exit 0
+    fi
 fi
 
 aur_pacman_dep=$(echo "$aur_pkgbuild" | grep -E "^(depends|makedepends)\\+?=" | grep -oP "pacman[><= ]+[0-9.]+" | head -1 || echo "")
@@ -7987,6 +8074,21 @@ fi
 echo "pamac-aur requires: $aur_pacman_dep"
 req_version=$(echo "$aur_pacman_dep" | grep -oP "[0-9.]+" | head -1 || echo "")
 req_op=$(echo "$aur_pacman_dep" | grep -oP "[><=]+" | head -1 || echo "")
+
+# Validate parsed version components — malformed PKGBUILD data (e.g., from
+# Cloudflare HTML pages that partially matched the regex) could produce empty
+# or nonsensical values. Fail gracefully instead of comparing against garbage.
+if [[ -z "$req_version" || -z "$req_op" ]]; then
+    echo "WARN: Could not parse version requirement from PKGBUILD (req_version='$req_version' req_op='$req_op')."
+    echo "WARN: PKGBUILD data may be malformed. Skipping compatibility check."
+    exit 0
+fi
+if [[ ! "$req_version" =~ ^[0-9]+\.[0-9]+ ]]; then
+    echo "WARN: Version string '$req_version' does not look like a valid version (expected major.minor[.patch])."
+    echo "WARN: PKGBUILD data may be corrupted. Skipping compatibility check."
+    exit 0
+fi
+
 echo "Required: pacman $req_op $req_version"
 
 req_major=$(echo "$req_version" | sanitize_version_component)

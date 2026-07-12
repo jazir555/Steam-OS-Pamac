@@ -980,14 +980,36 @@ check_system_requirements() {
     local available_space
     if available_space=$(df -k "$HOME" 2>/dev/null | awk 'NR==2{print $4}'); then
     if [[ -n "$available_space" ]] && [[ $available_space -lt ${DISK_SPACE_MIN_KB} ]]; then
-        log_warn "Low disk space detected. At least $(( DISK_SPACE_MIN_KB / 1024 / 1024 ))GB is recommended."
+        log_warn "Low disk space detected on $HOME. At least $(( DISK_SPACE_MIN_KB / 1024 / 1024 ))GB is recommended."
             log_info "Available space: $(( available_space / 1024 ))MB"
             all_ok=false
         elif [[ -n "$available_space" ]]; then
-            log_success "Sufficient disk space available: $(( available_space / 1024 / 1024 ))GB"
+            log_success "Sufficient disk space on $HOME: $(( available_space / 1024 / 1024 ))GB"
         fi
     else
-        log_warn "Could not check disk space."
+        log_warn "Could not check disk space on $HOME."
+    fi
+
+    local var_space
+    if var_space=$(df -k /var 2>/dev/null | awk 'NR==2{print $4}'); then
+        if [[ -n "$var_space" ]] && [[ "$var_space" -lt ${DISK_SPACE_MIN_KB} ]]; then
+            log_warn "Low disk space on /var (container write target). At least $(( DISK_SPACE_MIN_KB / 1024 / 1024 ))GB recommended."
+            log_info "Available on /var: $(( var_space / 1024 ))MB"
+            all_ok=false
+        elif [[ -n "$var_space" ]]; then
+            log_debug "Disk space on /var: $(( var_space / 1024 / 1024 ))GB"
+        fi
+    fi
+
+    local root_space
+    if root_space=$(df -k / 2>/dev/null | awk 'NR==2{print $4}'); then
+        if [[ -n "$root_space" ]] && [[ "$root_space" -lt ${DISK_SPACE_MIN_KB} ]]; then
+            log_warn "Low disk space on / (root filesystem). At least $(( DISK_SPACE_MIN_KB / 1024 / 1024 ))GB recommended."
+            log_info "Available on /: $(( root_space / 1024 ))MB"
+            all_ok=false
+        elif [[ -n "$root_space" ]]; then
+            log_debug "Disk space on /: $(( root_space / 1024 / 1024 ))GB"
+        fi
     fi
 
     if grep -q "ID=steamos" /etc/os-release 2>/dev/null; then
@@ -7504,6 +7526,10 @@ install_aur_helper() {
         return 0
     fi
     log_info "Prebuilt yay not available. Building from source..."
+    log_warn "Source compilation detected — building yay from AUR may take 10-30 minutes"
+    log_warn "depending on hardware (CPU speed, thermal throttling, storage type)."
+    log_warn "On eMMC/SD cards, write cycles during Go compilation can be significant."
+    log_warn "Keep the device plugged in and avoid sleep/hibernation during the build."
 
 	log_info "Verifying build dependencies (git, base-devel, go) are present..."
 	local verify_script
@@ -8291,6 +8317,12 @@ install_pamac() {
         return 0
     fi
     log_info "Prebuilt pamac-aur not available. Building from source..."
+    log_warn "Source compilation detected — building pamac-aur from AUR may take 15-45 minutes"
+    log_warn "depending on hardware (CPU speed, thermal throttling, storage type)."
+    log_warn "This package compiles complex C++/Vala dependencies (libalpm, pamac)."
+    log_warn "On eMMC/SD cards, the heavy write cycles during compilation can be"
+    log_warn "significant and may cause thermal throttling on budget hardware."
+    log_warn "Keep the device plugged in and avoid sleep/hibernation during the build."
 
     _PAMAC_COMPAT_COMMIT=""
     _PAMAC_COMPAT_STRATEGY=""

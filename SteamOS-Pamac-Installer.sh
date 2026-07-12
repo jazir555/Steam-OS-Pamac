@@ -25,6 +25,16 @@ trap '_err_trap $LINENO "$BASH_COMMAND"' ERR
 # Heredoc quoting convention:
 #   <<'EOF'  — no host variable expansion; content runs inside container
 #   <<EOF    — host variables expand at write-time; use \$ for literal $
+#
+# CRITICAL: When injecting host variables into heredoc content that will
+# execute inside the container or as a separate process:
+#   - Use ${VAR} for values to bake in at write-time (e.g., CONTAINER_NAME)
+#   - Use \$VAR for values to resolve at runtime (e.g., \$HOME, \$DISPLAY)
+#   - Never mix $VAR and \$VAR for the same variable in the same heredoc
+#   - For triple-nested quoting (heredoc → bash -c → inner bash -c), prefer
+#     writing a temp script file over inline escaping (\\\$ is error-prone)
+#
+# Validation: _validate_heredoc_sanity() checks for common mistakes.
 
 readonly SCRIPT_VERSION="5.4.0"
 readonly GITHUB_REPO="Steam-OS-Pamac/Steam-OS-Pamac"
@@ -324,6 +334,24 @@ log_success(){ _log "SUCCESS" "$GREEN"  "✓ $1"; }
 log_warn()   { _log "WARN"    "$YELLOW" "⚠ $1"; }
 log_error()  { _log "ERROR"   "$RED"    "✗ $1"; }
 log_debug()  { _log "DEBUG"   ""        "$1"; }
+
+# ── Heredoc expansion sanity check ──
+# Call after writing a heredoc to verify no accidental host variable leakage.
+# Usage: _validate_heredoc_sanity "$_heredoc_content" "description"
+# Checks for common mistakes: bare $VAR where \$VAR was intended, and
+# vice versa. Not exhaustive, but catches the most dangerous patterns.
+_validate_heredoc_sanity() {
+    local _content="$1" _desc="${2:-heredoc}"
+    # Check for bare $HOME, $USER, $CONTAINER_NAME that look like they
+    # should have been escaped (appear in a context suggesting container code)
+    if echo "$_content" | grep -q 'export HOME=/home/$HOME\|export HOME=$HOME'; then
+        log_warn "Heredoc '$_desc' may have unescaped \$HOME (should be \$\\\$HOME or baked value)."
+    fi
+    # Check for common double-escape mistakes
+    if echo "$_content" | grep -q '\\\\\\$'; then
+        log_debug "Heredoc '$_desc' contains triple-backslash-dollar — verify this is intentional."
+    fi
+}
 
 sanitize_and_upload_log() {
     if [[ "$UPLOAD_LOG" != "true" ]]; then
@@ -10801,18 +10829,20 @@ if command -v notify-send >/dev/null 2>&1; then
 notify-send -i package-generic "Uninstalling..." "Removing \$APP_NAME..." 2>/dev/null || true
 fi
 
-nohup bash -c "
-export HOME=/home/${current_user}
-export PATH=/home/${current_user}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin
-export DISPLAY=\$DISPLAY
-export WAYLAND_DISPLAY=\$WAYLAND_DISPLAY
-export XDG_RUNTIME_DIR=\$XDG_RUNTIME_DIR
-export DBUS_SESSION_BUS_ADDRESS=\$DBUS_SESSION_BUS_ADDRESS
-
-'\$UNINSTALL_HELPER' --desktop-file '\$DESKTOP_BASENAME' > '\$UNINSTALL_LOG' 2>&1
-rc=\\\$?
-echo \\\"Exit code: \\\$rc\\\" >> '\$UNINSTALL_LOG'
-" &>/dev/null &
+# Write uninstall command to a temp script to avoid triple-nested quoting.
+# Variables are baked in at write-time; runtime env is set via export.
+_UNINST_SCRIPT="\$STATE_DIR/.uninst-\$(date +%s).sh"
+cat > "\$_UNINST_SCRIPT" << _UNINST_EOF
+#!/bin/bash
+export HOME="/home/${current_user}"
+export PATH="/home/${current_user}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin"
+"\$UNINSTALL_HELPER" --desktop-file "\$DESKTOP_BASENAME" > "\$UNINSTALL_LOG" 2>&1
+rc=\$?
+echo "Exit code: \$rc" >> "\$UNINSTALL_LOG"
+chmod +x "\$_UNINST_SCRIPT"
+_UNINST_EOF
+chmod +x "\$_UNINST_SCRIPT"
+nohup "\$_UNINST_SCRIPT" &>/dev/null &
 
 disown
 log_msg "Uninstall launched in background (nohup)"
@@ -10854,7 +10884,17 @@ if command -v kdialog >/dev/null 2>&1; then
         exit 0
     fi
 fi
-    nohup bash -c "${CONTAINER_MANAGER:-podman} exec -u 0 ${CONTAINER_NAME} bash -c 'rm -f /var/lib/pacman/db.lck; pacman -R --noconfirm \$_pkg_name' 2>&1 && rm -f \$HOME/.local/share/applications/${CONTAINER_NAME}-\$_pkg_name.desktop && touch \$HOME/.local/share/applications && notify-send -i edit-delete 'Uninstalled' '\$_pkg_name has been removed.' 2>/dev/null || notify-send -i dialog-error 'Uninstall Failed' 'Could not remove \$_pkg_name' 2>/dev/null" &>/dev/null &
+    # Write uninstall to a temp script to avoid triple-nested quoting
+    _RM_SCRIPT="\$STATE_DIR/.rm-pkg-\$(date +%s).sh"
+    cat > "\$_RM_SCRIPT" << _RM_EOF
+#!/bin/bash
+${CONTAINER_MANAGER:-podman} exec -u 0 ${CONTAINER_NAME} bash -c 'rm -f /var/lib/pacman/db.lck; pacman -R --noconfirm \$_pkg_name' 2>&1
+rm -f "\$HOME/.local/share/applications/${CONTAINER_NAME}-\$_pkg_name.desktop"
+touch "\$HOME/.local/share/applications"
+notify-send -i edit-delete "Uninstalled" "\$_pkg_name has been removed." 2>/dev/null || notify-send -i dialog-error "Uninstall Failed" "Could not remove \$_pkg_name" 2>/dev/null
+_RM_EOF
+    chmod +x "\$_RM_SCRIPT"
+    nohup "\$_RM_SCRIPT" &>/dev/null &
     disown
     exit 0
 fi

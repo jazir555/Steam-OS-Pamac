@@ -26,7 +26,7 @@ trap '_err_trap $LINENO "$BASH_COMMAND"' ERR
 #   <<'EOF'  — no host variable expansion; content runs inside container
 #   <<EOF    — host variables expand at write-time; use \$ for literal $
 
-readonly SCRIPT_VERSION="5.3.0"
+readonly SCRIPT_VERSION="5.4.0"
 readonly GITHUB_REPO="Steam-OS-Pamac/Steam-OS-Pamac"
 readonly DEFAULT_CONTAINER_NAME="arch-pamac"
 
@@ -2807,8 +2807,19 @@ safe_install() {
                 _lock_pid=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo "")
                 if [[ -n "$_lock_pid" ]] && [[ "$_lock_pid" =~ ^[0-9]+$ ]] && \
                    [[ "$_lock_pid" != "$$" ]] && [[ "$_lock_pid" != "$PPID" ]]; then
-                    echo "  Stale lock held by PID $_lock_pid, force-killing..."
-                    kill -9 "$_lock_pid" 2>/dev/null || true
+                    if kill -0 "$_lock_pid" 2>/dev/null; then
+                        echo "  Lock held by PID $_lock_pid. Sending SIGTERM and waiting..."
+                        kill -15 "$_lock_pid" 2>/dev/null || true
+                        local _w=0
+                        while [[ $_w -lt 10 ]] && kill -0 "$_lock_pid" 2>/dev/null; do
+                            sleep 1; _w=$((_w + 1))
+                        done
+                        if kill -0 "$_lock_pid" 2>/dev/null; then
+                            echo "  Process did not exit after SIGTERM. Force-killing..."
+                            kill -9 "$_lock_pid" 2>/dev/null || true
+                            sleep 1
+                        fi
+                    fi
                 fi
                 sleep 1
                 # Re-sync with overwrite limited to standard package dirs
@@ -4461,11 +4472,13 @@ _run_sandboxed_unshare() {
     local _verify_cmd="_apply_sandbox; ${_inner_cmd}"
     if [[ -n "$_run_user" ]]; then
         if [[ -n "${_SECCOMP_HELPER:-}" ]]; then
-            _DSR_SBOX="${_CAP_PRIV}${_NNP}sudo -u '$_run_user' -H -- $_SECCOMP_HELPER $_seccomp_args -- bash -c '$_verify_cmd' -- ${CMD_ARGS[*]}"
+            unshare --mount $_unshare_net --propagation slave \
+                sudo -u "$_run_user" -H -- "$_SECCOMP_HELPER" $_seccomp_args \
+                -- bash -c "$_verify_cmd" -- "${CMD_ARGS[@]}"
         else
-            _DSR_SBOX="${_CAP_PRIV}${_NNP}sudo -u '$_run_user' -H -- bash -c '$_verify_cmd' -- ${CMD_ARGS[*]}"
+            unshare --mount $_unshare_net --propagation slave \
+                sudo -u "$_run_user" -H -- bash -c "$_verify_cmd" -- "${CMD_ARGS[@]}"
         fi
-        unshare --mount $_unshare_net --propagation slave bash -c "$_DSR_SBOX"
     else
         if [[ -n "${_SECCOMP_HELPER:-}" ]]; then
             unshare --mount $_unshare_net --propagation slave bash -c "
@@ -10404,7 +10417,7 @@ PAMAC_DESKTOP
     # boundary between [Desktop Entry] and the next section.
     awk -v container="${container_name}" -v user="${current_user}" \
         -v export_name="${export_name}" -v app_name="${app_name}" \
-        -v owner_pkg="${owner_pkg}" '
+        -v owner_pkg="${owner_pkg}" -v _cm="${_cm}" '
     BEGIN { in_entry=0; inserted=0; saw_next_section=0; in_uninstall=0 }
     /^\[Desktop Entry\]/ { in_entry=1; print; next }
     # Strip any pre-existing [Desktop Action uninstall] section FIRST so the
@@ -10446,7 +10459,7 @@ PAMAC_DESKTOP
         _desktop_bn=app_name ".desktop"
         _host_file="/home/" user "/.local/share/applications/" container "-" _desktop_bn
         _apps_dir="/home/" user "/.local/share/applications"
-        printf "Exec=bash -c '%s exec -u 0 %s pacman -R --noconfirm %s 2>/dev/null && rm -f %s && touch %s && notify-send -i edit-delete \"Uninstalled\" \"%s removed\" 2>/dev/null'\n", "\$_cm", container, owner_pkg, _host_file, _apps_dir, owner_pkg
+        printf "Exec=bash -c '%s exec -u 0 %s pacman -R --noconfirm %s 2>/dev/null && rm -f %s && touch %s && notify-send -i edit-delete \"Uninstalled\" \"%s removed\" 2>/dev/null'\n", _cm, container, owner_pkg, _host_file, _apps_dir, owner_pkg
         print "Icon=edit-delete"
     }
     { print }

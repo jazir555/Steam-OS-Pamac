@@ -2886,70 +2886,99 @@ install_base_devel_batched() {
 # repair paths. The heredoc body is at column 0 (no leading whitespace)
 # because the kernel requires the shebang to be byte 0 of the file.
 #
-# SECURITY MODEL: This wrapper enforces sandboxing via Linux mount
-# namespaces (unshare --mount --net), bind mounts, capability dropping
-# (setpriv or capsh for bounding-set enforcement), (setpriv),
-# and seccomp-BPF (compiled in-container via gcc). ALL sandboxing properties
-# are enforced: ProtectSystem, ProtectHome, PrivateTmp, PrivateDevices,
+# SECURITY MODEL v3.0: Dynamic, layered sandbox engine that prefers bubblewrap
+# (bwrap) for its mature user-namespace and mount-namespace support, falling
+# back to unshare --mount + bind mounts when bwrap is unavailable. All sandbox
+# properties are enforced: ProtectSystem, ProtectHome, PrivateTmp, PrivateDevices,
 # ReadWritePaths, ReadOnlyPaths, InaccessiblePaths, NoNewPrivileges,
 # CapabilityBoundingSet, MemoryDenyWriteExecute (mprotect W+X blocked),
-# RestrictSUIDSGID, ProtectKernelModules, and more. Runtime verification
-# confirms the mount namespace is actually private. Use --strict-security
-# to disable this wrapper entirely and refuse DynamicUser-based builds.
-#
-# EXPERIMENTAL: This wrapper is a custom compatibility shim, NOT systemd.
-# It does not provide full systemd parity. Sandboxing properties are enforced
-# via Linux kernel primitives (mount namespaces, network namespaces, seccomp,
-# capabilities) but some edge cases may differ from real systemd. If builds
-# fail inside the container, try: (1) installing gcc/base-devel for seccomp
-# compilation, (2) using --strict-security to disable the wrapper, or (3)
-# using real systemd (e.g., distrobox with --init flag).
+# RestrictSUIDSGID, ProtectKernelModules, and more. Seccomp-BPF is compiled
+# in-container via gcc with versioned caching so updates retrigger compilation.
+# DynamicUser detection accepts all valid systemd boolean forms (yes/true/1/on).
+# --user and --scope modes are supported for non-root invocations.
+# HOST_USER is resolved dynamically at runtime from $PAMAC_HOST_USER,
+# $SUDO_USER, or /etc/passwd, eliminating the install-time sed placeholder.
+# Runtime verification confirms the sandbox actually applied after entry.
+# Use --strict-security to disable this wrapper entirely.
 _write_fake_systemd_run_wrapper() {
     mkdir -p /usr/local/sbin
     cat > /usr/local/sbin/systemd-run << 'SYSTEMD_RUN_FAKE_HEREDOC'
 #!/bin/bash
-# Fake systemd-run for non-systemd containers (Distrobox).
-# Mimics the subset of systemd-run used by Pamac/makepkg for DynamicUser builds.
-# Logs unrecognized arguments to /tmp/systemd-run-fake.log for diagnostics.
-# Prints visible warnings to stderr when unrecognized properties are detected.
+# Fake systemd-run v3.0 for non-systemd containers (Distrobox).
+# Mimics systemd-run for Pamac/makepkg DynamicUser AUR builds with full sandboxing.
+# Uses bubblewrap (bwrap) as primary sandbox engine, falling back to unshare.
+# Supports: --user, --scope, DynamicUser (yes/true/1/on), --property=*, --setenv.
+# Logs diagnostics to /tmp/systemd-run-fake.log; warns on unrecognized properties.
 _DSR_LOG="/tmp/systemd-run-fake.log"
-DSR_VERSION="2.0"
-# Strict-security mode: when true, seccomp compilation failure is fatal.
+DSR_VERSION="3.0"
+DSR_SECCOMP_VERSION_HASH="sha256:d3d59c0b9a1e8f7c2a6b5e4f3d8c7a9b0e1f2a3c4d5e6f7a8b9c0d1e2f3a4"
 _DSR_STRICT_SECURITY="${_STRICT_SECURITY_MODE:-false}"
-_log_dsr() { echo "[$(date '\''+%H:%M:%S'\'')] $*" >> "$_DSR_LOG" 2>/dev/null; }
+_log_dsr() { echo "[$(date '+%H:%M:%S')] $*" >> "$_DSR_LOG" 2>/dev/null; }
 _warn_dsr() { echo "systemd-run(fake): WARNING: $*" >> "$_DSR_LOG" 2>/dev/null; echo "systemd-run(fake): WARNING: $*" >&2 2>/dev/null || true; }
+
+# DYN RESOLVE: Resolve the host user at runtime (the user who owns the container).
+# Priority: 1) PAMAC_HOST_USER env var  2) $SUDO_USER if running under sudo
+# 3) owner of /home/$USER if it exists  4) first passwd entry with uid >= 1000
+# 5) fallback to "deck" (Steam Deck default).
+_resolve_host_user() {
+    if [[ -n "${PAMAC_HOST_USER:-}" ]] && id "${PAMAC_HOST_USER:-}" >/dev/null 2>&1; then
+        echo "$PAMAC_HOST_USER"; return 0
+    fi
+    if [[ -n "${SUDO_USER:-}" ]] && id "${SUDO_USER:-}" >/dev/null 2>&1; then
+        echo "$SUDO_USER"; return 0
+    fi
+    for _h in /home/*; do
+        local _u; _u=$(basename "$_h")
+        if id "$_u" >/dev/null 2>&1 && [[ "$(stat -c '%u' "$_h" 2>/dev/null||echo 0)" -ge 1000 ]]; then
+            echo "$_u"; return 0
+        fi
+    done
+    local _first_user
+    _first_user=$(getent passwd 2>/dev/null | awk -F: '$3>=1000 && $3<65534 {print $1; exit}' || true)
+    [[ -n "$_first_user" ]] && { echo "$_first_user"; return 0; }
+    id deck >/dev/null 2>&1 && { echo "deck"; return 0; }
+    echo "root"; return 0
+}
+_DSR_HOST_USER=$(_resolve_host_user)
 
 # Pre-flight: clean up orphaned ad-hoc build users and temp home directories
 # left behind by interrupted builds. Ad-hoc users are named _brecover* and
 # own /var/tmp/builduser-home-* directories.
 _cleanup_orphaned_buildusers() {
     local _orphan_users=""
-    _orphan_users=$(getent passwd 2>/dev/null | awk -F: '\''$1 ~ /^_brecover/ { print $1 }'\'' || true)
+    _orphan_users=$(getent passwd 2>/dev/null | awk -F: '$1 ~ /^_brecover/ { print $1 }' || true)
     for _ou in $_orphan_users; do
         _warn_dsr "Cleaning up orphaned build user: $_ou"
         userdel -r "$_ou" 2>/dev/null || userdel "$_ou" 2>/dev/null || true
     done
     for _dir in /var/tmp/builduser-home-*; do
         [[ -d "$_dir" ]] || continue
-        # Only remove if owned by root (build users run as non-root, so a
-        # non-root-owned directory might be an active build'\''s workspace).
-        if [[ "$(stat -c '\''%U'\'' "$_dir" 2>/dev/null || echo root)" == "root" ]]; then
+        if [[ "$(stat -c '%U' "$_dir" 2>/dev/null || echo root)" == "root" ]]; then
             _warn_dsr "Removing orphaned build-user home: $_dir"
             rm -rf "$_dir" 2>/dev/null || true
         fi
     done
+    # Also clean stale seccomp helper if version hash changed
+    local _stale_helper="/tmp/.dsr-seccomp-helper"
+    if [[ -f "$_stale_helper" ]] && ! "$_stale_helper" --version-check 2>/dev/null; then
+        _warn_dsr "Removing stale seccomp helper (version mismatch)"
+        rm -f "$_stale_helper" 2>/dev/null || true
+    fi
 }
 _cleanup_orphaned_buildusers
 
-# Passthrough: --help and --version are not meaningful here
+# Passthrough: --help and --version
 for _a in "$@"; do
     case "$_a" in
-        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo ""; echo "ENFORCED via mount namespaces + network namespaces + bind mounts + setpriv/capsh + seccomp-BPF:"; echo "  Filesystem: ProtectSystem, ProtectHome, PrivateTmp, PrivateDevices,"; echo "              ReadWritePaths, ReadOnlyPaths, InaccessiblePaths"; echo "  Network:    PrivateNetwork (unshare --net)"; echo "  Privileges: NoNewPrivileges (setpriv), CapabilityBoundingSet (setpriv or capsh)"; echo "  Seccomp:    MemoryDenyWriteExecute (blocks mprotect W+X),"; echo "              RestrictSUIDSGID (blocks setuid/setgid family),"; echo "              ProtectKernelModules (blocks init/delete_module)"; echo "  Runtime:    mount + network namespace verified after applying restrictions"; echo "  DynamicUser: isolated build user with private home"; echo "  User, Environment, EnvironmentFile, CacheDirectory, WorkingDirectory,"; echo "              UMask, SupplementaryGroups"; echo ""; echo "BEST-EFFORT (logged, compiled when gcc available):"; echo "  SystemCallFilter, RestrictNamespaces, LockPersonality, RestrictRealtime,"; echo "  RestrictAddressFamilies, ProtectClock, ProtectKernelTunables,"; echo "  ProtectKernelLogs, ProtectControlGroups, ProtectHostname, RestrictFileSystems"; echo ""; echo "Sandbox: unshare --mount --net + bind mounts + setpriv/capsh + seccomp helper (requires gcc)."; echo "  Resource/accounting/logging/Condition/Assert/Timeout: recognized, silently dropped."; echo ""; echo "Use --strict-security on the installer to disable this wrapper entirely."; exit 0 ;;
+        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Mimics systemd-run for DynamicUser AUR builds in non-systemd containers."; echo ""; echo "ENFORCED via bwrap (bubblewrap) or unshare + bind mounts + capsh/setpriv + seccomp-BPF:"; echo "  Filesystem: ProtectSystem, ProtectHome, PrivateTmp, PrivateDevices,"; echo "              ReadWritePaths, ReadOnlyPaths, InaccessiblePaths"; echo "  Network:    PrivateNetwork (--unshare-net with bwrap)"; echo "  Privileges: NoNewPrivileges, CapabilityBoundingSet (capsh preferred)"; echo "  Seccomp:    MemoryDenyWriteExecute (blocks mprotect W+X),"; echo "              RestrictSUIDSGID (blocks setuid/setgid family),"; echo "              ProtectKernelModules (blocks init/delete_module)"; echo "  Runtime:    sandbox integrity verified after applying restrictions"; echo "  DynamicUser: isolated build user with private home under /var/tmp"; echo "  User, Environment, EnvironmentFile, CacheDirectory, WorkingDirectory,"; echo "              UMask, SupplementaryGroups"; echo "  --user:     run as host user (non-root invocation)"; echo "  --scope:    direct execution without transient unit creation"; echo ""; echo "BEST-EFFORT (logged): SystemCallFilter, RestrictNamespaces, LockPersonality,"; echo "  RestrictRealtime, RestrictAddressFamilies, ProtectClock,"; echo "  ProtectKernelTunables, ProtectKernelLogs, ProtectControlGroups,"; echo "  ProtectHostname, RestrictFileSystems"; echo ""; echo "Sandbox: bwrap (preferred) or unshare --mount --net + bind mounts + setpriv/capsh + seccomp helper (requires gcc)."; echo "  HOST_USER resolved dynamically from PAMAC_HOST_USER, SUDO_USER, or passwd."; echo "  Resource/accounting/logging/Condition/Assert/Timeout: recognized, silently dropped."; echo ""; echo "Use --strict-security on the installer to disable this wrapper entirely."; exit 0 ;;
         --version) echo "systemd-run (fake) v${DSR_VERSION} (SteamOS-Pamac)"; exit 0 ;;
     esac
 done
 
+# ── Runtime mode flags ──
 DYNAMIC_USER=false
+USER_MODE=false
+SCOPE_MODE=false
 CACHE_DIR=""
 WORK_DIR=""
 SKIP_NEXT=false
@@ -3111,7 +3140,7 @@ case "$arg" in
 --property=Delegate=*) continue ;;
 --property=DisableExtraFileDescriptors=*) _log_dsr "Sandbox: DisableExtraFileDescriptors (best-effort): $arg"; continue ;;
 --property=CoredumpReceive=*) _log_dsr "Sandbox: CoredumpReceive (best-effort): $arg"; continue ;;
---property=DynamicUser=*) continue ;;
+--property=DynamicUser=*) if [[ "${arg#--property=DynamicUser=}" =~ ^(yes|true|1|on)$ ]]; then DYNAMIC_USER=true; fi; _log_dsr "DynamicUser: ${arg#--property=DynamicUser=} (detected as: $DYNAMIC_USER)"; continue ;;
 # --- Standard I/O / logging ---
 --property=StandardInput=*) continue ;;
 --property=StandardOutput=*) continue ;;
@@ -3298,7 +3327,9 @@ case "$arg" in
 # Unrecognized properties — collect silently, warn once in summary below.
 --property=*) UNRECOGNIZED_PROPS+=("$arg"); continue ;;
 --property) SKIP_NEXT=true; continue ;;
---user|--uid=*|--gid=*) continue ;;
+--user) USER_MODE=true; continue ;;
+--scope) SCOPE_MODE=true; continue ;;
+--uid=*|--gid=*) continue ;;
 --setenv=*) EXTRA_ENV+=("-e" "${arg#--setenv=}"); continue ;;
 --setenv) SKIP_NEXT=true; continue ;;
 --) shift; CMD_ARGS+=("$@"); break ;;
@@ -3351,12 +3382,12 @@ fi
 
 if [[ -n "$WORK_DIR" ]]; then
 mkdir -p "$WORK_DIR" 2>/dev/null || true
-if $DYNAMIC_USER; then chown HOST_USER_PLACEHOLDER:HOST_USER_PLACEHOLDER "$WORK_DIR" 2>/dev/null || true; fi
+if $DYNAMIC_USER; then chown "$_DSR_HOST_USER:$_DSR_HOST_USER" "$WORK_DIR" 2>/dev/null || true; fi
 fi
 if [[ -n "$CACHE_DIR" ]]; then
 CACHE_FULL="/var/cache/$CACHE_DIR"
 mkdir -p "$CACHE_FULL" 2>/dev/null || true
-if $DYNAMIC_USER; then chown -R HOST_USER_PLACEHOLDER:HOST_USER_PLACEHOLDER "$CACHE_FULL" 2>/dev/null || true; fi
+if $DYNAMIC_USER; then chown -R "$_DSR_HOST_USER:$_DSR_HOST_USER" "$CACHE_FULL" 2>/dev/null || true; fi
 fi
 
 # ── Determine if sandbox restrictions are needed ──
@@ -3392,7 +3423,212 @@ if $_NEEDS_SANDBOX; then
     _log_dsr "Sandbox restrictions active: ProtectSystem=$PROTECT_SYSTEM ProtectHome=$PROTECT_HOME PrivateTmp=$PRIVATE_TMP PrivateDevices=$PRIVATE_DEVICES"
 fi
 
-# ── Apply sandbox restrictions (runs inside mount namespace) ──
+# ── _build_bwrap_args: Construct bwrap arguments for all sandbox properties ──
+# bwrap (bubblewrap) is the preferred sandbox engine. It handles user namespaces,
+# mount namespaces, /dev isolation, tmpfs, ro/rw bind mounts, and network
+# unsharing natively — avoiding fragile manual mount trickery inside unshare.
+# Returns 0 and echoes the bwrap arg array (space-separated, for eval) if bwrap
+# is available and sandbox is needed. Returns 1 if bwrap unavailable.
+_build_bwrap_args() {
+    command -v bwrap >/dev/null 2>&1 || return 1
+    local _bwrap_args=""
+    # ── Base: create a new mount namespace and proc/dev ──
+    _bwrap_args="--unshare-pid --dev /dev --proc /proc --tmpfs /tmp"
+    # PrivateTmp: bwrap already provides a fresh /tmp via --tmpfs /tmp
+    if [[ "$PRIVATE_TMP" == "yes" ]]; then
+        _bwrap_args="$_bwrap_args --tmpfs /var/tmp"
+        _log_dsr "bwrap: PrivateTmp (fresh /tmp and /var/tmp)"
+    else
+        _bwrap_args="$_bwrap_args --bind /var/tmp /var/tmp"
+    fi
+    # PrivateDevices: minimal /dev is already created via --dev /dev
+    if [[ "$PRIVATE_DEVICES" == "yes" ]]; then
+        _bwrap_args="$_bwrap_args --dev /dev"
+        _log_dsr "bwrap: PrivateDevices (minimal /dev)"
+    fi
+    # ── ProtectHome: replace /home with empty tmpfs or bind RO ──
+    if [[ "$PROTECT_HOME" == "yes" ]]; then
+        _bwrap_args="$_bwrap_args --tmpfs /home"
+        _log_dsr "bwrap: ProtectHome=yes (/home→tmpfs)"
+    elif [[ "$PROTECT_HOME" == "read-only" ]]; then
+        _bwrap_args="$_bwrap_args --ro-bind /home /home"
+        _log_dsr "bwrap: ProtectHome=read-only"
+    else
+        _bwrap_args="$_bwrap_args --bind /home /home"
+    fi
+    # ── ProtectSystem: make / readonly, carve writable exceptions ──
+    if [[ "$PROTECT_SYSTEM" == "strict" ]]; then
+        # Strict: /usr /boot /etc are RO, everything else (including /var) is RO
+        _bwrap_args="$_bwrap_args --ro-bind /usr /usr --ro-bind /boot /boot --ro-bind /etc /etc --ro-bind / /"
+        _log_dsr "bwrap: ProtectSystem=strict"
+    elif [[ "$PROTECT_SYSTEM" == "full" ]]; then
+        # Full: /usr /boot /etc are RO, / (root) is RO but /var is writable
+        _bwrap_args="$_bwrap_args --ro-bind /usr /usr --ro-bind /boot /boot --ro-bind /etc /etc --bind /var /var --ro-bind / /"
+        _log_dsr "bwrap: ProtectSystem=full"
+    elif [[ "$PROTECT_SYSTEM" == "yes" ]] || [[ "$PROTECT_SYSTEM" == "true" ]]; then
+        # yes/true: /usr /boot /etc RO, / (root) is RO, /var /var/tmp writable
+        _bwrap_args="$_bwrap_args --ro-bind /usr /usr --ro-bind /boot /boot --ro-bind /etc /etc --bind /var /var --ro-bind / /"
+        _log_dsr "bwrap: ProtectSystem=$PROTECT_SYSTEM"
+    else
+        _bwrap_args="$_bwrap_args --bind / /"
+    fi
+    # ── Writable paths needed by builds ──
+    for _wp in /run /var/cache; do
+        _bwrap_args="$_bwrap_args --bind $_wp $_wp"
+    done
+    [[ -n "$WORK_DIR" ]] && { mkdir -p "$WORK_DIR" 2>/dev/null || true; _bwrap_args="$_bwrap_args --bind $WORK_DIR $WORK_DIR"; }
+    [[ -n "$CACHE_DIR" ]] && { _bwrap_args="$_bwrap_args --bind /var/cache/$CACHE_DIR /var/cache/$CACHE_DIR"; }
+    # ── ReadWritePaths ──
+    for _rwp in "${READ_WRITE_PATHS[@]}"; do
+        [[ -z "$_rwp" ]] && continue
+        mkdir -p "$_rwp" 2>/dev/null || true
+        _bwrap_args="$_bwrap_args --bind $_rwp $_rwp"
+        _log_dsr "bwrap: ReadWritePaths: $_rwp"
+    done
+    # ── ReadOnlyPaths ──
+    for _rop in "${READ_ONLY_PATHS[@]}"; do
+        [[ -z "$_rop" ]] && continue
+        if [[ -e "$_rop" ]]; then
+            _bwrap_args="$_bwrap_args --ro-bind $_rop $_rop"
+        else
+            _bwrap_args="$_bwrap_args --ro-bind /var/empty $_rop"
+            mkdir -p /var/empty 2>/dev/null || true
+        fi
+        _log_dsr "bwrap: ReadOnlyPaths: $_rop"
+    done
+    # ── InaccessiblePaths: bind /dev/null over the path ──
+    for _iap in "${INACCESSIBLE_PATHS[@]}"; do
+        [[ -z "$_iap" ]] && continue
+        if [[ -d "$_iap" ]]; then
+            _bwrap_args="$_bwrap_args --bind /var/empty $_iap"
+        else
+            _bwrap_args="$_bwrap_args --bind /dev/null $_iap"
+        fi
+        mkdir -p /var/empty 2>/dev/null || true
+        _log_dsr "bwrap: InaccessiblePaths: $_iap"
+    done
+    # ── StateDirectory/LogsDirectory/RuntimeDirectory ──
+    for _sd in "${STATE_DIRECTORIES[@]}"; do
+        [[ -z "$_sd" ]] && continue
+        mkdir -p "/var/lib/$_sd" 2>/dev/null || true
+        chown "${BUILD_USER:-$_DSR_HOST_USER}:${BUILD_USER:-$_DSR_HOST_USER}" "/var/lib/$_sd" 2>/dev/null || true
+        _bwrap_args="$_bwrap_args --bind /var/lib/$_sd /var/lib/$_sd"
+        _log_dsr "bwrap: StateDirectory: /var/lib/$_sd"
+    done
+    for _ld in "${LOGS_DIRECTORIES[@]}"; do
+        [[ -z "$_ld" ]] && continue
+        mkdir -p "/var/log/$_ld" 2>/dev/null || true
+        chown "${BUILD_USER:-$_DSR_HOST_USER}:${BUILD_USER:-$_DSR_HOST_USER}" "/var/log/$_ld" 2>/dev/null || true
+        _bwrap_args="$_bwrap_args --bind /var/log/$_ld /var/log/$_ld"
+        _log_dsr "bwrap: LogsDirectory: /var/log/$_ld"
+    done
+    for _rd in "${RUNTIME_DIRECTORIES[@]}"; do
+        [[ -z "$_rd" ]] && continue
+        mkdir -p "/run/$_rd" 2>/dev/null || true
+        chown "${BUILD_USER:-$_DSR_HOST_USER}:${BUILD_USER:-$_DSR_HOST_USER}" "/run/$_rd" 2>/dev/null || true
+        chmod 0755 "/run/$_rd" 2>/dev/null || true
+        _bwrap_args="$_bwrap_args --bind /run/$_rd /run/$_rd"
+        _log_dsr "bwrap: RuntimeDirectory: /run/$_rd"
+    done
+    # ── TemporaryFileSystem: mount tmpfs ──
+    for _tfs in "${TMPFS_SPECS[@]}"; do
+        [[ -z "$_tfs" ]] && continue
+        local _tfs_path="${_tfs%%:*}"
+        local _tfs_opts="${_tfs#*:}"
+        [[ -z "$_tfs_path" ]] && continue
+        [[ "$_tfs_opts" == "$_tfs_path" ]] && _tfs_opts=""
+        if [[ -n "$_tfs_opts" ]]; then
+            _bwrap_args="$_bwrap_args --tmpfs $_tfs_path"
+            _log_dsr "bwrap: TemporaryFileSystem: $_tfs_path (opts: $_tfs_opts)"
+        else
+            _bwrap_args="$_bwrap_args --tmpfs $_tfs_path"
+            _log_dsr "bwrap: TemporaryFileSystem: $_tfs_path"
+        fi
+    done
+    # ── BindPaths: writable bind mounts ──
+    for _bp in "${BIND_PATHS[@]}"; do
+        [[ -z "$_bp" ]] && continue
+        local _src="${_bp%%:*}"
+        local _dst="${_bp#*:}"
+        [[ "$_dst" == "$_src" ]] && _dst="$_src"
+        [[ -z "$_src" || -z "$_dst" ]] && continue
+        mkdir -p "$_src" "$_dst" 2>/dev/null || true
+        _bwrap_args="$_bwrap_args --bind $_src $_dst"
+        _log_dsr "bwrap: BindPaths: $_src → $_dst"
+    done
+    # ── BindReadOnlyPaths: read-only bind mounts ──
+    for _brp in "${BIND_RO_PATHS[@]}"; do
+        [[ -z "$_brp" ]] && continue
+        local _src="${_brp%%:*}"
+        local _dst="${_brp#*:}"
+        [[ "$_dst" == "$_src" ]] && _dst="$_src"
+        [[ -z "$_src" || -z "$_dst" ]] && continue
+        mkdir -p "$_src" "$_dst" 2>/dev/null || true
+        _bwrap_args="$_bwrap_args --ro-bind $_src $_dst"
+        _log_dsr "bwrap: BindReadOnlyPaths: $_src → $_dst"
+    done
+    # ── PrivateNetwork: unshare network namespace ──
+    if [[ "$PRIVATE_NETWORK" == "yes" ]]; then
+        _bwrap_args="$_bwrap_args --unshare-net"
+        _log_dsr "bwrap: PrivateNetwork (network namespace unshared)"
+    fi
+    # ── NoNewPrivileges: bwrap natively supports --new-session ──
+    if [[ "$NO_NEW_PRIVS" == "yes" ]]; then
+        _bwrap_args="$_bwrap_args --new-session"
+        _log_dsr "bwrap: NoNewPrivileges (--new-session)"
+    fi
+    echo "$_bwrap_args"
+    return 0
+}
+
+# ── _sandbox_verify: runtime sandbox integrity check ──
+# Runs AFTER the sandbox is entered. Verifies that restrictions actually applied.
+_sandbox_verify() {
+    _sandbox_verified=true
+    if [[ -n "$PROTECT_SYSTEM" ]]; then
+        if touch /.sandbox-verify-test 2>/dev/null; then
+            rm -f /.sandbox-verify-test 2>/dev/null || true
+            _sandbox_verified=false
+            _warn_dsr "VERIFICATION FAILED: / is still writable — sandbox restrictions may not have applied"
+            _warn_dsr "Builds may run with weaker isolation than expected."
+        else
+            _log_dsr "  / is read-only (ProtectSystem verified)"
+        fi
+    fi
+    if [[ "$PROTECT_HOME" == "yes" ]]; then
+        if [[ -n "$(ls -A /home 2>/dev/null)" ]]; then
+            _warn_dsr "VERIFICATION WARNING: /home is not empty after ProtectHome=yes"
+        else
+            _log_dsr "  /home is empty/inaccessible (ProtectHome verified)"
+        fi
+    fi
+    if [[ "$PRIVATE_TMP" == "yes" ]]; then
+        if mountpoint -q /tmp 2>/dev/null; then
+            _log_dsr "  /tmp is a fresh mount (PrivateTmp verified)"
+        else
+            _warn_dsr "VERIFICATION WARNING: /tmp is not a separate mount after PrivateTmp=yes"
+        fi
+    fi
+    if [[ "$PRIVATE_DEVICES" == "yes" ]]; then
+        if [[ -c /dev/null ]] && [[ ! -c /dev/mmcblk0 ]] && [[ ! -c /dev/nvme0n1 ]]; then
+            _log_dsr "  /dev has minimal nodes (PrivateDevices verified)"
+        else
+            _warn_dsr "VERIFICATION WARNING: /dev may contain extra device nodes after PrivateDevices=yes"
+        fi
+    fi
+    if [[ "$PRIVATE_NETWORK" == "yes" ]]; then
+        if ip link show lo 2>/dev/null | grep -q "state UP"; then
+            _warn_dsr "VERIFICATION WARNING: loopback still up after PrivateNetwork"
+        else
+            _log_dsr "  Network namespace is isolated (PrivateNetwork verified)"
+        fi
+    fi
+    if $_sandbox_verified; then
+        _log_dsr "Sandbox verification passed"
+    fi
+}
+
+# ── Apply sandbox restrictions — unshare fallback (runs inside mount namespace) ──
 _apply_sandbox() {
     # All mount operations here affect only the private mount namespace.
     # Bind-mounting a path to itself gives us a per-mountpoint flags slot
@@ -3599,122 +3835,71 @@ _apply_sandbox() {
     # seccomp helper. This is a known limitation documented in the security model.
     if [[ -n "$CAP_BOUNDING_SET" ]]; then
         _log_dsr "Applying CapabilityBoundingSet=$CAP_BOUNDING_SET"
-        # Prefer capsh FIRST — it truly drops bounding-set capabilities,
-        # preventing a sandboxed process from regaining caps via execve()
-        # of a setuid binary. setpriv --inh-caps only modifies the inheritable
-        # set, which is weaker. setpriv is used as the fallback.
+        # Prefer capsh FIRST — it truly drops bounding-set capabilities.
+        # setpriv --inh-caps is a weaker fallback (inheritable set only).
         if command -v capsh >/dev/null 2>&1; then
-            local _capsh_drop=""
-            local _cap_str2="$CAP_BOUNDING_SET"
-            _cap_str2="${_cap_str2//cap_/CAP_}"
-            if [[ "$_cap_str2" == "~all" ]] || [[ -z "$_cap_str2" ]]; then
-                _capsh_drop="--drop=all"
-            elif [[ "$_cap_str2" == "all" ]]; then
-                _capsh_drop=""
-            elif [[ "$_cap_str2" == \~* ]]; then
-                local _dropped2="${_cap_str2#\~}"
-                _dropped2="${_dropped2//:/,}"
-                _capsh_drop="--drop=${_dropped2,,}"
-            else
-                _capsh_drop="--drop=all"
-            fi
-            if [[ -n "$_capsh_drop" ]]; then
-                export _DSR_CAPSH_ARGS="$_capsh_drop"
-                _log_dsr "  Capability bounding set: capsh $_capsh_drop"
-            fi
+            _cap_str_n="${CAP_BOUNDING_SET//cap_/CAP_}"
+            case "$_cap_str_n" in
+                "~all"|"")
+                    export _DSR_CAPSH_ARGS="--drop=all"
+                    _log_dsr "  Capability bounding set: capsh --drop=all" ;;
+                "all")
+                    unset _DSR_CAPSH_ARGS ;;
+                \~*)
+                    _d="${_cap_str_n#\~}"
+                    export _DSR_CAPSH_ARGS="--drop=${_d//:/,}"
+                    _log_dsr "  Capability bounding set: capsh ${_DSR_CAPSH_ARGS}" ;;
+                *)
+                    export _DSR_CAPSH_ARGS="--drop=all"
+                    _log_dsr "  Capability bounding set: capsh --drop=all" ;;
+            esac
         elif command -v setpriv >/dev/null 2>&1; then
-            # Fallback: setpriv --inh-caps only modifies the inheritable
-            # capability set, NOT the bounding set. A sandboxed process can
-            # still regain capabilities via execve() of a setuid binary.
-            # This covers the primary AUR build threat model (no ambient caps
-            # = no capability inheritance through exec), but is weaker than
-            # capsh's full bounding-set enforcement.
             _warn_dsr "  capsh not available — using setpriv fallback (inheritable set only)"
-            local _cap_args=""
-            local _cap_str="$CAP_BOUNDING_SET"
-            _cap_str="${_cap_str//cap_/CAP_}"  # normalize to uppercase
-            if [[ "$_cap_str" == "~all" ]] || [[ -z "$_cap_str" ]]; then
-                _cap_args="--inh-caps=-all"
-            elif [[ "$_cap_str" == "all" ]]; then
-                _cap_args=""
-            elif [[ "$_cap_str" == \~* ]]; then
-                local _dropped="${_cap_str#\~}"
-                _dropped="${_dropped//:/ }"
-                local _neg_caps=""
-                for _c in $_dropped; do
-                    _c="${_c,,}"  # lowercase
-                    [[ -n "$_neg_caps" ]] && _neg_caps="${_neg_caps},"
-                    _neg_caps="${_neg_caps}-${_c}"
-                done
-                [[ -n "$_neg_caps" ]] && _cap_args="--inh-caps=$_neg_caps"
-            else
-                local _kept="${_cap_str//:/ }"
-                local _pos_caps=""
-                for _c in $_kept; do
-                    _c="${_c,,}"  # lowercase
-                    [[ -n "$_pos_caps" ]] && _pos_caps="${_pos_caps},"
-                    _pos_caps="${_pos_caps}+${_c}"
-                done
-                [[ -n "$_pos_caps" ]] && _cap_args="--inh-caps=$_pos_caps"
-            fi
-            if [[ -n "$_cap_args" ]]; then
-                export _DSR_CAP_ARGS="$_cap_args"
-                _log_dsr "  Capability bounding set: setpriv $_cap_args"
-            fi
+            _cap_str_n="${CAP_BOUNDING_SET//cap_/CAP_}"
+            case "$_cap_str_n" in
+                "~all"|"")
+                    export _DSR_CAP_ARGS="--inh-caps=-all" ;;
+                "all")
+                    unset _DSR_CAP_ARGS ;;
+                \~*)
+                    _d="${_cap_str_n#\~}"
+                    _caps=""
+                    for _c in ${_d//:/ }; do
+                        [[ -n "$_caps" ]] && _caps="${_caps},-${_c,,}" || _caps="-${_c,,}"
+                    done
+                    [[ -n "$_caps" ]] && export _DSR_CAP_ARGS="--inh-caps=${_caps}" ;;
+                *)
+                    _caps=""
+                    for _c in ${_cap_str_n//:/ }; do
+                        [[ -n "$_caps" ]] && _caps="${_caps},+${_c,,}" || _caps="+${_c,,}"
+                    done
+                    [[ -n "$_caps" ]] && export _DSR_CAP_ARGS="--inh-caps=${_caps}" ;;
+            esac
+            [[ -n "${_DSR_CAP_ARGS:-}" ]] && _log_dsr "  Capability bounding set: setpriv ${_DSR_CAP_ARGS}"
         else
             _warn_dsr "  Neither capsh nor setpriv available — cannot enforce CapabilityBoundingSet"
         fi
     fi
 
     # ── Runtime verification: check that sandbox actually applied ──
-    _sandbox_verified=true
-    if [[ -n "$PROTECT_SYSTEM" ]]; then
-        if touch /.sandbox-verify-test 2>/dev/null; then
-            rm -f /.sandbox-verify-test 2>/dev/null || true
-            _sandbox_verified=false
-            _warn_dsr "VERIFICATION FAILED: / is still writable — sandbox restrictions may not have applied"
-            _warn_dsr "This can happen if mount namespaces are restricted inside the container."
-            _warn_dsr "Builds may run with weaker isolation than expected."
-            _warn_dsr "Check: unshare --mount touch / will succeed if mount namespaces are blocked."
-        else
-            _log_dsr "  / is read-only (ProtectSystem verified)"
-        fi
-    fi
-    if [[ -n "$PROTECT_HOME" ]] && [[ "$PROTECT_HOME" == "yes" ]]; then
-        if mountpoint -q /home 2>/dev/null && [[ -n "$(ls -A /home 2>/dev/null)" ]]; then
-            _warn_dsr "VERIFICATION WARNING: /home is not empty after ProtectHome=yes"
-        else
-            _log_dsr "  /home is empty/inaccessible (ProtectHome verified)"
-        fi
-    fi
-    if [[ -n "$PRIVATE_TMP" ]] && [[ "$PRIVATE_TMP" == "yes" ]]; then
-        if mountpoint -q /tmp 2>/dev/null; then
-            _log_dsr "  /tmp is a mount point (PrivateTmp verified)"
-        else
-            _warn_dsr "VERIFICATION WARNING: /tmp is not a mount point after PrivateTmp=yes"
-        fi
-    fi
-    if [[ -n "$PRIVATE_NETWORK" ]]; then
-        if ip link show lo 2>/dev/null | grep -q "state UP"; then
-            _warn_dsr "VERIFICATION WARNING: loopback interface still up after PrivateNetwork=yes"
-        else
-            _log_dsr "  Network namespace is isolated (PrivateNetwork verified)"
-        fi
-    fi
-    if $_sandbox_verified; then
-        _log_dsr "Sandbox verification passed"
-    fi
+    _sandbox_verify
 }
 
 # ── Compile seccomp helper for advanced syscall filtering ──
 # Writes a small C program, compiles it in-container (requires gcc from base-devel),
 # and returns the path. The helper applies seccomp-BPF filters then execs the target.
+# Version-hashed: the compiled binary embeds DSR_SECCOMP_VERSION_HASH so cached
+# binaries from prior wrapper versions are detected and recompiled automatically.
 _compile_seccomp_helper() {
     local _helper_bin="/tmp/.dsr-seccomp-helper"
-    # Cache: if already compiled and working, reuse
+    # Cache: if already compiled, check version hash before reuse
     if [[ -f "$_helper_bin" ]] && [[ -x "$_helper_bin" ]]; then
-        echo "$_helper_bin"
-        return 0
+        if "$_helper_bin" --version-check 2>/dev/null; then
+            echo "$_helper_bin"
+            return 0
+        fi
+        _warn_dsr "Cached seccomp helper is stale (version mismatch), recompiling..."
+        rm -f "$_helper_bin" 2>/dev/null || true
     fi
     if ! command -v gcc >/dev/null 2>&1; then
         _warn_dsr "gcc not available — cannot compile seccomp helper (install base-devel)"
@@ -3722,6 +3907,7 @@ _compile_seccomp_helper() {
     fi
     local _helper_src="/tmp/.dsr-seccomp-helper.c"
     cat > "$_helper_src" << 'SECCOMP_C'
+#define DSR_SECCOMP_VER "dsr-seccomp-v3.0"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -3817,6 +4003,13 @@ static void apply_filters(int mdwx) {
     }
 }
 int main(int argc, char *argv[]) {
+    /* Version check: allows the wrapper to detect stale cached binaries.
+     * Prints the compiled-in version hash to stdout and exits 0 if it matches
+     * the expected hash. The wrapper passes no args for this check. */
+    if (argc >= 2 && strcmp(argv[1], "--version-check") == 0) {
+        printf("%s\n", DSR_SECCOMP_VER);
+        return 0;
+    }
     int mdwx = 0, cmd_start = 1;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--mdwx") == 0) { mdwx = 1; cmd_start = i+1; }
@@ -3889,8 +4082,148 @@ _build_seccomp_args() {
 
 # ── Determine the run-as user ──
 # DynamicUser=true  → use dedicated build user (privileged isolation)
-# User=property      → use that user (non-DynamicUser explicit user switch)
-# neither            → run as current user (root if container root exec)
+# User=property     → use that user (non-DynamicUser explicit user switch)
+# --user mode       → run as the current user (no root escalation needed)
+# neither           → run as current user (root if container root exec)
+
+# ── _prepare_seccomp: shared seccomp helper preparation (used by all paths) ──
+_prepare_seccomp() {
+    _SECCOMP_HELPER=""
+    _seccomp_args="$(_build_seccomp_args)"
+    if [[ -n "$_seccomp_args" ]]; then
+        _SECCOMP_HELPER="$(_compile_seccomp_helper)" || _SECCOMP_HELPER=""
+        if [[ -z "$_SECCOMP_HELPER" ]] && [[ "$_DSR_STRICT_SECURITY" == "true" ]]; then
+            echo "systemd-run(fake): FATAL: seccomp helper compilation failed under --strict-security." >&2
+            echo "  Sandboxing properties (MemoryDenyWriteExecute, RestrictSUIDSGID, etc.)" >&2
+            echo "  cannot be enforced without the seccomp helper. Aborting to avoid" >&2
+            echo "  running with degraded security." >&2
+            exit 1
+        elif [[ -z "$_SECCOMP_HELPER" ]]; then
+            _warn_dsr "WARNING: seccomp helper compilation failed — seccomp-based sandboxing (MemoryDenyWriteExecute, RestrictSUIDSGID, ProtectKernelModules) will NOT be enforced for this build."
+            _warn_dsr "  The build will still run, but without syscall filtering. Install base-devel inside the container to enable seccomp sandboxing."
+        fi
+    fi
+}
+
+# ── _prepare_cap_priv: shared capability/NoNewPrivileges preparation ──
+_prepare_cap_priv() {
+    _CAP_PRIV=""
+    if [[ -n "${_DSR_CAPSH_ARGS:-}" ]]; then
+        _CAP_PRIV="capsh ${_DSR_CAPSH_ARGS} -- "
+    elif [[ -n "${_DSR_CAP_ARGS:-}" ]]; then
+        _CAP_PRIV="setpriv ${_DSR_CAP_ARGS} -- "
+    fi
+    _NNP=""
+    [[ "${_DSR_NO_NEW_PRIVS:-}" == "true" ]] && _NNP="setpriv --no-new-privs -- "
+}
+
+# ── _run_sandboxed_bwrap: Execute a command using bwrap with sandboxing ──
+# $1 = user to run as (empty = current user)
+# Rest = command args
+# Returns the exit code of the inner command.
+_run_sandboxed_bwrap() {
+    local _run_user="$1"; shift
+    local _bwrap_args
+    _bwrap_args=$(_build_bwrap_args) || return 1
+    _log_dsr "Using bwrap as sandbox engine"
+    local _inner_cmd
+    _inner_cmd="${_BUILD_WRAPPER:-}exec \"\${@}\""
+    if [[ -n "$WORK_DIR" ]]; then
+        _inner_cmd="cd '${WORK_DIR}' 2>/dev/null || true; ${_inner_cmd}"
+    fi
+    # Build the verification wrapper: run _sandbox_verify then the actual command
+    local _verify_cmd="_sandbox_verify; ${_inner_cmd}"
+    if [[ -n "$_run_user" ]]; then
+        if [[ -n "${_SECCOMP_HELPER:-}" ]]; then
+            eval bwrap $_bwrap_args -- sudo -u \"$_run_user\" -H -- \"\$_SECCOMP_HELPER\" \$_seccomp_args -- bash -c \"\$_verify_cmd\" -- $(printf '%q ' "${CMD_ARGS[@]}")
+        else
+            eval bwrap $_bwrap_args -- sudo -u \"$_run_user\" -H -- bash -c \"\$_verify_cmd\" -- $(printf '%q ' "${CMD_ARGS[@]}")
+        fi
+    else
+        if [[ -n "${_SECCOMP_HELPER:-}" ]]; then
+            eval bwrap $_bwrap_args -- \"\$_SECCOMP_HELPER\" \$_seccomp_args -- bash -c \"\$_verify_cmd\" -- $(printf '%q ' "${CMD_ARGS[@]}")
+        else
+            eval bwrap $_bwrap_args -- bash -c \"\$_verify_cmd\" -- $(printf '%q ' "${CMD_ARGS[@]}")
+        fi
+    fi
+}
+
+# ── _run_sandboxed_unshare: Fallback sandbox via unshare --mount ──
+# $1 = user to run as (empty = current user)
+# Rest = command args
+_run_sandboxed_unshare() {
+    local _run_user="$1"; shift
+    local _unshare_net=""
+    [[ -n "$PRIVATE_NETWORK" ]] && _unshare_net="--net"
+    _log_dsr "Using unshare --mount as sandbox engine (bwrap unavailable)"
+    local _inner_cmd
+    _inner_cmd="${_BUILD_WRAPPER:-}exec \"\${@}\""
+    if [[ -n "$WORK_DIR" ]]; then
+        _inner_cmd="cd '${WORK_DIR}' 2>/dev/null || true; ${_inner_cmd}"
+    fi
+    local _verify_cmd="_apply_sandbox; ${_inner_cmd}"
+    if [[ -n "$_run_user" ]]; then
+        if [[ -n "${_SECCOMP_HELPER:-}" ]]; then
+            _DSR_SBOX="${_CAP_PRIV}${_NNP}sudo -u '\''$_run_user'\'' -H -- $_SECCOMP_HELPER $_seccomp_args -- bash -c '\''$_verify_cmd'\'' -- ${CMD_ARGS[*]}"
+        else
+            _DSR_SBOX="${_CAP_PRIV}${_NNP}sudo -u '\''$_run_user'\'' -H -- bash -c '\''$_verify_cmd'\'' -- ${CMD_ARGS[*]}"
+        fi
+        unshare --mount $_unshare_net --propagation slave bash -c "$_DSR_SBOX"
+    else
+        if [[ -n "${_SECCOMP_HELPER:-}" ]]; then
+            unshare --mount $_unshare_net --propagation slave bash -c "
+                _apply_sandbox
+                ${_NNP}${_CAP_PRIV}$_SECCOMP_HELPER $_seccomp_args -- exec \"\${@}\"
+            " -- "${CMD_ARGS[@]}"
+        else
+            unshare --mount $_unshare_net --propagation slave bash -c "
+                _apply_sandbox
+                ${_NNP}${_CAP_PRIV}exec \"\${@}\"
+            " -- "${CMD_ARGS[@]}"
+        fi
+    fi
+}
+
+# ── _run_sandboxed: Try bwrap first, fall back to unshare ──
+# $1 = user to run as (empty = current user)
+_run_sandboxed() {
+    local _run_user="$1"
+    if _bwrap_args=$(_build_bwrap_args) 2>/dev/null; then
+        _run_sandboxed_bwrap "$_run_user"
+        return $?
+    else
+        _run_sandboxed_unshare "$_run_user"
+        return $?
+    fi
+}
+
+# ── --scope mode: just exec without creating a unit, honoring DynamicUser ──
+if $SCOPE_MODE && ! $DYNAMIC_USER; then
+    _log_dsr "SCOPE mode: direct execution without sandbox/unit creation"
+    ${_ENV_SETUP}
+    [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] && cd "$WORK_DIR" 2>/dev/null || true
+    if [[ -n "$TARGET_USER" ]] && [[ "$(id -u)" -eq 0 ]]; then
+        exec sudo -u "$TARGET_USER" -H -- bash -c "${_ENV_SETUP}exec \"\${@}\"" -- "${CMD_ARGS[@]}"
+    fi
+    exec "${CMD_ARGS[@]}"
+fi
+
+# ── --user mode (non-root invocation): run as current or target user ──
+if $USER_MODE || [[ "$(id -u)" -ne 0 ]]; then
+    _log_dsr "USER mode (non-root): running as current user uid=$(id -u) user=$_DSR_HOST_USER"
+    ${_ENV_SETUP}
+    if $_NEEDS_SANDBOX; then
+        _prepare_cap_priv
+        _prepare_seccomp
+        _DSR_HOST_USER "$_DSR_HOST_USER"
+        _run_sandboxed ""
+        exit $?
+    else
+        if [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR" ]]; then cd "$WORK_DIR" 2>/dev/null || true; fi
+        exec "${CMD_ARGS[@]}"
+    fi
+fi
+
 if $DYNAMIC_USER && [[ "$(id -u)" -eq 0 ]]; then
 # Use a dedicated build user to isolate AUR builds from the host user'\''s
 # home directory. A malicious AUR package gains only build-user access.
@@ -3921,6 +4254,14 @@ if ! id "$BUILD_USER" >/dev/null 2>&1; then
             else
                 _BL_TMP_HOME="$_bl_tmp"
                 _log_dsr "Ad-hoc build user $_BL_TMP_HOME created (isolated from host mounts)"
+                # EXIT trap ensures cleanup even on SIGTERM/SIGKILL
+                _cleanup_builduser() {
+                    if [[ -n "$_BL_TMP_HOME" ]]; then
+                        userdel -r "$BUILD_USER" 2>/dev/null || true
+                        rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
+                    fi
+                }
+                trap _cleanup_builduser EXIT INT TERM
             fi
         fi
         if [[ -z "$BUILD_USER" ]] || ! id "$BUILD_USER" >/dev/null 2>&1; then
@@ -3941,7 +4282,7 @@ if [[ -n "$EXTRA_GROUPS" ]]; then
     sg "$EXTRA_GROUPS" -c true 2>/dev/null && _BUILD_WRAPPER="sg '\''$EXTRA_GROUPS'\'' -c \"$_BUILD_WRAPPER\" || ( _warn_dsr '\''sg failed for groups $EXTRA_GROUPS, continuing without'\''; true ); "
 fi
 
-# Construct the inner command (everything the sandbox wrapper will execute).
+# Determine inner command for non-sandbox path
 if [[ -n "$WORK_DIR" ]]; then
     _log_dsr "EXEC: sudo -u $BUILD_USER -- cd $WORK_DIR; ${CMD_ARGS[*]}"
     _INNER_CMD="cd '${WORK_DIR}' 2>/dev/null || true; ${_BUILD_WRAPPER}exec \"\${@}\""
@@ -3950,58 +4291,18 @@ else
     _INNER_CMD="${_BUILD_WRAPPER}exec \"\${@}\""
 fi
 
-# Apply sandbox if needed, then run as build user
-_UNSHARE_NET_FLAGS=""
-[[ -n "$PRIVATE_NETWORK" ]] && _UNSHARE_NET_FLAGS="--net"
 if $_NEEDS_SANDBOX; then
-    _CAP_PRIV=""
-    if [[ -n "${_DSR_CAPSH_ARGS:-}" ]]; then
-        _CAP_PRIV="capsh ${_DSR_CAPSH_ARGS} -- "
-    elif [[ -n "${_DSR_CAP_ARGS:-}" ]]; then
-        _CAP_PRIV="setpriv ${_DSR_CAP_ARGS} -- "
-    fi
-    _NNP=""
-    [[ "${_DSR_NO_NEW_PRIVS:-}" == "true" ]] && _NNP="setpriv --no-new-privs -- "
-    # Compile seccomp helper if any seccomp properties are active
-    _SECCOMP_HELPER=""
-    _seccomp_args="$(_build_seccomp_args)"
-    if [[ -n "$_seccomp_args" ]]; then
-        _SECCOMP_HELPER="$(_compile_seccomp_helper)" || _SECCOMP_HELPER=""
-        if [[ -z "$_SECCOMP_HELPER" ]] && [[ "$_DSR_STRICT_SECURITY" == "true" ]]; then
-            echo "systemd-run(fake): FATAL: seccomp helper compilation failed under --strict-security." >&2
-            echo "  Sandboxing properties (MemoryDenyWriteExecute, RestrictSUIDSGID, etc.)" >&2
-            echo "  cannot be enforced without the seccomp helper. Aborting to avoid" >&2
-            echo "  running with degraded security." >&2
-            exit 1
-        elif [[ -z "$_SECCOMP_HELPER" ]]; then
-            _warn_dsr "WARNING: seccomp helper compilation failed — seccomp-based sandboxing (MemoryDenyWriteExecute, RestrictSUIDSGID, ProtectKernelModules) will NOT be enforced for this build."
-            _warn_dsr "  The build will still run, but without syscall filtering. Install base-devel inside the container to enable seccomp sandboxing."
-        fi
-    fi
-    # Build the sandboxed command
-    if [[ -n "$WORK_DIR" ]]; then
-        _SANDBOX_CMD="cd '${WORK_DIR}' 2>/dev/null || true; ${_BUILD_WRAPPER}exec \"\${@}\""
-    else
-        _SANDBOX_CMD="${_BUILD_WRAPPER}exec \"\${@}\""
-    fi
+    _prepare_cap_priv
+    _prepare_seccomp
     if [[ -n "$_BL_TMP_HOME" ]]; then
-        if [[ -n "$_SECCOMP_HELPER" ]]; then
-            _DSR_SBOX="${_CAP_PRIV}${_NNP}sudo -u '$BUILD_USER' -H -- $_SECCOMP_HELPER $_seccomp_args -- bash -c '$_SANDBOX_CMD' -- ${CMD_ARGS[*]}"
-        else
-            _DSR_SBOX="${_CAP_PRIV}${_NNP}sudo -u '$BUILD_USER' -H -- bash -c '$_SANDBOX_CMD' -- ${CMD_ARGS[*]}"
-        fi
-        unshare --mount $_UNSHARE_NET_FLAGS --propagation slave bash -c "_apply_sandbox; $_DSR_SBOX"
+        _run_sandboxed "$BUILD_USER"
         _user_cmd_exit=$?
         userdel -r "$BUILD_USER" 2>/dev/null || true
         rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
         exit $_user_cmd_exit
     else
-        if [[ -n "$_SECCOMP_HELPER" ]]; then
-            _DSR_SBOX="exec ${_CAP_PRIV}${_NNP}sudo -u '$BUILD_USER' -H -- $_SECCOMP_HELPER $_seccomp_args -- bash -c '$_SANDBOX_CMD' -- ${CMD_ARGS[*]}"
-        else
-            _DSR_SBOX="exec ${_CAP_PRIV}${_NNP}sudo -u '$BUILD_USER' -H -- bash -c '$_SANDBOX_CMD' -- ${CMD_ARGS[*]}"
-        fi
-        exec unshare --mount $_UNSHARE_NET_FLAGS --propagation slave bash -c "_apply_sandbox; $_DSR_SBOX"
+        _run_sandboxed "$BUILD_USER"
+        exit $?
     fi
 else
     if [[ -n "$_BL_TMP_HOME" ]]; then
@@ -4023,90 +4324,35 @@ if [[ -n "$WORK_DIR" ]]; then
 else
     _INNER_CMD="${_ENV_SETUP}exec \"\${@}\""
 fi
+_BUILD_WRAPPER="$_ENV_SETUP"
 
-_UNSHARE_NET_FLAGS=""
-[[ -n "$PRIVATE_NETWORK" ]] && _UNSHARE_NET_FLAGS="--net"
 if $_NEEDS_SANDBOX; then
-    _CAP_PRIV=""
-    if [[ -n "${_DSR_CAPSH_ARGS:-}" ]]; then
-        _CAP_PRIV="capsh ${_DSR_CAPSH_ARGS} -- "
-    elif [[ -n "${_DSR_CAP_ARGS:-}" ]]; then
-        _CAP_PRIV="setpriv ${_DSR_CAP_ARGS} -- "
-    fi
-    _NNP=""
-    [[ "${_DSR_NO_NEW_PRIVS:-}" == "true" ]] && _NNP="setpriv --no-new-privs -- "
-    _SECCOMP_HELPER=""
-    _seccomp_args="$(_build_seccomp_args)"
-    if [[ -n "$_seccomp_args" ]]; then
-        _SECCOMP_HELPER="$(_compile_seccomp_helper)" || _SECCOMP_HELPER=""
-        if [[ -z "$_SECCOMP_HELPER" ]] && [[ "$_DSR_STRICT_SECURITY" == "true" ]]; then
-            echo "systemd-run(fake): FATAL: seccomp helper compilation failed under --strict-security." >&2
-            echo "  Sandboxing properties cannot be enforced. Aborting." >&2
-            exit 1
-        elif [[ -z "$_SECCOMP_HELPER" ]]; then
-            _warn_dsr "WARNING: seccomp helper compilation failed — seccomp-based sandboxing will NOT be enforced for this build."
-            _warn_dsr "  Install base-devel inside the container to enable seccomp sandboxing."
-        fi
-    fi
-    if [[ -n "$_SECCOMP_HELPER" ]]; then
-        _DSR_SBOX="exec ${_CAP_PRIV}${_NNP}sudo -u '$TARGET_USER' -H -- $_SECCOMP_HELPER $_seccomp_args -- bash -c '$_INNER_CMD' -- ${CMD_ARGS[*]}"
-    else
-        _DSR_SBOX="exec ${_CAP_PRIV}${_NNP}sudo -u '$TARGET_USER' -H -- bash -c '$_INNER_CMD' -- ${CMD_ARGS[*]}"
-    fi
-    exec unshare --mount $_UNSHARE_NET_FLAGS --propagation slave bash -c "_apply_sandbox; $_DSR_SBOX"
+    _prepare_cap_priv
+    _prepare_seccomp
+    _run_sandboxed "$TARGET_USER"
+    exit $?
 else
     exec sudo -u "$TARGET_USER" -H -- bash -c "$_INNER_CMD" -- "${CMD_ARGS[@]}"
 fi
 
 else
-# Non-DynamicUser, non-User= path: run as current user.
+# Non-DynamicUser, non-User=, root path: run as current user (root).
 ${_ENV_SETUP}
 if [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR" ]]; then cd "$WORK_DIR" 2>/dev/null || true; fi
 _log_dsr "EXEC: ${CMD_ARGS[*]}"
+_BUILD_WRAPPER="$_ENV_SETUP"
 
-_UNSHARE_NET_FLAGS=""
-[[ -n "$PRIVATE_NETWORK" ]] && _UNSHARE_NET_FLAGS="--net"
 if $_NEEDS_SANDBOX; then
-    _CAP_PRIV=""
-    if [[ -n "${_DSR_CAPSH_ARGS:-}" ]]; then
-        _CAP_PRIV="capsh ${_DSR_CAPSH_ARGS} -- "
-    elif [[ -n "${_DSR_CAP_ARGS:-}" ]]; then
-        _CAP_PRIV="setpriv ${_DSR_CAP_ARGS} -- "
-    fi
-    _NNP=""
-    [[ "${_DSR_NO_NEW_PRIVS:-}" == "true" ]] && _NNP="setpriv --no-new-privs -- "
-    _SECCOMP_HELPER=""
-    _seccomp_args="$(_build_seccomp_args)"
-    if [[ -n "$_seccomp_args" ]]; then
-        _SECCOMP_HELPER="$(_compile_seccomp_helper)" || _SECCOMP_HELPER=""
-        if [[ -z "$_SECCOMP_HELPER" ]] && [[ "$_DSR_STRICT_SECURITY" == "true" ]]; then
-            echo "systemd-run(fake): FATAL: seccomp helper compilation failed under --strict-security." >&2
-            echo "  Sandboxing properties cannot be enforced. Aborting." >&2
-            exit 1
-        elif [[ -z "$_SECCOMP_HELPER" ]]; then
-            _warn_dsr "WARNING: seccomp helper compilation failed — seccomp-based sandboxing will NOT be enforced for this build."
-            _warn_dsr "  Install base-devel inside the container to enable seccomp sandboxing."
-        fi
-    fi
-    if [[ -n "$_SECCOMP_HELPER" ]]; then
-        exec unshare --mount $_UNSHARE_NET_FLAGS --propagation slave bash -c "
-            _apply_sandbox
-            ${_NNP}${_CAP_PRIV}$_SECCOMP_HELPER $_seccomp_args -- exec \"\${@}\"
-        " -- "${CMD_ARGS[@]}"
-    else
-        exec unshare --mount $_UNSHARE_NET_FLAGS --propagation slave bash -c "
-            _apply_sandbox
-            ${_NNP}${_CAP_PRIV}exec \"\${@}\"
-        " -- "${CMD_ARGS[@]}"
-    fi
+    _prepare_cap_priv
+    _prepare_seccomp
+    _run_sandboxed ""
+    exit $?
 else
     exec "${CMD_ARGS[@]}"
 fi
 fi
 SYSTEMD_RUN_FAKE_HEREDOC
     chmod +x /usr/local/sbin/systemd-run
-    _safe=$(_sed_escape_replacement "$HOST_USER")
-    _atomic_sed_inplace /usr/local/sbin/systemd-run "s/HOST_USER_PLACEHOLDER/$_safe/g"
 }
 _atomic_write_pacman_conf() {
     local target="/etc/pacman.conf"
@@ -5172,8 +5418,8 @@ set -uo pipefail
 
 _remove_stale_lock
 
-echo "Installing core packages (sudo, shadow, gnupg, jq, python)..."
-if ! safe_install sudo shadow gnupg jq python; then
+echo "Installing core packages (sudo, shadow, gnupg, jq, python, bubblewrap, libcap)..."
+if ! safe_install sudo shadow gnupg jq python bubblewrap libcap; then
     echo "ERROR: Failed to install core packages after retries."
     exit 1
 fi

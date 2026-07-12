@@ -122,6 +122,8 @@ LOW_MEMORY="${LOW_MEMORY:-false}"
 # --enable-ssh-env on a single-user trusted host (e.g. a personal Steam Deck).
 ENABLE_SSH_ENV="${ENABLE_SSH_ENV:-false}"
 ALLOW_WHEEL_NOPASSWD="${ALLOW_WHEEL_NOPASSWD:-false}"
+SELF_UPDATE="${SELF_UPDATE:-false}"
+REPAIR="${REPAIR:-false}"
 UPLOAD_LOG="${UPLOAD_LOG:-false}"
 PIN_ALPM="${PIN_ALPM:-true}"
 # SECURITY: --strict-security mode. When enabled, the script refuses to relax
@@ -1034,6 +1036,123 @@ check_kernel_glibc_compat() {
     fi
 }
 
+check_multi_user_warning() {
+    local active_users
+    active_users=$(who -u 2>/dev/null | awk '{print $1}' | sort -u | grep -v "^$" || true)
+    local user_count
+    user_count=$(echo "$active_users" | wc -l | tr -d ' ' || echo "0")
+    if [[ -n "$active_users" ]] && [[ "$user_count" -gt 1 ]]; then
+        log_warn "Multiple interactive users detected on this host:"
+        echo "$active_users" | while IFS= read -r u; do
+            [[ -n "$u" ]] && log_warn "  - $u"
+        done
+        log_warn "--allow-wheel-nopasswd grants passwordless sudo to the entire wheel group."
+        log_warn"Any user in the wheel group (including those listed above) can perform"
+        log_warn "administrative operations inside the container without authentication."
+        log_warn "Consider omitting --allow-wheel-nopasswd for per-user sudo restriction."
+        log_warn "If you need wheel-wide access, audit all wheel-group members first."
+        if [[ "$NON_INTERACTIVE" != "true" ]] && [[ -t 0 ]]; then
+            echo -ne "${YELLOW}${BOLD}Continue with --allow-wheel-nopasswd on multi-user host? (y/N): ${NC}" >&2
+            local mw_confirm
+            read -r mw_confirm
+            if [[ "$mw_confirm" != "y" && "$mw_confirm" != "Y" ]]; then
+                log_info "Aborted by user due to multi-user security concern."
+                exit "$EXIT_USER_ABORT"
+            fi
+        fi
+    fi
+}
+
+self_update() {
+    log_step "Checking for updates..."
+    local _latest_tag
+    _latest_tag=$(curl -sf --connect-timeout 10 --max-time 30 \
+        "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null \
+        | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+    if [[ -z "$_latest_tag" ]]; then
+        log_error "Could not fetch latest release info from GitHub."
+        log_info "Check your network connection or visit:"
+        log_info "  https://github.com/${GITHUB_REPO}/releases/latest"
+        return 1
+    fi
+    local _latest_ver="${_latest_tag#v}"
+    log_info "Current version: v${SCRIPT_VERSION}"
+    log_info "Latest version:  v${_latest_ver}"
+    if [[ "$_latest_ver" == "$SCRIPT_VERSION" ]]; then
+        log_success "Already up to date."
+        return 0
+    fi
+    log_info "Downloading v${_latest_ver}..."
+    local _tmp_script
+    _tmp_script=$(mktemp "${_SCRIPT_TMPDIR:-/tmp}/steamos-pamac-update-XXXXXX.sh") || {
+        log_error "Failed to create temp file for download."
+        return 1
+    }
+    local _download_url="https://raw.githubusercontent.com/${GITHUB_REPO}/v${_latest_ver}/SteamOS-Pamac-Installer.sh"
+    local _checksum_url="https://raw.githubusercontent.com/${GITHUB_REPO}/v${_latest_ver}/SHA256SUMS"
+    if ! curl -sfL --connect-timeout 10 --max-time 60 -o "$_tmp_script" "$_download_url" 2>/dev/null; then
+        log_error "Failed to download script from GitHub."
+        rm -f "$_tmp_script"
+        return 1
+    fi
+    if [[ ! -s "$_tmp_script" ]]; then
+        log_error "Downloaded script is empty."
+        rm -f "$_tmp_script"
+        return 1
+    fi
+    local _downloaded_hash=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        _downloaded_hash=$(sha256sum "$_tmp_script" 2>/dev/null | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        _downloaded_hash=$(shasum -a 256 "$_tmp_script" 2>/dev/null | awk '{print $1}')
+    fi
+    local _expected_hash=""
+    _expected_hash=$(curl -sfL --connect-timeout 10 --max-time 30 "$_checksum_url" 2>/dev/null \
+        | grep -i "SteamOS-Pamac-Installer.sh" | awk '{print $1}' || echo "")
+    if [[ -n "$_expected_hash" && -n "$_downloaded_hash" ]]; then
+        if [[ "$_downloaded_hash" != "$_expected_hash" ]]; then
+            log_error "Hash verification failed!"
+            log_error "  Expected: $_expected_hash"
+            log_error "  Got:      $_downloaded_hash"
+            rm -f "$_tmp_script"
+            return 1
+        fi
+        log_success "Hash verification passed."
+    elif [[ -n "$_downloaded_hash" ]]; then
+        log_warn "No checksum file found at $_checksum_url — skipping verification."
+        log_info "Downloaded script hash (compare manually if desired):"
+        log_info "  $_downloaded_hash"
+    fi
+    local _self_path
+    _self_path="$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")"
+    if [[ ! -w "$_self_path" ]]; then
+        log_warn "Current script is not writable ($_self_path). Attempting sudo install..."
+        if command -v sudo >/dev/null 2>&1; then
+            sudo cp "$_tmp_script" "$_self_path" && sudo chmod +x "$_self_path"
+            local _sudo_rc=$?
+            rm -f "$_tmp_script"
+            if [[ $_sudo_rc -eq 0 ]]; then
+                log_success "Updated to v${_latest_ver} (via sudo)."
+                return 0
+            fi
+        fi
+        log_error "Cannot update: $0 is not writable and sudo is unavailable."
+        log_info "Download manually from:"
+        log_info "  https://github.com/${GITHUB_REPO}/releases/download/v${_latest_ver}/SteamOS-Pamac-Installer.sh"
+        rm -f "$_tmp_script"
+        return 1
+    fi
+    cp "$_tmp_script" "$_self_path" && chmod +x "$_self_path"
+    local _cp_rc=$?
+    rm -f "$_tmp_script"
+    if [[ $_cp_rc -ne 0 ]]; then
+        log_error "Failed to overwrite script at $_self_path."
+        return 1
+    fi
+    log_success "Updated to v${_latest_ver}."
+    log_info "Please re-run the script with your desired options for the new version to take effect."
+}
+
 repair_podman() {
     log_step "Attempting rootless podman repair..."
 
@@ -1276,6 +1395,12 @@ OPTIONS:
   --low-memory              Reduce build parallelism on constrained systems
                             (e.g., 8GB RAM or less). Doubles per-job RAM
                             requirement to prevent OOM during AUR builds.
+  --self-update             Download and apply the latest version from GitHub
+                            (with SHA-256 hash verification when available)
+  --repair                  Re-run only failed or incomplete installation stages
+                            based on state sentinel files in
+                            ~/.local/share/steamos-pamac/<container>/stages/
+                            Safe to run repeatedly; skips already-completed stages.
   --version                 Show version information
   --version-check           Compare installed version against latest GitHub release
   --verify                  Print SHA-256 hash of this script for integrity verification
@@ -1340,6 +1465,122 @@ SECURITY NOTE — Polkit rules:
   unauthenticated remote or inactive-session access. Any process in the
   container with an active local session can still perform admin ops.
 
+--- Security Model ---
+
+  This script installs Pamac (a GUI package manager) inside an
+  isolated Distrobox/Podman container. The security model balances
+  usability (especially on a single-user Steam Deck) against
+  privilege-escalation risk:
+
+  (1) Rootless containers: The container runs under your user's
+      rootless podman/docker. The container engine acts as an
+      isolation boundary: even if an AUR PKGBUILD gains root inside
+      the container, it does not get host root.
+
+  (2) sudoers scoping: AUR builds require passwordless sudo for
+      pacman, yay, pacman-key, paccache, and pacscripts. By default
+      these are scoped to a SINGLE user (the one created inside the
+      container). --allow-wheel-nopasswd widens this to the whole
+      wheel group, which is DANGEROUS on multi-user hosts.
+
+  (3) sudo timestamp_timeout=0: Every sudo call re-authenticates
+      (passwordlessly via sudoers, but the credential is not cached).
+      This minimizes the window for credential reuse.
+
+  (4) Fake systemd-run wrapper: In non-systemd containers (SteamOS),
+      the script installs a custom /usr/local/sbin/systemd-run that
+      applies Linux sandboxing primitives (mount namespaces, seccomp,
+      capability dropping) instead of systemd's own unit sandboxing.
+      This is EXPERIMENTAL — it does not provide full systemd parity.
+      Use --strict-security to disable it.
+
+  (5) Pacman SigLevel: The container's /etc/pacman.conf uses the
+      default strict SigLevel (Required DatabaseOptional). The only
+      temporary relaxation is a throwaway pacman --config <tmp.conf>
+      with SigLevel=TrustAll during last-resort keyring bootstrap
+      (relaxation does NOT modify the real pacman.conf on disk).
+
+  (6) Polkit scoping: Pamac's polkit actions are set to
+      allow_active=yes (local active sessions only), with
+      allow_any=no and allow_inactive=no. Remote and inactive
+      sessions cannot perform admin operations without authentication.
+
+--- Troubleshooting Guide ---
+
+  KEYRING FAILURES:
+    Symptom: "invalid or corrupted package (PGP signature)"
+    Cause: Stale or missing pacman keyring inside the container.
+    Fix: The script auto-recovers via multi-strategy (keyserver
+      refresh, direct HTTPS keyring download, WKD lookup, offline
+      bootstrap from system keyring files, and a last-resort
+      throwaway TrustAll method). If keyring bootstrap fails:
+        1. Check network connectivity (the script runs a pre-flight
+           probe).
+        2. Manually enter the container and reinitialize:
+             distrobox enter $CONTAINER_NAME
+             sudo pacman-key --init
+             sudo pacman-key --populate archlinux
+             sudo pacman -Sy --noconfirm archlinux-keyring
+        3. Re-run the installer with --verbose for detailed output.
+
+  OOM KILLS (Exit code 137):
+    Symptom: Container crashes mid-build with exit 137.
+    Cause: The container ran out of memory (common on 8GB or 16GB
+      shared-memory Steam Deck when compiling large AUR packages).
+    Fix:
+        1. Re-run with --low-memory to halve build parallelism.
+        2. Close other applications (browser, games) before building.
+        3. Use the persistent build cache (default on) so partial
+           builds resume.
+        4. If swap is available, ensure it is not disabled in the
+           container.
+
+  CONTAINER STUCK / NOT STARTING:
+    Symptom: Container stays in "exited", "stopping", or "improper"
+      state; "container is not usable" errors.
+    Causes: Podman database corruption, stale lock files, subuid/
+      subgid misconfiguration, or incompatible container runtime.
+    Fix:
+        1. Run --status to see the container state.
+        2. Run --repair to re-run only uncompleted setup stages.
+        3. If that fails, re-run with --force-rebuild to recreate
+           the container from scratch.
+        4. Check subuid/subgid: grep $(whoami) /etc/subuid
+        5. Ensure XDG_RUNTIME_DIR is set and podman socket is active.
+
+  PACMAN DATABASE CORRUPTION:
+    Symptom: "database is inconsistent" warnings or pacman operations
+      failing after successful install.
+    Fix: The script auto-runs a multi-strategy repair (11 strategies)
+      when corruption indicators are detected in container output.
+      If repair fails:
+        1. Manually run inside the container:
+             sudo rm -f /var/lib/pacman/db.lck
+             sudo pacman -Dk
+           Fix any broken entries with:
+             sudo pacman -S --noconfirm --needed <package>
+        2. Re-run: sudo pacman -Syyu
+
+  KEYBOARD / LOCALE ISSUES:
+    Symptom: "warning: locale not supported by C library" or missing
+      languages in Pamac GUI.
+    Fix: The script generates en_US.UTF-8 by default. To add your
+      locale, enter the container and run:
+        sudo sed -i 's/^#de_DE/de_DE/' /etc/locale.gen
+        sudo locale-gen
+      (Replace de_DE with your locale.)
+
+  NETWORK / PROXY ISSUES:
+    Symptom: Package downloads fail; keyserver timeouts; "Could not
+      resolve host" errors.
+    Fix:
+        1. Check host network connectivity first.
+        2. If behind a proxy, export https_proxy/http_proxy before
+           running the installer.
+        3. The script tests keyserver reachability on port 443 only.
+           If your network blocks outbound HTTPS to keyservers, the
+           direct mirror download fallback (Method B) may still work.
+
 POST-INSTALL:
   To upgrade Pamac after installation: yay -Syu
   To upgrade the container: yay -Syu && exit; distrobox upgrade CONTAINER
@@ -1400,6 +1641,8 @@ parse_arguments() {
             --quiet) LOG_LEVEL="quiet"; shift ;;
             --no-color) NO_COLOR="true"; shift ;;
             --low-memory) LOW_MEMORY="true"; shift ;;
+            --self-update) SELF_UPDATE="true"; shift ;;
+            --repair) REPAIR="true"; shift ;;
             --version) echo "Steam Deck Pamac Setup v${SCRIPT_VERSION}"; exit 0 ;;
             --verify) _verify_script_hash; exit 0 ;;
             --version-check)
@@ -10295,6 +10538,119 @@ export_existing_apps() {
   fi
 }
 
+repair_installation() {
+    log_step "Repair mode: checking installation state for container '$CONTAINER_NAME'"
+    local state_dir="$HOME/.local/share/steamos-pamac/$CONTAINER_NAME"
+    local stages_dir="$state_dir/stages"
+    mkdir -p "$stages_dir" 2>/dev/null || true
+    local repair_ok=true
+    local already_repaired=false
+
+    local stage_names=(
+        "base_setup:configure_container_base"
+        "critical_helpers:ensure_critical_helpers"
+        "mirror_optimize:optimize_pacman_mirrors"
+        "multilib:configure_multilib"
+        "extra_repos:configure_extra_repos"
+        "aur_helper:install_aur_helper"
+        "pamac_install:install_pamac"
+        "cache_cleanup:setup_cache_cleanup"
+        "gaming_packages:install_gaming_packages"
+        "export_pamac:export_pamac_to_host"
+        "post_install_hooks:setup_post_install_hooks"
+        "keyring_refresh:setup_keyring_refresh"
+        "export_apps:export_existing_apps"
+        "ssh_env:configure_ssh_environment"
+    )
+
+    local has_pending=false
+    for stage_entry in "${stage_names[@]}"; do
+        local stage_key="${stage_entry%%:*}"
+        local stage_func="${stage_entry#*:}"
+        local sentinel="$stages_dir/$stage_key.done"
+        if [[ ! -f "$sentinel" ]]; then
+            log_info "Stage '$stage_key' has not been completed (no sentinel found)."
+            has_pending=true
+        fi
+    done
+
+    if [[ "$has_pending" == "false" ]]; then
+        log_success "All stages appear to be complete. Running verification..."
+        # Quick verification: check key components
+        if container_is_usable 2>/dev/null; then
+            local all_ok=true
+            container_root_exec bash -c "command -v pamac-manager >/dev/null 2>&1" 2>/dev/null || all_ok=false
+            container_root_exec bash -c "command -v yay >/dev/null 2>&1" 2>/dev/null || all_ok=false
+            if [[ "$all_ok" == "true" ]]; then
+                log_success "Installation verified: all components present."
+                return 0
+            fi
+            log_warn "Some components missing despite stage sentinels. Re-running all stages."
+            rm -f "$stages_dir"/*.done 2>/dev/null || true
+        else
+            log_warn "Container not usable. Attempting to start and re-run setup stages."
+            if ! container_start 2>/dev/null || ! container_is_usable; then
+                log_error "Container cannot be started. Try removing and recreating:"
+                log_error "  distrobox rm -f $CONTAINER_NAME && $0"
+                return 1
+            fi
+            rm -f "$stages_dir"/*.done 2>/dev/null || true
+        fi
+    fi
+
+    if ! distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
+        log_error "Container '$CONTAINER_NAME' does not exist. Cannot repair."
+        log_info "Run the full installation: $0"
+        return 1
+    fi
+
+    ensure_podman
+
+    log_info "Re-running incomplete stages..."
+
+    for stage_entry in "${stage_names[@]}"; do
+        local stage_key="${stage_entry%%:*}"
+        local stage_func="${stage_entry#*:}"
+        local sentinel="$stages_dir/$stage_key.done"
+
+        if [[ -f "$sentinel" ]]; then
+            log_debug "Stage '$stage_key' already completed, skipping."
+            continue
+        fi
+
+        log_info "Repairing stage: $stage_key"
+        if ! _ensure_healthy_or_recreate "before $stage_key" 2>/dev/null; then
+            log_warn "Container not healthy for '$stage_key', attempting restart..."
+            container_start 2>/dev/null || true
+            sleep 3
+        fi
+
+        if declare -f "$stage_func" >/dev/null 2>&1; then
+            if "$stage_func"; then
+                touch "$sentinel" 2>/dev/null || true
+                log_success "Stage '$stage_key' repaired successfully."
+            else
+                log_warn "Stage '$stage_key' failed during repair. Continuing to next stage."
+                repair_ok=false
+            fi
+        else
+            log_warn "Unknown stage function '$stage_func'. Skipping."
+        fi
+    done
+
+    log_info "Running final export and cleanup..."
+    export_pamac_to_host 2>/dev/null || true
+    setup_post_install_hooks 2>/dev/null || true
+    export_existing_apps 2>/dev/null || true
+
+    if [[ "$repair_ok" == "true" ]]; then
+        log_success "Repair completed successfully."
+    else
+        log_warn "Repair completed with some issues. Some stages may still need attention."
+        log_info "Re-run repair or check logs: $LOG_FILE"
+    fi
+}
+
 show_completion_message() {
     log_info ""
     log_success "Steam Deck Pamac Setup completed successfully!"
@@ -10607,6 +10963,17 @@ main() {
 
     initialize_logging
 
+    if [[ "$SELF_UPDATE" == "true" ]]; then
+        self_update
+        exit $?
+    fi
+
+    if [[ "$REPAIR" == "true" ]]; then
+        ensure_podman
+        repair_installation
+        exit $?
+    fi
+
     if [[ "$UNINSTALL" == "true" ]]; then
         uninstall_setup
         exit 0
@@ -10649,6 +11016,10 @@ main() {
   detect_init_support
 
     check_battery_power || exit "$EXIT_USER_ABORT"
+
+    if [[ "$ALLOW_WHEEL_NOPASSWD" == "true" ]]; then
+        check_multi_user_warning
+    fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
         echo -e "${BOLD}${BLUE}Steam Deck Pamac Setup v${SCRIPT_VERSION}${NC} ${BOLD}${YELLOW}(DRY RUN)${NC}"
@@ -10739,22 +11110,31 @@ main() {
         exit 1
     }
 
+    local stages_base="$HOME/.local/share/steamos-pamac/$CONTAINER_NAME/stages"
+    mkdir -p "$stages_base" 2>/dev/null || true
+    _touch_stage() { touch "$stages_base/$1.done" 2>/dev/null || true; }
+
 	if ! configure_container_base; then
 		log_error "Container base setup failed permanently. Aborting installation."
 		exit 1
 	fi
+	_touch_stage "base_setup"
 
 	_ensure_healthy_or_recreate "before critical helpers check" || exit 1
 	ensure_critical_helpers
+	_touch_stage "critical_helpers"
 
 	_ensure_healthy_or_recreate "before mirror optimization" || exit 1
 	optimize_pacman_mirrors
+	_touch_stage "mirror_optimize"
 
 	_ensure_healthy_or_recreate "before multilib setup" || exit 1
-configure_multilib
+    configure_multilib
+    _touch_stage "multilib"
 
     _ensure_healthy_or_recreate "before extra repos setup" || exit 1
     configure_extra_repos
+    _touch_stage "extra_repos"
 
     _ensure_healthy_or_recreate "after base setup" || exit 1
 
@@ -10772,6 +11152,7 @@ configure_multilib
 			exit 1
 		fi
 	fi
+	_touch_stage "aur_helper"
 
 	_ensure_healthy_or_recreate "after aur helper" || exit 1
 
@@ -10783,6 +11164,7 @@ configure_multilib
 			exit 1
 		fi
 	fi
+	_touch_stage "pamac_install"
 
 	_ensure_healthy_or_recreate "after pamac install" || exit 1
 
@@ -10791,19 +11173,29 @@ configure_multilib
         log_info "pamac-aur compatibility handled by ensure_pamac_aur_compat during install."
     fi
 
-ensure_critical_helpers
+    ensure_critical_helpers
+    _touch_stage "critical_helpers"
 
-setup_cache_cleanup
+    setup_cache_cleanup
+    _touch_stage "cache_cleanup"
 
-install_gaming_packages
+    install_gaming_packages
+    _touch_stage "gaming_packages"
 
     export_pamac_to_host
+    _touch_stage "export_pamac"
 
     setup_post_install_hooks
+    _touch_stage "post_install_hooks"
+
     setup_keyring_refresh
+    _touch_stage "keyring_refresh"
+
     export_existing_apps
+    _touch_stage "export_apps"
 
     configure_ssh_environment
+    _touch_stage "ssh_env"
 
     show_completion_message
 }

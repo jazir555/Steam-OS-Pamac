@@ -195,12 +195,6 @@ NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
 SKIP_COMPAT_CHECK="${SKIP_COMPAT_CHECK:-false}"
 NO_COLOR="${NO_COLOR:-false}"
 LOW_MEMORY="${LOW_MEMORY:-false}"
-# SECURITY (default off): PermitUserEnvironment yes in sshd lets any
-# SSH-authenticated user inject arbitrary environment variables (LD_PRELOAD,
-# PATH...) via ~/.ssh/environment — a known privilege-escalation vector on
-# multi-user hosts. Only enable when the user explicitly opts in via
-# --enable-ssh-env on a single-user trusted host (e.g. a personal Steam Deck).
-ENABLE_SSH_ENV="${ENABLE_SSH_ENV:-false}"
 ALLOW_WHEEL_NOPASSWD="${ALLOW_WHEEL_NOPASSWD:-false}"
 SELF_UPDATE="${SELF_UPDATE:-false}"
 REPAIR="${REPAIR:-false}"
@@ -1620,7 +1614,6 @@ OPTIONS:
                              to reduce option confusion on a first run.
   --disable-pin-alpm        Do NOT defer libalpm/pacman upgrade (risky on
                              rolling release containers; not recommended)
-  --enable-ssh-env           ENABLE SSH PermitUserEnvironment (INSECURE on multi-user hosts; opt-in only)
   --allow-wheel-nopasswd     Grant NOPASSWD to entire wheel group instead of
                              just the current user (INSECURE on multi-user
                              hosts; opt-in only, not auto-enabled)
@@ -1904,7 +1897,6 @@ parse_arguments() {
             --non-interactive) NON_INTERACTIVE="true"; shift ;;
             --quick-start) QUICK_START="true"; shift ;;
             --disable-pin-alpm) PIN_ALPM="false"; shift ;;
-            --enable-ssh-env) ENABLE_SSH_ENV="true"; shift ;;
             --allow-wheel-nopasswd) ALLOW_WHEEL_NOPASSWD="true"; shift ;;
             --upload-log) UPLOAD_LOG="true"; shift ;;
             --dry-run) DRY_RUN="true"; shift ;;
@@ -2047,19 +2039,6 @@ uninstall_setup() {
 
         local _discover_svc="$HOME/.config/systemd/user/app-org.kde.discover.notifier@autostart.service"
         [[ -L "$_discover_svc" || -f "$_discover_svc" ]] && { log_info "Unmasking Discover notifier: $_discover_svc"; systemctl --user unmask "app-org.kde.discover.notifier@autostart.service" 2>/dev/null || rm -f "$_discover_svc"; }
-
-        # Clean SSH environment file (created by --enable-ssh-env)
-        [[ -f "$HOME/.ssh/environment" ]] && {
-            if grep -q "pamac\|steamos-pamac" "$HOME/.ssh/environment" 2>/dev/null; then
-                log_info "Removing Pamac entries from ~/.ssh/environment"
-                grep -v "pamac\|steamos-pamac" "$HOME/.ssh/environment" > "$HOME/.ssh/environment.tmp" 2>/dev/null
-                if [[ -s "$HOME/.ssh/environment.tmp" ]]; then
-                    mv "$HOME/.ssh/environment.tmp" "$HOME/.ssh/environment"
-                else
-                    rm -f "$HOME/.ssh/environment" "$HOME/.ssh/environment.tmp"
-                fi
-            fi
-        }
 
         # Clean container image — offer to remove since it may be shared
         # with other containers.
@@ -9646,76 +9625,6 @@ EOF
     fi
 }
 
-configure_ssh_environment() {
-    log_step "Configuring SSH environment for nested commands"
-
-    if ! grep -qi steamos /etc/os-release 2>/dev/null; then
-        log_info "Not SteamOS, skipping SSH environment setup."
-        return 0
-    fi
-
-    # We are running as a regular user. To modify /etc/ssh, we need sudo.
-    local _use_sudo=""
-    if ! [ -w /etc ]; then
-        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-            _use_sudo="sudo -n"
-        else
-            log_warn "Cannot modify /etc/ssh without root privileges. Please run manually:"
-            log_warn "  sudo mkdir -p /etc/ssh/sshd_config.d && echo 'PermitUserEnvironment yes' | sudo tee /etc/ssh/sshd_config.d/permit-user-env.conf && sudo pkill -HUP sshd"
-            return 0
-        fi
-    fi
-
-    # ~/.ssh/environment is ONLY created when the user explicitly opts in
-    # via --enable-ssh-env. Creating it unconditionally creates a latent
-    # risk: if sshd is ever configured with PermitUserEnvironment yes
-    # (e.g., by a third-party tool or a config merge), the file would be
-    # ready to inject PATH/LD_PRELOAD/other variables without the user's
-    # knowledge. Keeping the file absent by default eliminates this risk.
-    if [[ "$ENABLE_SSH_ENV" != "true" ]]; then
-        log_info "SSH environment disabled (default). Pass --enable-ssh-env to opt in."
-        return 0
-    fi
-
-    local ssh_dir="$HOME/.ssh"
-    mkdir -p "$ssh_dir"
-    chmod 700 "$ssh_dir"
-
-    if [[ ! -f "$ssh_dir/environment" ]] || ! grep -q '^PATH=' "$ssh_dir/environment" 2>/dev/null; then
-        echo "PATH=/home/$CURRENT_USER/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin" > "$ssh_dir/environment"
-        chmod 600 "$ssh_dir/environment"
-        log_info "Created $ssh_dir/environment with clean PATH (permissions: 600)"
-    fi
-
-    local sshd_conf_dir="/etc/ssh/sshd_config.d"
-    local permit_env_conf="$sshd_conf_dir/permit-user-env.conf"
-
-    # Multi-user detection: PermitUserEnvironment exposes every user's
-    # ~/.ssh/environment to SSH sessions. On a shared host, one user could
-    # inject variables (e.g., LD_PRELOAD) that affect other users' sessions.
-    local _login_users
-    _login_users=$(awk -F: '$3 >= 1000 && $7 !~ /(nologin|false|sync|shutdown|halt)$/ {print $1}' /etc/passwd 2>/dev/null | wc -l || echo "1")
-    if [[ "$_login_users" -gt 1 ]]; then
-        log_warn "Multi-user system detected ($_login_users interactive users). PermitUserEnvironment is a privilege-escalation vector."
-    fi
-
-    if [[ ! -f "$permit_env_conf" ]]; then
-        $_use_sudo mkdir -p "$sshd_conf_dir" 2>/dev/null
-        echo "PermitUserEnvironment yes" | $_use_sudo tee "$permit_env_conf" > /dev/null 2>&1
-        $_use_sudo pkill -HUP sshd 2>/dev/null || true
-        log_info "Enabled PermitUserEnvironment in sshd"
-    fi
-
-    local profile_d_file="/etc/profile.d/deck-local-bin.sh"
-    if [[ ! -f "$profile_d_file" ]]; then
-        echo 'export PATH="/home/'"$CURRENT_USER"'/.local/bin:$PATH"' | $_use_sudo tee "$profile_d_file" > /dev/null 2>&1 || true
-        $_use_sudo chmod 644 "$profile_d_file" 2>/dev/null || true
-        log_info "Created $profile_d_file"
-    fi
-
-    log_success "SSH environment configured for nested commands"
-}
-
 export_pamac_to_host() {
     log_step "Exporting Pamac to host system"
 
@@ -12133,7 +12042,6 @@ repair_installation() {
         "post_install_hooks:setup_post_install_hooks"
         "keyring_refresh:setup_keyring_refresh"
         "export_apps:export_existing_apps"
-        "ssh_env:configure_ssh_environment"
     )
 
     local has_pending=false
@@ -12854,9 +12762,6 @@ main() {
 
     export_existing_apps
     _touch_stage "export_apps"
-
-    configure_ssh_environment
-    _touch_stage "ssh_env"
 
     show_completion_message
 }

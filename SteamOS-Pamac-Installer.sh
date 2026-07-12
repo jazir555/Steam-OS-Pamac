@@ -2356,6 +2356,7 @@ repair_pacman_db() {
     log_info "Checking and repairing pacman database (if needed)..."
     container_root_exec bash -c '
 set +e
+export LC_ALL=C
 
 # ── Internal helpers (not available from host preamble) ──
 _inner_remove_stale_lock() {

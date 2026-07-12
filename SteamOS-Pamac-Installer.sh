@@ -5265,6 +5265,9 @@ exec_container_script() {
     # covers early exits. Both paths are gated by the guard and exit-code check.
     printf '\n[ $? -eq 0 ] && echo "%s"\ntrap - EXIT\n' "$_marker" >> "$_script_file"
 
+    # Validate heredoc content for common quoting/escaping mistakes
+    _validate_heredoc_sanity "$_script" "$_desc"
+
   if _exec_dry_run_check "$_desc" "$_script_file"; then
     rm -f "$_script_file"
     return 0
@@ -5325,6 +5328,9 @@ exec_container_pipe() {
     # Trailing redundant emission (normal-fallthrough, exit-code-0 path); the
     # EXIT trap covers early `exit 0` cases. Both gated by pamac_script_marked.
     printf '\n[ $? -eq 0 ] && echo "%s"\ntrap - EXIT\n' "$_marker" >> "$_script_file"
+
+    # Validate generated file for common quoting/escaping mistakes
+    _validate_heredoc_sanity "$(cat "$_script_file")" "$_desc"
 
     if _exec_dry_run_check "$_desc" "$_script_file"; then
         rm -f "$_script_file"

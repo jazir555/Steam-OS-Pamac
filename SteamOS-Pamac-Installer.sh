@@ -459,6 +459,15 @@ run_command() {
     return "$status"
 }
 
+# ── Locale-safe pacman wrapper ──
+# Forces LC_ALL=C so pacman's English output strings (error messages,
+# "No database errors", "conflicting files", etc.) match the regexes
+# used throughout this script regardless of the user's locale.
+# Usage: _pacman [pacman args...]  (drop-in replacement for pacman)
+_pacman() {
+    LC_ALL=C pacman "$@"
+}
+
 container_runtime() {
     local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
     if [[ "$mgr" == "docker" ]]; then
@@ -2375,7 +2384,7 @@ _inner_remove_stale_lock() {
 }
 
 _inner_db_is_healthy() {
-    pacman -Dk 2>/dev/null | grep -q "No database errors"
+    _    _pacman -Dk 2>/dev/null | grep -q "No database errors"
 }
 
 # ── Quick exit: if DB is healthy, do nothing ──
@@ -2482,7 +2491,7 @@ while IFS= read -r line; do
     # "package-version: is installed but should not be" — wrong DB state
     _pkg=$(echo "$line" | awk -F: "{print \$1}" | sed "s/ is installed but should not be//" || true)
     [[ -n "$_pkg" ]] && _broken_pkgs="$_broken_pkgs $_pkg"
-done < <(pacman -Dk 2>&1 | grep -E "is installed but should not be|missing file" || true)
+done < <(_pacman -Dk 2>&1 | grep -E "is installed but should not be|missing file" || true)
 
 # Deduplicate
 _broken_pkgs=$(echo "$_broken_pkgs" | tr " " "\n" | sort -u | tr "\n" " ")
@@ -2602,7 +2611,7 @@ if [[ $_corrupted_removed -gt 0 ]]; then
     # Reinstall any removed packages that are still available.
     # Batch into groups of 50 to avoid command-line length limits and reduce
     # per-invocation overhead (each pacman -S invocation is expensive).
-    _pkg_list=$(pacman -Qn 2>/dev/null | awk "{print \$1}" || true)
+    _pkg_list=$(_pacman -Qn 2>/dev/null | awk "{print \$1}" || true)
     if [[ -n "$_pkg_list" ]]; then
         _batch=""
         _count=0
@@ -2753,7 +2762,7 @@ fi
 echo ""
 echo "=== Strategy 11: pacman --debug deep inspection ==="
 _inner_remove_stale_lock
-_debug_output=$(pacman --debug 2>&1 || true)
+_debug_output=$(_pacman --debug 2>&1 || true)
 _debug_issues=$(echo "$_debug_output" | grep -iE "warning|error|missing|corrupt|invalid" | head -20 || true)
 if [[ -n "$_debug_issues" ]]; then
     echo "  Found issues from pacman --debug:"
@@ -2825,6 +2834,10 @@ echo "the system is otherwise working. Not every -Dk warning requires action."
 # _PAMAC_EOF appears literally in the container script. A mismatch silently
 # produces a broken container script that cannot source _safe_sleep.
 _CONTAINER_PREAMBLE=$(cat << '_PREAMBLE_END'
+# Force C locale so pacman's English output matches the regexes used by
+# the host-side repair/diagnostic scripts. Arch containers default to
+# en_US.UTF-8 but some minimal images may inherit the host locale.
+export LC_ALL=C
 _write_pamac_common() {
 local _target="${1:-/usr/local/lib/pamac-common.sh}"
 cat > "$_target" << '_PAMAC_EOF'
@@ -3104,7 +3117,7 @@ safe_install() {
                     echo "  Exit 1: General error (dependency conflict, etc.)."
                     # Check for file conflicts — capture output first, then grep,
                     # to avoid pipefail truncating grep's input if pacman exits early.
-                    _pacman_diag=$(pacman -S --noconfirm --needed "$@" 2>&1 || true)
+                    _pacman_diag=$(_pacman -S --noconfirm --needed "$@" 2>&1 || true)
                     _conflict_output=$(echo "$_pacman_diag" | grep -i "conflicting files\|exists in filesystem" || true)
                     if [[ -n "$_conflict_output" ]]; then
                         echo "  File conflicts detected. Trying with targeted --overwrite for /usr/lib and /usr/share..."
@@ -5398,6 +5411,7 @@ configure_container_base() {
     local keyring_script
     read -r -d '' keyring_script <<'KEYRING_EOF' || true
 set -uo pipefail
+export LC_ALL=C
 
 # Arg 1: STRICT_SECURITY flag ("true" disables TrustAll relaxation recovery).
 _STRICT_SECURITY_MODE="${1:-}"
@@ -5923,7 +5937,7 @@ echo "Step 5/5: Verifying keyring and restoring security settings..."
 
 if [[ "$keyring_ok" == "true" ]]; then
     # Verify the keyring has actual Arch Linux signing keys (not just empty)
-    _sig_count=$(pacman-key --list-sigs 2>/dev/null | grep -c "archlinux" || echo "0")
+    _sig_count=$(_pacman-key --list-sigs 2>/dev/null | grep -c "archlinux" || echo "0")
     if [[ "$_sig_count" -gt 0 ]]; then
         echo "Keyring contains $_sig_count archlinux signature(s)."
     else
@@ -5936,7 +5950,7 @@ if [[ "$keyring_ok" == "true" ]]; then
                 [[ -f "$_kf" ]] && cp -f "$_kf" /etc/pacman.d/gnupg/ 2>/dev/null || true
             done
             timeout 60 pacman-key --populate archlinux 2>/dev/null || true
-            _sig_count=$(pacman-key --list-sigs 2>/dev/null | grep -c "archlinux" || echo "0")
+            _sig_count=$(_pacman-key --list-sigs 2>/dev/null | grep -c "archlinux" || echo "0")
             if [[ "$_sig_count" -gt 0 ]]; then
                 echo "  Final populate succeeded with $_sig_count signature(s)."
             else
@@ -6006,6 +6020,7 @@ KEYRING_EOF
     local upgrade_script
     read -r -d '' upgrade_script <<'UPG_EOF' || true
 set -uo pipefail
+export LC_ALL=C
 
 pin_alpm="${1:-false}"
 
@@ -6143,7 +6158,7 @@ if [[ -f /tmp/pre-upgrade-critical.list ]]; then
 fi
 
 # Verify database consistency
-if pacman -Dk 2>/dev/null | grep -q "No database errors"; then
+if     _pacman -Dk 2>/dev/null | grep -q "No database errors"; then
     echo "Database: consistent"
 else
     echo "WARNING: Database inconsistencies detected after upgrade."
@@ -6182,6 +6197,7 @@ UPG_EOF
     local core_script
     read -r -d '' core_script <<'CORE_EOF' || true
 set -uo pipefail
+export LC_ALL=C
 
 _remove_stale_lock
 
@@ -6216,6 +6232,7 @@ CORE_EOF
     local dev_script
     read -r -d '' dev_script <<'DEV_EOF' || true
 set -uo pipefail
+export LC_ALL=C
 
 _remove_stale_lock
 
@@ -6285,6 +6302,7 @@ DEV_EOF
     local user_script
     read -r -d '' user_script <<'USER_EOF' || true
 set -uo pipefail
+export LC_ALL=C
 
 current_user="$1"
 if [[ -z "$current_user" ]]; then
@@ -6396,6 +6414,7 @@ log_info "Stage 6a/7: Installing polkit and setting up D-Bus..."
 local polkit_dbus_script
 read -r -d '' polkit_dbus_script <<'POLKIT_DBUS_EOF' || true
 set -uo pipefail
+export LC_ALL=C
 
 current_user="$1"
 
@@ -6507,6 +6526,7 @@ log_info "Stage 6b/7: Installing critical helpers (bootstrap, systemd-run, D-Bus
 local critical_script
 read -r -d '' critical_script <<'CRITICAL_EOF' || true
 set -uo pipefail
+export LC_ALL=C
 
 HOST_USER="$1"
 _STRICT_SECURITY_MODE="${2:-}"
@@ -6621,7 +6641,7 @@ _ensure_keyring() {
 if [[ -f /etc/pacman.d/gnupg/pubring.gpg ]] && pacman-key --list-keys >/dev/null 2>&1; then
     # Keyring exists — verify all repo keyrings are populated
     local _populated
-    _populated=$(pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
+    _populated=$(_pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
     if [[ "$_populated" -gt 10 ]]; then
         return 0
     fi
@@ -6649,7 +6669,7 @@ for _kr in /usr/share/pacman/keyrings/*.gpg; do
     fi
 done
 local _count
-_count=$(pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
+_count=$(_pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
 log_bootstrap "Keyring initialized: $_count keys"
 }
 
@@ -6813,6 +6833,7 @@ log_info "Repairing ${#missing_items[@]} missing critical item(s): ${missing_ite
 local repair_script
 read -r -d '' repair_script <<'REPAIR_EOF' || true
 set -uo pipefail
+export LC_ALL=C
 
 HOST_USER="$1"
 _STRICT_SECURITY_MODE="${2:-}"
@@ -6930,7 +6951,7 @@ _ensure_keyring() {
 if [[ -f /etc/pacman.d/gnupg/pubring.gpg ]] && pacman-key --list-keys >/dev/null 2>&1; then
     # Keyring exists — verify all repo keyrings are populated
     local _populated
-    _populated=$(pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
+    _populated=$(_pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
     if [[ "$_populated" -gt 10 ]]; then
         return 0
     fi
@@ -6958,7 +6979,7 @@ for _kr in /usr/share/pacman/keyrings/*.gpg; do
     fi
 done
 local _count
-_count=$(pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
+_count=$(_pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
 log_bootstrap "Keyring initialized: $_count keys"
 }
 
@@ -7447,7 +7468,7 @@ _discover_keyring_fingerprint() {
     # signed by the repo maintainer. We look for keys whose uid contains the
     # repo name or known maintainer identifiers.
     local _all_fps
-    _all_fps=$(pacman-key --list-keys 2>/dev/null | grep -E "^[0-9A-F]{40}" || true)
+    _all_fps=$(_pacman-key --list-keys 2>/dev/null | grep -E "^[0-9A-F]{40}" || true)
     if [[ -z "$_all_fps" ]]; then
         return 1
     fi
@@ -7458,7 +7479,7 @@ _discover_keyring_fingerprint() {
         _fp="${_fp%% *}"  # take just the fingerprint
         [[ "$_fp" =~ ^[0-9A-F]{40}$ ]] || continue
         # Read the next line (uid) from pacman-key output
-        _uid=$(pacman-key --list-keys "$_fp" 2>/dev/null | grep -i "uid" | head -1 || true)
+        _uid=$(_pacman-key --list-keys "$_fp" 2>/dev/null | grep -i "uid" | head -1 || true)
         case "$_repo" in
             chaotic-aur)
                 # Chaotic-AUR signing key uid contains "pedrohlc" or "chaotic"
@@ -7832,6 +7853,7 @@ install_aur_helper() {
 	local verify_script
 	read -r -d '' verify_script <<'VERIFY_EOF' || true
 set -uo pipefail
+export LC_ALL=C
 
 _remove_stale_lock
 
@@ -7985,7 +8007,7 @@ echo "=== pamac-aur AUR Compatibility Auto-Remediation ==="
 
 installed_pacman_ver=""
 if command -v pacman >/dev/null 2>&1; then
-    installed_pacman_ver=$(pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
+    installed_pacman_ver=$(_pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
 fi
 echo "Installed pacman version: ${installed_pacman_ver:-unknown}"
 
@@ -8361,7 +8383,7 @@ if [[ "$can_upgrade_pacman" == "true" ]]; then
         echo "Database synced. Upgrading pacman and dependencies..."
         _remove_stale_lock
         if pacman -S --noconfirm --needed pacman 2>&1 | tail -10; then
-            new_ver=$(pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
+            new_ver=$(_pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
             echo "Upgraded pacman to: $new_ver"
             new_major=$(echo "$new_ver" | sanitize_version_component)
             _new_ver_stripped=$(echo "$new_ver" | sed 's/^[^:]*://')
@@ -8388,7 +8410,7 @@ if [[ "$can_upgrade_pacman" == "true" ]]; then
             echo "Attempting full system upgrade to pull in all dependencies..."
             _remove_stale_lock
             pacman -Syu --noconfirm 2>&1 | tail -20 || true
-            new_ver=$(pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
+            new_ver=$(_pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "")
             echo "After full upgrade, pacman version: $new_ver"
             new_major=$(echo "$new_ver" | sanitize_version_component)
             _new_ver_stripped2=$(echo "$new_ver" | sed 's/^[^:]*://')
@@ -8723,6 +8745,7 @@ install_pamac() {
     local pamac_install
     read -r -d '' pamac_install <<'PAMAC_INSTALL_EOF' || true
 set -uo pipefail
+export LC_ALL=C
 
 current_user="$1"
 compat_strategy="${2:-try_latest}"
@@ -9099,6 +9122,7 @@ fi
     local pamac_cfg
     read -r -d '' pamac_cfg <<'PAMAC_CFG_EOF' || true
 set -uo pipefail
+export LC_ALL=C
 
 current_user="$1"
 
@@ -9231,6 +9255,7 @@ setup_cache_cleanup() {
     local cache_script
     read -r -d '' cache_script <<'CACHE_EOF' || true
 set -uo pipefail
+export LC_ALL=C
 
 _remove_stale_lock
 
@@ -12119,7 +12144,7 @@ run_update() {
     container_root_exec bash -c '
 set +e
 # Check for database inconsistencies
-if ! pacman -Dk 2>/dev/null | grep -q "No database errors"; then
+if !     _pacman -Dk 2>/dev/null | grep -q "No database errors"; then
     echo "WARNING: Database inconsistencies detected after upgrade."
     pacman -Dk 2>&1 | head -10 || true
 fi

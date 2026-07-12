@@ -1314,31 +1314,56 @@ self_update() {
     fi
     local _self_path
     _self_path="$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")"
+    local _self_dir
+    _self_dir=$(dirname "$_self_path")
+
+    # Atomic write: write to a temp file in the same directory, sync to disk,
+    # then rename. This prevents corruption if interrupted mid-write (power cut,
+    # Ctrl+C during the copy). The old file stays valid until the rename
+    # completes atomically.
+    local _atomic_tmp
+    _atomic_tmp=$(mktemp "${_self_dir}/.steamos-update-XXXXXX") || {
+        log_error "Failed to create temp file for atomic update."
+        rm -f "$_tmp_script"
+        return 1
+    }
+
     if [[ ! -w "$_self_path" ]]; then
         log_warn "Current script is not writable ($_self_path). Attempting sudo install..."
         if command -v sudo >/dev/null 2>&1; then
-            sudo cp "$_tmp_script" "$_self_path" && sudo chmod +x "$_self_path"
+            sudo cp "$_tmp_script" "$_atomic_tmp" && sudo chmod +x "$_atomic_tmp" && sudo sync "$_atomic_tmp" 2>/dev/null && sudo mv -f "$_atomic_tmp" "$_self_path" && sudo sync "$_self_dir" 2>/dev/null
             local _sudo_rc=$?
             rm -f "$_tmp_script"
             if [[ $_sudo_rc -eq 0 ]]; then
-                log_success "Updated to v${_latest_ver} (via sudo)."
+                log_success "Updated to v${_latest_ver} (via sudo, atomic)."
                 return 0
             fi
         fi
+        rm -f "$_atomic_tmp"
         log_error "Cannot update: $0 is not writable and sudo is unavailable."
         log_info "Download manually from:"
         log_info "  https://github.com/${GITHUB_REPO}/releases/download/v${_latest_ver}/SteamOS-Pamac-Installer.sh"
-        rm -f "$_tmp_script"
         return 1
     fi
-    cp "$_tmp_script" "$_self_path" && chmod +x "$_self_path"
+
+    cp "$_tmp_script" "$_atomic_tmp" && chmod +x "$_atomic_tmp" && sync "$_atomic_tmp" 2>/dev/null || true
     local _cp_rc=$?
     rm -f "$_tmp_script"
     if [[ $_cp_rc -ne 0 ]]; then
-        log_error "Failed to overwrite script at $_self_path."
+        rm -f "$_atomic_tmp"
+        log_error "Failed to write updated script to temp file."
         return 1
     fi
-    log_success "Updated to v${_latest_ver}."
+    # Atomic rename — old file stays valid until this completes
+    mv -f "$_atomic_tmp" "$_self_path"
+    local _mv_rc=$?
+    sync "$_self_dir" 2>/dev/null || true
+    if [[ $_mv_rc -ne 0 ]]; then
+        log_error "Failed to atomically replace script at $_self_path."
+        log_info "The updated script may be at: $_atomic_tmp"
+        return 1
+    fi
+    log_success "Updated to v${_latest_ver} (atomic write)."
     log_info "Please re-run the script with your desired options for the new version to take effect."
 }
 
@@ -8316,7 +8341,7 @@ if [[ -z "$aur_pacman_dep" ]]; then
     exit 0
 fi
 
-echo "pamac-aur requires: pacman $aur_pacman_dep"
+echo "Required: pacman $req_op $req_version"
 
 # Parse version constraint: extract operator and version components.
 # The constraint format is like ">=6.0" or "=5.2.1" or ">5.0".
@@ -8336,113 +8361,113 @@ if [[ ! "$req_version" =~ ^[0-9]+\.[0-9]+ ]]; then
     exit 0
 fi
 
-echo "Required: pacman $req_op $req_version"
+echo "Installed: pacman $installed_pacman_ver"
+echo "Required:  pacman $req_op $req_version"
 
-req_major=$(echo "$req_version" | sanitize_version_component)
-if [[ "$req_version" == *.* ]]; then
-    _req_minor_raw=$(echo "$req_version" | cut -d. -f2)
-    req_minor=$(echo "$_req_minor_raw" | grep -oP '^[0-9]+' || echo "0")
-else
-    req_minor=0
+# Ensure vercmp is available for accurate version comparison.
+# vercmp handles epochs (6:5.2.0), pre-release suffixes (rc), and
+# package revisions — the manual fallback does not. Installing
+# pacman-contrib is cheap and makes the comparison reliable.
+if ! command -v vercmp >/dev/null 2>&1; then
+    echo "Installing pacman-contrib (provides vercmp) for accurate version comparison..."
+    pacman -S --noconfirm --needed pacman-contrib >/dev/null 2>&1 || true
 fi
-[[ -z "$req_minor" ]] && req_minor=0
-if [[ "$req_version" == *.*.* ]]; then
-    _req_patch_raw=$(echo "$req_version" | cut -d. -f3)
-    req_patch=$(echo "$_req_patch_raw" | grep -oP '^[0-9]+' || echo "0")
-else
-    req_patch=0
-fi
-[[ -z "$req_patch" ]] && req_patch=0
 
-version_meets_requirement() {
-    local cur_major="$1" cur_minor="$2" op="$3" rq_major="$4" rq_minor="${5:-0}"
-    local cur_patch="${6:-0}" rq_patch="${7:-0}"
-
-    # Use vercmp when available (standard Arch Linux utility that correctly handles
-    # epochs like "6:5.2.0", pre-release suffixes like "rc", and package revisions)
-    if command -v vercmp >/dev/null 2>&1; then
-        local cur_full="${cur_major}.${cur_minor}.${cur_patch}"
-        local rq_full="${rq_major}.${rq_minor}.${rq_patch}"
-        # Strip trailing .0 components for cleaner comparison (vercmp handles them)
-        cur_full="${cur_full%.0}"
-        rq_full="${rq_full%.0}"
-        local cmp_result
-        cmp_result=$(vercmp "$cur_full" "$rq_full" 2>/dev/null || echo "")
-        if [[ -n "$cmp_result" && "$cmp_result" =~ ^-?[0-9]+$ ]]; then
-            case "$op" in
-                ">="|"="|"==")
-                    [[ "$cmp_result" -ge 0 ]] && return 0 || return 1 ;;
-                ">")
-                    [[ "$cmp_result" -gt 0 ]] && return 0 || return 1 ;;
-                "<=")
-                    [[ "$cmp_result" -le 0 ]] && return 0 || return 1 ;;
-                "<")
-                    [[ "$cmp_result" -lt 0 ]] && return 0 || return 1 ;;
-                *)
-                    echo "WARNING: Unknown operator '$op' in version_meets_requirement (vercmp branch)." >&2
-                    return 1 ;;
-            esac
-        fi
+# Primary comparison: use vercmp (the standard Arch Linux version comparator).
+# This is the ONLY reliable way to compare version strings that may contain
+# epochs, pre-release suffixes, or non-standard formats.
+if command -v vercmp >/dev/null 2>&1; then
+    # Build full version strings for vercmp
+    local _cur_full="${installed_pacman_ver}"
+    local _req_full="${req_version}"
+    # Strip epoch from installed version if present (vercmp handles it, but
+    # we need to pass the full string including epoch)
+    local _cmp_result
+    _cmp_result=$(vercmp "$_cur_full" "$_req_full" 2>/dev/null || echo "")
+    if [[ -n "$_cmp_result" && "$_cmp_result" =~ ^-?[0-9]+$ ]]; then
+        case "$req_op" in
+            ">="|"="|"==")
+                [[ "$_cmp_result" -ge 0 ]] && { echo "PASS: pacman $installed_pacman_ver satisfies $aur_pacman_dep"; exit 0; } ;;
+            ">")
+                [[ "$_cmp_result" -gt 0 ]] && { echo "PASS: pacman $installed_pacman_ver satisfies $aur_pacman_dep"; exit 0; } ;;
+            "<=")
+                [[ "$_cmp_result" -le 0 ]] && { echo "PASS: pacman $installed_pacman_ver satisfies $aur_pacman_dep"; exit 0; } ;;
+            "<")
+                [[ "$_cmp_result" -lt 0 ]] && { echo "PASS: pacman $installed_pacman_ver satisfies $aur_pacman_dep"; exit 0; } ;;
+        esac
+        echo "INCOMPATIBLE: pacman $installed_pacman_ver does NOT satisfy $aur_pacman_dep (vercmp result: $_cmp_result)"
+    else
+        echo "WARN: vercmp returned unexpected result '$_cmp_result' for '$installed_pacman_ver' vs '$req_version'."
+        echo "WARN: Falling back to installed pacman version check."
     fi
-
-    # Fallback: manual major.minor.patch comparison (when vercmp is unavailable)
-    # Compares major, then minor, then patch to handle three-component versions.
-    # This is fragile for complex version strings (e.g. "6.0.2rc1", "1:5.2.0-3")
-    # but works for the simple major.minor.patch format used by pamac-aur.
-    # Install pacman-contrib (provides vercmp) to avoid this fallback.
-    echo "WARNING: vercmp unavailable — using manual version comparison fallback." >&2
-    case "$op" in
+else
+    echo "WARN: vercmp unavailable even after install attempt — version comparison may be inaccurate."
+    echo "WARN: Install pacman-contrib manually for reliable version comparison."
+    # Last resort: rough major.minor comparison (NOT reliable for epochs/pre-releases)
+    local _cur_major _cur_minor _req_major _req_minor
+    _cur_major=$(echo "$installed_pacman_ver" | sed 's/^[^:]*://' | cut -d. -f1)
+    _cur_minor=$(echo "$installed_pacman_ver" | sed 's/^[^:]*://' | cut -d. -f2)
+    _req_major=$(echo "$req_version" | cut -d. -f1)
+    _req_minor=$(echo "$req_version" | cut -d. -f2)
+    case "$req_op" in
         ">="|"="|"==")
-            if [[ "$cur_major" -gt "$rq_major" ]]; then return 0; fi
-            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -gt "$rq_minor" ]]; then return 0; fi
-            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -eq "$rq_minor" && "$cur_patch" -ge "$rq_patch" ]]; then return 0; fi
-            return 1
-            ;;
-        ">")
-            if [[ "$cur_major" -gt "$rq_major" ]]; then return 0; fi
-            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -gt "$rq_minor" ]]; then return 0; fi
-            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -eq "$rq_minor" && "$cur_patch" -gt "$rq_patch" ]]; then return 0; fi
-            return 1
-            ;;
-        "<=")
-            if [[ "$cur_major" -lt "$rq_major" ]]; then return 0; fi
-            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -lt "$rq_minor" ]]; then return 0; fi
-            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -eq "$rq_minor" && "$cur_patch" -le "$rq_patch" ]]; then return 0; fi
-            return 1
-            ;;
-        "<")
-            if [[ "$cur_major" -lt "$rq_major" ]]; then return 0; fi
-            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -lt "$rq_minor" ]]; then return 0; fi
-            if [[ "$cur_major" -eq "$rq_major" && "$cur_minor" -eq "$rq_minor" && "$cur_patch" -lt "$rq_patch" ]]; then return 0; fi
-            return 1
-            ;;
-        *)
-            echo "WARNING: Unknown operator '$op' in version_meets_requirement (fallback)." >&2
+            [[ "$_cur_major" -gt "$_req_major" ]] && { echo "PASS: pacman $installed_pacman_ver satisfies $aur_pacman_dep (rough check)"; exit 0; }
+            [[ "$_cur_major" -eq "$_req_major" && "$_cur_minor" -ge "$_req_minor" ]] && { echo "PASS: pacman $installed_pacman_ver satisfies $aur_pacman_dep (rough check)"; exit 0; } ;;
+    esac
+    echo "INCOMPATIBLE: pacman $installed_pacman_ver does NOT satisfy $aur_pacman_dep (rough check)"
+fi
             return 1
             ;;
     esac
-}
-
-if version_meets_requirement "$pacman_major" "$pacman_minor" "$req_op" "$req_major" "$req_minor" "$pacman_patch" "$req_patch"; then
-    echo "PASS: pacman $installed_pacman_ver satisfies requirement $aur_pacman_dep"
-    exit 0
 fi
 
-echo "INCOMPATIBLE: pacman $installed_pacman_ver does NOT satisfy $aur_pacman_dep"
+# version_meets_requirement: compare two version strings using vercmp.
+# Usage: version_meets_requirement <current_ver> <operator> <required_ver>
+# Returns 0 if current satisfies the requirement, 1 otherwise.
+# This is the single source of truth for all version comparisons in this
+# script. It delegates entirely to vercmp (pacman-contrib), which correctly
+# handles epochs (6:5.2.0), pre-release suffixes (rc), and revisions.
+version_meets_requirement() {
+    local _cur="$1" _op="$2" _req="$3"
+    if command -v vercmp >/dev/null 2>&1; then
+        local _cmp
+        _cmp=$(vercmp "$_cur" "$_req" 2>/dev/null || echo "")
+        if [[ -n "$_cmp" && "$_cmp" =~ ^-?[0-9]+$ ]]; then
+            case "$_op" in
+                ">="|"="|"==") [[ "$_cmp" -ge 0 ]] && return 0 || return 1 ;;
+                ">")           [[ "$_cmp" -gt 0 ]] && return 0 || return 1 ;;
+                "<=")          [[ "$_cmp" -le 0 ]] && return 0 || return 1 ;;
+                "<")           [[ "$_cmp" -lt 0 ]] && return 0 || return 1 ;;
+                *)             echo "WARN: Unknown operator '$_op'" >&2; return 1 ;;
+            esac
+        fi
+        echo "WARN: vercmp returned unexpected result '$_cmp' for '$_cur' vs '$_req'." >&2
+        return 1
+    else
+        echo "WARN: vercmp unavailable — cannot compare versions reliably." >&2
+        return 1
+    fi
+}
+
+# If we reach here, the initial vercmp comparison did not exit with PASS (INCOMPATIBLE)
 echo ""
 
 can_upgrade_pacman=false
+# Use vercmp for accurate comparison (handles epochs, pre-release suffixes)
 if command -v vercmp >/dev/null 2>&1; then
-    # Use vercmp for accurate comparison (handles epochs, pre-release suffixes)
     _cmp_result=$(vercmp "$installed_pacman_ver" "$req_version" 2>/dev/null || echo "")
     if [[ -n "$_cmp_result" && "$_cmp_result" =~ ^-?[0-9]+$ ]] && [[ "$_cmp_result" -lt 0 ]]; then
         can_upgrade_pacman=true
     fi
 else
-    # Fallback: manual major.minor.patch comparison
-    if [[ "$req_major" -gt "$pacman_major" ]] || \
-       { [[ "$req_major" -eq "$pacman_major" ]] && [[ "$req_minor" -gt "$pacman_minor" ]]; } || \
-       { [[ "$req_major" -eq "$pacman_major" ]] && [[ "$req_minor" -eq "$pacman_minor" ]] && [[ "$req_patch" -gt "$pacman_patch" ]]; }; then
+    # Last resort: rough major.minor comparison from version strings
+    local _cur_major _cur_minor _req_major _req_minor
+    _cur_major=$(echo "$installed_pacman_ver" | sed 's/^[^:]*://' | cut -d. -f1)
+    _cur_minor=$(echo "$installed_pacman_ver" | sed 's/^[^:]*://' | cut -d. -f2)
+    _req_major=$(echo "$req_version" | cut -d. -f1)
+    _req_minor=$(echo "$req_version" | cut -d. -f2)
+    if [[ "$_req_major" -gt "$_cur_major" ]] || \
+       { [[ "$_req_major" -eq "$_cur_major" ]] && [[ "$_req_minor" -gt "$_cur_minor" ]]; }; then
         can_upgrade_pacman=true
     fi
 fi
@@ -8473,7 +8498,7 @@ if [[ "$can_upgrade_pacman" == "true" ]]; then
                 new_patch=0
             fi
             [[ -z "$new_patch" ]] && new_patch=0
-            if version_meets_requirement "$new_major" "$new_minor" "$req_op" "$req_major" "$req_minor" "$new_patch" "$req_patch"; then
+            if version_meets_requirement "$new_ver" "$req_op" "$req_version"; then
                 echo "SUCCESS: Upgraded pacman $new_ver now satisfies $aur_pacman_dep"
                 ldconfig 2>/dev/null || true
                 exit 0
@@ -8500,7 +8525,7 @@ if [[ "$can_upgrade_pacman" == "true" ]]; then
                 new_patch=0
             fi
             [[ -z "$new_patch" ]] && new_patch=0
-            if version_meets_requirement "$new_major" "$new_minor" "$req_op" "$req_major" "$req_minor" "$new_patch" "$req_patch"; then
+            if version_meets_requirement "$new_ver" "$req_op" "$req_version"; then
                 echo "SUCCESS: Full upgrade brought pacman $new_ver which satisfies $aur_pacman_dep"
                 ldconfig 2>/dev/null || true
                 exit 0
@@ -8651,7 +8676,7 @@ for try_commit in $_commits; do
     [[ -z "$old_req_patch" ]] && old_req_patch=0
     old_req_op=$(echo "$old_dep" | grep -oP "[><=]+" | head -1 || echo "")
 
-    if version_meets_requirement "$pacman_major" "$pacman_minor" "$old_req_op" "$old_req_major" "$old_req_minor" "$pacman_patch" "$old_req_patch"; then
+    if version_meets_requirement "$installed_pacman_ver" "$old_req_op" "$old_req_ver"; then
         echo "  -> Compatible: requires pacman $old_dep (have $installed_pacman_ver)"
         _record_known_good_commit "$_COMPAT_CACHE_KEY" "$try_commit" "requires pacman $old_dep"
         rm -rf "$_AUR_WORK"

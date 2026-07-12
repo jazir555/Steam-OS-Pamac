@@ -4657,9 +4657,8 @@ _apply_sandbox() {
     # ── NoNewPrivileges: use prctl via setpriv if available ──
     if [[ -n "$NO_NEW_PRIVS" ]] && [[ "$NO_NEW_PRIVS" == "yes" ]]; then
         _log_dsr "Applying NoNewPrivileges=yes"
-        # setpriv --no-new-privs sets PR_SET_NO_NEW_PRIVS on the calling process.
-        # We export a flag so the execution wrapper can apply it.
-        export _DSR_NO_NEW_PRIVS=true
+        # Enforcement is handled by _prepare_cap_priv() which reads NO_NEW_PRIVS
+        # directly and builds the setpriv --no-new-privs command prefix.
     fi
 
     # ── SecureBits: set securebits flags via setpriv ──
@@ -4854,49 +4853,15 @@ CLOSEFDS_C
 
     # ── CapabilityBoundingSet: drop capabilities via seccomp helper + capsh/setpriv ──
     # The seccomp helper now includes prctl(PR_CAPBSET_DROP) for true bounding-set
-    # enforcement. capsh/setpriv remain as additional defense-in-depth layers.
+    # enforcement. Shell-side capsh/setpriv is handled by _prepare_cap_priv() which
+    # reads CAP_BOUNDING_SET directly (no export needed).
     if [[ -n "$CAP_BOUNDING_SET" ]]; then
         _log_dsr "Applying CapabilityBoundingSet=$CAP_BOUNDING_SET"
-        # Prefer capsh FIRST — it truly drops bounding-set capabilities.
-        # setpriv --inh-caps is a weaker fallback (inheritable set only).
         if command -v capsh >/dev/null 2>&1; then
-            _cap_str_n="${CAP_BOUNDING_SET//cap_/CAP_}"
-            case "$_cap_str_n" in
-                "~all"|"")
-                    export _DSR_CAPSH_ARGS="--drop=all"
-                    _log_dsr "  Capability bounding set: capsh --drop=all" ;;
-                "all")
-                    unset _DSR_CAPSH_ARGS ;;
-                \~*)
-                    _d="${_cap_str_n#\~}"
-                    export _DSR_CAPSH_ARGS="--drop=${_d//:/,}"
-                    _log_dsr "  Capability bounding set: capsh ${_DSR_CAPSH_ARGS}" ;;
-                *)
-                    export _DSR_CAPSH_ARGS="--drop=all"
-                    _log_dsr "  Capability bounding set: capsh --drop=all" ;;
-            esac
+            _log_dsr "  Capability bounding set: capsh (enforced via _prepare_cap_priv)"
         elif command -v setpriv >/dev/null 2>&1; then
-            _warn_dsr "  capsh not available — using setpriv fallback (inheritable set only)"
-            _cap_str_n="${CAP_BOUNDING_SET//cap_/CAP_}"
-            case "$_cap_str_n" in
-                "~all"|"")
-                    export _DSR_CAP_ARGS="--inh-caps=-all" ;;
-                "all")
-                    unset _DSR_CAP_ARGS ;;
-                \~*)
-                    _d="${_cap_str_n#\~}"
-                    _caps=""
-                    for _c in ${_d//:/ }; do
-                        [[ -n "$_caps" ]] && _caps="${_caps},-${_c,,}" || _caps="-${_c,,}"
-                    done
-                    [[ -n "$_caps" ]] && export _DSR_CAP_ARGS="--inh-caps=${_caps}" ;;
-                *)
-                    _caps=""
-                    for _c in ${_cap_str_n//:/ }; do
-                        [[ -n "$_caps" ]] && _caps="${_caps},+${_c,,}" || _caps="+${_c,,}"
-                    done
-                    [[ -n "$_caps" ]] && export _DSR_CAP_ARGS="--inh-caps=${_caps}" ;;
-            esac
+            _log_dsr "  Capability bounding set: setpriv (enforced via _prepare_cap_priv)"
+        fi
             [[ -n "${_DSR_CAP_ARGS:-}" ]] && _log_dsr "  Capability bounding set: setpriv ${_DSR_CAP_ARGS}"
         else
             _warn_dsr "  Neither capsh nor setpriv available — cannot enforce CapabilityBoundingSet"
@@ -4975,7 +4940,6 @@ _compile_seccomp_helper() {
 #include <linux/filter.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
-#include <sys/socket.h>
 
 static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
                           int protect_clock, int protect_hostname, int protect_kernel_logs,

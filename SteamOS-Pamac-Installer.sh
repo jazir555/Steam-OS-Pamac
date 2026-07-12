@@ -3826,10 +3826,10 @@ fi
 case "$arg" in
 --service-type=*) continue ;;
 --service-type) SKIP_NEXT=true; continue ;;
---pipe) PIPE_MODE=true; continue ;;
---wait) WAIT_MODE=true; continue ;;
+--pipe) continue ;;
+--wait) continue ;;
 --pty|-q|--quiet|--no-block) continue ;;
---description=*) DESCRIPTION="${arg#--description=}"; continue ;;
+--description=*) continue ;;
 --description) SKIP_NEXT=true; continue ;;
 --unit=*) continue ;;
 --unit) SKIP_NEXT=true; continue ;;
@@ -4223,6 +4223,9 @@ _NEEDS_SANDBOX=false
 [[ -n "$SYS_CALL_ARCH" ]] && _NEEDS_SANDBOX=true
 [[ -n "$SYS_CALL_LOG" ]] && _NEEDS_SANDBOX=true
 [[ -n "$SYS_CALL_ERRNO" ]] && _NEEDS_SANDBOX=true
+[[ -n "$NO_NEW_PRIVS" ]] && _NEEDS_SANDBOX=true
+[[ -n "$CAP_BOUNDING_SET" ]] && _NEEDS_SANDBOX=true
+[[ ${#READ_WRITE_PATHS[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
 if $_NEEDS_SANDBOX; then
     _log_dsr "Sandbox restrictions active: ProtectSystem=$PROTECT_SYSTEM ProtectHome=$PROTECT_HOME PrivateTmp=$PRIVATE_TMP PrivateDevices=$PRIVATE_DEVICES"
 fi
@@ -4799,10 +4802,14 @@ PERSONALITY_C
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/syscall.h>
-#include <linux/close_range.h>
+/* SYS_close_range: use direct syscall number for portability across
+   kernel header versions. Defined in asm/unistd.h on most arches. */
+#ifndef SYS_close_range
+#define SYS_close_range 436
+#endif
 int main() {
     /* close_range(3, ~0UL, 0): close all fds >= 3 */
-    if (syscall(__NR_close_range, 3, ~0UL, 0) == 0) {
+    if (syscall(SYS_close_range, 3, ~0UL, 0) == 0) {
         fprintf(stderr, "DisableExtraFileDescriptors: closed via close_range\n");
         return 0;
     }
@@ -4972,7 +4979,6 @@ _compile_seccomp_helper() {
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
-#include <linux/if.h>
 
 static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
                           int protect_clock, int protect_hostname, int protect_kernel_logs,
@@ -5478,7 +5484,7 @@ _build_seccomp_args() {
         [[ "$SYSTEM_CALL_FILTER" != "" ]] && _args="$_args --system-call-filter"
         [[ "$RESTRICT_FILE_SYSTEMS" != "" ]] && _args="$_args --restrict-file-systems"
         [[ -n "$CAP_BOUNDING_SET" ]] && _args="$_args --drop-caps"
-        [[ "$SYS_CALL_ARCH" == "native" ]] && _args="$_args --sys-call-arch-native"
+        [[ "$SYS_CALL_ARCH" == "native" || "$SYS_CALL_ARCH" == "yes" ]] && _args="$_args --sys-call-arch-native"
         [[ -n "$SYS_CALL_LOG" ]] && _args="$_args --sys-call-log"
         [[ -n "$SYS_CALL_ERRNO" ]] && _args="$_args --sys-call-errno=$SYS_CALL_ERRNO"
     fi
@@ -5531,15 +5537,32 @@ _prepare_seccomp() {
 }
 
 # ── _prepare_cap_priv: shared capability/NoNewPrivileges preparation ──
+# Reads the PARSED variables (NO_NEW_PRIVS, CAP_BOUNDING_SET) directly,
+# not the _DSR_* env vars which are only set by _apply_sandbox inside the sandbox.
 _prepare_cap_priv() {
     _CAP_PRIV=""
-    if [[ -n "${_DSR_CAPSH_ARGS:-}" ]]; then
-        _CAP_PRIV="capsh ${_DSR_CAPSH_ARGS} -- "
-    elif [[ -n "${_DSR_CAP_ARGS:-}" ]]; then
-        _CAP_PRIV="setpriv ${_DSR_CAP_ARGS} -- "
+    # Build capsh/setpriv prefix from the parsed CAP_BOUNDING_SET value
+    if [[ -n "${CAP_BOUNDING_SET:-}" ]]; then
+        if command -v capsh >/dev/null 2>&1; then
+            local _cap_str_n="${CAP_BOUNDING_SET//cap_/CAP_}"
+            case "$_cap_str_n" in
+                "~all"|"")    _CAP_PRIV="capsh --drop=all -- " ;;
+                "all")        _CAP_PRIV="" ;;
+                \~*)          _CAP_PRIV="capsh --drop=${_cap_str_n#\~} -- " ;;
+                *)            _CAP_PRIV="capsh --drop=all -- " ;;
+            esac
+        elif command -v setpriv >/dev/null 2>&1; then
+            local _cap_str_n="${CAP_BOUNDING_SET//cap_/CAP_}"
+            case "$_cap_str_n" in
+                "~all"|"")    _CAP_PRIV="setpriv --inh-caps=-all -- " ;;
+                "all")        _CAP_PRIV="" ;;
+                \~*)          _CAP_PRIV="setpriv --inh-caps=-${_cap_str_n#\~} -- " ;;
+                *)            _CAP_PRIV="setpriv --inh-caps=-all -- " ;;
+            esac
+        fi
     fi
     _NNP=""
-    [[ "${_DSR_NO_NEW_PRIVS:-}" == "true" ]] && _NNP="setpriv --no-new-privs -- "
+    [[ "${NO_NEW_PRIVS:-}" == "yes" ]] && _NNP="setpriv --no-new-privs -- "
 }
 
 # ── _run_sandboxed_bwrap: Execute a command using bwrap with sandboxing ──
@@ -5582,8 +5605,10 @@ _run_sandboxed_unshare() {
     local _run_user="$1"; shift
     local _unshare_net=""
     [[ -n "$PRIVATE_NETWORK" ]] && _unshare_net="--net"
+    # Use parsed PRIVATE_USERS directly (not _DSR_PRIVATE_USERS which is set
+    # by _apply_sandbox after sandbox entry — too late for unshare flags).
     local _unshare_user=""
-    [[ "${_DSR_PRIVATE_USERS:-}" == "true" ]] && _unshare_user="--user"
+    [[ "${PRIVATE_USERS:-}" == "yes" ]] && _unshare_user="--user"
     # Use --fork to create a new PID namespace (matches bwrap --unshare-pid)
     # and --mount-proc to give the child a private /proc showing only its own PIDs.
     # This closes the most significant gap in the unshare fallback: without PID

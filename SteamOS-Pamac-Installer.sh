@@ -275,7 +275,7 @@ sanitize_and_upload_log() {
         -e "s|$HOME|~HOME|g" \
         -e "s|/home/[a-zA-Z0-9_-]*|/home/<USER>|g" \
         -e 's/[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}/<IP>/g' \
-        -e 's/[0-9a-f]\{40,\}/<HASH>/gi' \
+        -e 's/(key_?id[=: ]|fingerprint[: ]|--fingerprint[= ])[0-9A-Fa-f]{40,}/key_id=<REDACTED>/gi' \
         -e 's/-----BEGIN [A-Z ]*KEY-----/<REDACTED KEY>/g' \
         -e 's/-----END [A-Z ]*KEY-----//g' \
         -e 's/(Bearer |Authorization:)[^ ]*/\1<REDACTED>/gi' \
@@ -346,16 +346,16 @@ _filter_verbose_output() {
     # NOTE: warning:.*downgrading and warning:.*removing are intentionally NOT
     # filtered — unexpected downgrades/removals during upgrades are exactly the
     # kind of issue a user must see, and hiding them can mask broken upgrades.
-    # NOTE: :: lines are partially filtered: only ::synchronizing and ::debug:
-    # are suppressed (these are noise). ::warning: and ::info: are intentionally
-    # KEPT VISIBLE — they contain actionable status (e.g. package downgrades,
-    # missing dependencies, version conflicts). Other :: lines (e.g. ::
-    # Retrieving packages, :: Processing changes, :: Proceed) are also kept.
+    # NOTE: Pacman uses `:: Synchronizing databases...` (space after `::` and
+    # capitalized text), `:: Retrieving packages...`, `:: Processing changes...`,
+    # `:: Proceed with installation?`, `debug: ...`, etc. Only the
+    # synchronizing and debug: progress markers are suppressed (noise);
+    # all other :: lines remain visible — they contain actionable status.
     # Pin: filter targets pacman 7.x output formats. If pacman changes its
     # :: prefix conventions, update the exclusion list accordingly.
     # Additional noise suppressed: plain "downloading" progress lines without
     # errors, "Nothing to do." churn, and "up to date" confirmations.
-    grep -v -E '^[[:space:]]*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database)|^downloading[[:space:]]|^::(synchronizing|debug:)|^Nothing to do\.| is up to date$' || true
+    grep -v -E '^[[:space:]]*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database)|^downloading[[:space:]]|^::[[:space:]]+(Synchronizing|debug:)|^Nothing to do\.| is up to date$' || true
 }
 
 run_command() {
@@ -2547,22 +2547,17 @@ safe_install() {
                 _remove_stale_lock
                 # Remove any stale lock aggressively
                 rm -f /var/lib/pacman/db.lck 2>/dev/null || true
-                # Kill only stale pacman/yay processes that held the lock
-                # (not all pacman processes — other builds may be running)
-                _stale_pids=$(pgrep -x pacman 2>/dev/null || true)
-                for _spid in $_stale_pids; do
-                    if [[ "$_spid" != "$$" ]] && [[ "$_spid" != "$PPID" ]]; then
-                        echo "  Force-killing stale pacman PID $_spid"
-                        kill -9 "$_spid" 2>/dev/null || true
-                    fi
-                done
-                _stale_yay_pids=$(pgrep -x yay 2>/dev/null || true)
-                for _ypid in $_stale_yay_pids; do
-                    if [[ "$_ypid" != "$$" ]] && [[ "$_ypid" != "$PPID" ]]; then
-                        echo "  Force-killing stale yay PID $_ypid"
-                        kill -9 "$_ypid" 2>/dev/null || true
-                    fi
-                done
+                # Only kill the process that holds /var/lib/pacman/db.lck (i.e.,
+                # the stale lock owner), NOT every pacman/yay PID on the system.
+                # Other legitimate pacman processes (other users, background
+                # updates) must not receive SIGKILL — doing so can corrupt the
+                # pacman database for other concurrent operations.
+                _lock_pid=$(cat /var/lib/pacman/db.lck 2>/dev/null || echo "")
+                if [[ -n "$_lock_pid" ]] && [[ "$_lock_pid" =~ ^[0-9]+$ ]] && \
+                   [[ "$_lock_pid" != "$$" ]] && [[ "$_lock_pid" != "$PPID" ]]; then
+                    echo "  Stale lock held by PID $_lock_pid, force-killing..."
+                    kill -9 "$_lock_pid" 2>/dev/null || true
+                fi
                 sleep 1
                 # Re-sync with overwrite limited to standard package dirs
                 pacman -Syy --noconfirm 2>/dev/null || true
@@ -2574,8 +2569,9 @@ safe_install() {
                 echo "  Recovery 3: Direct package reinstall attempt..."
                 _remove_stale_lock
                 for _pkg in "$@"; do
-                    # Try to find and install the package directly
-                    pacman -S --noconfirm --needed --overwrite "*" "$_pkg" 2>/dev/null || true
+                    # Overwrite only /usr/* — do not clobber /etc/ or /var/ config files.
+                    # A blanket --overwrite "*" can overwrite configuration files.
+                    pacman -S --noconfirm --needed --overwrite '/usr/*' "$_pkg" 2>/dev/null || true
                 done
                 _safe_sleep 2
             fi
@@ -3350,21 +3346,45 @@ _apply_sandbox() {
     # seccomp helper. This is a known limitation documented in the security model.
     if [[ -n "$CAP_BOUNDING_SET" ]]; then
         _log_dsr "Applying CapabilityBoundingSet=$CAP_BOUNDING_SET"
-        # Convert systemd format to setpriv --inh-caps format.
-        # systemd: "CAP_SYS_ADMIN:CAP_NET_ADMIN" or "~CAP_SYS_ADMIN" (drop these)
-        # setpriv: --inh-caps=+cap_sys_admin,+cap_net_admin or --inh-caps=-cap_sys_admin
-        if command -v setpriv >/dev/null 2>&1; then
+        # Prefer capsh FIRST — it truly drops bounding-set capabilities,
+        # preventing a sandboxed process from regaining caps via execve()
+        # of a setuid binary. setpriv --inh-caps only modifies the inheritable
+        # set, which is weaker. setpriv is used as the fallback.
+        if command -v capsh >/dev/null 2>&1; then
+            local _capsh_drop=""
+            local _cap_str2="$CAP_BOUNDING_SET"
+            _cap_str2="${_cap_str2//cap_/CAP_}"
+            if [[ "$_cap_str2" == "~all" ]] || [[ -z "$_cap_str2" ]]; then
+                _capsh_drop="--drop=all"
+            elif [[ "$_cap_str2" == "all" ]]; then
+                _capsh_drop=""
+            elif [[ "$_cap_str2" == \~* ]]; then
+                local _dropped2="${_cap_str2#\~}"
+                _dropped2="${_dropped2//:/,}"
+                _capsh_drop="--drop=${_dropped2,,}"
+            else
+                _capsh_drop="--drop=all"
+            fi
+            if [[ -n "$_capsh_drop" ]]; then
+                export _DSR_CAPSH_ARGS="$_capsh_drop"
+                _log_dsr "  Capability bounding set: capsh $_capsh_drop"
+            fi
+        elif command -v setpriv >/dev/null 2>&1; then
+            # Fallback: setpriv --inh-caps only modifies the inheritable
+            # capability set, NOT the bounding set. A sandboxed process can
+            # still regain capabilities via execve() of a setuid binary.
+            # This covers the primary AUR build threat model (no ambient caps
+            # = no capability inheritance through exec), but is weaker than
+            # capsh's full bounding-set enforcement.
+            _warn_dsr "  capsh not available — using setpriv fallback (inheritable set only)"
             local _cap_args=""
             local _cap_str="$CAP_BOUNDING_SET"
             _cap_str="${_cap_str//cap_/CAP_}"  # normalize to uppercase
             if [[ "$_cap_str" == "~all" ]] || [[ -z "$_cap_str" ]]; then
-                # Drop all capabilities
                 _cap_args="--inh-caps=-all"
             elif [[ "$_cap_str" == "all" ]]; then
-                # Keep all (no-op)
                 _cap_args=""
             elif [[ "$_cap_str" == \~* ]]; then
-                # Drop specific capabilities: ~CAP1:CAP2 → -cap1,-cap2
                 local _dropped="${_cap_str#\~}"
                 _dropped="${_dropped//:/ }"
                 local _neg_caps=""
@@ -3375,7 +3395,6 @@ _apply_sandbox() {
                 done
                 [[ -n "$_neg_caps" ]] && _cap_args="--inh-caps=$_neg_caps"
             else
-                # Keep specific capabilities: CAP1:CAP2 → +cap1,+cap2
                 local _kept="${_cap_str//:/ }"
                 local _pos_caps=""
                 for _c in $_kept; do
@@ -3390,32 +3409,7 @@ _apply_sandbox() {
                 _log_dsr "  Capability bounding set: setpriv $_cap_args"
             fi
         else
-            _warn_dsr "  setpriv not available — trying capsh fallback"
-            # Fallback: capsh --drop truly removes capabilities from the bounding
-            # set (not just the inheritable set like setpriv --inh-caps). This
-            # prevents a sandboxed process from regaining caps via setuid exec.
-            if command -v capsh >/dev/null 2>&1; then
-                local _capsh_drop=""
-                local _cap_str2="$CAP_BOUNDING_SET"
-                _cap_str2="${_cap_str2//cap_/CAP_}"
-                if [[ "$_cap_str2" == "~all" ]] || [[ -z "$_cap_str2" ]]; then
-                    _capsh_drop="--drop=all"
-                elif [[ "$_cap_str2" == "all" ]]; then
-                    _capsh_drop=""
-                elif [[ "$_cap_str2" == \~* ]]; then
-                    local _dropped2="${_cap_str2#\~}"
-                    _dropped2="${_dropped2//:/,}"
-                    _capsh_drop="--drop=${_dropped2,,}"
-                else
-                    _capsh_drop="--drop=all"
-                fi
-                if [[ -n "$_capsh_drop" ]]; then
-                    export _DSR_CAPSH_ARGS="$_capsh_drop"
-                    _log_dsr "  capsh fallback: capsh $_capsh_drop"
-                fi
-            else
-                _warn_dsr "  Neither setpriv nor capsh available — cannot enforce CapabilityBoundingSet"
-            fi
+            _warn_dsr "  Neither capsh nor setpriv available — cannot enforce CapabilityBoundingSet"
         fi
     fi
 
@@ -3724,6 +3718,9 @@ if $_NEEDS_SANDBOX; then
             echo "  cannot be enforced without the seccomp helper. Aborting to avoid" >&2
             echo "  running with degraded security." >&2
             exit 1
+        elif [[ -z "$_SECCOMP_HELPER" ]]; then
+            _warn_dsr "WARNING: seccomp helper compilation failed — seccomp-based sandboxing (MemoryDenyWriteExecute, RestrictSUIDSGID, ProtectKernelModules) will NOT be enforced for this build."
+            _warn_dsr "  The build will still run, but without syscall filtering. Install base-devel inside the container to enable seccomp sandboxing."
         fi
     fi
     # Build the sandboxed command
@@ -3791,6 +3788,9 @@ if $_NEEDS_SANDBOX; then
             echo "systemd-run(fake): FATAL: seccomp helper compilation failed under --strict-security." >&2
             echo "  Sandboxing properties cannot be enforced. Aborting." >&2
             exit 1
+        elif [[ -z "$_SECCOMP_HELPER" ]]; then
+            _warn_dsr "WARNING: seccomp helper compilation failed — seccomp-based sandboxing will NOT be enforced for this build."
+            _warn_dsr "  Install base-devel inside the container to enable seccomp sandboxing."
         fi
     fi
     if [[ -n "$_SECCOMP_HELPER" ]]; then
@@ -3828,6 +3828,9 @@ if $_NEEDS_SANDBOX; then
             echo "systemd-run(fake): FATAL: seccomp helper compilation failed under --strict-security." >&2
             echo "  Sandboxing properties cannot be enforced. Aborting." >&2
             exit 1
+        elif [[ -z "$_SECCOMP_HELPER" ]]; then
+            _warn_dsr "WARNING: seccomp helper compilation failed — seccomp-based sandboxing will NOT be enforced for this build."
+            _warn_dsr "  Install base-devel inside the container to enable seccomp sandboxing."
         fi
     fi
     if [[ -n "$_SECCOMP_HELPER" ]]; then
@@ -10660,8 +10663,7 @@ main() {
   if [[ "$FORCE_REBUILD" == "true" ]] && distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
     log_step "Force rebuild requested - removing existing container"
     CONTAINER_HAS_INIT="unknown"
-    uninstall_setup
-    force_remove_container "$CONTAINER_NAME"
+    uninstall_setup  # already calls force_remove_container internally
     sleep 2
   fi
 

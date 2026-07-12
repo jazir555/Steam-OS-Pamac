@@ -1227,7 +1227,7 @@ self_update() {
     if [[ -n "$_gh_resp" ]]; then
         # Prefer jq (structured JSON parsing) over fragile grep regex.
         # GitHub API may return HTML error pages if rate-limited (403/429).
-        if echo "$_gh_resp" | head -1 | grep -qiE '<!DOCTYPE|<html|message.*rate'; then
+        if grep -qiE '<!DOCTYPE|<html|message.*rate' <<< "$_gh_resp"; then
             log_warn "GitHub API rate-limited or returned HTML error. Cannot check for updates."
             return 1
         fi
@@ -7965,7 +7965,7 @@ _fetch_aur_pkgbuild() {
         # Detect Cloudflare challenges, rate limits, and HTML error pages
         if [[ "$_cgit_http_code" == "429" ]]; then
             echo "# WARN: CGIT endpoint rate-limited (HTTP 429). Cloudflare throttling." >&2
-        elif echo "$_cgit_resp" | head -5 | grep -qiE '<!DOCTYPE|<html|<head|challenge-platform|cf-browser|Attention Required|Just a moment'; then
+        elif grep -qiE '<!DOCTYPE|<html|<head|challenge-platform|cf-browser|Attention Required|Just a moment' <<< "$_cgit_resp"; then
             echo "# WARN: CGIT endpoint returned HTML (Cloudflare challenge/block, HTTP $_cgit_http_code)." >&2
         elif echo "$_cgit_resp" | grep -q "^pkgname="; then
             echo "$_cgit_resp"
@@ -8045,7 +8045,7 @@ fi
 
 # Validate that the fetched content is actually a PKGBUILD, not an HTML error
 # page (Cloudflare challenge, rate-limit block, or AUR maintenance page).
-if echo "$aur_pkgbuild" | head -5 | grep -qiE '<!DOCTYPE|<html|<head|challenge-platform|Attention Required|Just a moment|403 Forbidden|503 Service'; then
+if grep -qiE '<!DOCTYPE|<html|<head|challenge-platform|Attention Required|Just a moment|403 Forbidden|503 Service' <<< "$aur_pkgbuild"; then
     echo "WARN: Fetched content is not a valid PKGBUILD (HTML error page detected)."
     echo "WARN: AUR/CGIT may be rate-limited or blocked by Cloudflare."
     echo "WARN: If stale cache exists, it will be used; otherwise skipping compat check."

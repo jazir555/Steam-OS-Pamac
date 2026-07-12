@@ -6018,8 +6018,8 @@ set -uo pipefail
 
 _remove_stale_lock
 
-echo "Installing core packages (sudo, shadow, gnupg, jq, python, bubblewrap, libcap, pacman-contrib)..."
-if ! safe_install sudo shadow gnupg jq python bubblewrap libcap pacman-contrib; then
+echo "Installing core packages (sudo, shadow, gnupg, jq, python, bubblewrap, libcap, socat, pacman-contrib)..."
+if ! safe_install sudo shadow gnupg jq python bubblewrap libcap socat pacman-contrib; then
     echo "ERROR: Failed to install core packages after retries."
     exit 1
 fi
@@ -6027,7 +6027,7 @@ echo "Core packages installed."
 CORE_EOF
 
     if ! exec_container_script "$core_script" "core-packages"; then
-        log_error "Failed to install core packages (sudo, shadow, gnupg, jq, python)."
+        log_error "Failed to install core packages (sudo, shadow, gnupg, jq, python, socat)."
         log_error "CRITICAL: downstream stages (user setup, dev packages, pamac) require these."
         log_error "Any further failures are likely caused by this core-packages failure."
         _ok=false
@@ -9534,16 +9534,43 @@ if [[ -z "\${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
     # Priority 5: Start a private dbus-daemon session as last resort.
     # This handles cases where SteamOS modifies session lifecycle, the host
     # session bus is dead, or XDG_RUNTIME_DIR is missing/empty.
+    # The daemon is tracked via a PID file and cleaned up on wrapper exit
+    # so orphaned dbus-daemon processes don't accumulate across runs.
     if [[ "\$_dbus_found" == "false" ]]; then
         if command -v dbus-daemon >/dev/null 2>&1; then
             _private_bus_dir="\$XDG_RUNTIME_DIR"
             [[ -d "\$_private_bus_dir" ]] || _private_bus_dir="/tmp/dbus-session-\$(id -u)"
             mkdir -p "\$_private_bus_dir" 2>/dev/null || true
             _private_bus_addr="unix:path=\$_private_bus_dir/bus-session-private"
-            if dbus-daemon --session --fork --address="\$_private_bus_addr" \
-                --print-pid 2>/dev/null | head -1 > /tmp/.dsr-private-bus-pid; then
+            _private_bus_pidfile="/tmp/.dsr-private-bus-pid"
+            _dbus_daemon_pid=""
+            _dbus_daemon_pid=\$(dbus-daemon --session --fork --address="\$_private_bus_addr" \
+                --print-pid 2>/dev/null) || true
+            if [[ -n "\$_dbus_daemon_pid" ]] && [[ "\$_dbus_daemon_pid" =~ ^[0-9]+$ ]]; then
+                # Store PID and socket path for cleanup trap (trap fires after
+                # local variables go out of scope, so we persist to a file).
+                printf '%s\n%s\n' "\$_dbus_daemon_pid" "\$_private_bus_addr" > "\$_private_bus_pidfile" 2>/dev/null || true
                 export DBUS_SESSION_BUS_ADDRESS="\$_private_bus_addr"
                 _dbus_found=true
+                # Register cleanup: kill the private daemon when this wrapper exits.
+                # Prevents orphaned dbus-daemon processes from accumulating when
+                # pamac-manager crashes or the user closes it. Reads PID and socket
+                # path from the PID file since local variables are out of scope.
+                trap '_bp=\$(sed -n 1p /tmp/.dsr-private-bus-pid 2>/dev/null || echo "");
+                    _ba=\$(sed -n 2p /tmp/.dsr-private-bus-pid 2>/dev/null || echo "");
+                    if [[ -n "\$_bp" ]] && [[ "\$_bp" =~ ^[0-9]+$ ]] && kill -0 "\$_bp" 2>/dev/null; then
+                        kill "\$_bp" 2>/dev/null || true;
+                        _wt=0;
+                        while [[ \$_wt -lt 3 ]] && kill -0 "\$_bp" 2>/dev/null; do
+                            sleep 1; _wt=\$(( _wt + 1 ));
+                        done;
+                        kill -0 "\$_bp" 2>/dev/null && kill -9 "\$_bp" 2>/dev/null || true;
+                    fi;
+                    rm -f /tmp/.dsr-private-bus-pid 2>/dev/null;
+                    if [[ -n "\$_ba" ]]; then
+                        _bs=\${_ba#unix:path=};
+                        rm -f "\$_bs" 2>/dev/null || true;
+                    fi' EXIT INT TERM HUP
             fi
         fi
     fi

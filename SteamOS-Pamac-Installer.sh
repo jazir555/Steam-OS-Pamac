@@ -2992,6 +2992,53 @@ _set_makepkg_jobs() {
     echo "MAKEFLAGS set to -j${jobs} (RAM-constrained build parallelism)"
 }
 
+# ── Pre-build OOM check: dynamically reduce parallelism if memory dropped ──
+# Called before every makepkg/yay build invocation. If available RAM has
+# dropped below the threshold since _set_makepkg_jobs calculated the
+# parallelism, this function reduces MAKEFLAGS to prevent OOM-kills
+# mid-compilation (gcc/vala are memory-hungry and OOM during build
+# corrupts partial object files and wastes all prior write cycles).
+_preflight_oom_check() {
+    local _desc="${1:-build}"
+    if [[ ! -f /proc/meminfo ]]; then
+        return 0
+    fi
+    local _mem_avail_kb
+    _mem_avail_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    local _swap_avail_kb
+    _swap_avail_kb=$(awk '/^SwapFree:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    local _total_kb=$(( _mem_avail_kb + _swap_avail_kb ))
+
+    # Critical threshold: <256MB — abort to prevent OOM corruption
+    if [[ "$_total_kb" -lt 262144 ]]; then
+        local _avail_mb=$(( _total_kb / 1024 ))
+        log_error "CRITICAL: Only ${_avail_mb}MB RAM+swap available before $_desc."
+        log_error "OOM kill during gcc/vala compilation would corrupt build artifacts."
+        log_error "Close other applications or add swap, then retry."
+        return 1
+    fi
+
+    # Warning threshold: recalculate jobs if memory dropped significantly
+    # since the initial _set_makepkg_jobs call.
+    local _current_jobs
+    _current_jobs=$(echo "$MAKEFLAGS" | grep -oP '\-j\K[0-9]+' || echo 1)
+    local _ram_per_job_kb=768000
+    if [[ "${LOW_MEMORY:-false}" == "true" ]]; then
+        _ram_per_job_kb=$(( _ram_per_job_kb * 2 ))
+    fi
+    local _safe_jobs=$(( _total_kb / _ram_per_job_kb ))
+    [[ "$_safe_jobs" -lt 1 ]] && _safe_jobs=1
+    local _ncpu
+    _ncpu=$(nproc 2>/dev/null || echo 1)
+    [[ "$_safe_jobs" -gt "$_ncpu" ]] && _safe_jobs="$_ncpu"
+
+    if [[ "$_safe_jobs" -lt "$_current_jobs" ]]; then
+        log_warn "Memory dropped before $_desc: reducing MAKEFLAGS from -j${_current_jobs} to -j${_safe_jobs}"
+        export MAKEFLAGS="-j${_safe_jobs}"
+    fi
+    return 0
+}
+
 # ── eMMC/flash wear reduction: tmpfs build directory + ccache ──
 # Large C++/Vala AUR builds (yay, pamac-aur) generate massive write cycles
 # that degrade eMMC/SD flash memory. This function mitigates wear by:
@@ -7949,6 +7996,7 @@ _safe_sleep "$wait_time"
 done
 
 chown -R "$current_user:$current_user" "$_YAY_WORK/yay"
+_preflight_oom_check "yay build"
 _set_makepkg_jobs
 sudo -Hu "$current_user" bash -lc "cd '$_YAY_WORK/yay' && makepkg -si --noconfirm --clean"
 build_rc=$?
@@ -8049,6 +8097,7 @@ if [[ -n "$pamac_version_pin" && "$pamac_version_pin" != "latest" ]]; then
     _compat_work=$(mktemp -d /var/tmp/pamac-compat-XXXXXX) && chmod 700 "$_compat_work" 2>/dev/null || _compat_work=$(mktemp -d)
     if sudo -Hu "$current_user" bash -lc "git clone --depth 1 --branch '$pamac_version_pin' https://aur.archlinux.org/pamac-aur.git '$_compat_work/pamac-aur'" 2>&1 || \
        sudo -Hu "$current_user" bash -lc "git clone --depth 1 https://aur.archlinux.org/pamac-aur.git '$_compat_work/pamac-aur' && cd '$_compat_work/pamac-aur' && git checkout '$pamac_version_pin'" 2>&1; then
+        _preflight_oom_check "pamac-aur compat build"
         _set_makepkg_jobs
         if sudo -Hu "$current_user" bash -lc "cd '$_compat_work/pamac-aur' && makepkg -si --noconfirm --clean" 2>&1; then
             echo "SUCCESS: pamac-aur $pamac_version_pin installed from git."
@@ -8076,7 +8125,8 @@ _fetch_aur_pkgbuild() {
 
     # Method 1: AUR RPC v5 JSON API (most stable, no CGIT dependency)
     # Returns package metadata as JSON including Depends/MakeDepends arrays.
-    # We format the output as PKGBUILD-like text so downstream grep parsing works.
+    # We use jq exclusively to extract the pacman version constraint directly
+    # from the structured JSON, avoiding fragile grep/awk regex parsing.
     local _rpc_url="https://aur.archlinux.org/rpc/v5/info/pamac-aur"
     local _rpc_resp=""
     local _rpc_http_code=""
@@ -8093,30 +8143,36 @@ _fetch_aur_pkgbuild() {
         elif [[ "$_rpc_http_code" =~ ^5[0-9][0-9]$ ]]; then
             echo "# WARN: AUR RPC returned HTTP $_rpc_http_code (server error). AUR may be down." >&2
         fi
-        # Validate JSON response structure with jq (avoids regex fragility on
-        # future API field renames or reordering).
-        local _resultcount=""
-        _resultcount=$(echo "$_rpc_resp" | jq -r '.resultcount // empty' 2>/dev/null) || {
-            echo "# WARN: AUR RPC response is not valid JSON (may be HTML error page from Cloudflare)." >&2
-            _resultcount=""
-        }
-        if [[ "$_resultcount" == "1" ]]; then
-            local _deps_formatted _makedeps_formatted
-            _deps_formatted=$(echo "$_rpc_resp" | jq -r '.results[0].Depends // [] | join("\n")' 2>/dev/null || echo "")
-            _makedeps_formatted=$(echo "$_rpc_resp" | jq -r '.results[0].MakeDepends // [] | join("\n")' 2>/dev/null || echo "")
-            if [[ -n "$_deps_formatted" ]]; then
-                echo "depends=($_deps_formatted)"
-            fi
-            if [[ -n "$_makedeps_formatted" ]]; then
-                echo "makedepends=($_makedeps_formatted)"
-            fi
-            if [[ -n "$_deps_formatted" || -n "$_makedeps_formatted" ]]; then
-                echo "# Generated from AUR RPC v5 API"
+        # Validate JSON and extract pacman dependency constraint using jq.
+        # The RPC response contains Depends/MakeDepends as JSON arrays of strings
+        # like ["pacman>=6.0", "libalpm.so=14-64"]. We filter for entries starting
+        # with "pacman" and extract the operator + version directly from JSON.
+        if command -v jq >/dev/null 2>&1; then
+            local _pacman_dep=""
+            _pacman_dep=$(echo "$_rpc_resp" | jq -r '
+                (.results[0].Depends // []) + (.results[0].MakeDepends // [])
+                | map(select(test("^pacman")))
+                | .[0] // empty
+                ' 2>/dev/null || echo "")
+            if [[ -n "$_pacman_dep" ]]; then
+                echo "# Parsed from AUR RPC v5 (jq): $_pacman_dep"
+                echo "pacman_dep=$_pacman_dep"
                 _method_succeeded="RPC"
                 return 0
             fi
-        elif [[ -n "$_resultcount" ]]; then
-            echo "# WARN: AUR RPC returned resultcount=$_resultcount (expected 1)" >&2
+            # No pacman constraint found — check if we got valid data at all
+            local _resultcount=""
+            _resultcount=$(echo "$_rpc_resp" | jq -r '.resultcount // empty' 2>/dev/null || echo "")
+            if [[ "$_resultcount" == "1" ]]; then
+                echo "# No explicit pacman version constraint in pamac-aur Depends/MakeDepends."
+                echo "pacman_dep="
+                _method_succeeded="RPC"
+                return 0
+            elif [[ -n "$_resultcount" ]]; then
+                echo "# WARN: AUR RPC returned resultcount=$_resultcount (expected 1)" >&2
+            fi
+        else
+            echo "# WARN: jq not available — cannot parse AUR RPC response." >&2
         fi
     fi
 
@@ -8136,38 +8192,69 @@ _fetch_aur_pkgbuild() {
         elif grep -qiE '<!DOCTYPE|<html|<head|challenge-platform|cf-browser|Attention Required|Just a moment' <<< "$_cgit_resp"; then
             echo "# WARN: CGIT endpoint returned HTML (Cloudflare challenge/block, HTTP $_cgit_http_code)." >&2
         elif echo "$_cgit_resp" | grep -q "^pkgname="; then
-            echo "$_cgit_resp"
+            # Extract pacman dependency from PKGBUILD text using awk
+            local _cgit_pacman_dep
+            _cgit_pacman_dep=$(echo "$_cgit_resp" | awk '
+                /^(depends|makedepends)\+?=/ {
+                    for (i = 1; i <= NF; i++) {
+                        if ($i ~ /^pacman[><=]/) { print $i; exit }
+                    }
+                }
+            ' || echo "")
+            echo "# Parsed from CGIT PKGBUILD (awk): ${_cgit_pacman_dep:-none}"
+            echo "pacman_dep=$_cgit_pacman_dep"
             _method_succeeded="CGIT"
             return 0
         fi
     fi
 
     # Method 3: git clone to read PKGBUILD directly (bypasses web frontend)
+    # Retry up to 2 times with exponential backoff for transient network issues.
     _method_tried="git-clone"
     local _git_tmp=""
-    _git_tmp=$(mktemp -d 2>/dev/null || echo "")
-    if [[ -n "$_git_tmp" ]]; then
-        local _clone_err=""
-        _clone_err=$(mktemp 2>/dev/null || echo "/dev/null")
-        if git clone --depth 1 --single-branch https://aur.archlinux.org/pamac-aur.git "$_git_tmp/pamac-aur" 2>"$_clone_err"; then
-            if [[ -f "$_git_tmp/pamac-aur/PKGBUILD" ]]; then
-                cat "$_git_tmp/pamac-aur/PKGBUILD"
-                rm -rf "$_git_tmp" "$_clone_err"
-                _method_succeeded="git-clone"
-                return 0
+    local _clone_attempt=0
+    local _clone_max=2
+    while [[ $_clone_attempt -lt $_clone_max ]]; do
+        _git_tmp=$(mktemp -d 2>/dev/null || echo "")
+        if [[ -n "$_git_tmp" ]]; then
+            local _clone_err=""
+            _clone_err=$(mktemp 2>/dev/null || echo "/dev/null")
+            if git clone --depth 1 --single-branch https://aur.archlinux.org/pamac-aur.git "$_git_tmp/pamac-aur" 2>"$_clone_err"; then
+                if [[ -f "$_git_tmp/pamac-aur/PKGBUILD" ]]; then
+                    # Extract pacman dependency from PKGBUILD text using awk
+                    local _clone_pacman_dep
+                    _clone_pacman_dep=$(awk '
+                        /^(depends|makedepends)\+?=/ {
+                            for (i = 1; i <= NF; i++) {
+                                if ($i ~ /^pacman[><=]/) { print $i; exit }
+                            }
+                        }
+                    ' "$_git_tmp/pamac-aur/PKGBUILD" || echo "")
+                    echo "# Parsed from git-clone PKGBUILD (awk): ${_clone_pacman_dep:-none}"
+                    echo "pacman_dep=$_clone_pacman_dep"
+                    rm -rf "$_git_tmp" "$_clone_err"
+                    _method_succeeded="git-clone"
+                    return 0
+                fi
+            else
+                local _clone_msg
+                _clone_msg=$(cat "$_clone_err" 2>/dev/null || echo "unknown")
+                echo "# WARN: git clone attempt $((_clone_attempt+1))/$_clone_max failed: $_clone_msg" >&2
             fi
-        else
-            local _clone_msg
-            _clone_msg=$(cat "$_clone_err" 2>/dev/null || echo "unknown")
-            echo "# WARN: git clone of pamac-aur failed: $_clone_msg" >&2
+            rm -rf "$_git_tmp" "$_clone_err"
         fi
-        rm -rf "$_git_tmp" "$_clone_err"
-    fi
+        _clone_attempt=$((_clone_attempt + 1))
+        if [[ $_clone_attempt -lt $_clone_max ]]; then
+            local _backoff=$(( _clone_attempt * 3 ))
+            echo "# INFO: Retrying git clone in ${_backoff}s..." >&2
+            sleep "$_backoff"
+        fi
+    done
 
-    # All methods exhausted
-    echo "# WARN: All AUR fetch methods failed (tried: RPC v5, CGIT, git-clone)." >&2
+    # All methods exhausted — signal failure so caller can use stale cache
+    echo "# WARN: All AUR fetch methods failed (tried: RPC v5, CGIT, git-clone x${_clone_max})." >&2
     echo "# WARN: AUR may be rate-limited, down, or network is unreachable." >&2
-    echo "# WARN: Proceeding without AUR PKGBUILD data — compatibility check will be skipped." >&2
+    echo "# WARN: Will attempt to use stale cached PKGBUILD if available." >&2
     return 1
 }
 
@@ -8211,43 +8298,35 @@ if [[ -z "$aur_pkgbuild" ]]; then
     exit 0
 fi
 
-# Validate that the fetched content is actually a PKGBUILD, not an HTML error
-# page (Cloudflare challenge, rate-limit block, or AUR maintenance page).
-if grep -qiE '<!DOCTYPE|<html|<head|challenge-platform|Attention Required|Just a moment|403 Forbidden|503 Service' <<< "$aur_pkgbuild"; then
-    echo "WARN: Fetched content is not a valid PKGBUILD (HTML error page detected)."
-    echo "WARN: AUR/CGIT may be rate-limited or blocked by Cloudflare."
-    echo "WARN: If stale cache exists, it will be used; otherwise skipping compat check."
-    # Try to use stale cache as fallback
-    if [[ -f "$_AUR_CACHE_FILE" && "$_cache_age" -lt 2592000 ]]; then
-        aur_pkgbuild=$(cat "$_AUR_CACHE_FILE" 2>/dev/null || echo "")
-        if [[ -n "$aur_pkgbuild" ]] && echo "$aur_pkgbuild" | grep -q "^pkgname="; then
-            echo "Using stale cached PKGBUILD (${_cache_age}s old) as fallback."
-        else
-            echo "WARN: Stale cache also invalid. Skipping compat check."
-            exit 0
-        fi
-    else
-        echo "WARN: No valid cached PKGBUILD available. Skipping compat check."
-        exit 0
-    fi
+# Extract pacman dependency from the structured AUR RPC output.
+# _fetch_aur_pkgbuild now outputs "pacman_dep=X.Y" (from jq parsing)
+# or falls back to PKGBUILD text with grep extraction.
+aur_pacman_dep=""
+if echo "$aur_pkgbuild" | grep -q "^pacman_dep="; then
+    # Structured output from jq-based RPC parsing (preferred path)
+    aur_pacman_dep=$(echo "$aur_pkgbuild" | grep "^pacman_dep=" | cut -d= -f2-)
+elif echo "$aur_pkgbuild" | grep -q "^depends=\|^makedepends="; then
+    # Legacy PKGBUILD text fallback (CGIT/git-clone methods)
+    aur_pacman_dep=$(echo "$aur_pkgbuild" | grep -E "^(depends|makedepends)\\+?=" | grep -oP "pacman[><= ]+[0-9.]+" | head -1 || echo "")
 fi
 
-aur_pacman_dep=$(echo "$aur_pkgbuild" | grep -E "^(depends|makedepends)\\+?=" | grep -oP "pacman[><= ]+[0-9.]+" | head -1 || echo "")
 if [[ -z "$aur_pacman_dep" ]]; then
-    echo "No explicit pacman version constraint found in pamac-aur PKGBUILD."
+    echo "No explicit pacman version constraint found in pamac-aur."
     echo "Compatibility assumed. Proceeding."
     exit 0
 fi
 
-echo "pamac-aur requires: $aur_pacman_dep"
-req_version=$(echo "$aur_pacman_dep" | grep -oP "[0-9.]+" | head -1 || echo "")
-req_op=$(echo "$aur_pacman_dep" | grep -oP "[><=]+" | head -1 || echo "")
+echo "pamac-aur requires: pacman $aur_pacman_dep"
 
-# Validate parsed version components — malformed PKGBUILD data (e.g., from
-# Cloudflare HTML pages that partially matched the regex) could produce empty
+# Parse version constraint: extract operator and version components.
+# The constraint format is like ">=6.0" or "=5.2.1" or ">5.0".
+req_op=$(echo "$aur_pacman_dep" | grep -oP '[><=]+' | head -1 || echo "")
+req_version=$(echo "$aur_pacman_dep" | grep -oP '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || echo "")
+
+# Validate parsed version components — malformed data could produce empty
 # or nonsensical values. Fail gracefully instead of comparing against garbage.
 if [[ -z "$req_version" || -z "$req_op" ]]; then
-    echo "WARN: Could not parse version requirement from PKGBUILD (req_version='$req_version' req_op='$req_op')."
+    echo "WARN: Could not parse version requirement (req_version='$req_version' req_op='$req_op')."
     echo "WARN: PKGBUILD data may be malformed. Skipping compatibility check."
     exit 0
 fi
@@ -8541,7 +8620,17 @@ for try_commit in $_commits; do
         continue
     fi
 
-    old_dep=$(echo "$old_pkgbuild" | grep -E "^(depends|makedepends)\\+?=" | grep -oP "pacman[><= ]+[0-9.]+" | head -1 || echo "")
+    old_dep=$(echo "$old_pkgbuild" | awk '
+        /^(depends|makedepends)\+?=/ {
+            # Extract "pacman>=X.Y" or "pacman=X.Y" from the dependency list
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^pacman[><=]/) {
+                    print $i
+                    exit
+                }
+            }
+        }
+    ' || echo "")
     if [[ -z "$old_dep" ]]; then
         echo "  -> No pacman constraint in this revision (likely compatible)"
         commit_date=$(git -C "$_AUR_WORK" log -1 --format=%ai "$try_commit" 2>/dev/null || echo "unknown date")
@@ -8795,6 +8884,7 @@ install_from_aur_commit() {
         fi
     fi
     echo "Building pamac-aur from commit ${commit:0:12}..."
+    _preflight_oom_check "pamac-aur commit build"
     _set_makepkg_jobs
     sudo -Hu "$current_user" bash -lc "cd '$work_dir' && makepkg -si --noconfirm --clean" 2>/tmp/pamac_build_err
     local build_rc=$?
@@ -8808,6 +8898,7 @@ install_from_aur_commit() {
 }
 
 install_from_yay() {
+    _preflight_oom_check "pamac-aur yay install"
     _set_makepkg_jobs
     local _jobs
     _jobs=$(_calc_makepkg_jobs)
@@ -9022,6 +9113,7 @@ case "$compat_strategy" in
             local _fb_work
             _fb_work=$(mktemp -d /var/tmp/pamac-fb-XXXXXX) && chmod 700 "$_fb_work" 2>/dev/null || _fb_work=$(mktemp -d)
             if sudo -Hu "$current_user" bash -lc "git clone --depth=1 https://aur.archlinux.org/pamac-aur.git '$_fb_work/pamac-aur'" 2>"$_fb_work/err"; then
+                _preflight_oom_check "pamac-aur fallback build"
                 _set_makepkg_jobs
                 if sudo -Hu "$current_user" bash -lc "cd '$_fb_work/pamac-aur' && makepkg -si --noconfirm --clean" 2>&1 | tail -15; then
                     pamac_installed=true
@@ -9049,6 +9141,7 @@ fi
 if ! command -v pamac >/dev/null 2>&1; then
     echo "pamac CLI not found after install. Retrying without --needed..."
     _remove_stale_lock
+    _preflight_oom_check "pamac-aur retry install"
     _set_makepkg_jobs
     local _jobs
     _jobs=$(_calc_makepkg_jobs)
@@ -11293,14 +11386,35 @@ app_name = sys.argv[6]
 owner_pkg = sys.argv[7]
 _cm = sys.argv[8]
 
-# Read raw file to preserve sections configparser may flatten
-with open(desktop_path, 'r') as f:
-    raw = f.read()
+try:
+    # Read raw file to preserve sections configparser may flatten
+    with open(desktop_path, 'r') as f:
+        raw = f.read()
 
-# Parse into ordered sections
-parser = configparser.ConfigParser(strict=False, interpolation=None)
-parser.optionxform = str  # preserve key casing
-parser.read_string(raw)
+    if not raw.strip():
+        print(f"WARN: Desktop file is empty: {desktop_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # Parse into ordered sections. .desktop files are not strictly INI-compliant
+    # (duplicate keys, missing values, localized keys like Name[de]). Use
+    # strict=False and handle potential parsing errors gracefully.
+    parser = configparser.ConfigParser(strict=False, interpolation=None)
+    parser.optionxform = str  # preserve key casing
+    try:
+        parser.read_string(raw)
+    except configparser.ParsingError as e:
+        # Malformed .desktop file — try line-by-line recovery
+        print(f"WARN: ConfigParser failed ({e}), attempting line-by-line recovery", file=sys.stderr)
+        safe_lines = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith('[') or '=' in line:
+                safe_lines.append(line)
+        parser.read_string('\n'.join(safe_lines))
+
+    if not parser.sections():
+        print(f"WARN: No sections found in {desktop_path} — file may be malformed", file=sys.stderr)
+        sys.exit(1)
 
 entry = {}
 other_sections = {}
@@ -11394,6 +11508,12 @@ except Exception as e:
     if os.path.exists(temp_name):
         os.unlink(temp_name)
     raise e
+
+except Exception as e:
+    print(f"ERROR: Desktop file rewrite failed: {e}", file=sys.stderr)
+    print(f"  File: {desktop_path}", file=sys.stderr)
+    print(f"  The original file was preserved (backup at .bak if created).", file=sys.stderr)
+    sys.exit(1)
 PYTHON_DESKTOP_REWRITE
   local _py_rc=$?
   if [[ \$_py_rc -ne 0 ]]; then

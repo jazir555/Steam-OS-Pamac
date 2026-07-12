@@ -459,15 +459,6 @@ run_command() {
     return "$status"
 }
 
-# ── Locale-safe pacman wrapper ──
-# Forces LC_ALL=C so pacman's English output strings (error messages,
-# "No database errors", "conflicting files", etc.) match the regexes
-# used throughout this script regardless of the user's locale.
-# Usage: _pacman [pacman args...]  (drop-in replacement for pacman)
-_pacman() {
-    LC_ALL=C pacman "$@"
-}
-
 container_runtime() {
     local mgr="${DISTROBOX_CONTAINER_MANAGER:-podman}"
     if [[ "$mgr" == "docker" ]]; then
@@ -3118,7 +3109,7 @@ safe_install() {
                     echo "  Exit 1: General error (dependency conflict, etc.)."
                     # Check for file conflicts — capture output first, then grep,
                     # to avoid pipefail truncating grep's input if pacman exits early.
-                    _pacman_diag=$(_pacman -S --noconfirm --needed "$@" 2>&1 || true)
+                    _pacman_diag=$(LC_ALL=C pacman -S --noconfirm --needed "$@" 2>&1 || true)
                     _conflict_output=$(echo "$_pacman_diag" | grep -i "conflicting files\|exists in filesystem" || true)
                     if [[ -n "$_conflict_output" ]]; then
                         echo "  File conflicts detected. Trying with targeted --overwrite for /usr/lib and /usr/share..."

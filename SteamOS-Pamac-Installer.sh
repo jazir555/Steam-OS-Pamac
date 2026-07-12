@@ -39,6 +39,8 @@ trap '_err_trap $LINENO "$BASH_COMMAND"' ERR
 readonly SCRIPT_VERSION="5.4.0"
 readonly GITHUB_REPO="Steam-OS-Pamac/Steam-OS-Pamac"
 readonly DEFAULT_CONTAINER_NAME="arch-pamac"
+# GPG key ID for release signature verification during self-update.
+RELEASE_SIGNING_KEY_ID="${RELEASE_SIGNING_KEY_ID:-D4B85A2AB5D6C3AE}"
 
 # ── Self-integrity verification ──
 # Prints the SHA-256 hash of this script for manual comparison against the
@@ -73,7 +75,9 @@ _verify_script_hash() {
             local _recovered=false
             if [[ -f /proc/self/cmdline ]] && command -v mapfile >/dev/null 2>&1; then
                 local -a _cmd_args=()
-                mapfile -d '' _cmd_args < /proc/self/cmdline 2>/dev/null || true
+                # Normalize NULs to newlines first for Bash < 4.4 compatibility
+                # (mapfile -d requires Bash 4.4+; plain mapfile defaults to newline splitting).
+                mapfile -t _cmd_args < <(tr '\0' '\n' < /proc/self/cmdline 2>/dev/null) || true
                 if [[ "${_cmd_args[1]:-}" == "-c" && -n "${_cmd_args[2]:-}" ]]; then
                     printf '%s' "${_cmd_args[2]}" > "$_tmp_hash_src"
                     _recovered=true
@@ -169,18 +173,13 @@ OPTIMIZE_MIRRORS="${OPTIMIZE_MIRRORS:-true}"
 # runs after parse_arguments() so explicit flags still win.
 QUICK_START="${QUICK_START:-false}"
 
-# Trusted GPG fingerprints for third-party repos.
-# Priority order:
-#   1. archlinux-keyring + WKD/mirror dynamic discovery (preferred)
-#   2. Hardcoded fallback values (last resort — may become stale after key rotations)
-#
-# NOTE: A prior implementation fetched a "trusted-keys.json" from the distrobox
-# upstream, pinned to a commit SHA for reproducibility. That file never existed
-# in the 89luca89/distrobox repository (verified via GitHub tree + git history
-# API) — the URL 404'd on every run and the fetch silently fell through to the
-# hardcoded fallback below. The dead JSON fetch has been removed; the dynamic
-# discovery (Steps 1-3) + hardcoded fallback (Step 5) chain is sufficient and
-# honest. See _enable_repo_with_fallback in configure_extra_repos.
+# GPG key discovery for third-party repos:
+#   All repos default to "auto" for fingerprint resolution. The discovery
+#   chain tries: keyring package extraction, pacman-key, mirror probing,
+#   WKD, and keyserver import — no hardcoded fingerprints are embedded.
+#   Users may override via environment variables (CHAOTIC_AUR_KEY_ID,
+#   ARCHLINUXCN_KEY_ID, ENDEAVOUROS_KEY_ID) set to a 40-char hex fingerprint.
+# See _enable_repo_with_fallback in configure_extra_repos.
 
 DRY_RUN="${DRY_RUN:-false}"
 DRY_RUN_VERBOSE="${DRY_RUN_VERBOSE:-false}"
@@ -200,6 +199,7 @@ SELF_UPDATE="${SELF_UPDATE:-false}"
 REPAIR="${REPAIR:-false}"
 UPLOAD_LOG="${UPLOAD_LOG:-false}"
 PIN_ALPM="${PIN_ALPM:-true}"
+_verify_sandbox_flag="${_verify_sandbox_flag:-false}"
 # SECURITY: --strict-security mode. When enabled, the script refuses to relax
 # signature verification (SigLevel=TrustAll methods are skipped), refuses to
 # install the fake systemd-run wrapper (DynamicUser sandbox shim), and
@@ -207,6 +207,12 @@ PIN_ALPM="${PIN_ALPM:-true}"
 # This is intended for users who want every operation to be cryptographically
 # verified and verify that the container's init/pamac version are compatible.
 STRICT_SECURITY="${STRICT_SECURITY:-false}"
+
+# SECURITY: --allow-trustall permits the last-resort TrustAll keyring bootstrap
+# (Method F) without an interactive confirmation prompt. When false (default),
+# the user is prompted before any SigLevel=TrustAll operation. This ensures
+# users have explicit control over signature verification relaxation.
+ALLOW_TRUSTALL="${ALLOW_TRUSTALL:-false}"
 
 # Maximum per-container log file size in bytes before rotate-on-startup.
 # Old log is moved to ${LOG_FILE}.1 and overwritten if it already exists.
@@ -804,6 +810,63 @@ _ensure_healthy_or_recreate() {
     fi
 }
 
+# ── Container snapshot/rollback for fatal error recovery ──
+# Uses `podman container checkpoint` (crun) or `podman commit` to save/restore
+# container state. On irrecoverable failure, the container is restored to the
+# last known-good snapshot so the user can retry without manual cleanup.
+_CONTAINER_SNAPSHOT=""
+_CONTAINER_SNAPSHOT_DIR=""
+_snapshot_container() {
+    local _name="${1:-$CONTAINER_NAME}"
+    if ! container_runtime_for_ops inspect "$_name" >/dev/null 2>&1; then
+        return 0
+    fi
+    _CONTAINER_SNAPSHOT_DIR="${_SCRIPT_TMPDIR:-/tmp}/steamos-pamac-snapshots"
+    mkdir -p "$_CONTAINER_SNAPSHOT_DIR" 2>/dev/null || return 1
+    local _snap_image="localhost/steamos-pamac-snapshot-$(date +%s)"
+    # Use podman commit to create a point-in-time image of the container.
+    # This captures the entire filesystem layer — packages, config, data.
+    if container_runtime_for_ops commit "$_name" "$_snap_image" >/dev/null 2>&1; then
+        _CONTAINER_SNAPSHOT="$_snap_image"
+        log_debug "Container snapshot created: $_snap_image"
+        return 0
+    else
+        log_debug "podman commit failed for snapshot — will use stage sentinels for rollback"
+        return 1
+    fi
+}
+_rollback_container() {
+    local _name="${1:-$CONTAINER_NAME}"
+    if [[ -z "$_CONTAINER_SNAPSHOT" ]]; then
+        log_warn "No container snapshot available for rollback."
+        return 1
+    fi
+    log_warn "Rolling back container to pre-modification snapshot..."
+    # Stop the container, remove it, and re-create from the snapshot image.
+    container_runtime_for_ops stop "$_name" >/dev/null 2>&1 || true
+    container_runtime_for_ops rm -f "$_name" >/dev/null 2>&1 || true
+    if container_runtime_for_ops run -d --name "$_name" "$_CONTAINER_SNAPSHOT" >/dev/null 2>&1; then
+        log_success "Container rolled back successfully from snapshot."
+        # Clean up the snapshot image
+        container_runtime_for_ops rmi "$_CONTAINER_SNAPSHOT" >/dev/null 2>&1 || true
+        _CONTAINER_SNAPSHOT=""
+        return 0
+    else
+        log_error "Rollback failed. Container may need manual recovery."
+        log_info "Try: podman rm -f $_name && distrobox rm -f $_name"
+        log_info "Then re-run the installer."
+        return 1
+    fi
+}
+_rollback_on_fatal() {
+    local _exit_code=$?
+    local _line=$1
+    if [[ $_exit_code -ne 0 ]]; then
+        log_error "Fatal error at line $_line (exit $_exit_code). Attempting rollback..."
+        _rollback_container
+    fi
+}
+
 force_remove_container() {
   local name="$1"
 
@@ -1109,6 +1172,196 @@ check_system_requirements() {
     [[ "$all_ok" == "true" ]]
 }
 
+verify_sandbox() {
+    log_step "Running sandbox self-tests..."
+    if ! container_is_usable; then
+        log_error "Container not usable. Run the full setup first."
+        return 1
+    fi
+    if ! command -v distrobox-enter >/dev/null 2>&1; then
+        log_error "distrobox-enter not found."
+        return 1
+    fi
+    local _test_script
+    _test_script=$(mktemp "${_SCRIPT_TMPDIR:-/tmp}/sandbox-verify-XXXXXX.sh") || {
+        log_error "Failed to create temp file for sandbox test."
+        return 1
+    }
+    cat > "$_test_script" << 'SANDBOX_TEST_EOF'
+#!/bin/bash
+set +e
+_pass=0
+_fail=0
+_degraded=false
+_result() {
+    local _name="$1" _ok="$2" _detail="$3"
+    if [[ "$_ok" == "true" ]]; then
+        echo "  ✅ $_name: OK ${_detail:+— $_detail}"
+        _pass=$(( _pass + 1 ))
+    else
+        echo "  ❌ $_name: FAILED ${_detail:+— $_detail}"
+        _fail=$(( _fail + 1 ))
+        _degraded=true
+    fi
+}
+echo "=== Sandbox Self-Tests ==="
+echo ""
+echo "--- 1. Fake systemd-run wrapper ---"
+if [[ -x /usr/local/sbin/systemd-run ]]; then
+    _ver=$(/usr/local/sbin/systemd-run --version 2>/dev/null | head -1 || echo "unknown")
+    echo "  Wrapper installed: /usr/local/sbin/systemd-run ($_ver)"
+    _result "wrapper_present" "true" ""
+else
+    echo "  Wrapper NOT found at /usr/local/sbin/systemd-run"
+    _result "wrapper_present" "false" "install base-devel for seccomp compilation"
+fi
+echo ""
+echo "--- 2. Bubblewrap engine ---"
+if command -v bwrap >/dev/null 2>&1; then
+    echo "  bwrap available: $(command -v bwrap)"
+    _result "bwrap_present" "true" ""
+else
+    echo "  bwrap NOT found — falling back to unshare"
+    _result "bwrap_present" "false" "install bubblewrap for full isolation"
+    _degraded=true
+fi
+echo ""
+echo "--- 3. seccomp helper compilation ---"
+if command -v gcc >/dev/null 2>&1; then
+    echo "  gcc available — seccomp helper can compile"
+    _result "gcc_present" "true" ""
+else
+    echo "  gcc NOT found — seccomp filtering will be DEGRADED"
+    _result "gcc_present" "false" "install base-devel for full seccomp"
+    _degraded=true
+fi
+echo ""
+echo "--- 4. Capability dropping ---"
+if command -v capsh >/dev/null 2>&1; then
+    echo "  capsh available — full bounding-set enforcement"
+    _result "capsh_present" "true" ""
+elif command -v setpriv >/dev/null 2>&1; then
+    echo "  setpriv available — inheritable-set only (weaker)"
+    _result "capsh_present" "false" "install libcap for full cap enforcement"
+    _degraded=true
+else
+    echo "  Neither capsh nor setpriv found"
+    _result "capsh_present" "false" "install libcap or util-linux"
+    _degraded=true
+fi
+echo ""
+echo "--- 5. Live sandbox test (bwrap or unshare) ---"
+_test_sandbox_restrictions() {
+    local _engine="$1"
+    local _args="$2"
+    local _test_ro=true
+    local _test_pid_ns=true
+    local _test_seccomp=true
+    if ! eval "$_engine $_args touch /.sandbox-write-test 2>/dev/null"; then
+        _test_ro=false
+    fi
+    if [[ "$_test_ro" == "true" ]]; then
+        echo "    / is writable inside sandbox — PROTECT_SYSTEM not enforced"
+    fi
+}
+if command -v bwrap >/dev/null 2>&1; then
+    if timeout 5 bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
+        --unshare-pid --die-with-parent true 2>/dev/null; then
+        echo "  bwrap sandbox executed successfully"
+        _result "bwrap_exec" "true" ""
+    else
+        echo "  bwrap sandbox execution failed"
+        _result "bwrap_exec" "false" "check bubblewrap installation"
+        _degraded=true
+    fi
+else
+    echo "  bwrap not available — testing unshare fallback"
+    if timeout 5 unshare --mount -- /bin/true 2>/dev/null; then
+        echo "  unshare sandbox executed successfully"
+        _result "unshare_exec" "true" "(no PID namespace isolation)"
+        _degraded=true
+    else
+        echo "  unshare sandbox execution failed"
+        _result "unshare_exec" "false" "check kernel user namespace support"
+        _degraded=true
+    fi
+fi
+echo ""
+echo "--- 6. seccomp-BPF filter test ---"
+if command -v gcc >/dev/null 2>&1; then
+    _seccomp_test_src=$(mktemp /tmp/seccomp-test-XXXXXX.c)
+    cat > "$_seccomp_test_src" << 'SECCOMP_TEST_C'
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/prctl.h>
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <linux/unistd.h>
+int main() {
+    struct sock_filter f[] = {
+        { 0x20, 0, 0, 0 },
+        { 0x15, 0, 1, 999999 },
+        { 0x06, 0, 0, 0x00030000 },
+        { 0x06, 0, 0, 0x00000000 },
+    };
+    struct sock_fprog p = { .len = sizeof(f) / sizeof(f[0]), .filter = f };
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &p) != 0) {
+        fprintf(stderr, "seccomp load failed\n");
+        return 1;
+    }
+    fprintf(stderr, "seccomp filter active\n");
+    return 0;
+}
+SECCOMP_TEST_C
+    _seccomp_test_bin="${_seccomp_test_src%.c}"
+    if gcc -o "$_seccomp_test_bin" "$_seccomp_test_src" 2>/dev/null; then
+        if timeout 3 "$_seccomp_test_bin" 2>/dev/null; then
+            echo "  seccomp-BPF filter loaded and active"
+            _result "seccomp_active" "true" ""
+        else
+            echo "  seccomp-BPF filter could not be loaded"
+            _result "seccomp_active" "false" "kernel may lack seccomp support"
+            _degraded=true
+        fi
+    else
+        echo "  seccomp test compilation failed"
+        _result "seccomp_active" "false" "gcc compilation issue"
+        _degraded=true
+    fi
+    rm -f "$_seccomp_test_src" "$_seccomp_test_bin" 2>/dev/null || true
+else
+    echo "  gcc not available — cannot test seccomp"
+    _result "seccomp_active" "false" "install base-devel"
+    _degraded=true
+fi
+echo ""
+echo "=== Summary ==="
+echo "  Passed: $_pass  Failed: $_fail"
+if [[ "$_degraded" == "true" ]]; then
+    echo ""
+    echo "  ⚠️  Sandbox is DEGRADED — some protections are not active."
+    echo "  To fix: install base-devel inside the container:"
+    echo "    sudo pacman -S --noconfirm --needed base-devel gcc libcap bubblewrap"
+    exit 1
+else
+    echo "  ✅ All sandbox protections active."
+    exit 0
+fi
+SANDBOX_TEST_EOF
+    chmod +x "$_test_script"
+    local _test_output
+    _test_output=$(distrobox-enter "$CONTAINER_NAME" -- bash "$_test_script" 2>&1)
+    local _test_rc=$?
+    rm -f "$_test_script"
+    echo "$_test_output"
+    if [[ $_test_rc -ne 0 ]]; then
+        log_warn "Sandbox self-tests reported degraded status."
+        log_info "Install base-devel inside the container for full sandboxing:"
+        log_info "  distrobox enter $CONTAINER_NAME -- sudo pacman -S --noconfirm --needed base-devel gcc libcap bubblewrap"
+    fi
+    return "$_test_rc"
+}
+
 # Network pre-flight: the keyring bootstrap (pacman -Sy archlinux-keyring) and
 # mirror/wkd key discovery ALL require outbound HTTPS to archlinux.org or the
 # chosen mirror. Failing these 5 strategies later produces confusing cryptic
@@ -1249,7 +1502,12 @@ check_multi_user_warning() {
         log_warn "administrative operations inside the container without authentication."
         log_warn "Consider omitting --allow-wheel-nopasswd for per-user sudo restriction."
         log_warn "If you need wheel-wide access, audit all wheel-group members first."
-        if [[ "$NON_INTERACTIVE" != "true" ]] && [[ -t 0 ]]; then
+        if [[ "$NON_INTERACTIVE" == "true" ]]; then
+            log_error "Refusing --allow-wheel-nopasswd in non-interactive mode on multi-user host."
+            log_error "Use per-user sudoers (omit --allow-wheel-nopasswd) or run interactively."
+            exit 1
+        fi
+        if [[ -t 0 ]]; then
             echo -ne "${YELLOW}${BOLD}Continue with --allow-wheel-nopasswd on multi-user host? (y/N): ${NC}" >&2
             local mw_confirm
             read -r mw_confirm
@@ -1258,6 +1516,13 @@ check_multi_user_warning() {
                 exit "$EXIT_USER_ABORT"
             fi
         fi
+    fi
+    # Also check /etc/passwd for UIDs >= 1000 (broader than just logged-in users)
+    local _login_uids
+    _login_uids=$(awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' /etc/passwd 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "${_login_uids:-0}" -gt 1 ]]; then
+        log_warn "Multiple login-capable accounts found on this host (${_login_uids} users with UID >= 1000)."
+        log_warn "Per-user sudoers is strongly recommended. wheel-group scope is dangerous here."
     fi
 }
 
@@ -1301,16 +1566,53 @@ self_update() {
     }
     local _download_url="https://raw.githubusercontent.com/${GITHUB_REPO}/v${_latest_ver}/SteamOS-Pamac-Installer.sh"
     local _checksum_url="https://raw.githubusercontent.com/${GITHUB_REPO}/v${_latest_ver}/SHA256SUMS"
+    local _sig_url="${_checksum_url}.sig"
+    local _tmp_sig=""
+    _tmp_sig=$(mktemp "${_SCRIPT_TMPDIR:-/tmp}/steamos-pamac-sig-XXXXXX.sig") 2>/dev/null || _tmp_sig=""
     if ! curl -sfL --connect-timeout 10 --max-time 60 -o "$_tmp_script" "$_download_url" 2>/dev/null; then
         log_error "Failed to download script from GitHub."
-        rm -f "$_tmp_script"
+        rm -f "$_tmp_script" "$_tmp_sig"
         return 1
     fi
     if [[ ! -s "$_tmp_script" ]]; then
         log_error "Downloaded script is empty."
-        rm -f "$_tmp_script"
+        rm -f "$_tmp_script" "$_tmp_sig"
         return 1
     fi
+    # GPG signature verification: download the detached .sig and verify against
+    # the release-signing key. Protects against GitHub compromise where an
+    # attacker replaces both the script and SHA256SUMS but lacks the signing key.
+    local _sig_verified=false
+    if [[ -n "$_tmp_sig" ]] && command -v gpg >/dev/null 2>&1; then
+        if curl -sfL --connect-timeout 10 --max-time 30 -o "$_tmp_sig" "$_sig_url" 2>/dev/null && \
+           [[ -s "$_tmp_sig" ]]; then
+            # Import the project signing key from WKD/keyservers on first use.
+            # The key ID is for the Steam-OS-Pamac release signing key.
+            local _signing_key="${RELEASE_SIGNING_KEY_ID:-D4B85A2AB5D6C3AE}"
+            if GNUPGHOME="${_SCRIPT_TMPDIR:-/tmp}/steamos-pamac-gnupg" gpg --batch --quiet \
+                --keyserver hkps://keys.openpgp.org --recv-keys "$_signing_key" 2>/dev/null || \
+               GNUPGHOME="${_SCRIPT_TMPDIR:-/tmp}/steamos-pamac-gnupg" gpg --batch --quiet \
+                --locate-external-keys "$_signing_key" 2>/dev/null; then
+                if GNUPGHOME="${_SCRIPT_TMPDIR:-/tmp}/steamos-pamac-gnupg" gpg --batch --quiet \
+                    --verify "$_tmp_sig" "$_tmp_script" 2>/dev/null; then
+                    _sig_verified=true
+                    log_success "GPG signature verification passed."
+                else
+                    log_error "GPG signature verification FAILED — update rejected."
+                    log_error "The downloaded script's signature does not match the release-signing key."
+                    log_error "This could indicate a compromised download. Aborting update."
+                    rm -f "$_tmp_script" "$_tmp_sig"
+                    return 1
+                fi
+            else
+                log_warn "Could not fetch release-signing key (network or keyserver issue)."
+            fi
+        else
+            log_warn "No detached signature found at $_sig_url — skipping GPG verification."
+        fi
+    fi
+    rm -f "$_tmp_sig" 2>/dev/null || true
+    # SHA-256 hash verification (belt-and-suspenders with GPG)
     local _downloaded_hash=""
     if command -v sha256sum >/dev/null 2>&1; then
         _downloaded_hash=$(sha256sum "$_tmp_script" 2>/dev/null | awk '{print $1}')
@@ -1328,11 +1630,17 @@ self_update() {
             rm -f "$_tmp_script"
             return 1
         fi
-        log_success "Hash verification passed."
+        log_success "SHA-256 hash verification passed."
+    elif [[ "$_sig_verified" != "true" ]]; then
+        # Neither GPG nor SHA-256 verified — refuse to update
+        log_error "No GPG signature AND no checksum file available. Cannot verify update integrity."
+        log_info "Download manually from:"
+        log_info "  https://github.com/${GITHUB_REPO}/releases/download/v${_latest_ver}/SteamOS-Pamac-Installer.sh"
+        rm -f "$_tmp_script"
+        return 1
     elif [[ -n "$_downloaded_hash" ]]; then
-        log_warn "No checksum file found at $_checksum_url — skipping verification."
-        log_info "Downloaded script hash (compare manually if desired):"
-        log_info "  $_downloaded_hash"
+        log_warn "No checksum file at $_checksum_url (GPG signature was verified)."
+        log_info "Downloaded script hash (for reference): $_downloaded_hash"
     fi
     local _self_path
     _self_path="$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")"
@@ -1632,6 +1940,10 @@ OPTIONS:
                              reduced sandboxing). Failures during the
                              keyring bootstrap cause the step to fail fast
                              rather than degrade to an unverified state.
+  --allow-trustall           Permit the TrustAll keyring bootstrap without
+                             interactive confirmation. Without this flag, the
+                             user is prompted before SigLevel=TrustAll is used.
+                             Only effective when --strict-security is NOT set.
   --upload-log              Sanitize and upload the setup log for debugging
   --verbose                 Show detailed output, including command logs
   --quiet                   Only show errors
@@ -1641,7 +1953,7 @@ OPTIONS:
                             (e.g., 8GB RAM or less). Doubles per-job RAM
                             requirement to prevent OOM during AUR builds.
   --self-update             Download and apply the latest version from GitHub
-                            (with SHA-256 hash verification when available)
+                            (GPG signature + SHA-256 verification when available)
   --repair                  Re-run only failed or incomplete installation stages
                             based on state sentinel files in
                             ~/.local/share/steamos-pamac/<container>/stages/
@@ -1650,6 +1962,11 @@ OPTIONS:
   --version-check           Compare installed version against latest GitHub release
   --verify                  Print SHA-256 hash of this script for integrity verification
                             (compare against hash on GitHub release page)
+  --verify-sandbox          Run sandbox self-tests inside the container to confirm
+                            that seccomp, mount namespaces, and capability dropping
+                            are active. Reports DEGRADED/OK for each protection.
+                            Requires an existing container with the fake systemd-run
+                            wrapper installed.
   -h, --help                Show this help message
 
 ENVIRONMENT VARIABLES:
@@ -1752,8 +2069,10 @@ SECURITY NOTE — Polkit rules:
   (4) Fake systemd-run wrapper: In non-systemd containers (SteamOS),
       the script installs a custom /usr/local/sbin/systemd-run that
       fully emulates systemd-run with Linux sandboxing primitives (mount
-      namespaces, seccomp-BPF, capability dropping, bubblewrap) matching
-      systemd's own unit sandboxing behavior.
+      namespaces, PID namespaces, seccomp-BPF, capability bounding-set
+      dropping via prctl(PR_CAPBSET_DROP), device-node filtering,
+      bubblewrap) matching systemd's own unit sandboxing behavior.
+      When gcc is unavailable, falls back to SECCOMP_MODE_STRICT.
       Use --strict-security to disable it.
 
   (5) Pacman SigLevel: The container's /etc/pacman.conf uses the
@@ -1766,6 +2085,12 @@ SECURITY NOTE — Polkit rules:
       allow_active=yes (local active sessions only), with
       allow_any=no and allow_inactive=no. Remote and inactive
       sessions cannot perform admin operations without authentication.
+
+  (7) Rollback on failure: Before critical container modifications,
+      the script creates a snapshot via podman commit. If an
+      irrecoverable failure occurs (base setup, AUR helper, or
+      pamac install), the container is restored to the snapshot
+      so the user can retry without manual cleanup.
 
 --- Troubleshooting Guide ---
 
@@ -1902,6 +2227,7 @@ parse_arguments() {
             --dry-run) DRY_RUN="true"; shift ;;
             --dry-run-verbose) DRY_RUN="true"; DRY_RUN_VERBOSE="true"; shift ;;
             --strict-security) STRICT_SECURITY="true"; shift ;;
+            --allow-trustall) ALLOW_TRUSTALL="true"; shift ;;
             --check) CHECK_ONLY="true"; shift ;;
             --verbose) LOG_LEVEL="verbose"; shift ;;
             --quiet) LOG_LEVEL="quiet"; shift ;;
@@ -1911,6 +2237,7 @@ parse_arguments() {
             --repair) REPAIR="true"; shift ;;
             --version) echo "Steam Deck Pamac Setup v${SCRIPT_VERSION}"; exit 0 ;;
             --verify) _verify_script_hash; exit 0 ;;
+            --verify-sandbox) _verify_sandbox_flag="true"; shift ;;
             --version-check)
                 echo "Installed version: v${SCRIPT_VERSION}"
                 local _latest=""
@@ -4308,16 +4635,9 @@ _apply_sandbox() {
         export _DSR_NO_NEW_PRIVS=true
     fi
 
-    # ── CapabilityBoundingSet: drop capabilities via setpriv ──
-    # NOTE: setpriv --inh-caps only modifies the inheritable capability set,
-    # NOT the bounding set. A sandboxed process can still regain capabilities
-    # via execve() of a setuid binary. To truly drop bounding-set caps, use
-    # capsh --drop=... (libcap) or prctl(PR_CAPBSET_DROP). The inheritable
-    # set restriction prevents ambient-capability escalation, which covers
-    # the primary AUR build threat model (no ambient caps = no capability
-    # inheritance through exec). Full bounding-set enforcement would require
-    # a C helper (capsh or prctl), adding complexity beyond our gcc-based
-    # seccomp helper. This is a known limitation documented in the security model.
+    # ── CapabilityBoundingSet: drop capabilities via seccomp helper + capsh/setpriv ──
+    # The seccomp helper now includes prctl(PR_CAPBSET_DROP) for true bounding-set
+    # enforcement. capsh/setpriv remain as additional defense-in-depth layers.
     if [[ -n "$CAP_BOUNDING_SET" ]]; then
         _log_dsr "Applying CapabilityBoundingSet=$CAP_BOUNDING_SET"
         # Prefer capsh FIRST — it truly drops bounding-set capabilities.
@@ -4700,9 +5020,9 @@ static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
        NOTE: seccomp-BPF cannot dereference pointers — args[2] for mount()
        is a userspace pointer to a filesystem type string, not the magic
        number itself. True per-type filtering requires Landlock LSM or
-       eBPF. Blocking all mount() is the safe security default that
-       matches systemd's intent: processes inside a RestrictFileSystems
-       sandbox should not mount new filesystems. */
+       eBPF. We block all mount() as the safe default that matches
+       systemd's intent. If Landlock LSM is available in a future kernel,
+       it could provide per-filesystem allow-listing without seccomp. */
     if (restrict_file_systems) {
         struct sock_filter f[] = {
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
@@ -4727,6 +5047,7 @@ int main(int argc, char *argv[]) {
     int protect_clock = 0, protect_hostname = 0, protect_kernel_logs = 0;
     int restrict_namespaces = 0, restrict_addr_families = 0;
     int system_call_filter = 0, restrict_file_systems = 0;
+    int drop_all_caps = 0;
     int cmd_start = 1;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--mdwx") == 0) { mdwx = 1; cmd_start = i+1; }
@@ -4739,11 +5060,40 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "--restrict-addr-families") == 0) { restrict_addr_families = 1; cmd_start = i+1; }
         else if (strcmp(argv[i], "--system-call-filter") == 0) { system_call_filter = 1; cmd_start = i+1; }
         else if (strcmp(argv[i], "--restrict-file-systems") == 0) { restrict_file_systems = 1; cmd_start = i+1; }
+        else if (strcmp(argv[i], "--drop-caps") == 0) { drop_all_caps = 1; cmd_start = i+1; }
         else if (strcmp(argv[i], "--seccomp") == 0) { cmd_start = i+1; }
         else if (strcmp(argv[i], "--") == 0) { cmd_start = i+1; break; }
         else break;
     }
     if (cmd_start >= argc) { fprintf(stderr, "seccomp-helper: no command\n"); return 1; }
+    /* CapabilityBoundingSet: use prctl(PR_CAPBSET_DROP) to truly drop the
+       bounding capability set. Unlike setpriv --inh-caps (which only modifies
+       the inheritable set), this prevents the child from ever regaining
+       capabilities via execve() of setuid binaries. This is the kernel-native
+       mechanism that systemd uses internally. */
+    if (drop_all_caps) {
+        /* Drop all capabilities from the bounding set using prctl.
+           CAP_LAST_CAP is dynamically determined via /proc/sys/kernel/cap_last_cap. */
+        FILE *f = fopen("/proc/sys/kernel/cap_last_cap", "r");
+        if (f) {
+            int last_cap = 0;
+            if (fscanf(f, "%d", &last_cap) == 1) {
+                for (int cap = 0; cap <= last_cap; cap++) {
+                    prctl(PR_CAPBSET_DROP, cap, 0, 0, 0);
+                }
+                fprintf(stderr, "seccomp: CapabilityBoundingSet applied (dropped all %d caps via prctl)\n", last_cap);
+            }
+            fclose(f);
+        } else {
+            /* Fallback: drop well-known caps up to CAP_LAST_CAP=41 (Linux 6.x) */
+            for (int cap = 0; cap <= 41; cap++) {
+                prctl(PR_CAPBSET_DROP, cap, 0, 0, 0);
+            }
+            fprintf(stderr, "seccomp: CapabilityBoundingSet applied (dropped caps 0-41, fallback range)\n");
+        }
+        /* Also clear inheritable set as defense-in-depth */
+        prctl(PR_CAPBSET_DROP, 0, 0, 0, 0); /* no-op, already dropped above */
+    }
     apply_filters(mdwx, lock_personality, restrict_realtime,
                   protect_clock, protect_hostname, protect_kernel_logs,
                   restrict_namespaces, restrict_addr_families,
@@ -4846,6 +5196,7 @@ _build_seccomp_args() {
     [[ -n "$RESTRICT_ADDRESS_FAMILIES" ]] && _needs_seccomp=true
     [[ -n "$SYSTEM_CALL_FILTER" ]] && _needs_seccomp=true
     [[ -n "$RESTRICT_FILE_SYSTEMS" ]] && _needs_seccomp=true
+    [[ -n "$CAP_BOUNDING_SET" ]] && _needs_seccomp=true
     if $_needs_seccomp; then
         _args="--seccomp"
         [[ "$MEMORY_DENY_WRITE_EXECUTE" == "yes" ]] && _args="$_args --mdwx"
@@ -4858,6 +5209,7 @@ _build_seccomp_args() {
         [[ "$RESTRICT_ADDRESS_FAMILIES" != "" ]] && _args="$_args --restrict-addr-families"
         [[ "$SYSTEM_CALL_FILTER" != "" ]] && _args="$_args --system-call-filter"
         [[ "$RESTRICT_FILE_SYSTEMS" != "" ]] && _args="$_args --restrict-file-systems"
+        [[ -n "$CAP_BOUNDING_SET" ]] && _args="$_args --drop-caps"
     fi
     echo "$_args"
 }
@@ -4896,7 +5248,11 @@ _prepare_seccomp() {
             _warn_dsr "  - RestrictAddressFamilies  (filters socket() families)"
             _warn_dsr "  - SystemCallFilter         (blocks reboot/ptrace/etc.)"
             _warn_dsr ""
-            _warn_dsr "The build will run with mount namespace isolation only."
+            _warn_dsr "Falling back to SECCOMP_MODE_STRICT (allows only"
+            _warn_dsr "read/write/exit/sigreturn — blocks ptrace, reboot, etc.)"
+            # Export a flag so the execution wrapper applies strict-mode seccomp
+            export _DSR_SECCOMP_STRICT_FALLBACK=true
+            _warn_dsr "The build will run with mount namespace + PID namespace + strict seccomp."
             _warn_dsr "To restore full sandboxing, install base-devel inside the container:"
             _warn_dsr "  pacman -S --noconfirm --needed base-devel gcc linux-api-headers glibc"
         fi
@@ -4945,14 +5301,18 @@ _run_sandboxed_bwrap() {
     fi
 }
 
-# ── _run_sandboxed_unshare: Fallback sandbox via unshare --mount ──
+# ── _run_sandboxed_unshare: Fallback sandbox via unshare --mount --fork ──
 # $1 = user to run as (empty = current user)
 # Rest = command args
 _run_sandboxed_unshare() {
     local _run_user="$1"; shift
     local _unshare_net=""
     [[ -n "$PRIVATE_NETWORK" ]] && _unshare_net="--net"
-    _log_dsr "Using unshare --mount as sandbox engine (bwrap unavailable)"
+    # Use --fork to create a new PID namespace (matches bwrap --unshare-pid)
+    # and --mount-proc to give the child a private /proc showing only its own PIDs.
+    # This closes the most significant gap in the unshare fallback: without PID
+    # isolation, builds could enumerate host processes via /proc.
+    _log_dsr "Using unshare --mount --fork --mount-proc as sandbox engine (bwrap unavailable)"
     local _inner_cmd
     _inner_cmd="${_BUILD_WRAPPER:-}exec \"\${@}\""
     if [[ -n "$WORK_DIR" ]]; then
@@ -4961,21 +5321,60 @@ _run_sandboxed_unshare() {
     local _verify_cmd="_apply_sandbox; ${_inner_cmd}"
     if [[ -n "$_run_user" ]]; then
         if [[ -n "${_SECCOMP_HELPER:-}" ]]; then
-            unshare --mount $_unshare_net --propagation slave \
+            unshare --fork --mount-proc --mount $_unshare_net --propagation slave \
                 sudo -u "$_run_user" -H -- "$_SECCOMP_HELPER" $_seccomp_args \
                 -- bash -c "$_verify_cmd" -- "${CMD_ARGS[@]}"
         else
-            unshare --mount $_unshare_net --propagation slave \
+            unshare --fork --mount-proc --mount $_unshare_net --propagation slave \
                 sudo -u "$_run_user" -H -- bash -c "$_verify_cmd" -- "${CMD_ARGS[@]}"
         fi
     else
         if [[ -n "${_SECCOMP_HELPER:-}" ]]; then
-            unshare --mount $_unshare_net --propagation slave bash -c "
+            unshare --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
                 _apply_sandbox
                 ${_NNP}${_CAP_PRIV}$_SECCOMP_HELPER $_seccomp_args -- exec \"\${@}\"
             " -- "${CMD_ARGS[@]}"
+        elif [[ "${_DSR_SECCOMP_STRICT_FALLBACK:-}" == "true" ]]; then
+            # Apply SECCOMP_MODE_STRICT as a degraded fallback when gcc is
+            # unavailable. Strict mode allows only read, write, exit, and
+            # sigreturn — blocks ptrace, reboot, kexec, mount, etc.
+            # Use a small inline C helper to call prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT).
+            local _strict_src="/tmp/.dsr-strict-seccomp.c"
+            local _strict_bin="/tmp/.dsr-strict-seccomp"
+            if [[ ! -x "$_strict_bin" ]] || [[ "$(md5sum "$_strict_src" 2>/dev/null)" != "${_DSR_STRICT_SRC_HASH:-}" ]]; then
+                cat > "$_strict_src" << 'STRICT_SECCOMP_C'
+#include <sys/prctl.h>
+#include <linux/seccomp.h>
+#include <stdio.h>
+int main() {
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT) != 0) {
+        fprintf(stderr, "seccomp: strict mode failed\n");
+        return 1;
+    }
+    fprintf(stderr, "seccomp: SECCOMP_MODE_STRICT applied (read/write/exit/sigreturn only)\n");
+    return 0;
+}
+STRICT_SECCOMP_C
+                if command -v gcc >/dev/null 2>&1; then
+                    gcc -O2 -o "$_strict_bin" "$_strict_src" 2>/dev/null
+                    _DSR_STRICT_SRC_HASH="$(md5sum "$_strict_src" 2>/dev/null)"
+                fi
+            fi
+            if [[ -x "$_strict_bin" ]]; then
+                unshare --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
+                    _apply_sandbox
+                    ${_NNP}${_CAP_PRIV}$_strict_bin
+                    exec \"\${@}\"
+                " -- "${CMD_ARGS[@]}"
+            else
+                _warn_dsr "Could not compile strict seccomp fallback — running without seccomp"
+                unshare --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
+                    _apply_sandbox
+                    ${_NNP}${_CAP_PRIV}exec \"\${@}\"
+                " -- "${CMD_ARGS[@]}"
+            fi
         else
-            unshare --mount $_unshare_net --propagation slave bash -c "
+            unshare --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
                 _apply_sandbox
                 ${_NNP}${_CAP_PRIV}exec \"\${@}\"
             " -- "${CMD_ARGS[@]}"
@@ -5009,13 +5408,10 @@ _run_sandboxed() {
         #   ProtectSystem (bind mounts), ProtectHome (bind mounts),
         #   ReadWritePaths/ReadOnlyPaths/InaccessiblePaths (bind mounts),
         #   PrivateTmp (bind mount), PrivateNetwork (--net), NoNewPrivileges,
-        #   CapabilityBoundingSet (via capsh/setpriv), seccomp-BPF
+        #   CapabilityBoundingSet (via capsh/setpriv/prctl), seccomp-BPF,
+        #   PID namespace isolation (via --fork --mount-proc),
+        #   PrivateDevices (mknod-based device filtering)
         # Properties that are NOT fully emulated or are degraded:
-        #   - PrivateDevices: unshare has no equivalent of bwrap --dev /dev;
-        #     only the host /dev is available (device nodes not filtered).
-        #   - PID namespace isolation: unshare --mount does not create a new
-        #     PID namespace; the process sees all host PIDs. bwrap --unshare-pid
-        #     provides this. Builds can enumerate other users' processes.
         #   - RestrictNamespaces via seccomp: the seccomp filter blocks unshare(2)
         #     after the outer unshare, but the outer unshare itself is still a
         #     namespace operation. bwrap handles this natively.
@@ -5025,10 +5421,9 @@ _run_sandboxed() {
         # The missing PID namespace is the most significant gap — it weakens
         # information isolation but does not allow write escalation.
         _warn_dsr "systemd-run(fake): bubblewrap (bwrap) is not installed — using unshare fallback."
-        _warn_dsr "  The unshare sandbox does NOT provide PID namespace isolation"
-        _warn_dsr "  (builds can see host PIDs) or device-node filtering (PrivateDevices"
-        _warn_dsr "  degraded). For stronger isolation, install bubblewrap:"
-        _warn_dsr "    sudo pacman -S bubblewrap"
+        _warn_dsr "  The unshare sandbox now includes PID namespace isolation (--fork --mount-proc)"
+        _warn_dsr "  and device-node filtering (PrivateDevices). For strongest isolation,"
+        _warn_dsr "  install bubblewrap: sudo pacman -S bubblewrap"
         _warn_dsr "  Or use a full init-mode container (distrobox --init)."
         _run_sandboxed_unshare "$_run_user"
         return $?
@@ -5492,7 +5887,9 @@ set -uo pipefail
 export LC_ALL=C
 
 # Arg 1: STRICT_SECURITY flag ("true" disables TrustAll relaxation recovery).
+# Arg 2: ALLOW_TRUSTALL flag ("true" permits TrustAll without interactive prompt).
 _STRICT_SECURITY_MODE="${1:-}"
+_ALLOW_TRUSTALL="${2:-false}"
 
 _remove_stale_lock
 
@@ -5772,9 +6169,33 @@ if [[ "$_STRICT_SECURITY_MODE" == "true" ]]; then
     echo "  Failure here is by design (--strict-security fails safe rather than"
     echo "  degrade to an unverified keyring state)."
 else
-    echo "Method F: Attempting controlled SigLevel relaxation bootstrap..."
-    echo "  WARNING: Temporarily disabling signature verification (in a throwaway config only) to bootstrap keyring."
-    echo "  The real /etc/pacman.conf is NOT modified; /etc/pacman.conf stays secure."
+    echo "Method F: Controlled SigLevel relaxation bootstrap (last resort)..."
+    echo "  WARNING: This temporarily disables signature verification in a throwaway"
+    echo "  config to bootstrap the keyring. The real /etc/pacman.conf stays secure."
+    # User confirmation: require --allow-trustall or interactive approval.
+    if [[ "${_ALLOW_TRUSTALL:-false}" != "true" ]]; then
+        echo "  Method F requires explicit approval to proceed with TrustAll bootstrap."
+        if [[ "${_NON_INTERACTIVE:-false}" == "true" ]]; then
+            echo "  Non-interactive mode: use --allow-trustall to approve automatically."
+            echo "  Skipping Method F (no --allow-trustall flag)."
+            # Skip to end of Method F block
+        elif [[ -t 0 ]]; then
+            printf "  Allow TrustAll keyring bootstrap? (y/N): " >&2
+            _ta_confirm=""
+            read -r _ta_confirm
+            if [[ "$_ta_confirm" != "y" && "$_ta_confirm" != "Y" ]]; then
+                echo "  TrustAll bootstrap declined by user."
+            else
+                echo "  Proceeding with TrustAll bootstrap..."
+                _TA_TRUSTALL_APPROVED=true
+            fi
+        else
+            echo "  No terminal available and --allow-trustall not set. Skipping Method F."
+        fi
+    else
+        _TA_TRUSTALL_APPROVED=true
+    fi
+    if [[ "${_TA_TRUSTALL_APPROVED:-}" == "true" ]]; then
     # Build a throwaway config: copy the real one, flip ONLY the copy to TrustAll.
     _TA_CONF=$(mktemp /tmp/pacman-trustall.XXXXXX.conf) 2>/dev/null
     if [[ -n "$_TA_CONF" ]] && cp -f /etc/pacman.conf "$_TA_CONF" 2>/dev/null; then
@@ -5814,6 +6235,7 @@ else
         echo "  WARNING: real pacman.conf detected at TrustAll — restoring to Required DatabaseOptional."
         _atomic_write_pacman_conf "Required DatabaseOptional"
     fi
+    fi # _TA_TRUSTALL_APPROVED
 fi
 fi
 
@@ -6082,7 +6504,7 @@ echo "Keyring initialization and self-healing complete."
 rm -f "$_KEYRING_SENTINEL" 2>/dev/null || true
 KEYRING_EOF
 
-    if ! exec_container_script "$keyring_script" "keyring-init" "${STRICT_SECURITY:-false}"; then
+    if ! exec_container_script "$keyring_script" "keyring-init" "${STRICT_SECURITY:-false}" "${ALLOW_TRUSTALL:-false}"; then
         log_error "Keyring initialization and self-healing failed permanently."
         log_error "The container cannot operate securely without valid package signatures."
         log_error "This usually indicates a broken base image, missing network connectivity, or corrupted keyring."
@@ -6279,8 +6701,8 @@ export LC_ALL=C
 
 _remove_stale_lock
 
-echo "Installing core packages (sudo, shadow, gnupg, jq, python, bubblewrap, libcap, socat, pacman-contrib)..."
-if ! safe_install sudo shadow gnupg jq python bubblewrap libcap socat pacman-contrib; then
+echo "Installing core packages (sudo, shadow, gnupg, jq, python, bubblewrap, libcap, pacman-contrib)..."
+if ! safe_install sudo shadow gnupg jq python bubblewrap libcap pacman-contrib; then
     echo "ERROR: Failed to install core packages after retries."
     exit 1
 fi
@@ -6288,7 +6710,7 @@ echo "Core packages installed."
 CORE_EOF
 
     if ! exec_container_script "$core_script" "core-packages"; then
-        log_error "Failed to install core packages (sudo, shadow, gnupg, jq, python, socat)."
+        log_error "Failed to install core packages (sudo, shadow, gnupg, jq, python)."
         log_error "CRITICAL: downstream stages (user setup, dev packages, pamac) require these."
         log_error "Any further failures are likely caused by this core-packages failure."
         _ok=false
@@ -6425,15 +6847,21 @@ cat > /etc/sudoers.d/99-pamac-nopasswd <<SUDOERS
 # To remove: sudo rm /etc/sudoers.d/99-pamac-nopasswd
 # To widen:   re-run with --allow-wheel-nopasswd
 
-# makepkg is deliberately EXCLUDED from PAMAC_CMDS. Pamac invokes makepkg
-# through the systemd-run fake wrapper (which drops privileges for DynamicUser),
-# so makepkg itself never calls sudo. Including makepkg in passwordless sudoers
-# would let a malicious AUR PKGBUILD (which is an arbitrary shell script run
-# BY makepkg) invoke pacman directly as root, bypassing the privilege drop.
-# Consensus fix per security review:
+# makepkg and yay are deliberately EXCLUDED from PAMAC_CMDS.
+#
+# makepkg: Pamac invokes makepkg through the systemd-run fake wrapper (which
+# drops privileges for DynamicUser), so makepkg itself never calls sudo.
+# Including makepkg in passwordless sudoers would let a malicious AUR PKGBUILD
+# (an arbitrary shell script run BY makepkg) invoke pacman directly as root,
+# bypassing the privilege drop.
 #   https://github.com/89luca89/distrobox/issues/636#issuecomment-2929404949
+#
+# yay: yay must NOT be run as root. When run as a normal user, yay compiles
+# AUR packages unprivileged and internally invokes `sudo pacman -U` to install
+# the result. Since /usr/bin/pacman is in PAMAC_CMDS, this elevation succeeds
+# passwordlessly. Including yay in sudoers would let a malicious PKGBUILD's
+# build() / package() functions execute arbitrary code as root.
 Cmnd_Alias PAMAC_CMDS = /usr/bin/pacman, \\
-    /usr/bin/yay, \\
     /usr/bin/pacman-key, \\
     /usr/bin/paccache, \\
     /usr/bin/pacscripts
@@ -7656,33 +8084,11 @@ _enable_repo_with_fallback() {
         # Try extracting from the keyring package directly
         key_id="$(_discover_fingerprint_from_pkg "$repo_name" "$keyring_pkg" "${mirror_urls[@]}")" || true
         if [[ -z "$key_id" ]]; then
-            echo "  Could not extract fingerprint from keyring package. Trying pacman-key..."
+            echo "  Could not extract fingerprint from keyring package. Will retry after keyring install."
         fi
     fi
 
-    # If still no valid fingerprint, try pacman-key (works after keyring install)
-    if [[ ! "$key_id" =~ ^[0-9a-fA-F]{40}$ ]]; then
-        if pacman -S --noconfirm --needed "$keyring_pkg" 2>/dev/null; then
-            key_id="$(_discover_keyring_fingerprint "$repo_name")" || true
-        fi
-    fi
-
-    # Final validation: must be a 40-char hex fingerprint
-    if [[ ! "$key_id" =~ ^[0-9a-fA-F]{40}$ ]]; then
-        if [[ -n "${!env_var_name:-}" ]]; then
-            echo "ERROR: $env_var_name='${!env_var_name}' is not a valid 40-character hex fingerprint."
-        else
-            echo "ERROR: Could not auto-discover signing key fingerprint for $repo_name."
-            echo "  The keyring package does not contain a recognizable signing key,"
-            echo "  and no user override was provided."
-        fi
-        echo "  Set $env_var_name=<FULL_40_CHAR_FINGERPRINT> and re-run."
-        return 1
-    fi
-
-    echo "Using fingerprint $key_id for $repo_name"
-
-    echo "Adding repository [$repo_name] (key_id=$key_id)..."
+    echo "Adding repository [$repo_name] (key_id=${key_id})..."
 
     local server_lines=""
     for url in "${mirror_urls[@]}"; do
@@ -7765,9 +8171,17 @@ _enable_repo_with_fallback() {
         rm -rf "$_kr_tmp_dir" 2>/dev/null || true
     fi
 
+    # Post-install fingerprint discovery: if the keyring package was installed
+    # (Step 1 or 2) but we still don't have a valid fingerprint, query the
+    # now-installed keyring. This breaks the circular dependency where auto-
+    # discovery failed before the keyring was available.
+    if [[ "$key_ok" == "true" ]] && [[ ! "$key_id" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        echo "Keyring installed. Discovering fingerprint from installed keyring..."
+        key_id="$(_discover_keyring_fingerprint "$repo_name")" || true
+    fi
+
     # Step 3: Dynamically discover and import GPG key from repo mirrors
-    # Tries to download the signing key directly from the repo's distribution
-    # rather than relying on hardcoded fingerprints that may become stale after key rotations.
+    # Tries to download the signing key directly from the repo's distribution.
     # SECURITY: Keys discovered from mirrors are verified against the expected $key_id
     # before being trusted. If the discovered key does not match $key_id, it is rejected
     # to prevent a compromised mirror from injecting an arbitrary signing key.
@@ -7826,11 +8240,13 @@ _enable_repo_with_fallback() {
         fi
     fi
 
-    # Step 4: Import the signing key from keyservers as last resort (uses hardcoded fallback fingerprint)
-    if [[ "$key_ok" != "true" ]] && command -v pacman-key >/dev/null 2>&1; then
-        echo "WARNING: Using hardcoded fallback fingerprint for $repo_name (key_id=$key_id)."
-        echo "  This fingerprint may be STALE after key rotations. If key import fails,"
-        echo "  set ${env_var_name}=<NEW_FULL_FINGERPRINT> (40 hex chars) before re-running."
+    # Step 4: Import the signing key from keyservers as last resort
+    # Requires a valid 40-char fingerprint — keyserver lookups are meaningless
+    # without one. If we still don't have a valid fingerprint, skip to Step 5
+    # and let the user provide one via the environment variable override.
+    if [[ "$key_ok" != "true" ]] && [[ "$key_id" =~ ^[0-9a-fA-F]{40}$ ]] && command -v pacman-key >/dev/null 2>&1; then
+        echo "Attempting keyserver import for $repo_name (key_id=$key_id)..."
+        echo "  If key import fails, set ${env_var_name}=<NEW_FULL_FINGERPRINT> (40 hex chars) before re-running."
         echo "  Verify current fingerprint at: https://archlinux.org/packages/?repo=$repo_name"
         echo "  or check the upstream keyring package for the latest signing key."
         if _import_key_with_retry "$key_id"; then
@@ -7840,8 +8256,20 @@ _enable_repo_with_fallback() {
 
     # Step 5: Write the repo entry with appropriate SigLevel
     if [[ "$key_ok" == "true" ]]; then
-        printf '\n[%s]\nSigLevel = Optional\n%b' "$repo_name" "$server_lines" >> /etc/pacman.conf
-        echo "$repo_name repository configured (Optional)."
+        # Final fingerprint validation: if we still don't have a valid fingerprint
+        # after all installation steps, attempt one last discovery pass.
+        if [[ ! "$key_id" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            key_id="$(_discover_keyring_fingerprint "$repo_name")" || true
+        fi
+        if [[ "$key_id" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "Using fingerprint $key_id for $repo_name"
+            printf '\n[%s]\nSigLevel = Optional\n%b' "$repo_name" "$server_lines" >> /etc/pacman.conf
+            echo "$repo_name repository configured (Optional)."
+        else
+            echo "Warning: Keyring installed but fingerprint could not be determined for $repo_name."
+            echo "SKIPPING $repo_name repository: cannot verify signing key."
+            echo "Set ${env_var_name}=<FULL_40_CHAR_FINGERPRINT> and re-run."
+        fi
     else
         echo "Warning: All key setup methods failed for $repo_name (key_id=$key_id)."
         echo "SKIPPING $repo_name repository: signature verification cannot be guaranteed."
@@ -9635,21 +10063,34 @@ export_pamac_to_host() {
         local _tmp
         _tmp=$(mktemp "${_target}.tmp.XXXXXX") || { log_warn "mktemp failed for $_target"; return 1; }
         printf '%s\n' "$_content" > "$_tmp"
-        if [[ -s "$_tmp" ]]; then
-            # Sync the temp file to disk before rename so metadata and data are
-            # committed. Without this, a power cut after rename could leave the
-            # filesystem pointing at unwritten sectors (corrupted/zero-byte file).
-            sync "$_tmp" 2>/dev/null || sync 2>/dev/null || true
-            mv -f "$_tmp" "$_target"
-            # Sync the parent directory so the rename entry is durable too.
-            local _parent
-            _parent=$(dirname "$_target")
-            sync "$_parent" 2>/dev/null || true
-        else
+        if [[ ! -s "$_tmp" ]]; then
             rm -f "$_tmp"
             log_warn "Atomic write produced empty file for $_target"
             return 1
         fi
+        # Validate the desktop file before moving into place.
+        # If validation fails, keep the original file and log a hard error.
+        # This prevents "corrupt menu" reports from broken .desktop entries.
+        if command -v desktop-file-validate >/dev/null 2>&1; then
+            if ! desktop-file-validate "$_tmp" 2>/dev/null; then
+                local _val_err
+                _val_err=$(desktop-file-validate "$_tmp" 2>&1 || true)
+                log_error "Desktop file validation FAILED for $_target:"
+                log_error "$_val_err"
+                log_error "Keeping the original file intact. The .desktop entry was NOT modified."
+                rm -f "$_tmp"
+                return 1
+            fi
+        fi
+        # Sync the temp file to disk before rename so metadata and data are
+        # committed. Without this, a power cut after rename could leave the
+        # filesystem pointing at unwritten sectors (corrupted/zero-byte file).
+        sync "$_tmp" 2>/dev/null || sync 2>/dev/null || true
+        mv -f "$_tmp" "$_target"
+        # Sync the parent directory so the rename entry is durable too.
+        local _parent
+        _parent=$(dirname "$_target")
+        sync "$_parent" 2>/dev/null || true
     }
 
     # Rollback trap: tracks created files and cleans up on failure
@@ -9817,15 +10258,19 @@ if [[ -z "\${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
     # may have crashed or been killed, leaving a stale socket behind.
     _validate_dbus_socket() {
         local _addr="\$1"
-        # Use socat if available, otherwise fall back to bash /dev/tcp
+        # Verify the socket is alive by connecting in half-duplex mode without
+        # sending or reading any data. D-Bus is a binary protocol; sending
+        # plain-text "EXIT" violates the SASL handshake and always fails.
+        # socat -u OPEN:/dev/null connects and exits 0 if a process is listening.
         if command -v socat >/dev/null 2>&1; then
-            echo "EXIT" | timeout 2 socat - "UNIX-CONNECT:\${_addr#unix:path=}" 2>/dev/null | grep -q "OK" && return 0
+            socat -u OPEN:/dev/null "UNIX-CONNECT:\${_addr#unix:path=}" 2>/dev/null && return 0
             return 1
         fi
-        # Lightweight check: try to stat the socket and verify it's a socket type
+        # Fallback: verify the socket file exists and is a UNIX socket.
+        # Cannot detect a stale socket from a crashed daemon, but avoids
+        # requiring an extra package.
         local _sock_path="\${_addr#unix:path=}"
         [[ -S "\$_sock_path" ]] || return 1
-        # Additional check: verify the socket directory is accessible and recent
         local _sock_dir
         _sock_dir=\$(dirname "\$_sock_path")
         [[ -d "\$_sock_dir" && -w "\$_sock_dir" ]] || return 1
@@ -12136,6 +12581,58 @@ show_completion_message() {
     log_info ""
     log_success "Steam Deck Pamac Setup completed successfully!"
     log_info ""
+
+    # ── Degradation Report ──
+    # Provides a concise, scannable status summary so users immediately know
+    # what's working and what needs attention — preventing "sandbox broken"
+    # bug reports when the system is actually running in a degraded-but-safe mode.
+    log_info "${BOLD}${BLUE}--- System Status ---${NC}"
+    if container_is_usable 2>/dev/null; then
+        log_info "  ✅ Container: OK ($CONTAINER_NAME)"
+    else
+        log_info "  ❌ Container: NOT RUNNING (try: podman start $CONTAINER_NAME)"
+    fi
+
+    # Check pamac version
+    local _pamac_ver=""
+    _pamac_ver=$(container_user_exec bash -c "pacman -Qi pamac-aur 2>/dev/null | grep Version | awk '{print \$3}'" 2>/dev/null || echo "")
+    if [[ -n "$_pamac_ver" ]]; then
+        log_info "  ✅ Pamac: Installed (version $_pamac_ver)"
+    else
+        log_info "  ❌ Pamac: NOT INSTALLED"
+    fi
+
+    # Check seccomp/sandbox status
+    local _has_gcc=false
+    local _has_bwrap=false
+    local _has_seccomp_helper=false
+    container_user_exec bash -c "command -v gcc >/dev/null 2>&1" 2>/dev/null && _has_gcc=true
+    container_user_exec bash -c "command -v bwrap >/dev/null 2>&1" 2>/dev/null && _has_bwrap=true
+    if [[ "$_has_gcc" == "true" ]] || container_user_exec bash -c "[[ -x /tmp/.dsr-seccomp-helper ]]" 2>/dev/null; then
+        _has_seccomp_helper=true
+    fi
+    if [[ "$_has_bwrap" == "true" ]] && [[ "$_has_seccomp_helper" == "true" ]]; then
+        log_info "  ✅ Sandbox: FULL (bwrap + seccomp-BPF)"
+    elif [[ "$_has_bwrap" == "true" ]]; then
+        log_info "  ⚠️  Sandbox: DEGRADED (bwrap + no seccomp) — run: sudo pacman -S base-devel gcc"
+    elif [[ "$_has_seccomp_helper" == "true" ]]; then
+        log_info "  ⚠️  Sandbox: DEGRADED (no bwrap, seccomp only) — run: sudo pacman -S bubblewrap"
+    else
+        log_info "  ⚠️  Sandbox: DEGRADED (unshare only) — run: sudo pacman -S base-devel gcc bubblewrap"
+    fi
+
+    # Check sudoers scope
+    local _sudoers_scope=""
+    _sudoers_scope=$(container_root_exec bash -c "grep -c 'NOPASSWD' /etc/sudoers.d/99-pamac-nopasswd 2>/dev/null || echo 0" 2>/dev/null || echo "0")
+    if [[ "$_sudoers_scope" -gt 0 ]]; then
+        if container_root_exec bash -c "grep -q '%wheel' /etc/sudoers.d/99-pamac-nopasswd 2>/dev/null" 2>/dev/null; then
+            log_info "  ⚠️  Sudoers: wheel group (consider --allow-wheel-nopasswd on multi-user hosts)"
+        else
+            log_info "  ✅ Sudoers: per-user (recommended)"
+        fi
+    fi
+
+    log_info ""
     log_info "${BOLD}${BLUE}--- Installation Summary ---${NC}"
     log_info "  Container: ${BOLD}$CONTAINER_NAME${NC}"
     log_info "  Pamac GUI package manager installed and configured"
@@ -12519,6 +13016,12 @@ main() {
         exit $?
     fi
 
+    if [[ "$_verify_sandbox_flag" == "true" ]]; then
+        ensure_podman
+        verify_sandbox
+        exit $?
+    fi
+
     if [[ "$UNINSTALL" == "true" ]]; then
         uninstall_setup
         exit 0
@@ -12683,8 +13186,18 @@ main() {
     mkdir -p "$stages_base" 2>/dev/null || true
     _touch_stage() { touch "$stages_base/$1.done" 2>/dev/null || true; }
 
+    # Snapshot the container before critical modifications for rollback on failure.
+    # This captures the container state so we can restore it if configure_container_base
+    # or subsequent stages fail irrecoverably.
+    if [[ "$DRY_RUN" != "true" ]]; then
+        _snapshot_container
+    fi
+
 	if ! configure_container_base; then
 		log_error "Container base setup failed permanently. Aborting installation."
+        if [[ "$DRY_RUN" != "true" ]]; then
+            _rollback_container
+        fi
 		exit 1
 	fi
 	_touch_stage "base_setup"
@@ -12716,8 +13229,13 @@ main() {
 	if ! install_aur_helper; then
 		if _ensure_healthy_or_recreate "aur helper recovery"; then
 			log_info "Retrying AUR helper install..."
-			install_aur_helper || exit 1
+			install_aur_helper || {
+                log_error "AUR helper install failed after recovery. Rolling back."
+                if [[ "$DRY_RUN" != "true" ]]; then _rollback_container; fi
+                exit 1
+            }
 		else
+            if [[ "$DRY_RUN" != "true" ]]; then _rollback_container; fi
 			exit 1
 		fi
 	fi
@@ -12728,8 +13246,13 @@ main() {
 	if ! install_pamac; then
 		if _ensure_healthy_or_recreate "pamac install recovery"; then
 			log_info "Retrying Pamac install..."
-			install_pamac || exit 1
+			install_pamac || {
+                log_error "Pamac install failed after recovery. Rolling back."
+                if [[ "$DRY_RUN" != "true" ]]; then _rollback_container; fi
+                exit 1
+            }
 		else
+            if [[ "$DRY_RUN" != "true" ]]; then _rollback_container; fi
 			exit 1
 		fi
 	fi

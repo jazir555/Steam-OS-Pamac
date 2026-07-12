@@ -3675,7 +3675,6 @@ _write_fake_systemd_run_wrapper() {
 # Logs diagnostics to /tmp/systemd-run-fake.log; warns on unrecognized properties.
 _DSR_LOG="/tmp/systemd-run-fake.log"
 DSR_VERSION="4.0"
-DSR_SECCOMP_VERSION_HASH="sha256:f7e6d5c4b3a2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f"
 _DSR_STRICT_SECURITY="${_STRICT_SECURITY_MODE:-false}"
 _log_dsr() { echo "[$(date '+%H:%M:%S')] $*" >> "$_DSR_LOG" 2>/dev/null; }
 _warn_dsr() { echo "systemd-run(fake): WARNING: $*" >> "$_DSR_LOG" 2>/dev/null; echo "systemd-run(fake): WARNING: $*" >&2 2>/dev/null || true; }
@@ -4779,8 +4778,7 @@ PERSONALITY_C
     # PrivateUsers=yes: run in a user namespace with UID/GID mapping
     if [[ -n "$PRIVATE_USERS" ]] && [[ "$PRIVATE_USERS" == "yes" ]]; then
         _log_dsr "Applying PrivateUsers=yes (user namespace)"
-        # This is handled by unshare --user when available
-        export _DSR_PRIVATE_USERS=true
+        # Enforcement: unshare --user flag in _run_sandboxed_unshare
     fi
 
     # ── DisableExtraFileDescriptors: close all fds except stdin/stdout/stderr ──
@@ -4861,8 +4859,6 @@ CLOSEFDS_C
             _log_dsr "  Capability bounding set: capsh (enforced via _prepare_cap_priv)"
         elif command -v setpriv >/dev/null 2>&1; then
             _log_dsr "  Capability bounding set: setpriv (enforced via _prepare_cap_priv)"
-        fi
-            [[ -n "${_DSR_CAP_ARGS:-}" ]] && _log_dsr "  Capability bounding set: setpriv ${_DSR_CAP_ARGS}"
         else
             _warn_dsr "  Neither capsh nor setpriv available — cannot enforce CapabilityBoundingSet"
         fi
@@ -4911,7 +4907,7 @@ CLOSEFDS_C
 # ── Compile seccomp helper for advanced syscall filtering ──
 # Writes a small C program, compiles it in-container (requires gcc from base-devel),
 # and returns the path. The helper applies seccomp-BPF filters then execs the target.
-# Version-hashed: the compiled binary embeds DSR_SECCOMP_VERSION_HASH so cached
+# Version-hashed: the compiled binary embeds DSR_SECCOMP_VER so cached
 # binaries from prior wrapper versions are detected and recompiled automatically.
 _compile_seccomp_helper() {
     local _helper_bin="/tmp/.dsr-seccomp-helper"
@@ -5461,7 +5457,6 @@ _build_seccomp_args() {
 # ── _prepare_seccomp: shared seccomp helper preparation (used by all paths) ──
 _prepare_seccomp() {
     _SECCOMP_HELPER=""
-    _SECCOMP_DEGRADED=false
     _seccomp_args="$(_build_seccomp_args)"
     if [[ -n "$_seccomp_args" ]]; then
         _SECCOMP_HELPER="$(_compile_seccomp_helper)" || _SECCOMP_HELPER=""
@@ -5472,7 +5467,6 @@ _prepare_seccomp() {
             echo "  running with degraded security." >&2
             exit 1
         elif [[ -z "$_SECCOMP_HELPER" ]]; then
-            _SECCOMP_DEGRADED=true
             _warn_dsr "╔══════════════════════════════════════════════════════════════╗"
             _warn_dsr "║  SECCOMP SANDBOXING DEGRADED — reduced syscall filtering   ║"
             _warn_dsr "╚══════════════════════════════════════════════════════════════╝"
@@ -5496,6 +5490,11 @@ _prepare_seccomp() {
         fi
     fi
 }
+
+# Export functions so they're available in bash -c subprocesses
+# (bwrap/unshare run commands via bash -c which creates new shell instances)
+export -f _sandbox_verify 2>/dev/null || true
+export -f _apply_sandbox 2>/dev/null || true
 
 # ── _prepare_cap_priv: shared capability/NoNewPrivileges preparation ──
 # Reads the PARSED variables (NO_NEW_PRIVS, CAP_BOUNDING_SET) directly,

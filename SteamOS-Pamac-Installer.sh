@@ -2973,7 +2973,7 @@ _cleanup_orphaned_buildusers
 # Passthrough: --help and --version
 for _a in "$@"; do
     case "$_a" in
-        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Fully emulates systemd-run for DynamicUser AUR builds in non-systemd containers."; echo ""; echo "ALL ENFORCED via bwrap (bubblewrap) or unshare + bind mounts + capsh/setpriv + seccomp-BPF:"; echo "  Filesystem: ProtectSystem, ProtectHome, PrivateTmp, PrivateDevices,"; echo "              ReadWritePaths, ReadOnlyPaths, InaccessiblePaths,"; echo "              ProtectKernelTunables (/proc/sys, /sys read-only),"; echo "              ProtectControlGroups (/sys/fs/cgroup read-only)"; echo "  Network:    PrivateNetwork (--unshare-net with bwrap)"; echo "  Privileges: NoNewPrivileges, CapabilityBoundingSet (capsh preferred),"; echo "              LockPersonality (blocks personality syscall),"; echo "              RestrictRealtime (blocks sched_setscheduler/setparam/setattr)"; echo "  Seccomp:    MemoryDenyWriteExecute (blocks mprotect W+X),"; echo "              RestrictSUIDSGID (blocks setuid/setgid family),"; echo "              ProtectKernelModules (blocks init/delete_module),"; echo "              ProtectClock (blocks clock_settime/adjtime/settimeofday),"; echo "              ProtectHostname (blocks sethostname/setdomainname),"; echo "              ProtectKernelLogs (blocks syslog syscall),"; echo "              RestrictNamespaces (blocks unshare syscall),"; echo "              RestrictAddressFamilies (filters socket() by family),"; echo "              SystemCallFilter (denylist: reboot, kexec, ptrace, etc.),"; echo "              RestrictFileSystems (mount() type allowlist)"; echo "  Runtime:    sandbox integrity verified after applying restrictions"; echo "  DynamicUser: isolated build user with private home under /var/tmp"; echo "  User, Environment, EnvironmentFile, CacheDirectory, WorkingDirectory,"; echo "              UMask, SupplementaryGroups"; echo "  --user:     run as host user (non-root invocation)"; echo "  --scope:    direct execution without transient unit creation"; echo ""; echo "RECOGNIZED (not enforced): RootDirectory, RootImage, PrivateUsers, ProtectProc,"; echo "  ProcSubset, Personality, SystemCallArchitectures, SystemCallErrorNumber,"; echo "  SystemCallLog, DisableExtraFileDescriptors, CoredumpReceive"; echo ""; echo "  Resource/accounting/logging/Condition/Assert/Timeout: recognized, silently accepted."; echo "  HOST_USER resolved dynamically from PAMAC_HOST_USER, SUDO_USER, or passwd."; echo "  Sandbox: bwrap (preferred) or unshare --mount --net + bind mounts + setpriv/capsh + seccomp helper (requires gcc)."; echo ""; echo "Use --strict-security on the installer to disable this wrapper entirely."; exit 0 ;;
+        --help|-h) echo "systemd-run (fake) v${DSR_VERSION}: Fully emulates systemd-run for DynamicUser AUR builds in non-systemd containers."; echo ""; echo "ALL ENFORCED via bwrap (bubblewrap) or unshare + bind mounts + capsh/setpriv + seccomp-BPF:"; echo "  Filesystem: ProtectSystem, ProtectHome, PrivateTmp, PrivateDevices,"; echo "              ReadWritePaths, ReadOnlyPaths, InaccessiblePaths,"; echo "              ProtectKernelTunables (/proc/sys, /sys read-only),"; echo "              ProtectControlGroups (/sys/fs/cgroup read-only)"; echo "  Network:    PrivateNetwork (--unshare-net with bwrap)"; echo "  Privileges: NoNewPrivileges, CapabilityBoundingSet (capsh preferred),"; echo "              LockPersonality (blocks personality syscall),"; echo "              RestrictRealtime (blocks sched_setscheduler/setparam/setattr)"; echo "  Seccomp:    MemoryDenyWriteExecute (blocks mprotect W+X),"; echo "              RestrictSUIDSGID (blocks setuid/setgid family),"; echo "              ProtectKernelModules (blocks init/delete_module),"; echo "              ProtectClock (blocks clock_settime/adjtime/settimeofday),"; echo "              ProtectHostname (blocks sethostname/setdomainname),"; echo "              ProtectKernelLogs (blocks syslog syscall),"; echo "              RestrictNamespaces (blocks unshare, setns, clone with CLONE_NEW*),"; echo "              RestrictAddressFamilies (filters socket() by family),"; echo "              SystemCallFilter (denylist: reboot, kexec, ptrace, etc.),"; echo "              RestrictFileSystems (blocks mount syscall)"; echo "  Runtime:    sandbox integrity verified after applying restrictions"; echo "  DynamicUser: isolated build user with private home under /var/tmp"; echo "  User, Environment, EnvironmentFile, CacheDirectory, WorkingDirectory,"; echo "              UMask, SupplementaryGroups"; echo "  --user:     run as host user (non-root invocation)"; echo "  --scope:    direct execution without transient unit creation"; echo ""; echo "RECOGNIZED (not enforced): RootDirectory, RootImage, PrivateUsers, ProtectProc,"; echo "  ProcSubset, Personality, SystemCallArchitectures, SystemCallErrorNumber,"; echo "  SystemCallLog, DisableExtraFileDescriptors, CoredumpReceive"; echo ""; echo "  Resource/accounting/logging/Condition/Assert/Timeout: recognized, silently accepted."; echo "  HOST_USER resolved dynamically from PAMAC_HOST_USER, SUDO_USER, or passwd."; echo "  Sandbox: bwrap (preferred) or unshare --mount --net + bind mounts + setpriv/capsh + seccomp helper (requires gcc)."; echo ""; echo "Use --strict-security on the installer to disable this wrapper entirely."; exit 0 ;;
         --version) echo "systemd-run (fake) v${DSR_VERSION} (SteamOS-Pamac)"; exit 0 ;;
     esac
 done
@@ -3651,8 +3651,8 @@ _sandbox_verify() {
         fi
     fi
     if [[ "$PROTECT_KERNEL_LOGS" == "yes" ]]; then
-        if [[ -e /dev/kmsg ]] && [[ ! -e /dev/null ]]; then
-            _warn_dsr "VERIFICATION WARNING: /dev/kmsg may not be replaced with /dev/null"
+        if read -t 0 _klg_chk </dev/kmsg 2>/dev/null; then
+            _warn_dsr "VERIFICATION WARNING: /dev/kmsg still readable after ProtectKernelLogs (bind over may have failed)"
         else
             _log_dsr "  /dev/kmsg access controlled (ProtectKernelLogs verified)"
         fi
@@ -4148,17 +4148,39 @@ static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
         prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &p);
         fprintf(stderr, "seccomp: ProtectKernelLogs applied (syslog syscall blocked)\n");
     }
-    /* RestrictNamespaces: block unshare syscall (prevents creating new namespaces) */
+    /* RestrictNamespaces: block unshare, setns, and clone with namespace flags.
+       Matches systemd's implementation: prevents creating new namespaces
+       (unshare), joining existing ones (setns), and forking into namespaces
+       (clone with CLONE_NEW* flags). clone3() is also blocked since its
+       flags are in an opaque struct that seccomp cannot dereference. */
     if (restrict_namespaces) {
+        /* CLONE_NEW* bitmask: covers CLONE_NEWNS(0x20000), CLONE_NEWCGROUP(0x2000000),
+           CLONE_NEWUTS(0x4000000), CLONE_NEWIPC(0x8000000), CLONE_NEWUSER(0x10000000),
+           CLONE_NEWPID(0x20000000), CLONE_NEWNET(0x40000000) */
+        #define DSR_CLONE_NEWNS_FLAGS 0x7F020000
         struct sock_filter f[] = {
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
+            /* unshare: unconditional block */
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_unshare, 0, 1),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            /* setns: unconditional block */
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setns, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            /* clone3: unconditional block (flags in opaque struct) */
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_clone3, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            /* clone: block only when CLONE_NEW* flags are set */
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_clone, 0, 3),
+            BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,args[0])),
+            BPF_JUMP(BPF_JMP|BPF_JSET|BPF_K, DSR_CLONE_NEWNS_FLAGS, 1, 0),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
+            /* ALLOW for all other syscalls */
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
         };
         struct sock_fprog p = { .len=sizeof(f)/sizeof(f[0]), .filter=f };
         prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &p);
-        fprintf(stderr, "seccomp: RestrictNamespaces applied (unshare syscall blocked)\n");
+        fprintf(stderr, "seccomp: RestrictNamespaces applied (unshare, setns, clone3 blocked; clone with CLONE_NEW* blocked)\n");
     }
     /* RestrictAddressFamilies: filter socket() by allowed address families.
        Allowed: AF_UNIX(1), AF_INET(2), AF_INET6(10), AF_NETLINK(16).
@@ -4223,47 +4245,23 @@ static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
         prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &p);
         fprintf(stderr, "seccomp: SystemCallFilter applied (reboot, kexec, ptrace, vm, key syscalls blocked)\n");
     }
-    /* RestrictFileSystems: filter mount() filesystem type.
-       Allowed: tmpfs(0x01021993), proc(0x9fa0), sysfs(0x62656572),
-                devtmpfs(0x1011), cgroup(0x27e0eb), cgroup2(0x63677270),
-                none/overlay/fuse (bind mounts use type=0).
-       Blocks mount() with disallowed filesystem types. */
+    /* RestrictFileSystems: block mount() syscall entirely.
+       NOTE: seccomp-BPF cannot dereference pointers — args[2] for mount()
+       is a userspace pointer to a filesystem type string, not the magic
+       number itself. True per-type filtering requires Landlock LSM or
+       eBPF. Blocking all mount() is the safe security default that
+       matches systemd's intent: processes inside a RestrictFileSystems
+       sandbox should not mount new filesystems. */
     if (restrict_file_systems) {
         struct sock_filter f[] = {
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
-            /* If not mount, skip to ALLOW (skip 16 instructions) */
-            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_mount, 0, 16),
-            /* Load mount filesystemtype (args[2]) */
-            BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,args[2])),
-            /* tmpfs (0x01021993) */
-            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0x01021993, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
-            /* proc (0x9fa0) */
-            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0x9fa0, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
-            /* sysfs (0x62656572) */
-            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0x62656572, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
-            /* devtmpfs (0x1011) */
-            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0x1011, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
-            /* cgroup (0x27e0eb) */
-            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0x27e0eb, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
-            /* cgroup2 (0x63677270) */
-            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0x63677270, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
-            /* 0 (none/bind mount) */
-            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0, 0, 1),
-            BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
-            /* Not in allowed list -> block with EPERM */
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_mount, 0, 1),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO|(SECCOMP_EPERM&SECCOMP_RET_DATA)),
-            /* ALLOW for non-mount syscalls */
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
         };
         struct sock_fprog p = { .len=sizeof(f)/sizeof(f[0]), .filter=f };
         prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &p);
-        fprintf(stderr, "seccomp: RestrictFileSystems applied (tmpfs, proc, sysfs, devtmpfs, cgroup, bind allowed)\n");
+        fprintf(stderr, "seccomp: RestrictFileSystems applied (mount syscall blocked)\n");
     }
 }
 int main(int argc, char *argv[]) {

@@ -274,8 +274,8 @@ sanitize_and_upload_log() {
         -e 's/\x1B\[[0-9;]*[A-Za-z]//g' \
         -e "s|$HOME|~HOME|g" \
         -e "s|/home/[a-zA-Z0-9_-]*|/home/<USER>|g" \
-        -e 's/\b[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\b/<IP>/g' \
-        -e 's/\b[0-9a-f]\{40,\}\b/<HASH>/gi' \
+        -e 's/[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}/<IP>/g' \
+        -e 's/[0-9a-f]\{40,\}/<HASH>/gi' \
         -e 's/-----BEGIN [A-Z ]*KEY-----/<REDACTED KEY>/g' \
         -e 's/-----END [A-Z ]*KEY-----//g' \
         -e 's/(Bearer |Authorization:)[^ ]*/\1<REDACTED>/gi' \
@@ -295,7 +295,7 @@ sanitize_and_upload_log() {
         -e 's/ssh-(rsa|ed25519|dss|ecdsa) [A-Za-z0-9+/=]*/ssh-<REDACTED_KEY>/g' \
         -e 's/cookie[=: ].*$/cookie=<REDACTED>/gi' \
         -e 's/PRIVATE[_-]?KEY[_-]?FILE/PRIVATE_KEY_FILE/gi' \
-        -e 's/\.pem\b/<REDACTED_PEM>/g' \
+        -e 's/\.pem/<REDACTED_PEM>/g' \
         "$LOG_FILE" 2>/dev/null \
     | grep -viE '(
         AUR_[A-Z_]*KEY|             # AUR environment variable keys
@@ -355,7 +355,7 @@ _filter_verbose_output() {
     # :: prefix conventions, update the exclusion list accordingly.
     # Additional noise suppressed: plain "downloading" progress lines without
     # errors, "Nothing to do." churn, and "up to date" confirmations.
-    grep -v -E '^\s*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database)|^downloading\s|^::(synchronizing|debug:)|^Nothing to do\.| is up to date$' || true
+    grep -v -E '^[[:space:]]*$|^resolving dependencies|^looking for conflicting|^checking (keyring|package|group|database)|^downloading[[:space:]]|^::(synchronizing|debug:)|^Nothing to do\.| is up to date$' || true
 }
 
 run_command() {
@@ -408,12 +408,29 @@ container_root_exec() {
   fi
   local _rc=0
   if command -v distrobox-enter >/dev/null 2>&1; then
-    distrobox-enter "$CONTAINER_NAME" --root -- "$@" 2>/dev/null && return 0
-    _rc=$?
-    _LAST_USABLE_CHECK_TS=0  # invalidate cache on failure
-    log_debug "distrobox-enter --root failed (exit $_rc), falling back to direct container exec"
+    # Probe: check that distrobox-enter supports --root flag. Older versions
+    # (<1.5) may not support --root, causing silent failures. The probe runs
+    # once and caches in _DISTROBOX_HAS_ROOT so subsequent calls are fast.
+    if [[ "${_DISTROBOX_HAS_ROOT:-unset}" == "unset" ]]; then
+      if distrobox-enter --help 2>/dev/null | grep -q -- '--root'; then
+        _DISTROBOX_HAS_ROOT=true
+      else
+        _DISTROBOX_HAS_ROOT=false
+        log_warn "distrobox-enter does not support --root (distrobox < 1.5?). Falling back to direct exec."
+      fi
+    fi
+    if [[ "${_DISTROBOX_HAS_ROOT:-false}" == "true" ]]; then
+      local _dbx_stderr
+      _dbx_stderr=$(mktemp 2>/dev/null) || _dbx_stderr="/dev/null"
+      distrobox-enter "$CONTAINER_NAME" --root -- "$@" 2>"$_dbx_stderr" && { rm -f "$_dbx_stderr" 2>/dev/null; return 0; }
+      _rc=$?
+      log_debug "distrobox-enter --root stderr: $(cat "$_dbx_stderr" 2>/dev/null)"
+      rm -f "$_dbx_stderr" 2>/dev/null || true
+      _LAST_USABLE_CHECK_TS=0  # invalidate cache on failure
+      log_debug "distrobox-enter --root failed (exit $_rc), falling back to direct container exec"
+    fi
   fi
-  container_runtime_for_ops exec -i -u 0 -e HOME="/root" "$CONTAINER_NAME" "$@"
+  container_runtime_for_ops exec -i -u 0 -e HOME="/root" -e LOW_MEMORY="${LOW_MEMORY:-false}" "$CONTAINER_NAME" "$@"
   _rc=$?
   [[ $_rc -ne 0 ]] && _LAST_USABLE_CHECK_TS=0  # invalidate cache on failure
   return $_rc
@@ -994,6 +1011,10 @@ check_kernel_glibc_compat() {
         log_warn "     ARCHLINUX_IMAGE=archlinux:base-20240101 $0"
         log_warn "  2. Update your host kernel if possible."
         log_warn "  3. Accept the risk if your Arch packages are currently working."
+        log_warn ""
+        log_warn "NOTE: Installation will proceed despite this warning. If container"
+        log_warn "binaries start segfaulting after an Arch update, re-run with the"
+        log_warn "ARCHLINUX_IMAGE pin to roll back the container's glibc."
     elif [[ "$kernel_warn" == "true" ]]; then
         log_info "Host kernel ${kernel_major}.${kernel_minor} is close to the minimum"
         log_info "recommended for current Arch Linux glibc. Monitor Arch news for"
@@ -2024,11 +2045,16 @@ if [[ -d /var/cache/pacman/pkg ]]; then
     _cache_count=$(find /var/cache/pacman/pkg -maxdepth 1 -name '*.pkg.tar.*' 2>/dev/null | wc -l || echo "0")
     if [[ "$_cache_count" -gt 0 ]]; then
         echo "  Found $_cache_count cached packages."
+        if [[ "$_cache_count" -gt 500 ]]; then
+            echo "  Cache is large ($_cache_count packages). Limiting to 500 most recent to avoid excessive time."
+            _cache_count=500
+        fi
         _inner_remove_stale_lock
         pacman -Syy --noconfirm 2>/dev/null || true
         
         # Only reinstall cached packages that are NOT in the DB properly
         _reinstalled=0
+        _cache_processed=0
         for _cache_pkg in /var/cache/pacman/pkg/*.pkg.tar.*; do
             [[ -f "$_cache_pkg" ]] || continue
             _pkg_base=$(basename "$_cache_pkg" | sed "s/-[0-9].*//;s/\.pkg\.tar\.\(xz\|zst\|gz\|bz2\)$//" || true)
@@ -2039,6 +2065,11 @@ if [[ -d /var/cache/pacman/pkg ]]; then
             fi
             if pacman -U --noconfirm "$_cache_pkg" 2>/dev/null; then
                 _reinstalled=$((_reinstalled + 1))
+            fi
+            _cache_processed=$((_cache_processed + 1))
+            if [[ $_cache_processed -ge 500 ]]; then
+                echo "  Processed 500 packages (cache guard limit). Skipping remaining."
+                break
             fi
         done
         echo "  Reinstalled $_reinstalled packages from cache."
@@ -2147,10 +2178,9 @@ for _db_dir in /var/lib/pacman/local/*/; do
     if ! grep -q "^%NAME%$" "$_db_dir/desc" 2>/dev/null; then
         echo "  $_pkg_name: missing %NAME% field in desc — reconstructing"
         # Reconstruct NAME from directory name (pkgname-version format)
-        local _reconstructed_name="${_pkg_name%%-[0-9]*}"
+        _reconstructed_name="${_pkg_name%%-[0-9]*}"
         if [[ -n "$_reconstructed_name" ]]; then
             # Insert %NAME% at the beginning of desc
-            local _tmp_desc
             _tmp_desc=$(mktemp)
             printf '%%NAME%%\n%s\n\n' "$_reconstructed_name" | cat - "$_db_dir/desc" > "$_tmp_desc" 2>/dev/null
             if [[ -s "$_tmp_desc" ]]; then
@@ -2163,10 +2193,9 @@ for _db_dir in /var/lib/pacman/local/*/; do
     fi
     if ! grep -q "^%VERSION%$" "$_db_dir/desc" 2>/dev/null; then
         echo "  $_pkg_name: missing %VERSION% field in desc — reconstructing"
-        local _reconstructed_ver="${_pkg_name##*-}"
+        _reconstructed_ver="${_pkg_name##*-}"
         if [[ -n "$_reconstructed_ver" ]] && [[ "$_reconstructed_ver" != "$_pkg_name" ]]; then
             # Rebuild desc: keep everything up to %NAME% block, add VERSION
-            local _tmp_desc
             _tmp_desc=$(mktemp)
             # Extract everything up to and including %NAME% block, skip blank line
             awk "BEGIN{s=0} /^%NAME%\$/{print; s=1; next} s && /^[[:space:]]*\$/{print; s=2; next} s==2{next} {print}" \
@@ -2318,9 +2347,9 @@ fi
 if command -v perl >/dev/null 2>&1; then
     perl -e "select undef,undef,undef,\$ARGV[0]" "$_d" 2>/dev/null && return 0
 fi
-local _target=\$(( _d + 0 ))
-[[ \$_target -lt 1 ]] && _target=1
-local _start=\$SECONDS
+local _target=$(( _d + 0 ))
+[[ $_target -lt 1 ]] && _target=1
+local _start=$SECONDS
 while (( SECONDS - _start < _target )); do
     read -t 1 _dummy </dev/null 2>/dev/null || true
 done
@@ -2346,9 +2375,9 @@ fi
 if command -v perl >/dev/null 2>&1; then
     perl -e "select undef,undef,undef,\$ARGV[0]" "$_d" 2>/dev/null && return 0
 fi
-local _target=\$(( _d + 0 ))
-[[ \$_target -lt 1 ]] && _target=1
-local _start=\$SECONDS
+local _target=$(( _d + 0 ))
+[[ $_target -lt 1 ]] && _target=1
+local _start=$SECONDS
 while (( SECONDS - _start < _target )); do
     read -t 1 _dummy </dev/null 2>/dev/null || true
 done
@@ -2435,13 +2464,20 @@ _calc_makepkg_jobs() {
         ram_per_job_kb=$(( ram_per_job_kb * 2 ))
     fi
     local mem_avail_kb=0
+    local swap_avail_kb=0
     local ncpu
     ncpu=$(nproc 2>/dev/null || echo "1")
     if [[ -f /proc/meminfo ]]; then
         mem_avail_kb=$(awk "/^MemAvailable:/{print \$2}" /proc/meminfo 2>/dev/null || echo "0")
+        # Also check SwapFree. When LOW_MEMORY is enabled, total
+        # allocatable memory = RAM + swap. Without swap, large AUR
+        # builds (e.g. chromium) can OOM even with a conservative
+        # per-job RAM budget. Capping by RAM+swap prevents this.
+        swap_avail_kb=$(awk "/^SwapFree:/{print \$2}" /proc/meminfo 2>/dev/null || echo "0")
     fi
     if [[ "$mem_avail_kb" -gt 0 ]]; then
-        local jobs=$(( mem_avail_kb / ram_per_job_kb ))
+        local total_avail_kb=$(( mem_avail_kb + swap_avail_kb ))
+        local jobs=$(( total_avail_kb / ram_per_job_kb ))
         [[ "$jobs" -lt 1 ]] && jobs=1
         [[ "$jobs" -gt "$ncpu" ]] && jobs="$ncpu"
         echo "$jobs"
@@ -2567,6 +2603,7 @@ install_base_devel_batched() {
         "gzip libtool make patch"
         "pkgconf sed texinfo which"
     )
+    local batch
     for batch in "${BASE_DEVEL_BATCHES[@]}"; do
         echo "Installing batch: $batch"
         sync 2>/dev/null || true
@@ -3127,8 +3164,13 @@ _apply_sandbox() {
         [[ -n "$CACHE_DIR" ]] && _writable+=("/var/cache/$CACHE_DIR")
         for _wp in "${_writable[@]}"; do
             [[ -e "$_wp" ]] || mkdir -p "$_wp" 2>/dev/null || continue
-            mount --bind "$_wp" "$_wp" 2>/dev/null && mount -o remount,bind,rw "$_wp" 2>/dev/null \
-                || _warn_dsr "  Could not make writable: $_wp"
+            if mount --bind "$_wp" "$_wp" 2>/dev/null; then
+                if ! mount -o remount,bind,rw "$_wp" 2>/dev/null; then
+                    _warn_dsr "  Bind succeeded but remount failed for writable path: $_wp"
+                fi
+            else
+                _warn_dsr "  Could not make writable: $_wp"
+            fi
         done
         # ProtectSystem=full additionally makes /etc, /usr, /boot read-only
         if [[ "$PROTECT_SYSTEM" == "full" ]] || [[ "$PROTECT_SYSTEM" == "true" ]]; then
@@ -4182,14 +4224,14 @@ if [[ -f "$_KEYRING_SENTINEL" ]]; then
         echo "Found valid keyring recovery sentinel from previous run (pubring.gpg checksum matches). Keyring recovery already completed."
         _safe_recovered=true
         rm -f "$_KEYRING_SENTINEL" 2>/dev/null || true
-    elif [[ -z "$_sentinel_current" || "$_sentinel_current" == *":*" && "${_sentinel_current##*:}" == "" ]]; then
+    elif [[ -z "$_sentinel_current" || ( "$_sentinel_current" == *":*" && "${_sentinel_current##*:}" == "" ) ]]; then
         # No checksum tool available — try Python hashlib first (guaranteed
         # present, no pacman needed). Only fall back to pacman -S coreutils
         # if Python is also missing, but skip that if the keyring is broken
         # (pacman -S would fail with signature errors — chicken-and-egg).
         echo "Found keyring recovery sentinel, but no checksum tool is available to validate pubring.gpg."
         _sentinel_current=$(_keyring_checksum)
-        if [[ -z "$_sentinel_current" || "$_sentinel_current" == *":*" && "${_sentinel_current##*:}" == "" ]]; then
+        if [[ -z "$_sentinel_current" || ( "$_sentinel_current" == *":*" && "${_sentinel_current##*:}" == "" ) ]]; then
             echo "WARNING: No checksum tool available (sha256sum/sha256/shasum/python3 all missing). Trusting sentinel (presence-only) so recovery is not blocked."
             _safe_recovered=true
             rm -f "$_KEYRING_SENTINEL" 2>/dev/null || true
@@ -4255,7 +4297,8 @@ done
 # Method B: Download keyring package directly via HTTPS and import keys manually
 if [[ "$_safe_recovered" != "true" ]] && command -v curl >/dev/null 2>&1; then
     echo "Method B: Attempting direct keyring package download via HTTPS..."
-    _SECURE_TMP=$(mktemp -d /var/tmp/pamac-kr-XXXXXX) && chmod 700 "$_SECURE_TMP" 2>/dev/null || _SECURE_TMP=$(mktemp -d)
+    _SECURE_TMP=$(mktemp -d /var/tmp/pamac-kr-XXXXXX 2>/dev/null) || _SECURE_TMP=$(mktemp -d)
+    chmod 700 "$_SECURE_TMP" 2>/dev/null || true
     # Try multiple mirrors for keyring package download
     _mirror_urls=(
         "https://geo.mirror.pkgbuild.com/core/os/x86_64"
@@ -5180,7 +5223,7 @@ if [[ -f "$pamac_policy" ]]; then
     # Any active local session could trigger a full system upgrade without
     # authentication, which is a privilege escalation vector. It remains at
     # auth_admin (requires password) so only intentional upgrades proceed.
-
+fi
 
 echo "Polkit and D-Bus setup finished."
 POLKIT_DBUS_EOF
@@ -5585,6 +5628,8 @@ start_pamac_daemon() {
 _refresh_pacman_databases() {
 local sync_dir="/var/lib/pacman/sync"
 local max_age=43200  # 12 hours in seconds
+
+# If no .db files exist, sync immediately
 if ! ls "$sync_dir"/*.db >/dev/null 2>&1; then
     log_bootstrap "No sync databases found, syncing..."
     rm -rf "$sync_dir"/download-* 2>/dev/null || true
@@ -5596,39 +5641,65 @@ if ! ls "$sync_dir"/*.db >/dev/null 2>&1; then
     fi
     return 0
 fi
+
+# Check age of newest database file
 local newest_db
 newest_db=$(ls -t "$sync_dir"/*.db 2>/dev/null | head -1)
-[[ -z "$newest_db" ]] && return 0
+if [[ -z "$newest_db" ]]; then
+    pacman -Sy --noconfirm 2>&1 | tail -5 >> "$BOOTSTRAP_LOG" || true
+    return 0
+fi
+
 local db_mtime db_age now
 db_mtime=$(stat -c %Y "$newest_db" 2>/dev/null || echo "0")
 now=$(date +%s 2>/dev/null || echo "0")
 db_age=$(( now - db_mtime ))
+
 if [[ "$db_age" -gt "$max_age" ]]; then
-    log_bootstrap "Sync databases are ${db_age}s old. Refreshing..."
+    log_bootstrap "Sync databases are ${db_age}s old (max ${max_age}s). Refreshing..."
     rm -rf "$sync_dir"/download-* 2>/dev/null || true
     pacman -Sy --noconfirm 2>&1 | tail -5 >> "$BOOTSTRAP_LOG" || true
     log_bootstrap "Database refresh complete."
+else
+    log_bootstrap "Sync databases are ${db_age}s old (within ${max_age}s limit). OK."
 fi
 }
 
+# Ensure pacman keyring is initialized (first-run or corrupted)
 _ensure_keyring() {
 if [[ -f /etc/pacman.d/gnupg/pubring.gpg ]] && pacman-key --list-keys >/dev/null 2>&1; then
+    # Keyring exists — verify all repo keyrings are populated
     local _populated
     _populated=$(pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
     if [[ "$_populated" -gt 10 ]]; then
         return 0
     fi
+    log_bootstrap "Keyring exists but only has $_populated keys. Re-populating..."
 fi
-log_bootstrap "Repairing keyring..."
+log_bootstrap "Initializing pacman keyring..."
 rm -rf /etc/pacman.d/gnupg 2>/dev/null || true
 mkdir -p /etc/pacman.d/gnupg 2>/dev/null || true
 chmod 700 /etc/pacman.d/gnupg 2>/dev/null || true
 pacman-key --init 2>/dev/null || true
+# Populate all available keyrings (archlinux, blackarch, archlinuxcn, endeavouros, etc.)
 for _kr in /usr/share/pacman/keyrings/*.gpg; do
     [[ -f "$_kr" ]] || continue
     _kr_name=$(basename "$_kr" .gpg)
-    pacman-key --populate "$_kr_name" 2>/dev/null || true
+    if pacman-key --populate "$_kr_name" 2>/dev/null; then
+        log_bootstrap "Populated keyring: $_kr_name"
+    fi
 done
+# Also import any locally added keys
+for _kr in /usr/share/pacman/keyrings/*.gpg; do
+    [[ -f "$_kr" ]] || continue
+    _kr_name=$(basename "$_kr" .gpg)
+    if pacman-key --lsign-key --no-confirm "pacman@$_kr_name" 2>/dev/null; then
+        log_bootstrap "Locally signed keyring: $_kr_name"
+    fi
+done
+local _count
+_count=$(pacman-key --list-keys 2>/dev/null | grep -c "^pub " || echo "0")
+log_bootstrap "Keyring initialized: $_count keys"
 }
 
 # Clean stale pacman lock file
@@ -6170,7 +6241,7 @@ _discover_fingerprint_from_pkg() {
         _direct="${_direct//\\\$arch/$_host_arch}"
         _direct="${_direct//\$arch/$_host_arch}"
         _direct="${_direct//\\\$repo/$_repo}"
-        _direct="${_direct//\$/repo/$_repo}"
+        _direct="${_direct//\$repo/$_repo}"
         _direct="${_direct//\$\{arch\}/$_host_arch}"
         _direct="${_direct//\$\{repo\}/$_repo}"
         local _pkg_url="${_direct%/}/${_keyring_pkg}.pkg.tar.zst"
@@ -6862,7 +6933,8 @@ version_meets_requirement() {
                 "<")
                     [[ "$cmp_result" -lt 0 ]] && return 0 || return 1 ;;
                 *)
-                    return 0 ;;
+                    echo "WARNING: Unknown operator '$op' in version_meets_requirement (vercmp branch)." >&2
+                    return 1 ;;
             esac
         fi
     fi
@@ -6895,7 +6967,8 @@ version_meets_requirement() {
             return 1
             ;;
         *)
-            return 0
+            echo "WARNING: Unknown operator '$op' in version_meets_requirement (fallback)." >&2
+            return 1
             ;;
     esac
 }
@@ -7966,10 +8039,6 @@ EOF
     fi
 }
 
-_is_root_writable() {
-    [ -w /etc ]
-}
-
 configure_ssh_environment() {
     log_step "Configuring SSH environment for nested commands"
 
@@ -7990,6 +8059,17 @@ configure_ssh_environment() {
         fi
     fi
 
+    # ~/.ssh/environment is ONLY created when the user explicitly opts in
+    # via --enable-ssh-env. Creating it unconditionally creates a latent
+    # risk: if sshd is ever configured with PermitUserEnvironment yes
+    # (e.g., by a third-party tool or a config merge), the file would be
+    # ready to inject PATH/LD_PRELOAD/other variables without the user's
+    # knowledge. Keeping the file absent by default eliminates this risk.
+    if [[ "$ENABLE_SSH_ENV" != "true" ]]; then
+        log_info "SSH environment disabled (default). Pass --enable-ssh-env to opt in."
+        return 0
+    fi
+
     local ssh_dir="$HOME/.ssh"
     mkdir -p "$ssh_dir"
     chmod 700 "$ssh_dir"
@@ -8002,11 +8082,6 @@ configure_ssh_environment() {
 
     local sshd_conf_dir="/etc/ssh/sshd_config.d"
     local permit_env_conf="$sshd_conf_dir/permit-user-env.conf"
-
-    if [[ "$ENABLE_SSH_ENV" != "true" ]]; then
-        log_info "SSH PermitUserEnvironment is disabled (default). Pass --enable-ssh-env to opt in."
-        return 0
-    fi
 
     # Multi-user detection: PermitUserEnvironment exposes every user's
     # ~/.ssh/environment to SSH sessions. On a shared host, one user could
@@ -9571,7 +9646,7 @@ PAMAC_DESKTOP
         _desktop_bn=app_name ".desktop"
         _host_file="/home/" user "/.local/share/applications/" container "-" _desktop_bn
         _apps_dir="/home/" user "/.local/share/applications"
-        printf "Exec=bash -c '%s exec -u 0 %s pacman -R --noconfirm %s 2>/dev/null && rm -f %s && touch %s && notify-send -i edit-delete \"Uninstalled\" \"%s removed\" 2>/dev/null'\n" "\$_cm" container, owner_pkg, _host_file, _apps_dir, owner_pkg
+        printf "Exec=bash -c '%s exec -u 0 %s pacman -R --noconfirm %s 2>/dev/null && rm -f %s && touch %s && notify-send -i edit-delete \"Uninstalled\" \"%s removed\" 2>/dev/null'\n", "\$_cm", container, owner_pkg, _host_file, _apps_dir, owner_pkg
         print "Icon=edit-delete"
     }
     { print }
@@ -10584,6 +10659,7 @@ main() {
 
   if [[ "$FORCE_REBUILD" == "true" ]] && distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
     log_step "Force rebuild requested - removing existing container"
+    CONTAINER_HAS_INIT="unknown"
     uninstall_setup
     force_remove_container "$CONTAINER_NAME"
     sleep 2

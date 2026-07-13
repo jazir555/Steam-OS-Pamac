@@ -3856,9 +3856,7 @@ UNSET_ENV=()
 CONFIG_DIRS=()
 # ── OOM ──
 OOM_SCORE_ADJUST=""
-# ── Timeouts ──
 TIMEOUT_START=""
-TIMEOUT_STOP=""
 for arg in "$@"; do
 if $SKIP_NEXT; then
 SKIP_NEXT=false
@@ -4168,7 +4166,7 @@ case "$arg" in
 --property=RestartForceExitStatus=*) continue ;;
 --property=WatchdogSec=*) continue ;;
 --property=TimeoutStartSec=*) TIMEOUT_START="${arg#--property=TimeoutStartSec=}"; _log_dsr "Sandbox: $arg"; continue ;;
---property=TimeoutStopSec=*) TIMEOUT_STOP="${arg#--property=TimeoutStopSec=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=TimeoutStopSec=*) continue ;;
 --property=TimeoutAbortSec=*) continue ;;
 --property=TimeoutCleanSec=*) continue ;;
 --property=TimeoutStartFailureMode=*) continue ;;
@@ -5016,7 +5014,7 @@ CLOSEFDS_C
                 [[ "$_rl_val" == "infinity" || "$_rl_val" == "max" ]] && _rl_val="unlimited"
                 local _ul_scope="S"
                 [[ "$_ul_hard" == "true" ]] && _ul_scope="H"
-                ulimit "$_ul_flag" "$_ul_val" 2>/dev/null \
+                ulimit "-${_ul_scope}" "${_ul_flag}" "${_rl_val}" 2>/dev/null \
                     && _log_dsr "  ${_rl_name}=${_rl_val} (ulimit -${_ul_scope} $_ul_flag)" \
                     || _warn_dsr "  Failed to set ${_rl_name}=${_rl_val}"
             fi

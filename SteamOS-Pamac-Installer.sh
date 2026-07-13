@@ -1491,14 +1491,69 @@ check_network_connectivity() {
     log_step "Checking outbound network connectivity..."
     local _probe_url="https://archlinux.org"
     local _http_code
-    _http_code=$(timeout ${NETWORK_PROBE_TIMEOUT} curl -sI --connect-timeout ${NETWORK_PROBE_CONNECT_TIMEOUT} --max-time ${NETWORK_PROBE_TIMEOUT} -o /dev/null -w "%{http_code}" "$_probe_url" 2>/dev/null || echo "000")
+    local _curl_output=""
+    local _curl_rc=0
+
+    # Check for proxy configuration first — common on corporate/hotel networks.
+    if [[ -n "${http_proxy:-}" || -n "${https_proxy:-}" || -n "${HTTP_PROXY:-}" || -n "${HTTPS_PROXY:-}" ]]; then
+        local _proxy="${http_proxy:-}${https_proxy:-}${HTTP_PROXY:-}${HTTPS_PROXY:-}"
+        log_info "Proxy detected: $_proxy"
+        log_info "curl/pacman will use this proxy for all HTTPS connections."
+    fi
+
+    # Check for captive portal: connect to archlinux.org and inspect the response.
+    # Captive portals typically return HTTP 200/3xx with HTML content instead of
+    # the expected Arch Linux page, or intercept HTTPS with a self-signed cert.
+    _curl_output=$(timeout ${NETWORK_PROBE_TIMEOUT} curl -sSf --connect-timeout ${NETWORK_PROBE_CONNECT_TIMEOUT} \
+        --max-time ${NETWORK_PROBE_TIMEOUT} -o /dev/null -w "%{http_code}\n%{ssl_verify_result}" \
+        "$_probe_url" 2>/tmp/pamac_curl_err) || _curl_rc=$?
+    _http_code=$(echo "$_curl_output" | head -1 || echo "000")
+    local _ssl_verify=$(echo "$_curl_output" | tail -1 || echo "")
+
+    # SSL verification result: 0 = valid, non-zero = cert issue (captive portal
+    # or corporate proxy intercepting HTTPS with self-signed cert).
+    if [[ "$_ssl_verify" =~ ^[1-9] ]]; then
+        log_warn "SSL certificate verification failed (result=$_ssl_verify)."
+        log_warn "This usually indicates a captive portal or corporate proxy intercepting HTTPS."
+        log_warn ""
+        log_warn "Captive portal detected! You need to:"
+        log_warn "  1. Open a browser and accept the captive portal login page."
+        log_warn "  2. If behind a corporate proxy, set the proxy before re-running:"
+        log_warn "     export http_proxy=http://proxy-host:port"
+        log_warn "     export https_proxy=http://proxy-host:port"
+        log_warn "  3. If the proxy uses a custom CA certificate, add it:"
+        log_warn "     export CURL_CA_BUNDLE=/path/to/ca-cert.pem"
+        log_warn "  4. If all else fails, run with --skip-compat-check to bypass"
+        log_warn "     network-dependent checks (keyring bootstrap may still fail)."
+        log_info ""
+        log_info "The keyring bootstrap and AUR operations require HTTPS to archlinux.org"
+        log_info "and key servers. Without valid SSL, these will fail with cryptic errors."
+    fi
+
     case "$_http_code" in
         000)
-            log_warn "Network probe could not reach $_probe_url (this is a heuristic — mirrors may still work)."
-            log_info "The keyring bootstrap will attempt recovery and report failures at runtime if needed."
-            log_info "If you know the host is offline, install cached packages instead."
-            log_info "  - Verify DNS: getent hosts archlinux.org"
-            log_info "  - Behind captive portal/proxy? export https_proxy=http://host:port"
+            local _curl_err=""
+            _curl_err=$(cat /tmp/pamac_curl_err 2>/dev/null || echo "")
+            if echo "$_curl_err" | grep -qi "SSL\|certificate\|cert\|verify"; then
+                log_warn "SSL/TLS error connecting to $_probe_url:"
+                log_warn "  $_curl_err"
+                log_warn "This is likely a captive portal or proxy with self-signed certificates."
+                log_warn ""
+                log_warn "To work around:"
+                log_warn "  1. export https_proxy=http://proxy-host:port"
+                log_warn "  2. export CURL_CA_BUNDLE=/path/to/ca-cert.pem"
+                log_warn "  3. Or open a browser to accept the captive portal login page."
+            elif echo "$_curl_err" | grep -qi "resolve\|DNS\|name"; then
+                log_warn "DNS resolution failed for $_probe_url."
+                log_warn "Check: getent hosts archlinux.org"
+                log_warn "If behind a proxy: export http_proxy=http://proxy-host:port"
+            else
+                log_warn "Network probe could not reach $_probe_url (this is a heuristic — mirrors may still work)."
+                log_info "The keyring bootstrap will attempt recovery and report failures at runtime if needed."
+                log_info "If you know the host is offline, install cached packages instead."
+                log_info "  - Verify DNS: getent hosts archlinux.org"
+                log_info "  - Behind captive portal/proxy? export https_proxy=http://host:port"
+            fi
             ;;
         2*|3*)
             log_success "Network connectivity OK (HTTP $_http_code from $_probe_url)."
@@ -1507,6 +1562,7 @@ check_network_connectivity() {
             log_debug "Reachable probe (HTTP $_http_code) — common redirect/maintenance code, treating as reachable."
             ;;
     esac
+    rm -f /tmp/pamac_curl_err 2>/dev/null || true
 }
 
 # Detect the host desktop environment in a lowercased, normalized form.
@@ -10703,6 +10759,14 @@ _atomic_edit_pamac_conf() {
     sed -i 's/^#CheckAURVCSUpdates/CheckAURVCSUpdates/' "$tmp"
     grep -q '^EnableAUR' "$tmp" || printf 'EnableAUR\n' >> "$tmp"
     grep -q '^CheckAURUpdates' "$tmp" || printf 'CheckAURUpdates\n' >> "$tmp"
+    # Disable Flatpak support: SteamOS has native Flatpak via Discover.
+    # Pamac's Flatpak integration would show duplicate entries (Flathub via
+    # Pamac + Flathub via Discover), confusing users. Force Pamac to be
+    # strictly an AUR/Pacman management tool.
+    if grep -q '^EnableFlatpak' "$tmp"; then
+        sed -i 's/^EnableFlatpak.*/#EnableFlatpak/' "$tmp"
+    fi
+    grep -q '^EnableFlatpak' "$tmp" || printf '#EnableFlatpak (disabled: use Discover for Flatpaks)\n' >> "$tmp"
     if grep -q '^BuildDirectory' "$tmp"; then
         sed -i 's|^BuildDirectory.*|BuildDirectory = /home/'"$current_user"'/\.pamac-build|' "$tmp"
     else
@@ -10752,7 +10816,9 @@ fi
 else
     echo "Warning: /etc/pamac.conf not found. Creating minimal config."
     mkdir -p /etc
-    printf 'EnableAUR\nCheckAURUpdates\nCheckAURVCSUpdates\nBuildDirectory = /home/'"$current_user"'/.pamac-build\n' > /etc/pamac.conf
+    # Flatpak disabled: SteamOS uses Discover for Flatpaks. Pamac should only
+    # manage Arch/AUR packages to avoid duplicate entries.
+    printf '#EnableFlatpak (disabled: use Discover for Flatpaks)\nEnableAUR\nCheckAURUpdates\nCheckAURVCSUpdates\nBuildDirectory = /home/'"$current_user"'/.pamac-build\n' > /etc/pamac.conf
     mkdir -p "/home/$current_user/.pamac-build"
     chown "$current_user:$current_user" "/home/$current_user/.pamac-build" 2>/dev/null || true
 fi

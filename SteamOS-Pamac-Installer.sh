@@ -150,6 +150,27 @@ _cleanup_temp_files() {
         rm -rf "$_SCRIPT_TMPDIR" 2>/dev/null || true
     fi
 }
+# Clean up container snapshot on success. On failure, the snapshot is
+# preserved so the user can roll back manually or via _rollback_container.
+_cleanup_container_snapshot() {
+    local _exit_code=$?
+    if [[ "$_exit_code" -eq 0 && -n "${_CONTAINER_SNAPSHOT:-}" ]]; then
+        log_debug "Cleaning up container snapshot (installation succeeded)."
+        container_runtime_for_ops rmi "$_CONTAINER_SNAPSHOT" >/dev/null 2>&1 || true
+        _CONTAINER_SNAPSHOT=""
+    elif [[ "$_exit_code" -ne 0 && -n "${_CONTAINER_SNAPSHOT:-}" ]]; then
+        log_warn "Installation failed. Container snapshot preserved for rollback."
+        log_info "Snapshot image: $_CONTAINER_SNAPSHOT"
+        log_info "To roll back: re-run the script (automatic) or manually:"
+        log_info "  podman stop $CONTAINER_NAME 2>/dev/null; podman rm -f $CONTAINER_NAME 2>/dev/null"
+        log_info "  podman run -d --name $CONTAINER_NAME $_CONTAINER_SNAPSHOT"
+        log_info "To remove the snapshot later:"
+        log_info "  podman rmi $_CONTAINER_SNAPSHOT"
+    fi
+    # Also clean up any stale snapshots from previous failed runs
+    # (images matching the naming pattern that are dangling/unreferenced).
+    container_runtime_for_ops rmi $(container_runtime_for_ops images -q --filter "reference=localhost/steamos-pamac-snapshot-*" 2>/dev/null) >/dev/null 2>&1 || true
+}
 # Track individual temp files for backward compatibility with code that
 # references _TEMP_FILES directly. New code should use _SCRIPT_TMPDIR.
 _TEMP_FILES=()
@@ -304,7 +325,7 @@ initialize_logging() {
     _init_script_tmpdir
 
     # shellcheck disable=SC2064 # $exit_code/$date MUST expand at trap execution, not definition
-    trap 'exit_code=$?; _cleanup_temp_files; echo "=== Run finished: $(date) - Exit: $exit_code ===" >> "$LOG_FILE"; [[ "$UPLOAD_LOG" == "true" ]] && sanitize_and_upload_log || true' EXIT
+    trap 'exit_code=$?; _cleanup_container_snapshot; _cleanup_temp_files; echo "=== Run finished: $(date) - Exit: $exit_code ===" >> "$LOG_FILE"; [[ "$UPLOAD_LOG" == "true" ]] && sanitize_and_upload_log || true' EXIT
 }
 
 _log() {

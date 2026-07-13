@@ -3932,7 +3932,7 @@ case "$arg" in
 --property=RestrictRealtime=*) RESTRICT_REALTIME="${arg#--property=RestrictRealtime=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=RestrictAddressFamilies=*) RESTRICT_ADDRESS_FAMILIES="${arg#--property=RestrictAddressFamilies=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=RemoveIPC=*) continue ;;
---property=UMask=*) SET_UMASK="${arg#--property=UMask=}"; continue ;;
+--property=UMask=*) SET_UMASK="${arg#--property=UMask=}"; if [[ "$SET_UMASK" =~ ^[0-7]+$ ]]; then _log_dsr "Sandbox: $arg"; else _warn_dsr "UMask=$SET_UMASK is not a valid octal mode"; SET_UMASK=""; fi; continue ;;
 --property=KeyringMode=*) continue ;;
 --property=ProtectClock=*) PROTECT_CLOCK="${arg#--property=ProtectClock=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=ProtectKernelTunables=*) PROTECT_KERNEL_TUNABLES="${arg#--property=ProtectKernelTunables=}"; _log_dsr "Sandbox: $arg"; continue ;;
@@ -5887,7 +5887,6 @@ _run_sandboxed_unshare() {
                 _apply_sandbox
                 ${_NNP}${_CAP_PRIV}$_SECCOMP_HELPER $_seccomp_args -- ${_BUILD_WRAPPER:-}exec \"\${@}\"
             " -- "${CMD_ARGS[@]}"
-        elif [[ "${_DSR_SECCOMP_STRICT_FALLBACK:-}" == "true" ]]; then
         elif [[ "${_DSR_SECCOMP_STRICT_FALLBACK:-}" == "true" ]]; then
             # Apply SECCOMP_MODE_STRICT as a degraded fallback when gcc is
             # unavailable. Strict mode allows only read, write, exit, and

@@ -5804,6 +5804,8 @@ for _da in READ_ONLY_PATHS INACCESSIBLE_PATHS STATE_DIRECTORIES LOGS_DIRECTORIES
 done
 declare -f _sandbox_verify >> "$_DSR_FUNCS_FILE" 2>/dev/null || true
 declare -f _apply_sandbox >> "$_DSR_FUNCS_FILE" 2>/dev/null || true
+declare -f _log_dsr >> "$_DSR_FUNCS_FILE" 2>/dev/null || true
+declare -f _warn_dsr >> "$_DSR_FUNCS_FILE" 2>/dev/null || true
 chmod 600 "$_DSR_FUNCS_FILE" 2>/dev/null || true
 # Clean up the sourceable functions file on exit
 trap 'rm -f "$_DSR_FUNCS_FILE" 2>/dev/null' EXIT

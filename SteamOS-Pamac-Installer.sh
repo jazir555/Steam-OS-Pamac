@@ -3699,6 +3699,10 @@ DSR_VERSION="4.0"
 _DSR_STRICT_SECURITY="${_STRICT_SECURITY_MODE:-false}"
 _log_dsr() { echo "[$(date '+%H:%M:%S')] $*" >> "$_DSR_LOG" 2>/dev/null; }
 _warn_dsr() { echo "systemd-run(fake): WARNING: $*" >> "$_DSR_LOG" 2>/dev/null; echo "systemd-run(fake): WARNING: $*" >&2 2>/dev/null || true; }
+# SECURITY: Sanitize property values to prevent shell injection when values
+# are interpolated into command strings (_assemble_build_wrapper, _ENV_SETUP).
+# Only allows alphanumeric chars, hyphens, underscores, colons, dots, equals, spaces, slashes.
+_dsr_sanitize_val() { echo "$1" | tr -cd 'a-zA-Z0-9_\-:=./ '; }
 
 # DYN RESOLVE: Resolve the host user at runtime (the user who owns the container).
 # Priority: 1) PAMAC_HOST_USER env var  2) $SUDO_USER if running under sudo
@@ -4478,6 +4482,7 @@ _sandbox_verify() {
     if [[ "$PROTECT_HOME" == "yes" ]]; then
         if [[ -n "$(ls -A /home 2>/dev/null)" ]]; then
             _warn_dsr "VERIFICATION WARNING: /home is not empty after ProtectHome=yes"
+            _sandbox_verified=false
         else
             _log_dsr "  /home is empty/inaccessible (ProtectHome verified)"
         fi
@@ -4764,8 +4769,12 @@ _apply_sandbox() {
             *|native)         _per_val=0 ;;
         esac
         # Use a small C helper to call personality() syscall (cached)
-        local _per_src="/tmp/.dsr-personality.c"
-        local _per_bin="/tmp/.dsr-personality"
+        # SECURITY: Use a private dir under /tmp with restrictive permissions
+        # to prevent symlink/TOCTOU attacks on compiled binaries.
+        local _dsr_tmp="/tmp/.dsr-helpers-$$"
+        mkdir -p "$_dsr_tmp" 2>/dev/null && chmod 700 "$_dsr_tmp" 2>/dev/null || _dsr_tmp="/tmp"
+        local _per_src="${_dsr_tmp}/.dsr-personality.c"
+        local _per_bin="${_dsr_tmp}/.dsr-personality"
         if [[ ! -x "$_per_bin" ]]; then
             cat > "$_per_src" << 'PERSONALITY_C'
 #include <stdio.h>
@@ -4775,7 +4784,7 @@ _apply_sandbox() {
 int main(int argc, char *argv[]) {
     if (argc < 2) { fprintf(stderr, "usage: personality <value>\n"); return 1; }
     unsigned long val = strtoul(argv[1], NULL, 10);
-    if (personality(val) != 0) { fprintf(stderr, "personality failed\n"); return 1; }
+    if (personality(val) == (unsigned long)-1) { fprintf(stderr, "personality failed\n"); return 1; }
     fprintf(stderr, "personality: set to %lu\n", val);
     return 0;
 }
@@ -4854,8 +4863,8 @@ PERSONALITY_C
         # Close all file descriptors except 0, 1, 2 using a small C helper
         # that calls close_range(3, ~0UL, 0). Falls back to /proc/self/fd
         # iteration if close_range is unavailable (kernel < 5.9).
-        local _clex_src="/tmp/.dsr-close-fds.c"
-        local _clex_bin="/tmp/.dsr-close-fds"
+        local _clex_src="${_dsr_tmp}/.dsr-close-fds.c"
+        local _clex_bin="${_dsr_tmp}/.dsr-close-fds"
         if [[ ! -x "$_clex_bin" ]]; then
             cat > "$_clex_src" << 'CLOSEFDS_C'
 #include <stdio.h>
@@ -5099,13 +5108,18 @@ CLOSEFDS_C
 
     # ── OOMScoreAdjust: write to /proc/self/oom_score_adj ──
     if [[ -n "$OOM_SCORE_ADJUST" ]]; then
-        _log_dsr "Applying OOMScoreAdjust=$OOM_SCORE_ADJUST"
-        if [[ -w /proc/self/oom_score_adj ]]; then
-            echo "$OOM_SCORE_ADJUST" > /proc/self/oom_score_adj 2>/dev/null \
-                && _log_dsr "  oom_score_adj set to $OOM_SCORE_ADJUST" \
-                || _warn_dsr "  Failed to set oom_score_adj"
+        # SECURITY: Validate value is a sane integer between -1000 and 1000.
+        if [[ "$OOM_SCORE_ADJUST" =~ ^-?[0-9]+$ ]] && (( OOM_SCORE_ADJUST >= -1000 && OOM_SCORE_ADJUST <= 1000 )); then
+            _log_dsr "Applying OOMScoreAdjust=$OOM_SCORE_ADJUST"
+            if [[ -w /proc/self/oom_score_adj ]]; then
+                echo "$OOM_SCORE_ADJUST" > /proc/self/oom_score_adj 2>/dev/null \
+                    && _log_dsr "  oom_score_adj set to $OOM_SCORE_ADJUST" \
+                    || _warn_dsr "  Failed to set oom_score_adj"
+            else
+                _warn_dsr "  /proc/self/oom_score_adj not writable"
+            fi
         else
-            _warn_dsr "  /proc/self/oom_score_adj not writable"
+            _warn_dsr "OOMScoreAdjust=$OOM_SCORE_ADJUST is not a valid integer (-1000 to 1000)"
         fi
     fi
 
@@ -5133,7 +5147,7 @@ _compile_seccomp_helper() {
         _warn_dsr "gcc not available — cannot compile seccomp helper (install base-devel)"
         return 1
     fi
-    local _helper_src="/tmp/.dsr-seccomp-helper.c"
+    local _helper_src="/tmp/.dsr-seccomp-helper-${$}.c"
     cat > "$_helper_src" << 'SECCOMP_C'
 #define DSR_SECCOMP_VER "dsr-seccomp-v4.0"
 #include <stdio.h>
@@ -5700,10 +5714,17 @@ _prepare_seccomp() {
     fi
 }
 
-# Export functions so they're available in bash -c subprocesses
-# (bwrap/unshare run commands via bash -c which creates new shell instances)
-export -f _sandbox_verify 2>/dev/null || true
-export -f _apply_sandbox 2>/dev/null || true
+# SECURITY: Write sandbox functions to a temp file instead of using export -f.
+# export -f leaks function bodies into the environment (BASH_FUNC_* variables),
+# which a malicious PKGBUILD can read/override. A sourceable file avoids this.
+_DSR_FUNCS_FILE="/tmp/.dsr-sandbox-funcs-$$.sh"
+cat > "$_DSR_FUNCS_FILE" << 'SANDBOX_FUNCS'
+# Populated by _write_sandbox_func_file() below
+SANDBOX_FUNCS
+# Write _apply_sandbox and _sandbox_verify to the file
+declare -f _sandbox_verify >> "$_DSR_FUNCS_FILE" 2>/dev/null || true
+declare -f _apply_sandbox >> "$_DSR_FUNCS_FILE" 2>/dev/null || true
+chmod 600 "$_DSR_FUNCS_FILE" 2>/dev/null || true
 
 # ── _prepare_cap_priv: shared capability/NoNewPrivileges preparation ──
 # Reads the PARSED variables (NO_NEW_PRIVS, CAP_BOUNDING_SET) directly,
@@ -5751,7 +5772,7 @@ _run_sandboxed_bwrap() {
     # doesn't handle natively: SecureBits, Personality, ProtectProc, ProcSubset,
     # DisableExtraFileDescriptors, CoredumpReceive), then _sandbox_verify, then
     # the actual command.
-    local _verify_cmd="_apply_sandbox; _sandbox_verify; ${_inner_cmd}"
+    local _verify_cmd="source $_DSR_FUNCS_FILE 2>/dev/null; _apply_sandbox; _sandbox_verify; ${_inner_cmd}"
     if [[ -n "$_run_user" ]]; then
         if [[ -n "${_SECCOMP_HELPER:-}" ]]; then
             bwrap "${_DSR_BWRAP_ARGS[@]}" -- sudo -u "$_run_user" -H -- "$_SECCOMP_HELPER" $_seccomp_args -- bash -c "$_verify_cmd" -- "${CMD_ARGS[@]}"
@@ -5788,7 +5809,7 @@ _run_sandboxed_unshare() {
     if [[ -n "$WORK_DIR" ]]; then
         _inner_cmd="cd '${WORK_DIR}' 2>/dev/null || true; ${_inner_cmd}"
     fi
-    local _verify_cmd="_apply_sandbox; ${_inner_cmd}"
+    local _verify_cmd="source $_DSR_FUNCS_FILE 2>/dev/null; _apply_sandbox; _sandbox_verify; ${_inner_cmd}"
     if [[ -n "$_run_user" ]]; then
         if [[ -n "${_SECCOMP_HELPER:-}" ]]; then
             unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave \
@@ -5801,6 +5822,7 @@ _run_sandboxed_unshare() {
     else
         if [[ -n "${_SECCOMP_HELPER:-}" ]]; then
             unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
+                source $_DSR_FUNCS_FILE 2>/dev/null
                 _apply_sandbox
                 ${_NNP}${_CAP_PRIV}$_SECCOMP_HELPER $_seccomp_args -- exec \"\${@}\"
             " -- "${CMD_ARGS[@]}"
@@ -5809,8 +5831,8 @@ _run_sandboxed_unshare() {
             # unavailable. Strict mode allows only read, write, exit, and
             # sigreturn — blocks ptrace, reboot, kexec, mount, etc.
             # Use a small inline C helper to call prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT).
-            local _strict_src="/tmp/.dsr-strict-seccomp.c"
-            local _strict_bin="/tmp/.dsr-strict-seccomp"
+            local _strict_src="${_dsr_tmp:-/tmp}/.dsr-strict-seccomp.c"
+            local _strict_bin="${_dsr_tmp:-/tmp}/.dsr-strict-seccomp"
             if [[ ! -x "$_strict_bin" ]] || [[ "$(md5sum "$_strict_src" 2>/dev/null)" != "${_DSR_STRICT_SRC_HASH:-}" ]]; then
                 cat > "$_strict_src" << 'STRICT_SECCOMP_C'
 #include <sys/prctl.h>
@@ -5832,6 +5854,7 @@ STRICT_SECCOMP_C
             fi
             if [[ -x "$_strict_bin" ]]; then
                 unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
+                    source $_DSR_FUNCS_FILE 2>/dev/null
                     _apply_sandbox
                     ${_NNP}${_CAP_PRIV}$_strict_bin
                     exec \"\${@}\"
@@ -5839,12 +5862,14 @@ STRICT_SECCOMP_C
             else
                 _warn_dsr "Could not compile strict seccomp fallback — running without seccomp"
                 unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
+                    source $_DSR_FUNCS_FILE 2>/dev/null
                     _apply_sandbox
                     ${_NNP}${_CAP_PRIV}exec \"\${@}\"
                 " -- "${CMD_ARGS[@]}"
             fi
         else
             unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
+                source $_DSR_FUNCS_FILE 2>/dev/null
                 _apply_sandbox
                 ${_NNP}${_CAP_PRIV}exec \"\${@}\"
             " -- "${CMD_ARGS[@]}"
@@ -5995,60 +6020,70 @@ fi
 # Sets _BUILD_WRAPPER from _ENV_SETUP + all applicable command prefixes.
 _assemble_build_wrapper() {
     _BUILD_WRAPPER="$_ENV_SETUP"
+    # SECURITY: Sanitize all values before interpolation into command strings.
+    local _safe_extra_groups="$(_dsr_sanitize_val "${EXTRA_GROUPS:-}")"
+    local _safe_group_name="$(_dsr_sanitize_val "${GROUP_NAME:-}")"
+    local _safe_ambient_caps="$(_dsr_sanitize_val "${AMBIENT_CAPS:-}")"
+    local _safe_timeout_start="$(_dsr_sanitize_val "${TIMEOUT_START:-}")"
+    local _safe_nice_level="$(_dsr_sanitize_val "${NICE_LEVEL:-}")"
+    local _safe_ionice_class="$(_dsr_sanitize_val "${IOSCHED_CLASS:-}")"
+    local _safe_ionice_prio="$(_dsr_sanitize_val "${IOSCHED_PRIORITY:-}")"
+    local _safe_chrt_policy="$(_dsr_sanitize_val "${CPUSCHED_POLICY:-}")"
+    local _safe_chrt_prio="$(_dsr_sanitize_val "${CPUSCHED_PRIORITY:-}")"
     # SupplementaryGroups via sg
-    if [[ -n "$EXTRA_GROUPS" ]]; then
-        sg "$EXTRA_GROUPS" -c true 2>/dev/null && _BUILD_WRAPPER="sg '$EXTRA_GROUPS' -c \"$_BUILD_WRAPPER\" || ( _warn_dsr 'sg failed for groups $EXTRA_GROUPS, continuing without'; true ); "
+    if [[ -n "$_safe_extra_groups" ]]; then
+        sg "$_safe_extra_groups" -c true 2>/dev/null && _BUILD_WRAPPER="sg '$_safe_extra_groups' -c \"$_BUILD_WRAPPER\" || ( _warn_dsr 'sg failed for groups $_safe_extra_groups, continuing without'; true ); "
     fi
     # Group property via sg
-    if [[ -n "${GROUP_NAME:-}" ]]; then
-        if sg "$GROUP_NAME" -c true 2>/dev/null; then
-            _BUILD_WRAPPER="sg '$GROUP_NAME' -c \"$_BUILD_WRAPPER\" || ( _warn_dsr 'sg failed for group $GROUP_NAME, continuing without'; true ); "
+    if [[ -n "${_safe_group_name}" ]]; then
+        if sg "$_safe_group_name" -c true 2>/dev/null; then
+            _BUILD_WRAPPER="sg '$_safe_group_name' -c \"$_BUILD_WRAPPER\" || ( _warn_dsr 'sg failed for group $_safe_group_name, continuing without'; true ); "
         fi
     fi
     # AmbientCapabilities via setpriv
-    if [[ -n "${AMBIENT_CAPS:-}" ]] && command -v setpriv >/dev/null 2>&1; then
+    if [[ -n "${_safe_ambient_caps}" ]] && command -v setpriv >/dev/null 2>&1; then
         local _cap_args=""
-        case "${AMBIENT_CAPS,,}" in
+        case "${_safe_ambient_caps,,}" in
             "~all"|"")  _cap_args="--inh-caps=-all --ambient-caps=-all" ;;
             "all")      _cap_args="--inh-caps=+all --ambient-caps=+all" ;;
-            \~*)        _cap_args="--inh-caps=-${AMBIENT_CAPS#\~} --ambient-caps=-${AMBIENT_CAPS#\~}" ;;
-            *)          _cap_args="--inh-caps=+${AMBIENT_CAPS} --ambient-caps=+${AMBIENT_CAPS}" ;;
+            \~*)        _cap_args="--inh-caps=-${_safe_ambient_caps#\~} --ambient-caps=-${_safe_ambient_caps#\~}" ;;
+            *)          _cap_args="--inh-caps=+${_safe_ambient_caps} --ambient-caps=+${_safe_ambient_caps}" ;;
         esac
         _BUILD_WRAPPER="setpriv $_cap_args $_BUILD_WRAPPER"
     fi
     # I/O scheduling via ionice
-    if [[ -n "${IOSCHED_CLASS:-}" ]] && command -v ionice >/dev/null 2>&1; then
-        local _ionice_class=""
-        case "${IOSCHED_CLASS,,}" in
-            idle|7)       _ionice_class="3" ;;
-            best-effort|2) _ionice_class="2" ;;
-            realtime|1)   _ionice_class="1" ;;
-            none|0)       _ionice_class="0" ;;
+    if [[ -n "${_safe_ionice_class}" ]] && command -v ionice >/dev/null 2>&1; then
+        local _ionice_num=""
+        case "${_safe_ionice_class,,}" in
+            idle|7)       _ionice_num="3" ;;
+            best-effort|2) _ionice_num="2" ;;
+            realtime|1)   _ionice_num="1" ;;
+            none|0)       _ionice_num="0" ;;
         esac
-        if [[ -n "$_ionice_class" ]]; then
-            _BUILD_WRAPPER="ionice -c $_ionice_class -n ${IOSCHED_PRIORITY:-4} $_BUILD_WRAPPER"
+        if [[ -n "$_ionice_num" ]]; then
+            _BUILD_WRAPPER="ionice -c $_ionice_num -n ${_safe_ionice_prio:-4} $_BUILD_WRAPPER"
         fi
     fi
     # CPU scheduling via nice/chrt
-    if [[ -n "${NICE_LEVEL:-}" ]] && command -v nice >/dev/null 2>&1; then
-        _BUILD_WRAPPER="nice -n $NICE_LEVEL $_BUILD_WRAPPER"
+    if [[ -n "${_safe_nice_level}" ]] && command -v nice >/dev/null 2>&1; then
+        _BUILD_WRAPPER="nice -n $_safe_nice_level $_BUILD_WRAPPER"
     fi
-    if [[ -n "${CPUSCHED_POLICY:-}" ]] && command -v chrt >/dev/null 2>&1; then
-        local _chrt_policy=""
-        case "${CPUSCHED_POLICY,,}" in
-            other|0)     _chrt_policy="-o" ;;
-            batch|3)     _chrt_policy="-b" ;;
-            idle|5)      _chrt_policy="-i" ;;
-            fifo|1)      _chrt_policy="-f" ;;
-            rr|2)        _chrt_policy="-r" ;;
+    if [[ -n "${_safe_chrt_policy}" ]] && command -v chrt >/dev/null 2>&1; then
+        local _chrt_num=""
+        case "${_safe_chrt_policy,,}" in
+            other|0)     _chrt_num="-o" ;;
+            batch|3)     _chrt_num="-b" ;;
+            idle|5)      _chrt_num="-i" ;;
+            fifo|1)      _chrt_num="-f" ;;
+            rr|2)        _chrt_num="-r" ;;
         esac
-        if [[ -n "$_chrt_policy" ]]; then
-            _BUILD_WRAPPER="chrt $_chrt_policy ${CPUSCHED_PRIORITY:-0} $_BUILD_WRAPPER"
+        if [[ -n "$_chrt_num" ]]; then
+            _BUILD_WRAPPER="chrt $_chrt_num ${_safe_chrt_prio:-0} $_BUILD_WRAPPER"
         fi
     fi
     # Timeout via timeout command
-    if [[ -n "${TIMEOUT_START:-}" ]] && [[ "$TIMEOUT_START" != "infinity" && "$TIMEOUT_START" != "0" ]]; then
-        _BUILD_WRAPPER="timeout ${TIMEOUT_START}s $_BUILD_WRAPPER"
+    if [[ -n "${_safe_timeout_start}" ]] && [[ "$_safe_timeout_start" != "infinity" && "$_safe_timeout_start" != "0" ]]; then
+        _BUILD_WRAPPER="timeout ${_safe_timeout_start}s $_BUILD_WRAPPER"
     fi
 }
 

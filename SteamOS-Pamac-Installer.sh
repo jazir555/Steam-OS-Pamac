@@ -236,7 +236,7 @@ STRICT_SECURITY="${STRICT_SECURITY:-false}"
 ALLOW_TRUSTALL="${ALLOW_TRUSTALL:-false}"
 
 # Maximum per-container log file size in bytes before rotate-on-startup.
-# Old log is moved to ${LOG_FILE}.1 and overwritten if it already exists.
+# Rotated logs are compressed and maintained as a ring of up to 3 backups.
 LOG_ROTATION_MAX_SIZE="${LOG_ROTATION_MAX_SIZE:-5242880}"  # 5 MiB
 
 # Tunable constants: extracted from scattered magic numbers so timeouts,
@@ -283,7 +283,9 @@ initialize_logging() {
 
     # Rotate the log if it has grown beyond the configured max size. This keeps
     # per-container logs from filling the user's home directory on repeated
-    # install/update runs. We keep exactly one backup generation.
+    # install/update runs. Maintains a ring of 3 compressed rotated logs
+    # (LOG_FILE.1.gz through LOG_FILE.3.gz) to preserve historical debug data
+    # across multiple failing runs.
     if [[ -n "${LOG_FILE:-}" ]] && [[ -f "$LOG_FILE" ]]; then
         local _log_size
         local _max_size="${LOG_ROTATION_MAX_SIZE:-5242880}"
@@ -292,8 +294,24 @@ initialize_logging() {
         fi
         _log_size=$(stat -c '%s' "$LOG_FILE" 2>/dev/null || echo "0")
         if [[ "$_log_size" =~ ^[0-9]+$ ]] && [[ "$_log_size" -gt "$_max_size" ]]; then
-            # Only print to stderr/stdout before logging is ready; then rotate.
+            local _max_rotations="${LOG_ROTATION_KEEP:-3}"
             echo "Rotating log (size ${_log_size} bytes exceeds ${_max_size} bytes): $LOG_FILE" >&2
+            # Shift the ring: .3.gz deleted, .2.gz -> .3.gz, .1.gz -> .2.gz, current -> .1.gz
+            local _i
+            for (( _i = _max_rotations; _i >= 2; _i-- )); do
+                rm -f "${LOG_FILE}.${_i}.gz" 2>/dev/null || true
+                [[ -f "${LOG_FILE}.$(( _i - 1 )).gz" ]] && \
+                    mv -f "${LOG_FILE}.$(( _i - 1 )).gz" "${LOG_FILE}.${_i}.gz" 2>/dev/null || true
+            done
+            # Compress the oldest rotation (.1) if it exists
+            if [[ -f "${LOG_FILE}.1" ]]; then
+                if command -v gzip >/dev/null 2>&1; then
+                    gzip -f "${LOG_FILE}.1" 2>/dev/null || mv -f "${LOG_FILE}.1" "${LOG_FILE}.2.gz" 2>/dev/null || true
+                else
+                    mv -f "${LOG_FILE}.1" "${LOG_FILE}.2.gz" 2>/dev/null || true
+                fi
+            fi
+            # Rotate current log to .1
             mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null || rm -f "$LOG_FILE" 2>/dev/null || true
         fi
     fi
@@ -7531,8 +7549,8 @@ export LC_ALL=C
 
 _remove_stale_lock
 
-echo "Installing core packages (sudo, shadow, gnupg, jq, python, bubblewrap, libcap, pacman-contrib)..."
-if ! safe_install sudo shadow gnupg jq python bubblewrap libcap pacman-contrib; then
+echo "Installing core packages (sudo, shadow, gnupg, jq, python, bubblewrap, libcap, pacman-contrib, socat, python-configparser)..."
+if ! safe_install sudo shadow gnupg jq python bubblewrap libcap pacman-contrib socat python-configparser; then
     echo "ERROR: Failed to install core packages after retries."
     exit 1
 fi
@@ -7540,7 +7558,7 @@ echo "Core packages installed."
 CORE_EOF
 
     if ! exec_container_script "$core_script" "core-packages"; then
-        log_error "Failed to install core packages (sudo, shadow, gnupg, jq, python)."
+        log_error "Failed to install core packages (sudo, shadow, gnupg, jq, python, socat, python-configparser)."
         log_error "CRITICAL: downstream stages (user setup, dev packages, pamac) require these."
         log_error "Any further failures are likely caused by this core-packages failure."
         _ok=false
@@ -7673,7 +7691,7 @@ fi
 # that visudo rejects, breaking sudo inside the container.
 _sudoers_lock="/etc/sudoers.d/.pamac-lock"
 (
-    flock -w 10 200 || { echo "Warning: Could not acquire sudoers lock. Proceeding without lock."; exec 200>&-; }
+    flock -w 30 200 || { echo "Warning: Could not acquire sudoers lock after 30s. Proceeding without lock."; exec 200>&-; }
 
     cat > /etc/sudoers.d/99-pamac-nopasswd <<SUDOERS
 # SECURITY NOTE: AUR PKGBUILDs are arbitrary shell scripts run via makepkg; a

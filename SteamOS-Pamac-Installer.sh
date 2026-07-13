@@ -4213,9 +4213,27 @@ if [[ ${#UNRECOGNIZED_PROPS[@]} -gt 0 ]]; then
     for _up in "${UNRECOGNIZED_PROPS[@]}"; do
         _warn_dsr "  $_up"
     done
+    # Track unrecognized properties for feature-creep mitigation.
+    # Append to a persistent log so operators can review which new upstream
+    # properties are being silently ignored. This log is rotated when it
+    # exceeds 100 entries and is never shipped externally.
+    _PROP_TRACKER="/tmp/.dsr-unrecognized-props.log"
+    for _up in "${UNRECOGNIZED_PROPS[@]}"; do
+        local _prop_name="${_up#--property=}"
+        _prop_name="${_prop_name%%=*}"
+        echo "$(date -Iseconds) $_prop_name" >> "$_PROP_TRACKER" 2>/dev/null || true
+    done
+    if [[ -f "$_PROP_TRACKER" ]]; then
+        local _tracker_lines
+        _tracker_lines=$(wc -l < "$_PROP_TRACKER" 2>/dev/null || echo "0")
+        if (( _tracker_lines > 100 )); then
+            tail -50 "$_PROP_TRACKER" > "${_PROP_TRACKER}.tmp" 2>/dev/null || true
+            mv "${_PROP_TRACKER}.tmp" "$_PROP_TRACKER" 2>/dev/null || true
+        fi
+    fi
     _warn_dsr "These are silently accepted without enforcement. Normal when Pamac/makepkg"
     _warn_dsr "adds new systemd options not yet in this wrapper. Only investigate if"
-    _warn_dsr "AUR builds fail."
+    _warn_dsr "AUR builds fail. Check $_PROP_TRACKER for cumulative property usage."
 fi
 
 # ── Build environment setup string ──
@@ -9214,74 +9232,118 @@ _fetch_aur_pkgbuild() {
     local _method_tried=""
     local _method_succeeded=""
 
+    # Resilient HTTP fetch with retry and exponential backoff.
+    # Usage: _aur_fetch_with_retry <url> <max_retries>
+    # Outputs: raw response body to stdout, HTTP status code to fd 3.
+    _aur_fetch_with_retry() {
+        local _url="$1" _max_retries="${2:-2}" _attempt=0 _resp="" _code="" _delay=2
+        while (( _attempt <= _max_retries )); do
+            _resp=$(curl -sSf --connect-timeout 10 --max-time 30 -w "\n%{http_code}" "$_url" 2>/dev/null) || true
+            _code=$(echo "$_resp" | tail -1)
+            _resp=$(echo "$_resp" | sed '$d')
+            # Success or client error (not retryable): return immediately
+            if [[ "$_code" =~ ^2[0-9][0-9]$ ]] || [[ "$_code" =~ ^4[0-9][0-9]$ && "$_code" != "429" ]]; then
+                echo "$_resp"
+                return 0
+            fi
+            # Rate-limited or server error: retry with backoff
+            _attempt=$(( _attempt + 1 ))
+            if (( _attempt <= _max_retries )); then
+                echo "# AUR fetch attempt $_attempt failed (HTTP $_code), retrying in ${_delay}s..." >&2
+                sleep "$_delay" 2>/dev/null || true
+                _delay=$(( _delay * 2 ))
+            fi
+        done
+        # All retries exhausted
+        echo "$_resp"
+        return 1
+    }
+
+    # Validate AUR RPC v5 JSON schema before extracting data.
+    # Checks: valid JSON, results array exists, first element has expected keys.
+    # Returns 0 if schema is valid, 1 if not. Outputs "type=..." line for diagnostics.
+    _validate_rpc_schema() {
+        local _json="$1"
+        if ! echo "$_json" | jq -e '.results[0]' >/dev/null 2>&1; then
+            echo "type=missing_results"
+            return 1
+        fi
+        local _type
+        _type=$(echo "$_json" | jq -r '.results[0].Type // "unknown"' 2>/dev/null || echo "unknown")
+        echo "type=$_type"
+        # Validate that the expected keys exist (Depends, MakeDepends)
+        local _has_depends _has_makedepends
+        _has_depends=$(echo "$_json" | jq -e '.results[0].Depends' >/dev/null 2>&1 && echo "yes" || echo "no")
+        _has_makedepends=$(echo "$_json" | jq -e '.results[0].MakeDepends' >/dev/null 2>&1 && echo "yes" || echo "no")
+        if [[ "$_has_depends" == "no" && "$_has_makedepends" == "no" ]]; then
+            echo "# WARN: RPC schema missing both Depends and MakeDepends keys" >&2
+            echo "type=missing_depends_keys"
+            return 1
+        fi
+        return 0
+    }
+
     # Method 1: AUR RPC v5 JSON API (most stable, no CGIT dependency)
     # Returns package metadata as JSON including Depends/MakeDepends arrays.
     # We use jq exclusively to extract the pacman version constraint directly
     # from the structured JSON, avoiding fragile grep/awk regex parsing.
+    # Mitigation: Retry with exponential backoff for transient failures,
+    # schema validation before parsing, and graceful degradation on parse errors.
     local _rpc_url="https://aur.archlinux.org/rpc/v5/info/pamac-aur"
     local _rpc_resp=""
-    local _rpc_http_code=""
     _method_tried="RPC"
-    _rpc_resp=$(curl -sSf --connect-timeout 10 --max-time 30 -w "\n%{http_code}" "$_rpc_url" 2>/dev/null) || true
-    _rpc_http_code=$(echo "$_rpc_resp" | tail -1)
-    _rpc_resp=$(echo "$_rpc_resp" | sed '$d')
+    _rpc_resp=$(_aur_fetch_with_retry "$_rpc_url" 2) || {
+        echo "# WARN: AUR RPC fetch failed after retries." >&2
+    }
     if [[ -n "$_rpc_resp" ]]; then
-        # Detect rate-limiting (Cloudflare or AUR)
-        if [[ "$_rpc_http_code" == "429" ]]; then
-            echo "# WARN: AUR RPC rate-limited (HTTP 429). Cloudflare or AUR throttling active." >&2
-        elif [[ "$_rpc_http_code" =~ ^4[0-9][0-9]$ ]]; then
-            echo "# WARN: AUR RPC returned HTTP $_rpc_http_code (client error)." >&2
-        elif [[ "$_rpc_http_code" =~ ^5[0-9][0-9]$ ]]; then
-            echo "# WARN: AUR RPC returned HTTP $_rpc_http_code (server error). AUR may be down." >&2
-        fi
-        # Validate JSON and extract pacman dependency constraint using jq.
-        # The RPC response contains Depends/MakeDepends as JSON arrays of strings
-        # like ["pacman>=6.0", "libalpm.so=14-64"]. We filter for entries starting
-        # with "pacman" and extract the operator + version directly from JSON.
-        if command -v jq >/dev/null 2>&1; then
-            local _pacman_dep=""
-            _pacman_dep=$(echo "$_rpc_resp" | jq -r '
-                (.results[0].Depends // []) + (.results[0].MakeDepends // [])
-                | map(select(test("^pacman")))
-                | .[0] // empty
-                ' 2>/dev/null || echo "")
-            if [[ -n "$_pacman_dep" ]]; then
-                echo "# Parsed from AUR RPC v5 (jq): $_pacman_dep"
-                echo "pacman_dep=$_pacman_dep"
-                _method_succeeded="RPC"
-                return 0
-            fi
-            # No pacman constraint found — check if we got valid data at all
-            local _resultcount=""
-            _resultcount=$(echo "$_rpc_resp" | jq -r '.resultcount // empty' 2>/dev/null || echo "")
-            if [[ "$_resultcount" == "1" ]]; then
-                echo "# No explicit pacman version constraint in pamac-aur Depends/MakeDepends."
-                echo "pacman_dep="
-                _method_succeeded="RPC"
-                return 0
-            elif [[ -n "$_resultcount" ]]; then
-                echo "# WARN: AUR RPC returned resultcount=$_resultcount (expected 1)" >&2
-            fi
+        # Validate RPC JSON schema before parsing — protects against upstream
+        # schema changes that would make jq queries silently return empty.
+        local _schema_info=""
+        _schema_info=$(_validate_rpc_schema "$_rpc_resp") || true
+        if echo "$_schema_info" | grep -q "^type=missing"; then
+            echo "# WARN: AUR RPC response has unexpected schema ($_schema_info). Skipping RPC method." >&2
         else
-            echo "# WARN: jq not available — cannot parse AUR RPC response." >&2
+            if command -v jq >/dev/null 2>&1; then
+                local _pacman_dep=""
+                _pacman_dep=$(echo "$_rpc_resp" | jq -r '
+                    (.results[0].Depends // []) + (.results[0].MakeDepends // [])
+                    | map(select(test("^pacman")))
+                    | .[0] // empty
+                    ' 2>/dev/null || echo "")
+                if [[ -n "$_pacman_dep" ]]; then
+                    echo "# Parsed from AUR RPC v5 (jq): $_pacman_dep"
+                    echo "pacman_dep=$_pacman_dep"
+                    _method_succeeded="RPC"
+                    return 0
+                fi
+                local _resultcount=""
+                _resultcount=$(echo "$_rpc_resp" | jq -r '.resultcount // empty' 2>/dev/null || echo "")
+                if [[ "$_resultcount" == "1" ]]; then
+                    echo "# No explicit pacman version constraint in pamac-aur Depends/MakeDepends."
+                    echo "pacman_dep="
+                    _method_succeeded="RPC"
+                    return 0
+                elif [[ -n "$_resultcount" ]]; then
+                    echo "# WARN: AUR RPC returned resultcount=$_resultcount (expected 1)" >&2
+                fi
+            else
+                echo "# WARN: jq not available — cannot parse AUR RPC response." >&2
+            fi
         fi
     fi
 
     # Method 2: CGIT web endpoint (may be rate-limited by Cloudflare)
-    # Validate response is an actual PKGBUILD (not an HTML error page).
+    # Mitigation: Use retry wrapper, validate response is PKGBUILD (not HTML).
     _method_tried="CGIT"
     local _cgit_resp=""
-    local _cgit_http_code=""
-    _cgit_resp=$(curl -sSf --connect-timeout 10 --max-time 30 -w "\n%{http_code}" \
-        "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=pamac-aur" 2>/dev/null) || true
-    _cgit_http_code=$(echo "$_cgit_resp" | tail -1)
-    _cgit_resp=$(echo "$_cgit_resp" | sed '$d')
+    _cgit_resp=$(_aur_fetch_with_retry "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=pamac-aur" 2) || {
+        echo "# WARN: CGIT fetch failed after retries." >&2
+    }
     if [[ -n "$_cgit_resp" ]]; then
         # Detect Cloudflare challenges, rate limits, and HTML error pages
-        if [[ "$_cgit_http_code" == "429" ]]; then
-            echo "# WARN: CGIT endpoint rate-limited (HTTP 429). Cloudflare throttling." >&2
-        elif grep -qiE '<!DOCTYPE|<html|<head|challenge-platform|cf-browser|Attention Required|Just a moment' <<< "$_cgit_resp"; then
-            echo "# WARN: CGIT endpoint returned HTML (Cloudflare challenge/block, HTTP $_cgit_http_code)." >&2
+        # by content inspection (no HTTP code available from retry wrapper).
+        if grep -qiE '<!DOCTYPE|<html|<head|challenge-platform|cf-browser|Attention Required|Just a moment' <<< "$_cgit_resp"; then
+            echo "# WARN: CGIT endpoint returned HTML (Cloudflare challenge/block)." >&2
         elif echo "$_cgit_resp" | grep -q "^pkgname="; then
             # Extract pacman dependency from PKGBUILD text using awk
             local _cgit_pacman_dep
@@ -9392,13 +9454,24 @@ fi
 # Extract pacman dependency from the structured AUR RPC output.
 # _fetch_aur_pkgbuild now outputs "pacman_dep=X.Y" (from jq parsing)
 # or falls back to PKGBUILD text with grep extraction.
+# Mitigation: Multiple extraction strategies with fallbacks. If the structured
+# format changes, the grep fallback still works. If all extraction fails,
+# compatibility is assumed (conservative, avoids blocking installation).
 aur_pacman_dep=""
 if echo "$aur_pkgbuild" | grep -q "^pacman_dep="; then
     # Structured output from jq-based RPC parsing (preferred path)
     aur_pacman_dep=$(echo "$aur_pkgbuild" | grep "^pacman_dep=" | cut -d= -f2-)
 elif echo "$aur_pkgbuild" | grep -q "^depends=\|^makedepends="; then
     # Legacy PKGBUILD text fallback (CGIT/git-clone methods)
-    aur_pacman_dep=$(echo "$aur_pkgbuild" | grep -E "^(depends|makedepends)\\+?=" | grep -oP "pacman[><= ]+[0-9.]+" | head -1 || echo "")
+    # Try multiple regex patterns to handle formatting variations:
+    #   1. Strict: "pacman>=6.0" (inline in dependency array)
+    #   2. Spaced: "pacman >= 6.0" (separated by spaces)
+    #   3. Quoted: "pacman>=6.0" (inside quotes in PKGBUILD)
+    aur_pacman_dep=$(echo "$aur_pkgbuild" | grep -E "^(depends|makedepends)\\+?=" | grep -oP "pacman[><= ]+[0-9.]+" | head -1 \
+        || echo "$aur_pkgbuild" | grep -E "^(depends|makedepends)\\+?=" | grep -oP "['\"]pacman[><= ]+[0-9.]+'?\"?" | head -1 \
+        || echo "")
+    # Strip surrounding quotes if present
+    aur_pacman_dep=$(echo "$aur_pacman_dep" | sed "s/^['\"]//;s/['\"]$//")
 fi
 
 if [[ -z "$aur_pacman_dep" ]]; then

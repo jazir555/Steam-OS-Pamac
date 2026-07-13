@@ -3835,6 +3835,30 @@ PROC_SUBSET=""
 PRIVATE_USERS=""
 DISABLE_EXTRA_FDS=""
 COREDUMP_RECEIVE=""
+# ── Resource limits (enforced via ulimit/prlimit) ──
+LIMITS_RLIMIT=()
+# ── Scheduling (enforced via ionice/nice/chrt) ──
+IOSCHED_CLASS=""
+IOSCHED_PRIORITY=""
+CPUSCHED_POLICY=""
+CPUSCHED_PRIORITY=""
+NICE_LEVEL=""
+# ── Capabilities ──
+AMBIENT_CAPS=""
+# ── Group identity ──
+GROUP_NAME=""
+# ── Mount propagation ──
+MOUNT_FLAGS=""
+# ── Environment ──
+PASS_ENV=()
+UNSET_ENV=()
+# ── Directories ──
+CONFIG_DIRS=()
+# ── OOM ──
+OOM_SCORE_ADJUST=""
+# ── Timeouts ──
+TIMEOUT_START=""
+TIMEOUT_STOP=""
 for arg in "$@"; do
 if $SKIP_NEXT; then
 SKIP_NEXT=false
@@ -3873,14 +3897,18 @@ case "$arg" in
 --property=SystemCallFilter=*) SYSTEM_CALL_FILTER="${arg#--property=SystemCallFilter=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=CapabilityBoundingSet=*) CAP_BOUNDING_SET="${arg#--property=CapabilityBoundingSet=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=User=*) TARGET_USER="${arg#--property=User=}"; continue ;;
---property=Group=*) continue ;;
+--property=Group=*) GROUP_NAME="${arg#--property=Group=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=SupplementaryGroups=*) EXTRA_GROUPS="${arg#--property=SupplementaryGroups=}"; continue ;;
---property=AmbientCapabilities=*) _log_dsr "Sandbox: AmbientCapabilities (via setpriv): $arg"; continue ;;
+--property=AmbientCapabilities=*) AMBIENT_CAPS="${arg#--property=AmbientCapabilities=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=EnvironmentFile=*) ENV_FILES+=("${arg#--property=EnvironmentFile=}"); continue ;;
 --property=Ephemeral=*) continue ;;
 --property=Slice=*) continue ;;
---property=IOSchedulingClass=*) continue ;;
---property=CPUSchedulingPolicy=*) continue ;;
+--property=IOSchedulingClass=*) IOSCHED_CLASS="${arg#--property=IOSchedulingClass=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=IOSchedulingPriority=*) IOSCHED_PRIORITY="${arg#--property=IOSchedulingPriority=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=CPUSchedulingPolicy=*) CPUSCHED_POLICY="${arg#--property=CPUSchedulingPolicy=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=CPUSchedulingPriority=*) CPUSCHED_PRIORITY="${arg#--property=CPUSchedulingPriority=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=CPUSchedulingResetOnFork=*) continue ;;
+--property=Nice=*) NICE_LEVEL="${arg#--property=Nice=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=RestrictNamespaces=*) RESTRICT_NAMESPACES="${arg#--property=RestrictNamespaces=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=RestrictSUIDSGID=*) RESTRICT_SUID_SGID="${arg#--property=RestrictSUIDSGID=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=LockPersonality=*) LOCK_PERSONALITY="${arg#--property=LockPersonality=}"; _log_dsr "Sandbox: $arg"; continue ;;
@@ -3909,20 +3937,34 @@ case "$arg" in
 # Additional recognized systemd-run properties (not previously handled).
 # Grouped per systemd.exec(5)/systemd.resource-control(5). Security/sandboxing
 # properties are enforced via seccomp-BPF, mount namespaces, and capability
-# dropping. Resource/accounting/metadata/IO/log properties are silently accepted.
+# dropping. Resource/accounting/metadata/IO/log properties:
+# - Limit* (RLIMIT_*): enforced via ulimit
+# - IOSchedulingClass: enforced via ionice
+# - CPUSchedulingPolicy/Nice: enforced via chrt/nice
+# - OOMScoreAdjust: enforced via /proc/oom_score_adj
+# - AmbientCapabilities: enforced via setpriv --ambient-caps
+# - Group: enforced via sg
+# - MountFlags: enforced via mount --make-rslave/private/shared
+# - PassEnvironment/UnsetEnvironment: enforced via env export/unset
+# - ConfigurationDirectory: enforced via mkdir + perms
+# - TimeoutStartSec: enforced via timeout command
+# - CGroup props (CPUQuota, TasksMax, MemoryMax, IO*): require cgroup v2
+# - Logging props (SyslogIdentifier, LogNamespace): require journald
+# - TTY props (TTYPath, etc.): require systemd PTY management
+# - Condition*/Assert*: require systemd unit manager evaluation
 # --- Filesystem / namespace sandboxing ---
 --property=PrivateDevices=*) PRIVATE_DEVICES="${arg#--property=PrivateDevices=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=PrivateMounts=*) _log_dsr "Sandbox: PrivateMounts (default in mount namespace): $arg"; continue ;;
 --property=PrivateNetwork=*) PRIVATE_NETWORK="${arg#--property=PrivateNetwork=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=PrivateUsers=*) PRIVATE_USERS="${arg#--property=PrivateUsers=}"; _log_dsr "Sandbox: $arg"; continue ;;
---property=MountFlags=*) _log_dsr "Sandbox: MountFlags (default in mount namespace): $arg"; continue ;;
+--property=MountFlags=*) MOUNT_FLAGS="${arg#--property=MountFlags=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=MountAPIVFS=*) _log_dsr "Sandbox: MountAPIVFS (default in mount namespace): $arg"; continue ;;
 --property=ReadWritePaths=*) READ_WRITE_PATHS+=("${arg#--property=ReadWritePaths=}"); _log_dsr "Sandbox: $arg"; continue ;;
 --property=ReadOnlyPaths=*) READ_ONLY_PATHS+=("${arg#--property=ReadOnlyPaths=}"); _log_dsr "Sandbox: $arg"; continue ;;
 --property=InaccessiblePaths=*) INACCESSIBLE_PATHS+=("${arg#--property=InaccessiblePaths=}"); _log_dsr "Sandbox: $arg"; continue ;;
 --property=ExecPaths=*) READ_WRITE_PATHS+=("${arg#--property=ExecPaths=}"); _log_dsr "Sandbox: ExecPaths→ReadWritePaths: $arg"; continue ;;
 --property=NoExecPaths=*) READ_ONLY_PATHS+=("${arg#--property=NoExecPaths=}"); _log_dsr "Sandbox: NoExecPaths→ReadOnlyPaths: $arg"; continue ;;
---property=ConfigurationDirectory=*) continue ;;
+--property=ConfigurationDirectory=*) CONFIG_DIRS+=("${arg#--property=ConfigurationDirectory=}"); _log_dsr "Sandbox: $arg"; continue ;;
 --property=RootDirectory=*) _warn_dsr "Sandbox: RootDirectory (requires chroot-like setup, not supported in shim): $arg"; continue ;;
 --property=RootImage=*) _warn_dsr "Sandbox: RootImage (requires disk image mount, not supported in shim): $arg"; continue ;;
 --property=RootHash=*) _warn_dsr "Sandbox: RootHash (requires dm-verity, not supported in shim): $arg"; continue ;;
@@ -3937,8 +3979,8 @@ case "$arg" in
 --property=SecureBits=*) SECURE_BITS="${arg#--property=SecureBits=}"; _log_dsr "Sandbox: $arg"; continue ;;
 # --- Environment ---
 --property=Environment=*) EXTRA_ENV+=("-e" "${arg#--property=Environment=}"); continue ;;
---property=PassEnvironment=*) continue ;;
---property=UnsetEnvironment=*) continue ;;
+--property=PassEnvironment=*) PASS_ENV+=("${arg#--property=PassEnvironment=}"); _log_dsr "Sandbox: $arg"; continue ;;
+--property=UnsetEnvironment=*) UNSET_ENV+=("${arg#--property=UnsetEnvironment=}"); _log_dsr "Sandbox: $arg"; continue ;;
 # --- Personality / arch ---
 --property=Personality=*) PERSONALITY="${arg#--property=Personality=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=SystemCallArchitectures=*) SYS_CALL_ARCH="${arg#--property=SystemCallArchitectures=}"; _log_dsr "Sandbox: $arg"; continue ;;
@@ -3977,39 +4019,38 @@ case "$arg" in
 --property=LogFilterDeny=*) continue ;;
 --property=LogLevelOverride=*) continue ;;
 # --- Resource limits (RLIMIT_*) and accounting ---
---property=LimitCPU=*) continue ;;
---property=LimitCPUSoft=*) continue ;;
---property=LimitFSIZE=*) continue ;;
---property=LimitFIZESoft=*) continue ;;
---property=LimitDATA=*) continue ;;
---property=LimitDATASoft=*) continue ;;
---property=LimitSTACK=*) continue ;;
---property=LimitSTACKSoft=*) continue ;;
---property=LimitCORE=*) continue ;;
---property=LimitCORESoft=*) continue ;;
---property=LimitRSS=*) continue ;;
---property=LimitRSSSoft=*) continue ;;
---property=LimitNOFILE=*) continue ;;
---property=LimitNOFILESoft=*) continue ;;
---property=LimitAS=*) continue ;;
---property=LimitASSoft=*) continue ;;
---property=LimitNPROC=*) continue ;;
---property=LimitNPROCSoft=*) continue ;;
---property=LimitMEMLOCK=*) continue ;;
---property=LimitMEMLOCKSoft=*) continue ;;
---property=LimitLOCKS=*) continue ;;
---property=LimitLOCKSSoft=*) continue ;;
---property=LimitSIGPENDING=*) continue ;;
---property=LimitSIGPENDINGSoft=*) continue ;;
---property=LimitMSGQUEUE=*) continue ;;
---property=LimitMSGQUEUESoft=*) continue ;;
---property=LimitNICE=*) continue ;;
---property=LimitNICESoft=*) continue ;;
---property=LimitRTPRIO=*) continue ;;
---property=LimitRTPRIOSoft=*) continue ;;
---property=LimitRTTIME=*) continue ;;
---property=LimitRTTIMESoft=*) continue ;;
---property=LimitNFILEVSZ=*) continue ;;
+--property=LimitCPU=*) LIMITS_RLIMIT+=("cpu=${arg#--property=LimitCPU=}"); continue ;;
+--property=LimitCPUSoft=*) LIMITS_RLIMIT+=("cpu-soft=${arg#--property=LimitCPUSoft=}"); continue ;;
+--property=LimitFSIZE=*) LIMITS_RLIMIT+=("fsize=${arg#--property=LimitFSIZE=}"); continue ;;
+--property=LimitFIZESoft=*) LIMITS_RLIMIT+=("fsize-soft=${arg#--property=LimitFIZESoft=}"); continue ;;
+--property=LimitDATA=*) LIMITS_RLIMIT+=("data=${arg#--property=LimitDATA=}"); continue ;;
+--property=LimitDATASoft=*) LIMITS_RLIMIT+=("data-soft=${arg#--property=LimitDATASoft=}"); continue ;;
+--property=LimitSTACK=*) LIMITS_RLIMIT+=("stack=${arg#--property=LimitSTACK=}"); continue ;;
+--property=LimitSTACKSoft=*) LIMITS_RLIMIT+=("stack-soft=${arg#--property=LimitSTACKSoft=}"); continue ;;
+--property=LimitCORE=*) LIMITS_RLIMIT+=("core=${arg#--property=LimitCORE=}"); continue ;;
+--property=LimitCORESoft=*) LIMITS_RLIMIT+=("core-soft=${arg#--property=LimitCORESoft=}"); continue ;;
+--property=LimitRSS=*) LIMITS_RLIMIT+=("rss=${arg#--property=LimitRSS=}"); continue ;;
+--property=LimitRSSSoft=*) LIMITS_RLIMIT+=("rss-soft=${arg#--property=LimitRSSSoft=}"); continue ;;
+--property=LimitNOFILE=*) LIMITS_RLIMIT+=("nofile=${arg#--property=LimitNOFILE=}"); continue ;;
+--property=LimitNOFILESoft=*) LIMITS_RLIMIT+=("nofile-soft=${arg#--property=LimitNOFILESoft=}"); continue ;;
+--property=LimitAS=*) LIMITS_RLIMIT+=("as=${arg#--property=LimitAS=}"); continue ;;
+--property=LimitASSoft=*) LIMITS_RLIMIT+=("as-soft=${arg#--property=LimitASSoft=}"); continue ;;
+--property=LimitNPROC=*) LIMITS_RLIMIT+=("nproc=${arg#--property=LimitNPROC=}"); continue ;;
+--property=LimitNPROCSoft=*) LIMITS_RLIMIT+=("nproc-soft=${arg#--property=LimitNPROCSoft=}"); continue ;;
+--property=LimitMEMLOCK=*) LIMITS_RLIMIT+=("memlock=${arg#--property=LimitMEMLOCK=}"); continue ;;
+--property=LimitMEMLOCKSoft=*) LIMITS_RLIMIT+=("memlock-soft=${arg#--property=LimitMEMLOCKSoft=}"); continue ;;
+--property=LimitLOCKS=*) LIMITS_RLIMIT+=("locks=${arg#--property=LimitLOCKS=}"); continue ;;
+--property=LimitLOCKSSoft=*) LIMITS_RLIMIT+=("locks-soft=${arg#--property=LimitLOCKSSoft=}"); continue ;;
+--property=LimitSIGPENDING=*) LIMITS_RLIMIT+=("sigpending=${arg#--property=LimitSIGPENDING=}"); continue ;;
+--property=LimitSIGPENDINGSoft=*) LIMITS_RLIMIT+=("sigpending-soft=${arg#--property=LimitSIGPENDINGSoft=}"); continue ;;
+--property=LimitMSGQUEUE=*) LIMITS_RLIMIT+=("msgqueue=${arg#--property=LimitMSGQUEUE=}"); continue ;;
+--property=LimitMSGQUEUESoft=*) LIMITS_RLIMIT+=("msgqueue-soft=${arg#--property=LimitMSGQUEUESoft=}"); continue ;;
+--property=LimitNICE=*) LIMITS_RLIMIT+=("nice=${arg#--property=LimitNICE=}"); continue ;;
+--property=LimitNICESoft=*) LIMITS_RLIMIT+=("nice-soft=${arg#--property=LimitNICESoft=}"); continue ;;
+--property=LimitRTPRIO=*) LIMITS_RLIMIT+=("rtprio=${arg#--property=LimitRTPRIO=}"); continue ;;
+--property=LimitRTPRIOSoft=*) LIMITS_RLIMIT+=("rtprio-soft=${arg#--property=LimitRTPRIOSoft=}"); continue ;;
+--property=LimitRTTIME=*) LIMITS_RLIMIT+=("rttime=${arg#--property=LimitRTTIME=}"); continue ;;
+--property=LimitRTTIMESoft=*) LIMITS_RLIMIT+=("rttime-soft=${arg#--property=LimitRTTIMESoft=}"); continue ;;
 --property=TasksMax=*) continue ;;
 --property=TasksAccounting=*) continue ;;
 --property=CPUAccounting=*) continue ;;
@@ -4060,7 +4101,7 @@ case "$arg" in
 --property=DisableMemoryMax=*) continue ;;
 --property=MemoryHighWriteback=*) continue ;;
 # --- OOM / pressure / cachettl ---
---property=OOMScoreAdjust=*) continue ;;
+--property=OOMScoreAdjust=*) OOM_SCORE_ADJUST="${arg#--property=OOMScoreAdjust=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=OOMPolicy=*) continue ;;
 --property=OOMScoreAdjustPerWeight=*) continue ;;
 --property=MemoryPressureWatch=*) continue ;;
@@ -4126,8 +4167,8 @@ case "$arg" in
 --property=RestartPreventExitStatus=*) continue ;;
 --property=RestartForceExitStatus=*) continue ;;
 --property=WatchdogSec=*) continue ;;
---property=TimeoutStartSec=*) continue ;;
---property=TimeoutStopSec=*) continue ;;
+--property=TimeoutStartSec=*) TIMEOUT_START="${arg#--property=TimeoutStartSec=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=TimeoutStopSec=*) TIMEOUT_STOP="${arg#--property=TimeoutStopSec=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=TimeoutAbortSec=*) continue ;;
 --property=TimeoutCleanSec=*) continue ;;
 --property=TimeoutStartFailureMode=*) continue ;;
@@ -4243,6 +4284,19 @@ _NEEDS_SANDBOX=false
 [[ -n "$NO_NEW_PRIVS" ]] && _NEEDS_SANDBOX=true
 [[ -n "$CAP_BOUNDING_SET" ]] && _NEEDS_SANDBOX=true
 [[ ${#READ_WRITE_PATHS[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
+[[ ${#LIMITS_RLIMIT[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
+[[ -n "$IOSCHED_CLASS" ]] && _NEEDS_SANDBOX=true
+[[ -n "$CPUSCHED_POLICY" ]] && _NEEDS_SANDBOX=true
+[[ -n "$NICE_LEVEL" ]] && _NEEDS_SANDBOX=true
+[[ -n "$AMBIENT_CAPS" ]] && _NEEDS_SANDBOX=true
+[[ -n "$GROUP_NAME" ]] && _NEEDS_SANDBOX=true
+[[ -n "$MOUNT_FLAGS" ]] && _NEEDS_SANDBOX=true
+[[ ${#PASS_ENV[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
+[[ ${#UNSET_ENV[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
+[[ ${#CONFIG_DIRS[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
+[[ -n "$OOM_SCORE_ADJUST" ]] && _NEEDS_SANDBOX=true
+[[ -n "$TIMEOUT_START" ]] && _NEEDS_SANDBOX=true
+[[ -n "$TIMEOUT_STOP" ]] && _NEEDS_SANDBOX=true
 if $_NEEDS_SANDBOX; then
     _log_dsr "Sandbox restrictions active: ProtectSystem=$PROTECT_SYSTEM ProtectHome=$PROTECT_HOME PrivateTmp=$PRIVATE_TMP PrivateDevices=$PRIVATE_DEVICES"
 fi
@@ -4918,6 +4972,174 @@ CLOSEFDS_C
             mount --bind /dev/null /dev/kmsg 2>/dev/null \
                 && _log_dsr "  /dev/kmsg replaced with /dev/null" \
                 || _warn_dsr "  Could not replace /dev/kmsg"
+        fi
+    fi
+
+    # ── Resource limits (Limit*=) via ulimit ──
+    if [[ ${#LIMITS_RLIMIT[@]} -gt 0 ]]; then
+        _log_dsr "Applying resource limits: ${LIMITS_RLIMIT[*]}"
+        for _rl in "${LIMITS_RLIMIT[@]}"; do
+            local _rl_name="${_rl%%=*}"
+            local _rl_val="${_rl#*=}"
+            # Map systemd limit names to ulimit flags
+            local _ul_flag=""
+            case "$_rl_name" in
+                cpu)        _ul_flag="-t" ;;
+                fsize)      _ul_flag="-f" ;;
+                data)       _ul_flag="-d" ;;
+                stack)      _ul_flag="-s" ;;
+                core)       _ul_flag="-c" ;;
+                rss)        _ul_flag="-m" ;;
+                nofile)     _ul_flag="-n" ;;
+                as)         _ul_flag="-v" ;;
+                nproc)      _ul_flag="-u" ;;
+                memlock)    _ul_flag="-l" ;;
+                locks)      _ul_flag="-x" ;;
+                sigpending) _ul_flag="-i" ;;
+                msgqueue)   _ul_flag="-q" ;;
+                nice)       _ul_flag="-e" ;;
+                rtprio)     _ul_flag="-r" ;;
+                rttime)     _ul_flag="-R" ;;
+            esac
+            if [[ -n "$_ul_flag" ]]; then
+                # Handle "infinity" value
+                [[ "$_rl_val" == "infinity" || "$_rl_val" == "max" ]] && _rl_val="unlimited"
+                ulimit "$_ul_flag" "$_rl_val" 2>/dev/null \
+                    && _log_dsr "  ${_rl_name}=${_rl_val} (ulimit $_ul_flag)" \
+                    || _warn_dsr "  Failed to set ${_rl_name}=${_rl_val}"
+            fi
+        done
+    fi
+
+    # ── I/O scheduling (IOSchedulingClass) via ionice ──
+    if [[ -n "$IOSCHED_CLASS" ]]; then
+        _log_dsr "Applying IOSchedulingClass=$IOSCHED_CLASS"
+        local _ionice_class=""
+        case "${IOSCHED_CLASS,,}" in
+            idle|7)       _ionice_class="-c3" ;;
+            best-effort|2) _ionice_class="-c2" ;;
+            realtime|1)   _ionice_class="-c1" ;;
+            none|0)       _ionice_class="-c0" ;;
+        esac
+        if [[ -n "$_ionice_class" ]] && command -v ionice >/dev/null 2>&1; then
+            local _ionice_prio="${IOSCHED_PRIORITY:-4}"
+            ionice "$_ionice_class" -n "$_ionice_prio" 2>/dev/null \
+                && _log_dsr "  ionice class=$_ionice_class priority=$_ionice_prio" \
+                || _warn_dsr "  Failed to set ionice class=$_ionice_class"
+        fi
+    fi
+
+    # ── CPU scheduling (CPUSchedulingPolicy, Nice) via nice/chrt ──
+    if [[ -n "$NICE_LEVEL" ]]; then
+        _log_dsr "Applying Nice=$NICE_LEVEL"
+        nice -n "$NICE_LEVEL" 2>/dev/null \
+            && _log_dsr "  Nice level set to $NICE_LEVEL" \
+            || _warn_dsr "  Failed to set Nice level to $NICE_LEVEL"
+    fi
+    if [[ -n "$CPUSCHED_POLICY" ]]; then
+        _log_dsr "Applying CPUSchedulingPolicy=$CPUSCHED_POLICY"
+        local _chrt_policy=""
+        case "${CPUSCHED_POLICY,,}" in
+            other|0)     _chrt_policy="-o" ;;
+            batch|3)     _chrt_policy="-b" ;;
+            idle|5)      _chrt_policy="-i" ;;
+            fifo|1)      _chrt_policy="-f" ;;
+            rr|2)        _chrt_policy="-r" ;;
+        esac
+        if [[ -n "$_chrt_policy" ]] && command -v chrt >/dev/null 2>&1; then
+            local _chrt_prio="${CPUSCHED_PRIORITY:-0}"
+            chrt "$_chrt_policy" "$_chrt_prio" -- true 2>/dev/null \
+                && _log_dsr "  chrt policy=$_chrt_policy priority=$_chrt_prio" \
+                || _warn_dsr "  Failed to set chrt policy=$_chrt_policy"
+        fi
+    fi
+
+    # ── AmbientCapabilities via setpriv ──
+    if [[ -n "$AMBIENT_CAPS" ]]; then
+        _log_dsr "Applying AmbientCapabilities=$AMBIENT_CAPS"
+        if command -v setpriv >/dev/null 2>&1; then
+            local _cap_args=""
+            case "${AMBIENT_CAPS,,}" in
+                "~all"|"")  _cap_args="--inh-caps=-all --ambient-caps=-all" ;;
+                "all")      _cap_args="--inh-caps=+all --ambient-caps=+all" ;;
+                \~*)        _cap_args="--inh-caps=-${AMBIENT_CAPS#\~} --ambient-caps=-${AMBIENT_CAPS#\~}" ;;
+                *)          _cap_args="--inh-caps=+${AMBIENT_CAPS} --ambient-caps=+${AMBIENT_CAPS}" ;;
+            esac
+            setpriv $_cap_args true 2>/dev/null \
+                && _log_dsr "  AmbientCaps: $_cap_args" \
+                || _warn_dsr "  Failed to set AmbientCapabilities"
+        else
+            _warn_dsr "  setpriv not available — cannot enforce AmbientCapabilities"
+        fi
+    fi
+
+    # ── Group identity via sg ──
+    if [[ -n "$GROUP_NAME" ]]; then
+        _log_dsr "Applying Group=$GROUP_NAME"
+        if getent group "$GROUP_NAME" >/dev/null 2>&1; then
+            export _DSR_GROUP_NAME="$GROUP_NAME"
+            _log_dsr "  Group set to $GROUP_NAME (will be applied via sg)"
+        else
+            _warn_dsr "  Group '$GROUP_NAME' does not exist"
+        fi
+    fi
+
+    # ── MountFlags: set mount propagation ──
+    if [[ -n "$MOUNT_FLAGS" ]]; then
+        _log_dsr "Applying MountFlags=$MOUNT_FLAGS"
+        local _propagation=""
+        case "${MOUNT_FLAGS,,}" in
+            slave)       _propagation="--make-rslave" ;;
+            private)     _propagation="--make-rprivate" ;;
+            shared)      _propagation="--make-rshared" ;;
+        esac
+        if [[ -n "$_propagation" ]]; then
+            mount "$_propagation" / 2>/dev/null \
+                && _log_dsr "  Mount propagation: $_propagation" \
+                || _warn_dsr "  Failed to set mount propagation to $_propagation"
+        fi
+    fi
+
+    # ── PassEnvironment: export parent env vars into sandbox ──
+    if [[ ${#PASS_ENV[@]} -gt 0 ]]; then
+        _log_dsr "Applying PassEnvironment: ${PASS_ENV[*]}"
+        for _pe in "${PASS_ENV[@]}"; do
+            if [[ -n "${!_pe:-}" ]]; then
+                export "$_pe"="${!_pe}"
+                _log_dsr "  Passed: $_pe"
+            else
+                _warn_dsr "  PassEnvironment: $_pe not set in parent"
+            fi
+        done
+    fi
+
+    # ── UnsetEnvironment: unset specified env vars ──
+    if [[ ${#UNSET_ENV[@]} -gt 0 ]]; then
+        _log_dsr "Applying UnsetEnvironment: ${UNSET_ENV[*]}"
+        for _ue in "${UNSET_ENV[@]}"; do
+            unset "$_ue" 2>/dev/null
+            _log_dsr "  Unset: $_ue"
+        done
+    fi
+
+    # ── ConfigurationDirectory: create + bind-mount writable ──
+    for _cd in "${CONFIG_DIRS[@]}"; do
+        local _cd_path="/etc/$_cd"
+        mkdir -p "$_cd_path" 2>/dev/null || continue
+        chown "${BUILD_USER:-root}:${BUILD_USER:-root}" "$_cd_path" 2>/dev/null || true
+        chmod 0755 "$_cd_path" 2>/dev/null || true
+        _log_dsr "  ConfigurationDirectory: $_cd_path"
+    done
+
+    # ── OOMScoreAdjust: write to /proc/self/oom_score_adj ──
+    if [[ -n "$OOM_SCORE_ADJUST" ]]; then
+        _log_dsr "Applying OOMScoreAdjust=$OOM_SCORE_ADJUST"
+        if [[ -w /proc/self/oom_score_adj ]]; then
+            echo "$OOM_SCORE_ADJUST" > /proc/self/oom_score_adj 2>/dev/null \
+                && _log_dsr "  oom_score_adj set to $OOM_SCORE_ADJUST" \
+                || _warn_dsr "  Failed to set oom_score_adj"
+        else
+            _warn_dsr "  /proc/self/oom_score_adj not writable"
         fi
     fi
 
@@ -5807,6 +6029,19 @@ fi
 _BUILD_WRAPPER="$_ENV_SETUP"
 if [[ -n "$EXTRA_GROUPS" ]]; then
     sg "$EXTRA_GROUPS" -c true 2>/dev/null && _BUILD_WRAPPER="sg '$EXTRA_GROUPS' -c \"$_BUILD_WRAPPER\" || ( _warn_dsr 'sg failed for groups $EXTRA_GROUPS, continuing without'; true ); "
+fi
+# Group property: run command as specified group via sg
+if [[ -n "${_DSR_GROUP_NAME:-}" ]]; then
+    if sg "$_DSR_GROUP_NAME" -c true 2>/dev/null; then
+        _BUILD_WRAPPER="sg '$_DSR_GROUP_NAME' -c \"$_BUILD_WRAPPER\" || ( _warn_dsr 'sg failed for group $_DSR_GROUP_NAME, continuing without'; true ); "
+    else
+        _warn_dsr "sg for group '$_DSR_GROUP_NAME' failed — continuing without group switch"
+    fi
+fi
+# Timeout: wrap command with timeout if TimeoutStartSec is set
+if [[ -n "$TIMEOUT_START" ]] && [[ "$TIMEOUT_START" != "infinity" && "$TIMEOUT_START" != "0" ]]; then
+    _BUILD_WRAPPER="timeout ${TIMEOUT_START}s $_BUILD_WRAPPER"
+    _log_dsr "TimeoutStartSec=${TIMEOUT_START}s applied"
 fi
 
 # Determine inner command for non-sandbox path

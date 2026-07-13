@@ -7513,9 +7513,12 @@ else
     pacman -Dk 2>&1 | head -5 || true
 fi
 
-# Verify critical shared libraries
-for _lib in /usr/lib/libc.so.6 /usr/lib/libm.so.6; do
-    if [[ -f "$_lib" ]] && ! ldd "$_lib" >/dev/null 2>&1; then
+# Verify critical shared libraries (resolve paths dynamically via ldconfig
+# instead of assuming /usr/lib — some Arch derivatives use /usr/lib64 or
+# other layouts).
+for _lib_name in libc.so.6 libm.so.6; do
+    _lib=$(ldconfig -p 2>/dev/null | grep "$_lib_name" | head -1 | awk '{print $NF}' || echo "")
+    if [[ -n "$_lib" && -f "$_lib" ]] && ! ldd "$_lib" >/dev/null 2>&1; then
         echo "CRITICAL: $_lib has broken dependencies!"
     fi
 done
@@ -10468,15 +10471,15 @@ verify_pamac_libalpm_compat() {
                 if [[ "$_lib_soname" =~ ^libalpm\.so\.([0-9]+)$ ]]; then
                     local _linked_abi="${BASH_REMATCH[1]}"
                     local _system_abi=""
-                    for _so_candidate in /usr/lib/libalpm.so.*; do
-                        if [[ -L "$_so_candidate" ]] || [[ -f "$_so_candidate" ]]; then
-                            local _so_name
-                            _so_name=$(basename "$_so_candidate" 2>/dev/null || echo "")
-                            if [[ "$_so_name" =~ ^libalpm\.so\.([0-9]+)$ ]]; then
-                                _system_abi="${BASH_REMATCH[1]}"
-                            fi
+                    local _alpm_so_path
+                    _alpm_so_path=$(ldconfig -p 2>/dev/null | grep "libalpm\.so" | head -1 | awk '{print $NF}' || echo "")
+                    if [[ -n "$_alpm_so_path" ]]; then
+                        local _so_name
+                        _so_name=$(basename "$_alpm_so_path" 2>/dev/null || echo "")
+                        if [[ "$_so_name" =~ ^libalpm\.so\.([0-9]+)$ ]]; then
+                            _system_abi="${BASH_REMATCH[1]}"
                         fi
-                    done
+                    fi
                     if [[ -n "$_system_abi" && "$_linked_abi" != "$_system_abi" ]]; then
                         echo "  WARNING: libalpm ABI mismatch — binary links .so.$_linked_abi but system has .so.$_system_abi"
                         echo "  This is the pacman 7.1/libalpm.so.15 transition. pamac-aur was compiled"
@@ -10493,15 +10496,15 @@ verify_pamac_libalpm_compat() {
                 if [[ "$_lib_path" =~ libalpm\.so\.([0-9]+) ]]; then
                     local _expected_abi="${BASH_REMATCH[1]}"
                     local _system_abi=""
-                    for _so_candidate in /usr/lib/libalpm.so.*; do
-                        if [[ -f "$_so_candidate" ]] || [[ -L "$_so_candidate" ]]; then
-                            local _so_name
-                            _so_name=$(basename "$_so_candidate" 2>/dev/null || echo "")
-                            if [[ "$_so_name" =~ ^libalpm\.so\.([0-9]+)$ ]]; then
-                                _system_abi="${BASH_REMATCH[1]}"
-                            fi
+                    local _alpm_so_path2
+                    _alpm_so_path2=$(ldconfig -p 2>/dev/null | grep "libalpm\.so" | head -1 | awk '{print $NF}' || echo "")
+                    if [[ -n "$_alpm_so_path2" ]]; then
+                        local _so_name
+                        _so_name=$(basename "$_alpm_so_path2" 2>/dev/null || echo "")
+                        if [[ "$_so_name" =~ ^libalpm\.so\.([0-9]+)$ ]]; then
+                            _system_abi="${BASH_REMATCH[1]}"
                         fi
-                    done
+                    fi
                     if [[ -n "$_system_abi" ]]; then
                         echo "  Expected libalpm.so.$_expected_abi, system has libalpm.so.$_system_abi"
                         echo "  This is the pacman 7.1 transition. Try:"
@@ -13793,10 +13796,12 @@ if ! pacman -Dk 2>/dev/null | grep -q "No database errors"; then
     pacman -Dk 2>&1 | head -10 || true
 fi
 
-# Verify critical shared libraries are intact
+# Verify critical shared libraries are intact (resolve via ldconfig, not
+# hardcoded /usr/lib paths)
 _critical_libs_ok=true
-for _lib in /usr/lib/libc.so.6 /usr/lib/libm.so.6 /usr/lib/libpthread.so.0; do
-    if [[ -f "$_lib" ]] && ! ldd "$_lib" >/dev/null 2>&1; then
+for _lib_name in libc.so.6 libm.so.6 libpthread.so.0; do
+    _lib=$(ldconfig -p 2>/dev/null | grep "$_lib_name" | head -1 | awk '{print $NF}' || echo "")
+    if [[ -n "$_lib" && -f "$_lib" ]] && ! ldd "$_lib" >/dev/null 2>&1; then
         echo "WARNING: Critical library $_lib has broken dependencies."
         _critical_libs_ok=false
     fi

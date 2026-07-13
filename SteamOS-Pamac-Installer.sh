@@ -5793,7 +5793,7 @@ for _dv in PROTECT_SYSTEM PROTECT_HOME PRIVATE_TMP PRIVATE_DEVICES PRIVATE_NETWO
     PRIVATE_USERS DISABLE_EXTRA_FDS COREDUMP_RECEIVE \
     IOSCHED_CLASS IOSCHED_PRIORITY CPUSCHED_POLICY CPUSCHED_PRIORITY \
     NICE_LEVEL AMBIENT_CAPS GROUP_NAME MOUNT_FLAGS OOM_SCORE_ADJUST \
-    TIMEOUT_START BUILD_USER DSR_VERSION _DSR_LOG; do
+    TIMEOUT_START BUILD_USER DSR_VERSION _DSR_LOG WORK_DIR CACHE_DIR; do
     declare -p "$_dv" >> "$_DSR_FUNCS_FILE" 2>/dev/null || true
 done
 for _da in READ_ONLY_PATHS INACCESSIBLE_PATHS STATE_DIRECTORIES LOGS_DIRECTORIES \
@@ -5925,12 +5925,11 @@ _run_sandboxed_unshare() {
                 _apply_sandbox
                 ${_NNP}${_CAP_PRIV}${_BUILD_WRAPPER:-}exec \"\${@}\"
             " -- "${CMD_ARGS[@]}"
-            fi
         else
             unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
                 source $_DSR_FUNCS_FILE 2>/dev/null
                 _apply_sandbox
-                ${_NNP}${_CAP_PRIV}exec \"\${@}\"
+                ${_NNP}${_CAP_PRIV}${_BUILD_WRAPPER:-}exec \"\${@}\"
             " -- "${CMD_ARGS[@]}"
         fi
     fi

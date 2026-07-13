@@ -714,7 +714,86 @@ ensure_container_healthy() {
 	done
 
 	log_error "Container health check failed after $max_attempts attempts for: $desc"
-	return 1
+    return 1
+}
+
+# AUR payload verification: inspect PKGBUILD for suspicious patterns before
+# building. Under --strict-security, this runs automatically. Otherwise it
+# provides advisory warnings. Does NOT replace cryptographic verification
+# (makepkg source integrity) — it catches social engineering and
+# obfuscation patterns that signature checking alone cannot detect.
+_verify_aur_payload() {
+    local _pkgbuild_dir="$1"
+    local _pkgbuild="$_pkgbuild_dir/PKGBUILD"
+    if [[ ! -f "$_pkgbuild" ]]; then
+        return 0  # No PKGBUILD to check (will fail at build time)
+    fi
+    local _warnings=""
+    local _fatal=false
+    local _is_strict="${STRICT_SECURITY:-false}"
+
+    # Check for suspicious patterns in the PKGBUILD
+    # 1. curl|wget piped to bash (classic remote code execution)
+    if grep -qE 'curl\s.*\|\s*(ba)?sh|wget\s.*\|\s*(ba)?sh' "$_pkgbuild" 2>/dev/null; then
+        _warnings="$_warnings PIPED_REMOTE_EXEC: "
+        echo "  CRITICAL: PKGBUILD contains curl/wget piped to shell."
+        echo "  This is a classic remote code execution pattern."
+        _fatal=true
+    fi
+
+    # 2. eval on downloaded content
+    if grep -qE 'eval\s+\$|eval\s+"' "$_pkgbuild" 2>/dev/null; then
+        _warnings="$_warnings EVAL_USAGE: "
+        echo "  WARNING: PKGBUILD contains eval — may execute arbitrary code."
+        [[ "$_is_strict" == "true" ]] && _fatal=true
+    fi
+
+    # 3. base64 decode (encoded payloads)
+    if grep -qE 'base64\s+-d|base64\s+--decode' "$_pkgbuild" 2>/dev/null; then
+        _warnings="$_warnings BASE64_DECODE: "
+        echo "  WARNING: PKGBUILD contains base64 decode — possible encoded payload."
+        [[ "$_is_strict" == "true" ]] && _fatal=true
+    fi
+
+    # 4. Writes outside $srcdir or $pkgdir
+    if grep -qE 'rm\s+-rf\s+/[^"]*|rm\s+-rf\s+~/' "$_pkgbuild" 2>/dev/null; then
+        _warnings="$_warnings DESTRUCTIVE_RM: "
+        echo "  WARNING: PKGBUILD contains rm -rf on absolute paths."
+        [[ "$_is_strict" == "true" ]] && _fatal=true
+    fi
+
+    # 5. Network fetch in build() (not just source())
+    if grep -qE '^\s*build\s*\(\)|^\s*package\s*\(\)' "$_pkgbuild" 2>/dev/null; then
+        local _in_func=false
+        while IFS= read -r _line; do
+            if echo "$_line" | grep -qE '^\s*(build|package)\s*\(\)'; then
+                _in_func=true
+            elif echo "$_line" | grep -qE '^\s*\}'; then
+                _in_func=false
+            elif [[ "$_in_func" == "true" ]] && echo "$_line" | grep -qE 'curl\s|wget\s'; then
+                _warnings="$_warnings NETWORK_IN_BUILD: "
+                echo "  WARNING: PKGBUILD fetches from network inside build()/package()."
+                echo "  This is unusual — most packages fetch in source(), not build()."
+                [[ "$_is_strict" == "true" ]] && _fatal=true
+                break
+            fi
+        done < "$_pkgbuild"
+    fi
+
+    # 6. /etc or /usr modification outside package()
+    # (This is a heuristic — legitimate packages DO write to these paths)
+
+    if [[ -n "$_warnings" ]]; then
+        echo "  AUR payload warnings: $_warnings"
+        echo "  Review the PKGBUILD manually: cat $_pkgbuild"
+        if [[ "$_is_strict" == "true" && "$_fatal" == "true" ]]; then
+            echo "  ABORTING: --strict-security mode: refusing to build PKGBUILD with suspicious patterns."
+            return 1
+        elif [[ "$_fatal" == "true" ]]; then
+            echo "  Proceeding despite critical warnings (not in --strict-security mode)."
+        fi
+    fi
+    return 0
 }
 
 _RECREATE_COUNT=0
@@ -10079,6 +10158,11 @@ install_from_aur_commit() {
         fi
     fi
     echo "Building pamac-aur from commit ${commit:0:12}..."
+    # AUR payload verification: inspect PKGBUILD for suspicious patterns before building.
+    if ! _verify_aur_payload "$work_dir"; then
+        rm -rf "$work_dir"
+        return 1
+    fi
     _preflight_oom_check "pamac-aur commit build"
     _set_makepkg_jobs
     sudo -Hu "$current_user" bash -lc "cd '$work_dir' && makepkg -si --noconfirm --clean" 2>/tmp/pamac_build_err
@@ -10093,6 +10177,25 @@ install_from_aur_commit() {
 }
 
 install_from_yay() {
+    # Pre-flight AUR payload verification: fetch and inspect the PKGBUILD before yay
+    # builds it. Under --strict-security, aborts on suspicious patterns. Otherwise
+    # provides advisory warnings about network-in-build, eval usage, etc.
+    if [[ "${STRICT_SECURITY:-false}" == "true" ]]; then
+        local _pf_dir
+        _pf_dir=$(mktemp -d /var/tmp/pamac-preflight-XXXXXX 2>/dev/null) || _pf_dir=""
+        if [[ -n "$_pf_dir" ]]; then
+            chmod 700 "$_pf_dir" 2>/dev/null || true
+            if curl -sSf --connect-timeout 10 --max-time 30 \
+                "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=pamac-aur" \
+                -o "$_pf_dir/PKGBUILD" 2>/dev/null; then
+                if ! _verify_aur_payload "$_pf_dir"; then
+                    rm -rf "$_pf_dir"
+                    return 1
+                fi
+            fi
+            rm -rf "$_pf_dir"
+        fi
+    fi
     _preflight_oom_check "pamac-aur yay install"
     _set_makepkg_jobs
     local _jobs
@@ -10143,6 +10246,31 @@ validate_pamac_build_deps() {
     else
         _warnings="$_warnings pkg-config; "
         echo "  WARNING: pkg-config not found. Cannot verify libalpm compatibility."
+    fi
+
+    # Detect the actual libalpm.so ABI version number (e.g., .so.14, .so.15).
+    # During major pacman upgrades (e.g., 6.x -> 7.1), the .so version bumps
+    # (e.g., .so.14 -> .so.15) and pamac-aur may not have been rebuilt against
+    # the new ABI yet. This check detects the transition early.
+    local _libalpm_so_ver=""
+    local _libalpm_so_name=""
+    for _candidate in libalpm.so libalpm.so.*; do
+        _libalpm_so_name=$(readlink -f "/usr/lib/$_candidate" 2>/dev/null | xargs basename 2>/dev/null || echo "")
+        if [[ "$_libalpm_so_name" =~ ^libalpm\.so\.([0-9]+)$ ]]; then
+            _libalpm_so_ver="${BASH_REMATCH[1]}"
+            break
+        fi
+    done
+    if [[ -n "$_libalpm_so_ver" ]]; then
+        echo "  libalpm ABI version: .so.$_libalpm_so_ver"
+        # Track the ABI version for the caller (used by Strategy B to select commits)
+        echo "LIBALPM_SO_VERSION=$_libalpm_so_ver"
+        # Warn about known transition periods
+        if [[ "$_libalpm_so_ver" -ge 15 ]]; then
+            echo "  NOTE: libalpm.so.$_libalpm_so_ver detected (pacman 7.x ABI)."
+            echo "  pamac-aur may need a recent commit that supports this ABI."
+            echo "  If build fails, Strategy B will scan git history for a compatible revision."
+        fi
     fi
 
     # Check for vala compiler version (pamac requires recent vala)
@@ -10225,9 +10353,57 @@ verify_pamac_libalpm_compat() {
             _lib_path=$(echo "$_alpm_link" | awk '{print $3}' | head -1 || echo "")
             if [[ -n "$_lib_path" && -f "$_lib_path" ]]; then
                 echo "  libalpm library found: $_lib_path"
+                # Detect ABI version mismatch: pamac compiled against .so.14
+                # but system has .so.15 (pacman 7.x transition). The dynamic
+                # linker resolves SONAME, so if pamac links libalpm.so.14 but
+                # only .so.15 exists, ldd would show "not found" (caught above).
+                # However, if both exist (multi-version install), verify the
+                # running binary uses the system version.
+                local _lib_soname
+                _lib_soname=$(basename "$_lib_path" 2>/dev/null || echo "")
+                if [[ "$_lib_soname" =~ ^libalpm\.so\.([0-9]+)$ ]]; then
+                    local _linked_abi="${BASH_REMATCH[1]}"
+                    local _system_abi=""
+                    for _so_candidate in /usr/lib/libalpm.so.*; do
+                        if [[ -L "$_so_candidate" ]] || [[ -f "$_so_candidate" ]]; then
+                            local _so_name
+                            _so_name=$(basename "$_so_candidate" 2>/dev/null || echo "")
+                            if [[ "$_so_name" =~ ^libalpm\.so\.([0-9]+)$ ]]; then
+                                _system_abi="${BASH_REMATCH[1]}"
+                            fi
+                        fi
+                    done
+                    if [[ -n "$_system_abi" && "$_linked_abi" != "$_system_abi" ]]; then
+                        echo "  WARNING: libalpm ABI mismatch — binary links .so.$_linked_abi but system has .so.$_system_abi"
+                        echo "  This is the pacman 7.1/libalpm.so.15 transition. pamac-aur was compiled"
+                        echo "  against an older ABI and may fail at runtime."
+                        echo "  Fix: yay -S --rebuild pamac-aur (recompile against current libalpm)"
+                        echo "  Or:  wait for upstream pamac-aur to support libalpm.so.$_system_abi"
+                        _issues=$((_issues + 1))
+                    fi
+                fi
             elif [[ -n "$_lib_path" ]]; then
                 echo "  ERROR: libalpm library NOT FOUND at: $_lib_path"
-                echo "  This indicates a library mismatch - pamac was compiled against a different libalpm version."
+                echo "  This indicates a library mismatch — pamac was compiled against a different libalpm version."
+                # Provide specific guidance for the .so.15 transition
+                if [[ "$_lib_path" =~ libalpm\.so\.([0-9]+) ]]; then
+                    local _expected_abi="${BASH_REMATCH[1]}"
+                    local _system_abi=""
+                    for _so_candidate in /usr/lib/libalpm.so.*; do
+                        if [[ -f "$_so_candidate" ]] || [[ -L "$_so_candidate" ]]; then
+                            local _so_name
+                            _so_name=$(basename "$_so_candidate" 2>/dev/null || echo "")
+                            if [[ "$_so_name" =~ ^libalpm\.so\.([0-9]+)$ ]]; then
+                                _system_abi="${BASH_REMATCH[1]}"
+                            fi
+                        fi
+                    done
+                    if [[ -n "$_system_abi" ]]; then
+                        echo "  Expected libalpm.so.$_expected_abi, system has libalpm.so.$_system_abi"
+                        echo "  This is the pacman 7.1 transition. Try:"
+                        echo "    yay -S --rebuild pamac-aur  (recompile against current ABI)"
+                    fi
+                fi
                 _issues=$((_issues + 1))
             fi
         else

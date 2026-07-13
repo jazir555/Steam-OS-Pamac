@@ -4227,8 +4227,10 @@ if [[ ${#UNRECOGNIZED_PROPS[@]} -gt 0 ]]; then
         local _tracker_lines
         _tracker_lines=$(wc -l < "$_PROP_TRACKER" 2>/dev/null || echo "0")
         if (( _tracker_lines > 100 )); then
-            tail -50 "$_PROP_TRACKER" > "${_PROP_TRACKER}.tmp" 2>/dev/null || true
-            mv "${_PROP_TRACKER}.tmp" "$_PROP_TRACKER" 2>/dev/null || true
+            # Use PID-suffixed temp file to prevent concurrent wrapper instances
+            # from overwriting each other's rotation during log pruning.
+            tail -50 "$_PROP_TRACKER" > "${_PROP_TRACKER}.tmp.$$" 2>/dev/null || true
+            mv "${_PROP_TRACKER}.tmp.$$" "$_PROP_TRACKER" 2>/dev/null || true
         fi
     fi
     _warn_dsr "These are silently accepted without enforcement. Normal when Pamac/makepkg"

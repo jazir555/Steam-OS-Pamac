@@ -244,6 +244,11 @@ SELF_UPDATE="${SELF_UPDATE:-false}"
 REPAIR="${REPAIR:-false}"
 UPLOAD_LOG="${UPLOAD_LOG:-false}"
 PIN_ALPM="${PIN_ALPM:-true}"
+# --enable-flatpak: Re-enable Flatpak support in Pamac (default: disabled).
+# On SteamOS, Flatpak is managed by Discover. Enabling it in Pamac shows
+# duplicate Flathub entries. Users who prefer Pamac for all package
+# management (including Flatpaks) can opt in with this flag.
+ENABLE_FLATPAK="${ENABLE_FLATPAK:-false}"
 _verify_sandbox_flag="${_verify_sandbox_flag:-false}"
 # SECURITY: --strict-security mode. When enabled, the script refuses to relax
 # signature verification (SigLevel=TrustAll methods are skipped), refuses to
@@ -2140,6 +2145,11 @@ OPTIONS:
   --force-rebuild           Rebuild existing container if it exists
   --enable-multilib         Enable 32-bit package support (default)
   --disable-multilib        Explicitly disable 32-bit package support
+  --enable-flatpak          Re-enable Flatpak support in Pamac (default: off).
+                             On SteamOS, Discover handles Flatpaks; enabling
+                             Flatpak in Pamac shows duplicate Flathub entries.
+                             Use this if you prefer Pamac for all package
+                             management, including Flatpaks.
   --rolling-release         Use archlinux:latest (rolling release) instead of
                             the pinned stable image (archlinux:base). Packages
                             update frequently; may break on major upstream changes.
@@ -2166,11 +2176,14 @@ OPTIONS:
                              just the current user (INSECURE on multi-user
                              hosts; opt-in only, not auto-enabled)
   --dedicated-builduser      Create a dedicated _pamac_builder user inside the
-                             container. AUR builds and pamac operations run
-                             under this user, not the host login user, providing
-                             an additional isolation layer between host home
-                             data and AUR PKGBUILD access. The host-alias user
-                             is still created for distrobox entry.
+                             container. AUR builds run under this user with NO
+                             passwordless sudo, preventing privilege escalation
+                             via malicious PKGBUILDs. NOTE: Distrobox mounts
+                             /home by default, so the build user retains read
+                             access to host files. This is privilege separation,
+                             not filesystem isolation. Use distrobox --no-home-
+                             mount for full isolation. The host-alias user is
+                             still created for distrobox entry.
   --security-opt OPT         Pass an additional --security-opt to the container
                              runtime during creation. May be repeated.
                              Examples: --security-opt seccomp:profile.json
@@ -2226,6 +2239,10 @@ ENVIRONMENT VARIABLES:
                             Use --rolling-release for archlinux:latest.
   FORCE_REBUILD            Set to 'true' to force-rebuild existing container
   ENABLE_GAMING_PACKAGES   Set to 'true' to install gaming packages
+  ENABLE_FLATPAK           Set to 'true' to re-enable Flatpak support in Pamac
+                           (default 'false'). On SteamOS, Discover handles
+                           Flatpaks; enabling Flatpak in Pamac shows duplicate
+                           Flathub entries. Same as --enable-flatpak flag.
   PAMAC_VERSION            Specific pamac-aur version/commit to install (AUR fallback)
   NON_INTERACTIVE          Set to 'true' to skip all interactive prompts (safe for
                            background tools, automated installers, and cron jobs)
@@ -2302,11 +2319,17 @@ SECURITY NOTE — --allow-wheel-nopasswd:
   Default is per-user NOPASSWD (limits escalation to one user).
 
 SECURITY NOTE -- --dedicated-builduser:
-  Creates a dedicated _pamac_builder user for AUR builds. This isolates
-  AUR PKGBUILD execution from the host login user's home directory and
-  data. The host user retains no passwordless sudo for package commands.
-  The pamac GUI still runs as the host user via polkit/D-Bus; only the
-  AUR build/install path runs under the dedicated user.
+  Creates a dedicated _pamac_builder user for AUR builds. This provides
+  privilege separation: the build user has NO passwordless sudo, so a
+  malicious AUR PKGBUILD cannot escalate via pacman. However, Distrobox
+  mounts the host /home into the container by default, so the build user
+  retains READ access to host user files. This is an inherent trade-off
+  of Distrobox's design — the isolation is privilege-based, not filesystem-
+  based. For full filesystem isolation, configure distrobox with
+    --no-home-mount
+  in the container creation. The pamac GUI still runs as the host user
+  via polkit/D-Bus; only the AUR build/install path runs under the
+  dedicated user.
 
 SECURITY NOTE — Sudoers permissions (inside container):
   The following commands are granted passwordless sudo via
@@ -2485,6 +2508,7 @@ parse_arguments() {
             --enable-extra-repos) ENABLE_EXTRA_REPOS="true"; shift ;;
             --disable-extra-repos) ENABLE_EXTRA_REPOS="false"; shift ;;
             --enable-build-cache) ENABLE_BUILD_CACHE="true"; shift ;;
+            --enable-flatpak) ENABLE_FLATPAK="true"; shift ;;
             --disable-build-cache) ENABLE_BUILD_CACHE="false"; shift ;;
             --optimize-mirrors) OPTIMIZE_MIRRORS="true"; shift ;;
             --no-optimize-mirrors) OPTIMIZE_MIRRORS="false"; shift ;;
@@ -2930,11 +2954,30 @@ create_container() {
     fi
 
     # Apply additional security profiles (--security-opt).
+    # These are NOT validated by the script — they are passed directly to the
+    # container runtime. Users are responsible for ensuring profile compatibility
+    # with the container (e.g. seccomp profiles must not block pacman or makepkg
+    # syscalls; AppArmor profiles must not restrict filesystem access needed for
+    # builds). Incompatible profiles may cause the container to fail to start.
     if [[ ${#CONTAINER_SECURITY_OPT[@]} -gt 0 ]]; then
         for _sopt in "${CONTAINER_SECURITY_OPT[@]}"; do
+            # Basic sanity check: warn if the profile file doesn't exist
+            if [[ "$_sopt" == seccomp:* ]]; then
+                local _seccomp_path="${_sopt#seccomp:}"
+                if [[ "$_seccomp_path" != "unconfined" && ! -f "$_seccomp_path" ]]; then
+                    log_warn "security-opt: seccomp profile file not found: $_seccomp_path"
+                    log_info "  Continuing anyway — the runtime will fail if the profile is required."
+                fi
+            elif [[ "$_sopt" == apparmor:* ]]; then
+                local _apparmor_name="${_sopt#apparmor:}"
+                log_info "security-opt: AppArmor profile '$_apparmor_name' will be applied at container start."
+                log_info "  Ensure this profile exists on the host and permits container operations."
+            fi
             create_args+=(--security-opt "$_sopt")
         done
-        log_info "Applied security-opt profiles: ${CONTAINER_SECURITY_OPT[*]}"
+        log_warn "Applied security-opt profiles: ${CONTAINER_SECURITY_OPT[*]}"
+        log_warn "  These profiles are NOT validated — users are responsible for compatibility."
+        log_warn "  Incompatible profiles may prevent the container from starting."
     fi
 
   if [[ -n "${_CREATE_RECREATION_GUARD:-}" ]]; then
@@ -2952,10 +2995,19 @@ create_container() {
   _CREATE_RECREATION_GUARD=1
 
   if ! run_command distrobox create "${create_args[@]}"; then
+    if [[ ${#CONTAINER_SECURITY_OPT[@]} -gt 0 ]]; then
+        log_error "Container creation failed with --security-opt profiles: ${CONTAINER_SECURITY_OPT[*]}"
+        log_error "The security profiles may be incompatible with the container runtime."
+        log_error "Try removing --security-opt and re-running to isolate the issue."
+    fi
     log_warn "Container create failed - attempting cleanup and retry..."
     force_remove_container "$CONTAINER_NAME"
     sleep 2
     if ! run_command distrobox create "${create_args[@]}"; then
+      if [[ ${#CONTAINER_SECURITY_OPT[@]} -gt 0 ]]; then
+          log_error "Retry also failed. The --security-opt profiles are likely incompatible."
+          log_error "Re-run without --security-opt, or verify your profile against the runtime docs."
+      fi
       unset _CREATE_RECREATION_GUARD
       log_error "Failed to create Distrobox container after retry."
       return 1
@@ -7864,6 +7916,12 @@ if [[ "__DEDICATED_BUILDUSER__" == "true" ]]; then
         echo "  Home: /var/lib/${_builder_name} (isolated from host /home mounts)"
         echo "  Shell: /bin/bash (needed for makepkg/yay builds)"
         echo "  Group: wheel (sudo access)"
+        echo ""
+        echo "  NOTE: Distrobox mounts /home by default — this user retains READ"
+        echo "  access to host files. The isolation is privilege-based (no sudo"
+        echo "  escalation), not filesystem-based. For full isolation, configure"
+        echo "  distrobox with --no-home-mount."
+        echo ""
     else
         echo "Dedicated build user '$_builder_name' already exists."
     fi
@@ -10849,6 +10907,9 @@ if ! verify_pamac_libalpm_compat; then
 fi
 PAMAC_INSTALL_EOF
 
+    # Template substitution: bake ENABLE_FLATPAK into the single-quoted heredoc.
+    pamac_install="${pamac_install//__ENABLE_FLATPAK__/${ENABLE_FLATPAK:-false}}"
+
     if ! exec_container_script "$pamac_install" "pamac-install" "$CURRENT_USER" "$_compat_strategy" "$_compat_commit"; then
         log_warn "First pamac install attempt failed. Retrying once..."
         container_start 2>/dev/null || true
@@ -10904,14 +10965,20 @@ _atomic_edit_pamac_conf() {
     sed -i 's/^#CheckAURVCSUpdates/CheckAURVCSUpdates/' "$tmp"
     grep -q '^EnableAUR' "$tmp" || printf 'EnableAUR\n' >> "$tmp"
     grep -q '^CheckAURUpdates' "$tmp" || printf 'CheckAURUpdates\n' >> "$tmp"
-    # Disable Flatpak support: SteamOS has native Flatpak via Discover.
-    # Pamac's Flatpak integration would show duplicate entries (Flathub via
-    # Pamac + Flathub via Discover), confusing users. Force Pamac to be
-    # strictly an AUR/Pacman management tool.
-    if grep -q '^EnableFlatpak' "$tmp"; then
-        sed -i 's/^EnableFlatpak.*/#EnableFlatpak/' "$tmp"
+    # Flatpak support: disabled by default (SteamOS uses Discover for Flatpaks).
+    # --enable-flatpak overrides this to keep Flatpak enabled in Pamac.
+    if [[ "__ENABLE_FLATPAK__" == "true" ]]; then
+        if grep -q '^#EnableFlatpak' "$tmp"; then
+            sed -i 's/^#EnableFlatpak.*/EnableFlatpak/' "$tmp"
+        fi
+        grep -q '^EnableFlatpak' "$tmp" || printf 'EnableFlatpak\n' >> "$tmp"
+        echo "Flatpak support re-enabled (--enable-flatpak)."
+    else
+        if grep -q '^EnableFlatpak' "$tmp"; then
+            sed -i 's/^EnableFlatpak.*/#EnableFlatpak/' "$tmp"
+        fi
+        grep -q '^EnableFlatpak' "$tmp" || printf '#EnableFlatpak (disabled: use Discover for Flatpaks)\n' >> "$tmp"
     fi
-    grep -q '^EnableFlatpak' "$tmp" || printf '#EnableFlatpak (disabled: use Discover for Flatpaks)\n' >> "$tmp"
     if grep -q '^BuildDirectory' "$tmp"; then
         sed -i 's|^BuildDirectory.*|BuildDirectory = /home/'"$current_user"'/\.pamac-build|' "$tmp"
     else
@@ -10961,9 +11028,12 @@ fi
 else
     echo "Warning: /etc/pamac.conf not found. Creating minimal config."
     mkdir -p /etc
-    # Flatpak disabled: SteamOS uses Discover for Flatpaks. Pamac should only
-    # manage Arch/AUR packages to avoid duplicate entries.
-    printf '#EnableFlatpak (disabled: use Discover for Flatpaks)\nEnableAUR\nCheckAURUpdates\nCheckAURVCSUpdates\nBuildDirectory = /home/'"$current_user"'/.pamac-build\n' > /etc/pamac.conf
+    if [[ "__ENABLE_FLATPAK__" == "true" ]]; then
+        printf 'EnableFlatpak\nEnableAUR\nCheckAURUpdates\nCheckAURVCSUpdates\nBuildDirectory = /home/'"$current_user"'/.pamac-build\n' > /etc/pamac.conf
+        echo "Flatpak support re-enabled (--enable-flatpak)."
+    else
+        printf '#EnableFlatpak (disabled: use Discover for Flatpaks)\nEnableAUR\nCheckAURUpdates\nCheckAURVCSUpdates\nBuildDirectory = /home/'"$current_user"'/.pamac-build\n' > /etc/pamac.conf
+    fi
     mkdir -p "/home/$current_user/.pamac-build"
     chown "$current_user:$current_user" "/home/$current_user/.pamac-build" 2>/dev/null || true
 fi

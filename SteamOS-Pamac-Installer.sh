@@ -4893,8 +4893,8 @@ PERSONALITY_C
         # Close all file descriptors except 0, 1, 2 using a small C helper
         # that calls close_range(3, ~0UL, 0). Falls back to /proc/self/fd
         # iteration if close_range is unavailable (kernel < 5.9).
-        local _clex_src="${_dsr_tmp}/.dsr-close-fds.c"
-        local _clex_bin="${_dsr_tmp}/.dsr-close-fds"
+        local _clex_src="${_dsr_tmp:-/tmp}/.dsr-close-fds.c"
+        local _clex_bin="${_dsr_tmp:-/tmp}/.dsr-close-fds"
         if [[ ! -x "$_clex_bin" ]]; then
             cat > "$_clex_src" << 'CLOSEFDS_C'
 #include <stdio.h>
@@ -5619,8 +5619,8 @@ SECCOMP_C
     # program that includes ALL headers the seccomp helper needs.
     # Capture gcc error output for diagnostics so we can distinguish between
     # "missing headers" vs "linker errors" vs "gcc version mismatch".
-    local _test_src="/tmp/.dsr-toolchain-test.c"
-    local _test_bin="/tmp/.dsr-toolchain-test"
+    local _test_src="${_dsr_tmp:-/tmp}/.dsr-toolchain-test.c"
+    local _test_bin="${_dsr_tmp:-/tmp}/.dsr-toolchain-test"
     local _gcc_err="/tmp/.dsr-gcc-err.log"
     cat > "$_test_src" << 'TOOLCHAIN_TEST'
 #include <stdio.h>

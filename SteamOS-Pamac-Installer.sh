@@ -3694,7 +3694,11 @@ _write_fake_systemd_run_wrapper() {
 # mount namespaces, capability dropping, and bubblewrap (bwrap).
 # Supports: --user, --scope, DynamicUser (yes/true/1/on), --property=*, --setenv.
 # Logs diagnostics to /tmp/systemd-run-fake.log; warns on unrecognized properties.
+# SECURITY: Restrict log permissions to root-only to avoid leaking sandbox config.
 _DSR_LOG="/tmp/systemd-run-fake.log"
+if [[ ! -f "$_DSR_LOG" ]]; then
+    touch "$_DSR_LOG" 2>/dev/null && chmod 600 "$_DSR_LOG" 2>/dev/null || true
+fi
 DSR_VERSION="4.0"
 _DSR_STRICT_SECURITY="${_STRICT_SECURITY_MODE:-false}"
 _log_dsr() { echo "[$(date '+%H:%M:%S')] $*" >> "$_DSR_LOG" 2>/dev/null; }
@@ -3997,7 +4001,7 @@ case "$arg" in
 # --- Personality / arch ---
 --property=Personality=*) PERSONALITY="${arg#--property=Personality=}"; _log_dsr "Sandbox: $arg"; continue ;;
 --property=SystemCallArchitectures=*) SYS_CALL_ARCH="${arg#--property=SystemCallArchitectures=}"; _log_dsr "Sandbox: $arg"; continue ;;
---property=SystemCallErrorNumber=*) SYS_CALL_ERRNO="${arg#--property=SystemCallErrorNumber=}"; _log_dsr "Sandbox: $arg"; continue ;;
+--property=SystemCallErrorNumber=*) SYS_CALL_ERRNO="${arg#--property=SystemCallErrorNumber=}"; if [[ "$SYS_CALL_ERRNO" =~ ^[0-9]+$ ]]; then _log_dsr "Sandbox: $arg"; else _warn_dsr "SystemCallErrorNumber=$SYS_CALL_ERRNO is not a valid positive integer"; SYS_CALL_ERRNO=""; fi; continue ;;
 --property=SystemCallLog=*) SYS_CALL_LOG="${arg#--property=SystemCallLog=}"; _log_dsr "Sandbox: $arg"; continue ;;
 # --- IPC / time / misc ---
 --property=TimerSlackNSec=*) continue ;;
@@ -4640,7 +4644,7 @@ _apply_sandbox() {
     if [[ -n "$PRIVATE_TMP" ]] && [[ "$PRIVATE_TMP" == "yes" ]]; then
         _log_dsr "Applying PrivateTmp=yes"
         local _fresh_tmp
-        _fresh_tmp=$(mktemp -d /tmp/.private-tmp-XXXXXX 2>/dev/null) || _fresh_tmp=""
+        _fresh_tmp=$(mktemp -d 2>/dev/null) || _fresh_tmp=""
         if [[ -n "$_fresh_tmp" ]]; then
             mount --bind "$_fresh_tmp" /tmp 2>/dev/null \
                 || mount -t tmpfs tmpfs /tmp 2>/dev/null
@@ -5215,10 +5219,14 @@ static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
         seccomp_ret_action = SECCOMP_RET_LOG | ((custom_errno ? custom_errno : SECCOMP_EPERM) & SECCOMP_RET_DATA);
         fprintf(stderr, "seccomp: SystemCallLog active (blocked syscalls logged to audit)\n");
     }
-    /* RestrictSUIDSGID: block setuid/setgid/setreuid/setregid/setresuid/setresgid/setfsuid/setfsgid/setgroups */
+    /* RestrictSUIDSGID: block setuid/setgid/setreuid/setregid/setresuid/setresgid/setfsuid/setfsgid/setgroups.
+       Also block 32-bit compat syscall variants on x86_64 (setuid32, etc.)
+       to prevent bypass via 32-bit binaries when SystemCallArchitectures=native
+       is not active. */
     {
         struct sock_filter f[] = {
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
+            /* Native setuid family */
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setuid, 0, 1),
             BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setgid, 0, 1),
@@ -5237,6 +5245,23 @@ static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
             BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setgroups, 0, 1),
             BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
+#ifdef __NR_setuid32
+            /* 32-bit compat variants (x86_64) */
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setuid32, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setgid32, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setreuid32, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setregid32, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setresuid32, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setresgid32, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_setgroups32, 0, 1),
+            BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
+#endif
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
         };
         struct sock_fprog p = { .len=sizeof(f)/sizeof(f[0]), .filter=f };

@@ -5993,73 +5993,69 @@ if ! id "$BUILD_USER" >/dev/null 2>&1; then
     chown "$BUILD_USER:$BUILD_USER" /var/lib/builduser 2>/dev/null || true
 fi
 
-# Build the env+command wrapper for sudo invocation.
-_BUILD_WRAPPER="$_ENV_SETUP"
-if [[ -n "$EXTRA_GROUPS" ]]; then
-    sg "$EXTRA_GROUPS" -c true 2>/dev/null && _BUILD_WRAPPER="sg '$EXTRA_GROUPS' -c \"$_BUILD_WRAPPER\" || ( _warn_dsr 'sg failed for groups $EXTRA_GROUPS, continuing without'; true ); "
-fi
-# Group property: run command as specified group via sg
-if [[ -n "${GROUP_NAME:-}" ]]; then
-    if sg "$GROUP_NAME" -c true 2>/dev/null; then
-        _BUILD_WRAPPER="sg '$GROUP_NAME' -c \"$_BUILD_WRAPPER\" || ( _warn_dsr 'sg failed for group $GROUP_NAME, continuing without'; true ); "
-    else
-        _warn_dsr "sg for group '$GROUP_NAME' failed — continuing without group switch"
+# ── _assemble_build_wrapper: build command prefix for scheduling/caps/group/timeout ──
+# Sets _BUILD_WRAPPER from _ENV_SETUP + all applicable command prefixes.
+_assemble_build_wrapper() {
+    _BUILD_WRAPPER="$_ENV_SETUP"
+    # SupplementaryGroups via sg
+    if [[ -n "$EXTRA_GROUPS" ]]; then
+        sg "$EXTRA_GROUPS" -c true 2>/dev/null && _BUILD_WRAPPER="sg '$EXTRA_GROUPS' -c \"$_BUILD_WRAPPER\" || ( _warn_dsr 'sg failed for groups $EXTRA_GROUPS, continuing without'; true ); "
     fi
-fi
-# AmbientCapabilities: prepend setpriv --ambient-caps to command
-if [[ -n "${AMBIENT_CAPS:-}" ]] && command -v setpriv >/dev/null 2>&1; then
-    local _cap_args=""
-    case "${AMBIENT_CAPS,,}" in
-        "~all"|"")  _cap_args="--inh-caps=-all --ambient-caps=-all" ;;
-        "all")      _cap_args="--inh-caps=+all --ambient-caps=+all" ;;
-        \~*)        _cap_args="--inh-caps=-${AMBIENT_CAPS#\~} --ambient-caps=-${AMBIENT_CAPS#\~}" ;;
-        *)          _cap_args="--inh-caps=+${AMBIENT_CAPS} --ambient-caps=+${AMBIENT_CAPS}" ;;
-    esac
-    _BUILD_WRAPPER="setpriv $_cap_args $_BUILD_WRAPPER"
-    _log_dsr "AmbientCapabilities=$_AMBIENT_CAPS applied via setpriv prefix"
-fi
-# I/O scheduling: prepend ionice to command
-if [[ -n "${IOSCHED_CLASS:-}" ]] && command -v ionice >/dev/null 2>&1; then
-    local _ionice_class=""
-    case "${IOSCHED_CLASS,,}" in
-        idle|7)       _ionice_class="3" ;;
-        best-effort|2) _ionice_class="2" ;;
-        realtime|1)   _ionice_class="1" ;;
-        none|0)       _ionice_class="0" ;;
-    esac
-    if [[ -n "$_ionice_class" ]]; then
-        local _ionice_prio="${IOSCHED_PRIORITY:-4}"
-        _BUILD_WRAPPER="ionice -c $_ionice_class -n $_ionice_prio $_BUILD_WRAPPER"
-        _log_dsr "IOSchedulingClass=$_ionice_class priority=$_ionice_prio applied via ionice prefix"
+    # Group property via sg
+    if [[ -n "${GROUP_NAME:-}" ]]; then
+        if sg "$GROUP_NAME" -c true 2>/dev/null; then
+            _BUILD_WRAPPER="sg '$GROUP_NAME' -c \"$_BUILD_WRAPPER\" || ( _warn_dsr 'sg failed for group $GROUP_NAME, continuing without'; true ); "
+        fi
     fi
-fi
-# CPU scheduling: prepend nice/chrt to command
-if [[ -n "${NICE_LEVEL:-}" ]] && command -v nice >/dev/null 2>&1; then
-    _BUILD_WRAPPER="nice -n $NICE_LEVEL $_BUILD_WRAPPER"
-    _log_dsr "Nice=$NICE_LEVEL applied via nice prefix"
-fi
-if [[ -n "${CPUSCHED_POLICY:-}" ]] && command -v chrt >/dev/null 2>&1; then
-    local _chrt_policy=""
-    case "${CPUSCHED_POLICY,,}" in
-        other|0)     _chrt_policy="-o" ;;
-        batch|3)     _chrt_policy="-b" ;;
-        idle|5)      _chrt_policy="-i" ;;
-        fifo|1)      _chrt_policy="-f" ;;
-        rr|2)        _chrt_policy="-r" ;;
-    esac
-    if [[ -n "$_chrt_policy" ]]; then
-        local _chrt_prio="${CPUSCHED_PRIORITY:-0}"
-        _BUILD_WRAPPER="chrt $_chrt_policy $_chrt_prio $_BUILD_WRAPPER"
-        _log_dsr "CPUSchedulingPolicy=$_chrt_policy priority=$_chrt_prio applied via chrt prefix"
+    # AmbientCapabilities via setpriv
+    if [[ -n "${AMBIENT_CAPS:-}" ]] && command -v setpriv >/dev/null 2>&1; then
+        local _cap_args=""
+        case "${AMBIENT_CAPS,,}" in
+            "~all"|"")  _cap_args="--inh-caps=-all --ambient-caps=-all" ;;
+            "all")      _cap_args="--inh-caps=+all --ambient-caps=+all" ;;
+            \~*)        _cap_args="--inh-caps=-${AMBIENT_CAPS#\~} --ambient-caps=-${AMBIENT_CAPS#\~}" ;;
+            *)          _cap_args="--inh-caps=+${AMBIENT_CAPS} --ambient-caps=+${AMBIENT_CAPS}" ;;
+        esac
+        _BUILD_WRAPPER="setpriv $_cap_args $_BUILD_WRAPPER"
     fi
-fi
-# Timeout: wrap command with timeout if TimeoutStartSec is set
-if [[ -n "$TIMEOUT_START" ]] && [[ "$TIMEOUT_START" != "infinity" && "$TIMEOUT_START" != "0" ]]; then
-    _BUILD_WRAPPER="timeout ${TIMEOUT_START}s $_BUILD_WRAPPER"
-    _log_dsr "TimeoutStartSec=${TIMEOUT_START}s applied"
-fi
+    # I/O scheduling via ionice
+    if [[ -n "${IOSCHED_CLASS:-}" ]] && command -v ionice >/dev/null 2>&1; then
+        local _ionice_class=""
+        case "${IOSCHED_CLASS,,}" in
+            idle|7)       _ionice_class="3" ;;
+            best-effort|2) _ionice_class="2" ;;
+            realtime|1)   _ionice_class="1" ;;
+            none|0)       _ionice_class="0" ;;
+        esac
+        if [[ -n "$_ionice_class" ]]; then
+            _BUILD_WRAPPER="ionice -c $_ionice_class -n ${IOSCHED_PRIORITY:-4} $_BUILD_WRAPPER"
+        fi
+    fi
+    # CPU scheduling via nice/chrt
+    if [[ -n "${NICE_LEVEL:-}" ]] && command -v nice >/dev/null 2>&1; then
+        _BUILD_WRAPPER="nice -n $NICE_LEVEL $_BUILD_WRAPPER"
+    fi
+    if [[ -n "${CPUSCHED_POLICY:-}" ]] && command -v chrt >/dev/null 2>&1; then
+        local _chrt_policy=""
+        case "${CPUSCHED_POLICY,,}" in
+            other|0)     _chrt_policy="-o" ;;
+            batch|3)     _chrt_policy="-b" ;;
+            idle|5)      _chrt_policy="-i" ;;
+            fifo|1)      _chrt_policy="-f" ;;
+            rr|2)        _chrt_policy="-r" ;;
+        esac
+        if [[ -n "$_chrt_policy" ]]; then
+            _BUILD_WRAPPER="chrt $_chrt_policy ${CPUSCHED_PRIORITY:-0} $_BUILD_WRAPPER"
+        fi
+    fi
+    # Timeout via timeout command
+    if [[ -n "${TIMEOUT_START:-}" ]] && [[ "$TIMEOUT_START" != "infinity" && "$TIMEOUT_START" != "0" ]]; then
+        _BUILD_WRAPPER="timeout ${TIMEOUT_START}s $_BUILD_WRAPPER"
+    fi
+}
 
-# Determine inner command for non-sandbox path
+# ── DynamicUser path ──
+_assemble_build_wrapper
 if [[ -n "$WORK_DIR" ]]; then
     _log_dsr "EXEC: sudo -u $BUILD_USER -- cd $WORK_DIR; ${CMD_ARGS[*]}"
     _INNER_CMD="cd '${WORK_DIR}' 2>/dev/null || true; ${_BUILD_WRAPPER}exec \"\${@}\""
@@ -6101,7 +6097,7 @@ if [[ -n "$WORK_DIR" ]]; then
 else
     _INNER_CMD="${_ENV_SETUP}exec \"\${@}\""
 fi
-_BUILD_WRAPPER="$_ENV_SETUP"
+_assemble_build_wrapper
 
 if $_NEEDS_SANDBOX; then
     _prepare_cap_priv
@@ -6117,7 +6113,7 @@ else
 ${_ENV_SETUP}
 if [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR" ]]; then cd "$WORK_DIR" 2>/dev/null || true; fi
 _log_dsr "EXEC: ${CMD_ARGS[*]}"
-_BUILD_WRAPPER="$_ENV_SETUP"
+_assemble_build_wrapper
 
 if $_NEEDS_SANDBOX; then
     _prepare_cap_priv

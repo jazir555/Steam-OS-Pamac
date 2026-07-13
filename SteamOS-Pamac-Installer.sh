@@ -4022,7 +4022,7 @@ case "$arg" in
 --property=LimitCPU=*) LIMITS_RLIMIT+=("cpu=${arg#--property=LimitCPU=}"); continue ;;
 --property=LimitCPUSoft=*) LIMITS_RLIMIT+=("cpu-soft=${arg#--property=LimitCPUSoft=}"); continue ;;
 --property=LimitFSIZE=*) LIMITS_RLIMIT+=("fsize=${arg#--property=LimitFSIZE=}"); continue ;;
---property=LimitFIZESoft=*) LIMITS_RLIMIT+=("fsize-soft=${arg#--property=LimitFIZESoft=}"); continue ;;
+--property=LimitFSIZESoft=*) LIMITS_RLIMIT+=("fsize-soft=${arg#--property=LimitFSIZESoft=}"); continue ;;
 --property=LimitDATA=*) LIMITS_RLIMIT+=("data=${arg#--property=LimitDATA=}"); continue ;;
 --property=LimitDATASoft=*) LIMITS_RLIMIT+=("data-soft=${arg#--property=LimitDATASoft=}"); continue ;;
 --property=LimitSTACK=*) LIMITS_RLIMIT+=("stack=${arg#--property=LimitSTACK=}"); continue ;;
@@ -4222,13 +4222,8 @@ if [[ -n "$SET_UMASK" ]]; then
     _log_dsr "Setting umask: $SET_UMASK"
 fi
 
-# ── Build sudo option array for SupplementaryGroups ──
-_SGROUP_OPTS=()
+# ── SupplementaryGroups: handled via sg in _BUILD_WRAPPER ──
 if [[ -n "$EXTRA_GROUPS" ]]; then
-    # sudo -u supports -G for supplementary groups but only when creating a
-    # new PAM session; the -H flag resets HOME. For groups, we use the
-    # bash -c wrapper with newgrp or sg if available.
-    _SGROUP_OPTS=(-g "$EXTRA_GROUPS")
     _log_dsr "SupplementaryGroups requested: $EXTRA_GROUPS (via sg)"
 fi
 
@@ -4296,7 +4291,6 @@ _NEEDS_SANDBOX=false
 [[ ${#CONFIG_DIRS[@]} -gt 0 ]] && _NEEDS_SANDBOX=true
 [[ -n "$OOM_SCORE_ADJUST" ]] && _NEEDS_SANDBOX=true
 [[ -n "$TIMEOUT_START" ]] && _NEEDS_SANDBOX=true
-[[ -n "$TIMEOUT_STOP" ]] && _NEEDS_SANDBOX=true
 if $_NEEDS_SANDBOX; then
     _log_dsr "Sandbox restrictions active: ProtectSystem=$PROTECT_SYSTEM ProtectHome=$PROTECT_HOME PrivateTmp=$PRIVATE_TMP PrivateDevices=$PRIVATE_DEVICES"
 fi
@@ -4976,110 +4970,84 @@ CLOSEFDS_C
     fi
 
     # ── Resource limits (Limit*=) via ulimit ──
+    # Process hard limits first (LimitXXX=), then soft limits (LimitXXXSoft=).
+    # ulimit -H sets hard limits, ulimit -S sets soft limits. Soft cannot exceed hard.
     if [[ ${#LIMITS_RLIMIT[@]} -gt 0 ]]; then
         _log_dsr "Applying resource limits: ${LIMITS_RLIMIT[*]}"
         for _rl in "${LIMITS_RLIMIT[@]}"; do
             local _rl_name="${_rl%%=*}"
             local _rl_val="${_rl#*=}"
-            # Map systemd limit names to ulimit flags
-            local _ul_flag=""
+            local _ul_flag="" _ul_hard=false
             case "$_rl_name" in
-                cpu)        _ul_flag="-t" ;;
-                fsize)      _ul_flag="-f" ;;
-                data)       _ul_flag="-d" ;;
-                stack)      _ul_flag="-s" ;;
-                core)       _ul_flag="-c" ;;
-                rss)        _ul_flag="-m" ;;
-                nofile)     _ul_flag="-n" ;;
-                as)         _ul_flag="-v" ;;
-                nproc)      _ul_flag="-u" ;;
-                memlock)    _ul_flag="-l" ;;
-                locks)      _ul_flag="-x" ;;
-                sigpending) _ul_flag="-i" ;;
-                msgqueue)   _ul_flag="-q" ;;
-                nice)       _ul_flag="-e" ;;
-                rtprio)     _ul_flag="-r" ;;
-                rttime)     _ul_flag="-R" ;;
+                cpu)           _ul_flag="-t"; _ul_hard=true ;;
+                fsize)         _ul_flag="-f"; _ul_hard=true ;;
+                data)          _ul_flag="-d"; _ul_hard=true ;;
+                stack)         _ul_flag="-s"; _ul_hard=true ;;
+                core)          _ul_flag="-c"; _ul_hard=true ;;
+                rss)           _ul_flag="-m"; _ul_hard=true ;;
+                nofile)        _ul_flag="-n"; _ul_hard=true ;;
+                as)            _ul_flag="-v"; _ul_hard=true ;;
+                nproc)         _ul_flag="-u"; _ul_hard=true ;;
+                memlock)       _ul_flag="-l"; _ul_hard=true ;;
+                locks)         _ul_flag="-x"; _ul_hard=true ;;
+                sigpending)    _ul_flag="-i"; _ul_hard=true ;;
+                msgqueue)      _ul_flag="-q"; _ul_hard=true ;;
+                nice)          _ul_flag="-e"; _ul_hard=true ;;
+                rtprio)        _ul_flag="-r"; _ul_hard=true ;;
+                rttime)        _ul_flag="-R"; _ul_hard=true ;;
+                cpu-soft)      _ul_flag="-t"; _ul_hard=false ;;
+                fsize-soft)    _ul_flag="-f"; _ul_hard=false ;;
+                data-soft)     _ul_flag="-d"; _ul_hard=false ;;
+                stack-soft)    _ul_flag="-s"; _ul_hard=false ;;
+                core-soft)     _ul_flag="-c"; _ul_hard=false ;;
+                rss-soft)      _ul_flag="-m"; _ul_hard=false ;;
+                nofile-soft)   _ul_flag="-n"; _ul_hard=false ;;
+                as-soft)       _ul_flag="-v"; _ul_hard=false ;;
+                nproc-soft)    _ul_flag="-u"; _ul_hard=false ;;
+                memlock-soft)  _ul_flag="-l"; _ul_hard=false ;;
+                locks-soft)    _ul_flag="-x"; _ul_hard=false ;;
+                sigpending-soft) _ul_flag="-i"; _ul_hard=false ;;
+                msgqueue-soft) _ul_flag="-q"; _ul_hard=false ;;
+                nice-soft)     _ul_flag="-e"; _ul_hard=false ;;
+                rtprio-soft)   _ul_flag="-r"; _ul_hard=false ;;
+                rttime-soft)   _ul_flag="-R"; _ul_hard=false ;;
             esac
             if [[ -n "$_ul_flag" ]]; then
-                # Handle "infinity" value
                 [[ "$_rl_val" == "infinity" || "$_rl_val" == "max" ]] && _rl_val="unlimited"
-                ulimit "$_ul_flag" "$_rl_val" 2>/dev/null \
-                    && _log_dsr "  ${_rl_name}=${_rl_val} (ulimit $_ul_flag)" \
+                local _ul_scope="S"
+                [[ "$_ul_hard" == "true" ]] && _ul_scope="H"
+                ulimit "$_ul_flag" "$_ul_val" 2>/dev/null \
+                    && _log_dsr "  ${_rl_name}=${_rl_val} (ulimit -${_ul_scope} $_ul_flag)" \
                     || _warn_dsr "  Failed to set ${_rl_name}=${_rl_val}"
             fi
         done
     fi
 
     # ── I/O scheduling (IOSchedulingClass) via ionice ──
+    # Note: enforcement is via _BUILD_WRAPPER command prefix, not here.
     if [[ -n "$IOSCHED_CLASS" ]]; then
-        _log_dsr "Applying IOSchedulingClass=$IOSCHED_CLASS"
-        local _ionice_class=""
-        case "${IOSCHED_CLASS,,}" in
-            idle|7)       _ionice_class="-c3" ;;
-            best-effort|2) _ionice_class="-c2" ;;
-            realtime|1)   _ionice_class="-c1" ;;
-            none|0)       _ionice_class="-c0" ;;
-        esac
-        if [[ -n "$_ionice_class" ]] && command -v ionice >/dev/null 2>&1; then
-            local _ionice_prio="${IOSCHED_PRIORITY:-4}"
-            ionice "$_ionice_class" -n "$_ionice_prio" 2>/dev/null \
-                && _log_dsr "  ionice class=$_ionice_class priority=$_ionice_prio" \
-                || _warn_dsr "  Failed to set ionice class=$_ionice_class"
-        fi
+        _log_dsr "Applying IOSchedulingClass=$IOSCHED_CLASS (enforced via _BUILD_WRAPPER)"
     fi
 
     # ── CPU scheduling (CPUSchedulingPolicy, Nice) via nice/chrt ──
+    # Note: enforcement is via _BUILD_WRAPPER command prefix, not here.
     if [[ -n "$NICE_LEVEL" ]]; then
-        _log_dsr "Applying Nice=$NICE_LEVEL"
-        nice -n "$NICE_LEVEL" 2>/dev/null \
-            && _log_dsr "  Nice level set to $NICE_LEVEL" \
-            || _warn_dsr "  Failed to set Nice level to $NICE_LEVEL"
+        _log_dsr "Applying Nice=$NICE_LEVEL (enforced via _BUILD_WRAPPER)"
     fi
     if [[ -n "$CPUSCHED_POLICY" ]]; then
-        _log_dsr "Applying CPUSchedulingPolicy=$CPUSCHED_POLICY"
-        local _chrt_policy=""
-        case "${CPUSCHED_POLICY,,}" in
-            other|0)     _chrt_policy="-o" ;;
-            batch|3)     _chrt_policy="-b" ;;
-            idle|5)      _chrt_policy="-i" ;;
-            fifo|1)      _chrt_policy="-f" ;;
-            rr|2)        _chrt_policy="-r" ;;
-        esac
-        if [[ -n "$_chrt_policy" ]] && command -v chrt >/dev/null 2>&1; then
-            local _chrt_prio="${CPUSCHED_PRIORITY:-0}"
-            chrt "$_chrt_policy" "$_chrt_prio" -- true 2>/dev/null \
-                && _log_dsr "  chrt policy=$_chrt_policy priority=$_chrt_prio" \
-                || _warn_dsr "  Failed to set chrt policy=$_chrt_policy"
-        fi
+        _log_dsr "Applying CPUSchedulingPolicy=$CPUSCHED_POLICY (enforced via _BUILD_WRAPPER)"
     fi
 
     # ── AmbientCapabilities via setpriv ──
+    # Note: enforcement is via _BUILD_WRAPPER command prefix, not here.
     if [[ -n "$AMBIENT_CAPS" ]]; then
-        _log_dsr "Applying AmbientCapabilities=$AMBIENT_CAPS"
-        if command -v setpriv >/dev/null 2>&1; then
-            local _cap_args=""
-            case "${AMBIENT_CAPS,,}" in
-                "~all"|"")  _cap_args="--inh-caps=-all --ambient-caps=-all" ;;
-                "all")      _cap_args="--inh-caps=+all --ambient-caps=+all" ;;
-                \~*)        _cap_args="--inh-caps=-${AMBIENT_CAPS#\~} --ambient-caps=-${AMBIENT_CAPS#\~}" ;;
-                *)          _cap_args="--inh-caps=+${AMBIENT_CAPS} --ambient-caps=+${AMBIENT_CAPS}" ;;
-            esac
-            setpriv $_cap_args true 2>/dev/null \
-                && _log_dsr "  AmbientCaps: $_cap_args" \
-                || _warn_dsr "  Failed to set AmbientCapabilities"
-        else
-            _warn_dsr "  setpriv not available — cannot enforce AmbientCapabilities"
-        fi
+        _log_dsr "Applying AmbientCapabilities=$AMBIENT_CAPS (enforced via _BUILD_WRAPPER)"
     fi
 
-    # ── Group identity via sg ──
+    # ── Group identity via sg (enforced via _BUILD_WRAPPER) ──
     if [[ -n "$GROUP_NAME" ]]; then
-        _log_dsr "Applying Group=$GROUP_NAME"
-        if getent group "$GROUP_NAME" >/dev/null 2>&1; then
-            export _DSR_GROUP_NAME="$GROUP_NAME"
-            _log_dsr "  Group set to $GROUP_NAME (will be applied via sg)"
-        else
+        _log_dsr "Applying Group=$GROUP_NAME (enforced via _BUILD_WRAPPER)"
+        if ! getent group "$GROUP_NAME" >/dev/null 2>&1; then
             _warn_dsr "  Group '$GROUP_NAME' does not exist"
         fi
     fi
@@ -6031,11 +5999,58 @@ if [[ -n "$EXTRA_GROUPS" ]]; then
     sg "$EXTRA_GROUPS" -c true 2>/dev/null && _BUILD_WRAPPER="sg '$EXTRA_GROUPS' -c \"$_BUILD_WRAPPER\" || ( _warn_dsr 'sg failed for groups $EXTRA_GROUPS, continuing without'; true ); "
 fi
 # Group property: run command as specified group via sg
-if [[ -n "${_DSR_GROUP_NAME:-}" ]]; then
-    if sg "$_DSR_GROUP_NAME" -c true 2>/dev/null; then
-        _BUILD_WRAPPER="sg '$_DSR_GROUP_NAME' -c \"$_BUILD_WRAPPER\" || ( _warn_dsr 'sg failed for group $_DSR_GROUP_NAME, continuing without'; true ); "
+if [[ -n "${GROUP_NAME:-}" ]]; then
+    if sg "$GROUP_NAME" -c true 2>/dev/null; then
+        _BUILD_WRAPPER="sg '$GROUP_NAME' -c \"$_BUILD_WRAPPER\" || ( _warn_dsr 'sg failed for group $GROUP_NAME, continuing without'; true ); "
     else
-        _warn_dsr "sg for group '$_DSR_GROUP_NAME' failed — continuing without group switch"
+        _warn_dsr "sg for group '$GROUP_NAME' failed — continuing without group switch"
+    fi
+fi
+# AmbientCapabilities: prepend setpriv --ambient-caps to command
+if [[ -n "${AMBIENT_CAPS:-}" ]] && command -v setpriv >/dev/null 2>&1; then
+    local _cap_args=""
+    case "${AMBIENT_CAPS,,}" in
+        "~all"|"")  _cap_args="--inh-caps=-all --ambient-caps=-all" ;;
+        "all")      _cap_args="--inh-caps=+all --ambient-caps=+all" ;;
+        \~*)        _cap_args="--inh-caps=-${AMBIENT_CAPS#\~} --ambient-caps=-${AMBIENT_CAPS#\~}" ;;
+        *)          _cap_args="--inh-caps=+${AMBIENT_CAPS} --ambient-caps=+${AMBIENT_CAPS}" ;;
+    esac
+    _BUILD_WRAPPER="setpriv $_cap_args $_BUILD_WRAPPER"
+    _log_dsr "AmbientCapabilities=$_AMBIENT_CAPS applied via setpriv prefix"
+fi
+# I/O scheduling: prepend ionice to command
+if [[ -n "${IOSCHED_CLASS:-}" ]] && command -v ionice >/dev/null 2>&1; then
+    local _ionice_class=""
+    case "${IOSCHED_CLASS,,}" in
+        idle|7)       _ionice_class="3" ;;
+        best-effort|2) _ionice_class="2" ;;
+        realtime|1)   _ionice_class="1" ;;
+        none|0)       _ionice_class="0" ;;
+    esac
+    if [[ -n "$_ionice_class" ]]; then
+        local _ionice_prio="${IOSCHED_PRIORITY:-4}"
+        _BUILD_WRAPPER="ionice -c $_ionice_class -n $_ionice_prio $_BUILD_WRAPPER"
+        _log_dsr "IOSchedulingClass=$_ionice_class priority=$_ionice_prio applied via ionice prefix"
+    fi
+fi
+# CPU scheduling: prepend nice/chrt to command
+if [[ -n "${NICE_LEVEL:-}" ]] && command -v nice >/dev/null 2>&1; then
+    _BUILD_WRAPPER="nice -n $NICE_LEVEL $_BUILD_WRAPPER"
+    _log_dsr "Nice=$NICE_LEVEL applied via nice prefix"
+fi
+if [[ -n "${CPUSCHED_POLICY:-}" ]] && command -v chrt >/dev/null 2>&1; then
+    local _chrt_policy=""
+    case "${CPUSCHED_POLICY,,}" in
+        other|0)     _chrt_policy="-o" ;;
+        batch|3)     _chrt_policy="-b" ;;
+        idle|5)      _chrt_policy="-i" ;;
+        fifo|1)      _chrt_policy="-f" ;;
+        rr|2)        _chrt_policy="-r" ;;
+    esac
+    if [[ -n "$_chrt_policy" ]]; then
+        local _chrt_prio="${CPUSCHED_PRIORITY:-0}"
+        _BUILD_WRAPPER="chrt $_chrt_policy $_chrt_prio $_BUILD_WRAPPER"
+        _log_dsr "CPUSchedulingPolicy=$_chrt_policy priority=$_chrt_prio applied via chrt prefix"
     fi
 fi
 # Timeout: wrap command with timeout if TimeoutStartSec is set

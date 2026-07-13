@@ -5430,8 +5430,8 @@ static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
     if (restrict_addr_families) {
         struct sock_filter f[] = {
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,nr)),
-            /* If not socket, skip to ALLOW (skip 12 instructions) */
-            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_socket, 0, 12),
+            /* If not socket, skip to ALLOW (skip 10 instructions to instruction [12]) */
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_socket, 0, 10),
             /* Load socket domain (args[0]) */
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,args[0])),
             /* AF_UNIX (1) */
@@ -5881,17 +5881,22 @@ _run_sandboxed_unshare() {
                 sudo -u "$_run_user" -H -- bash -c "$_verify_cmd" -- "${CMD_ARGS[@]}"
         fi
     else
+        # No _run_user: build the command as a single bash -c invocation.
+        # SECURITY: _BUILD_WRAPPER must run BEFORE the seccomp helper because it
+        # contains shell builtins (set -a, source, umask, ionice, etc.) that cannot
+        # be exec'd by the C helper. The seccomp helper wraps only the final exec.
         if [[ -n "${_SECCOMP_HELPER:-}" ]]; then
             unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
                 source $_DSR_FUNCS_FILE 2>/dev/null
                 _apply_sandbox
-                ${_NNP}${_CAP_PRIV}$_SECCOMP_HELPER $_seccomp_args -- ${_BUILD_WRAPPER:-}exec \"\${@}\"
+                ${_BUILD_WRAPPER:-}
+                ${_NNP}${_CAP_PRIV}$_SECCOMP_HELPER $_seccomp_args -- exec \"\${@}\"
             " -- "${CMD_ARGS[@]}"
         elif [[ "${_DSR_SECCOMP_STRICT_FALLBACK:-}" == "true" ]]; then
             # Apply SECCOMP_MODE_STRICT as a degraded fallback when gcc is
             # unavailable. Strict mode allows only read, write, exit, and
             # sigreturn — blocks ptrace, reboot, kexec, mount, etc.
-            # Use a small inline C helper to call prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT).
+            # The strict helper exec's into the target so seccomp is inherited.
             local _strict_src="${_dsr_tmp:-/tmp}/.dsr-strict-seccomp.c"
             local _strict_bin="${_dsr_tmp:-/tmp}/.dsr-strict-seccomp"
             if [[ ! -x "$_strict_bin" ]] || [[ "$(md5sum "$_strict_src" 2>/dev/null)" != "${_DSR_STRICT_SRC_HASH:-}" ]]; then
@@ -5899,12 +5904,18 @@ _run_sandboxed_unshare() {
 #include <sys/prctl.h>
 #include <linux/seccomp.h>
 #include <stdio.h>
-int main() {
+#include <unistd.h>
+int main(int argc, char *argv[]) {
     if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT) != 0) {
         fprintf(stderr, "seccomp: strict mode failed\n");
         return 1;
     }
     fprintf(stderr, "seccomp: SECCOMP_MODE_STRICT applied (read/write/exit/sigreturn only)\n");
+    /* exec the remaining command so seccomp applies to the target, not us */
+    if (argc > 1) {
+        execvp(argv[1], &argv[1]);
+        perror("execvp");
+    }
     return 0;
 }
 STRICT_SECCOMP_C
@@ -5917,8 +5928,8 @@ STRICT_SECCOMP_C
                 unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
                     source $_DSR_FUNCS_FILE 2>/dev/null
                     _apply_sandbox
-                    ${_NNP}${_CAP_PRIV}$_strict_bin
-                    ${_BUILD_WRAPPER:-}exec \"\${@}\"
+                    ${_BUILD_WRAPPER:-}
+                    ${_NNP}${_CAP_PRIV}$_strict_bin bash -c '${_BUILD_WRAPPER:-}exec \"\${@}\"' -- \"\${@}\"
                 " -- "${CMD_ARGS[@]}"
             else
                 _warn_dsr "Could not compile strict seccomp fallback — running without seccomp"

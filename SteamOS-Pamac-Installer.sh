@@ -5312,13 +5312,30 @@ _compile_seccomp_helper() {
     if ! command -v gcc >/dev/null 2>&1; then
         # Auto-repair: try to install the toolchain if it's missing after a
         # partial upgrade or fresh container where base-devel was removed.
+        # Uses the same staged batched install as the main installer's
+        # install_base_devel_batched() to avoid OOM on constrained devices.
         _warn_dsr "gcc not available — attempting auto-repair..."
         if command -v pacman >/dev/null 2>&1; then
-            _warn_dsr "Installing base-devel (includes gcc) for seccomp compilation..."
-            _remove_stale_lock 2>/dev/null || true
-            pacman -S --noconfirm --needed base-devel gcc linux-api-headers glibc 2>/dev/null && \
-                _warn_dsr "Toolchain installed successfully." || \
-                _warn_dsr "Auto-repair failed — seccomp will be unavailable."
+            # Remove stale pacman lock before installing
+            local _lock="/var/lib/pacman/db.lck"
+            if [[ -f "$_lock" ]]; then
+                local _lck_pid
+                _lck_pid=$(cat "$_lock" 2>/dev/null || echo "")
+                if [[ -n "$_lck_pid" ]] && ! kill -0 "$_lck_pid" 2>/dev/null; then
+                    rm -f "$_lock" 2>/dev/null || true
+                fi
+            fi
+            # Install in batches matching install_base_devel_batched() pattern
+            local _batch
+            for _batch in "m4 autoconf automake binutils" "bison debugedit diffutils fakeroot" \
+                          "flex" "gcc" "gettext groff" "gzip libtool make patch" \
+                          "pkgconf sed texinfo which" "linux-api-headers glibc"; do
+                _warn_dsr "Installing batch: $_batch"
+                pacman -S --noconfirm --needed $_batch 2>/dev/null && \
+                    _warn_dsr "  Batch succeeded." || \
+                    _warn_dsr "  Batch failed (may already be installed)."
+                sleep 1 2>/dev/null || true
+            done
         fi
         # Re-check after install attempt
         command -v gcc >/dev/null 2>&1 || { _warn_dsr "gcc still not available after repair attempt."; return 1; }
@@ -5840,17 +5857,30 @@ TOOLCHAIN_TEST
         _warn_dsr "a larger source file exposed a linker or optimization issue."
         # Auto-repair attempt: try reinstalling the full toolchain in case of
         # partial upgrade (gcc version doesn't match installed headers).
+        # Uses the same staged batched install as install_base_devel_batched().
         _warn_dsr "Attempting auto-repair: reinstalling toolchain packages..."
         if command -v pacman >/dev/null 2>&1; then
-            _remove_stale_lock 2>/dev/null || true
-            if pacman -S --noconfirm --needed base-devel gcc glibc linux-api-headers 2>/dev/null; then
-                _warn_dsr "Toolchain reinstalled. Retrying compilation..."
-                if gcc -O2 -o "$_helper_bin" "$_helper_src" 2>/dev/null; then
-                    rm -f "$_helper_src" "$_compile_err"
-                    chmod 755 "$_helper_bin"
-                    echo "$_helper_bin"
-                    return 0
+            local _lock="/var/lib/pacman/db.lck"
+            if [[ -f "$_lock" ]]; then
+                local _lck_pid
+                _lck_pid=$(cat "$_lock" 2>/dev/null || echo "")
+                if [[ -n "$_lck_pid" ]] && ! kill -0 "$_lck_pid" 2>/dev/null; then
+                    rm -f "$_lock" 2>/dev/null || true
                 fi
+            fi
+            local _batch
+            for _batch in "m4 autoconf automake binutils" "bison debugedit diffutils fakeroot" \
+                          "flex" "gcc" "gettext groff" "gzip libtool make patch" \
+                          "pkgconf sed texinfo which" "linux-api-headers glibc"; do
+                pacman -S --noconfirm --needed $_batch 2>/dev/null
+                sleep 1 2>/dev/null || true
+            done
+            _warn_dsr "Toolchain reinstalled. Retrying compilation..."
+            if gcc -O2 -o "$_helper_bin" "$_helper_src" 2>/dev/null; then
+                rm -f "$_helper_src" "$_compile_err"
+                chmod 755 "$_helper_bin"
+                echo "$_helper_bin"
+                return 0
             fi
         fi
         _warn_dsr "Auto-repair failed. Full FIX: pacman -Syyu && pacman -S base-devel gcc glibc linux-api-headers"

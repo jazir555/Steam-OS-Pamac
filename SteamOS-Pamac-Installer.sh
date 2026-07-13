@@ -2151,7 +2151,7 @@ SECURITY NOTE — fake systemd-run wrapper:
   ProcSubset, PrivateUsers, DisableExtraFileDescriptors, CoredumpReceive,
   etc.) are enforced via seccomp-BPF, mount namespaces, prctl, and
   capability dropping. When gcc is unavailable, falls back to
-  SECCOMP_MODE_STRICT. If AUR builds fail inside the container, try:
+  SECCOMP_MODE_STRICT (middle-ground profile without seccomp). If AUR builds fail inside the container, try:
     (1) Install base-devel for seccomp compilation
     (2) Use --strict-security to disable the wrapper
     (3) Use real systemd (e.g., distrobox --init flag)
@@ -2204,7 +2204,7 @@ SECURITY NOTE — Polkit rules:
       namespaces, PID namespaces, seccomp-BPF, capability bounding-set
       dropping via prctl(PR_CAPBSET_DROP), device-node filtering,
       bubblewrap) matching systemd's own unit sandboxing behavior.
-      When gcc is unavailable, falls back to SECCOMP_MODE_STRICT.
+      When gcc is unavailable, falls back to a middle-ground profile (mount namespace + PID namespace + capability dropping, without seccomp).
       Use --strict-security to disable it.
 
   (5) Pacman SigLevel: The container's /etc/pacman.conf uses the
@@ -5935,11 +5935,13 @@ _prepare_seccomp() {
             _warn_dsr "  - RestrictAddressFamilies  (filters socket() families)"
             _warn_dsr "  - SystemCallFilter         (blocks reboot/ptrace/etc.)"
             _warn_dsr ""
-            _warn_dsr "Falling back to SECCOMP_MODE_STRICT (allows only"
-            _warn_dsr "read/write/exit/sigreturn — blocks ptrace, reboot, etc.)"
-            # Export a flag so the execution wrapper applies strict-mode seccomp
+            _warn_dsr "Using middle-ground sandbox (no seccomp): mount namespace,"
+            _warn_dsr "PID namespace, capability dropping, and mount restrictions"
+            _warn_dsr "remain active. SECCOMP_MODE_STRICT cannot be used because"
+            _warn_dsr "it blocks execve, preventing build processes from running."
+            # Export a flag so the execution wrapper applies middle-ground sandbox
             export _DSR_SECCOMP_STRICT_FALLBACK=true
-            _warn_dsr "The build will run with mount namespace + PID namespace + strict seccomp."
+            _warn_dsr "The build will run with mount namespace + PID namespace + capabilities."
             _warn_dsr "To restore full sandboxing, install base-devel inside the container:"
             _warn_dsr "  pacman -S --noconfirm --needed base-devel gcc linux-api-headers glibc"
         fi
@@ -6089,13 +6091,13 @@ _run_sandboxed_unshare() {
                 ${_NNP}${_CAP_PRIV}$_SECCOMP_HELPER $_seccomp_args -- exec \"\${@}\"
             " -- "${CMD_ARGS[@]}"
         elif [[ "${_DSR_SECCOMP_STRICT_FALLBACK:-}" == "true" ]]; then
-            # SECCOMP_MODE_STRICT only allows read/write/exit/sigreturn — it
-            # blocks execve, so we cannot apply it and then run a build command.
-            # The mount namespace + PID namespace + capability dropping already
-            # provide substantial isolation. Log a warning and proceed without
-            # seccomp in this degraded path.
-            _warn_dsr "SECCOMP_MODE_STRICT cannot be applied (blocks execve)."
-            _warn_dsr "Proceeding with mount namespace + PID namespace + capability dropping."
+            # Middle-ground sandbox: mount namespace + PID namespace + capability
+            # dropping. SECCOMP_MODE_STRICT cannot be used because it blocks
+            # execve (only allows read/write/exit/sigreturn). Build processes
+            # need execve to compile and run. All mount-based restrictions
+            # (ProtectSystem, ProtectHome, PrivateTmp, etc.) remain active.
+            _warn_dsr "Using middle-ground sandbox: mount + PID namespaces + capabilities."
+            _warn_dsr "Seccomp filtering unavailable (requires gcc for compilation)."
             unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
                 source $_DSR_FUNCS_FILE 2>/dev/null
                 _apply_sandbox
@@ -7636,7 +7638,14 @@ else
     echo "Restricting NOPASSWD to user '$current_user' only."
 fi
 
-cat > /etc/sudoers.d/99-pamac-nopasswd <<SUDOERS
+# SECURITY: Use flock to prevent concurrent container processes from racing
+# during sudoers.d writes. A race could produce a partially-written file
+# that visudo rejects, breaking sudo inside the container.
+_sudoers_lock="/etc/sudoers.d/.pamac-lock"
+(
+    flock -w 10 200 || { echo "Warning: Could not acquire sudoers lock. Proceeding without lock."; exec 200>&-; }
+
+    cat > /etc/sudoers.d/99-pamac-nopasswd <<SUDOERS
 # SECURITY NOTE: AUR PKGBUILDs are arbitrary shell scripts run via makepkg; a
 # malicious or compromised AUR package can invoke the commands below and
 # effectively escalate to root inside this container.
@@ -7692,6 +7701,8 @@ if command -v visudo >/dev/null 2>&1; then
 else
     echo "Sudoers configured (visudo not available for validation)."
 fi
+
+) 200>"$_sudoers_lock"
 
 if [[ "\$_use_wheel_group" == "true" ]]; then
     echo ""

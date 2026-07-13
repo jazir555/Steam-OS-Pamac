@@ -5310,8 +5310,18 @@ _compile_seccomp_helper() {
         rm -f "$_helper_bin" 2>/dev/null || true
     fi
     if ! command -v gcc >/dev/null 2>&1; then
-        _warn_dsr "gcc not available — cannot compile seccomp helper (install base-devel)"
-        return 1
+        # Auto-repair: try to install the toolchain if it's missing after a
+        # partial upgrade or fresh container where base-devel was removed.
+        _warn_dsr "gcc not available — attempting auto-repair..."
+        if command -v pacman >/dev/null 2>&1; then
+            _warn_dsr "Installing base-devel (includes gcc) for seccomp compilation..."
+            _remove_stale_lock 2>/dev/null || true
+            pacman -S --noconfirm --needed base-devel gcc linux-api-headers glibc 2>/dev/null && \
+                _warn_dsr "Toolchain installed successfully." || \
+                _warn_dsr "Auto-repair failed — seccomp will be unavailable."
+        fi
+        # Re-check after install attempt
+        command -v gcc >/dev/null 2>&1 || { _warn_dsr "gcc still not available after repair attempt."; return 1; }
     fi
     local _helper_src="/tmp/.dsr-seccomp-helper-${$}.c"
     cat > "$_helper_src" << 'SECCOMP_C'
@@ -5789,8 +5799,28 @@ TOOLCHAIN_TEST
         local _gcc_ver
         _gcc_ver=$(gcc --version 2>/dev/null | head -1 || echo "unknown")
         _warn_dsr "gcc version: $_gcc_ver"
-        rm -f "$_test_src" "$_test_bin" "$_gcc_err"
-        return 1
+        # Auto-repair: try reinstalling missing headers in case of partial upgrade
+        _warn_dsr "Attempting auto-repair: reinstalling missing headers..."
+        if command -v pacman >/dev/null 2>&1; then
+            _remove_stale_lock 2>/dev/null || true
+            if pacman -S --noconfirm --needed linux-api-headers glibc 2>/dev/null; then
+                _warn_dsr "Headers reinstalled. Retrying toolchain test..."
+                if gcc -O2 -o "$_test_bin" "$_test_src" 2>/dev/null; then
+                    _warn_dsr "Toolchain test passed after auto-repair."
+                    rm -f "$_test_src" "$_test_bin" "$_gcc_err"
+                    # Continue to full compilation below
+                else
+                    rm -f "$_test_src" "$_test_bin" "$_gcc_err"
+                    return 1
+                fi
+            else
+                rm -f "$_test_src" "$_test_bin" "$_gcc_err"
+                return 1
+            fi
+        else
+            rm -f "$_test_src" "$_test_bin" "$_gcc_err"
+            return 1
+        fi
     fi
     rm -f "$_test_src" "$_test_bin" "$_gcc_err"
 
@@ -5808,7 +5838,22 @@ TOOLCHAIN_TEST
         _warn_dsr "$_compile_output"
         _warn_dsr "Toolchain validation passed but full compilation failed — this suggests"
         _warn_dsr "a larger source file exposed a linker or optimization issue."
-        _warn_dsr "FIX: pacman -S --noconfirm --needed base-devel gcc glibc linux-api-headers"
+        # Auto-repair attempt: try reinstalling the full toolchain in case of
+        # partial upgrade (gcc version doesn't match installed headers).
+        _warn_dsr "Attempting auto-repair: reinstalling toolchain packages..."
+        if command -v pacman >/dev/null 2>&1; then
+            _remove_stale_lock 2>/dev/null || true
+            if pacman -S --noconfirm --needed base-devel gcc glibc linux-api-headers 2>/dev/null; then
+                _warn_dsr "Toolchain reinstalled. Retrying compilation..."
+                if gcc -O2 -o "$_helper_bin" "$_helper_src" 2>/dev/null; then
+                    rm -f "$_helper_src" "$_compile_err"
+                    chmod 755 "$_helper_bin"
+                    echo "$_helper_bin"
+                    return 0
+                fi
+            fi
+        fi
+        _warn_dsr "Auto-repair failed. Full FIX: pacman -Syyu && pacman -S base-devel gcc glibc linux-api-headers"
         _warn_dsr "  Or use --strict-security to abort instead of silently degrading."
         rm -f "$_helper_src" "$_helper_bin" "$_compile_err"
         return 1
@@ -11572,6 +11617,35 @@ if [[ -z "\${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
         export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\$_uid/bus"
     fi
 fi
+
+# D-Bus session bus watchdog: SteamOS switches between Game Mode (gamescope)
+# and Desktop Mode, which can kill the user session bus. If DBUS_SESSION_BUS_ADDRESS
+# points to a stale socket, pamac-daemon will silently fail to register. This
+# watchdog re-discovers the bus if the current one dies, and retries once
+# (handles the Game Mode -> Desktop Mode transition where the bus restarts).
+_dbus_validate_and_watch() {
+    [[ -z "\${DBUS_SESSION_BUS_ADDRESS:-}" ]] && return 1
+    local _sock_path="\${DBUS_SESSION_BUS_ADDRESS#unix:path=}"
+    [[ -S "\$_sock_path" ]] || {
+        # Socket disappeared — try re-discovery
+        for _candidate in "\$XDG_RUNTIME_DIR/bus" "/run/user/\$(id -u)/bus" \$(ls /tmp/dbus-* 2>/dev/null | head -1); do
+            [[ -n "\$_candidate" && -S "\$_candidate" ]] || continue
+            if command -v dbus-send >/dev/null 2>&1; then
+                DBUS_SESSION_BUS_ADDRESS="unix:path=\$_candidate" \
+                    dbus-send --session --dest=org.freedesktop.DBus --type=method_call \
+                    --print-reply /org/freedesktop/DBus org.freedesktop.DBus.ListNames \
+                    >/dev/null 2>&1 && {
+                    export DBUS_SESSION_BUS_ADDRESS="unix:path=\$_candidate"
+                    return 0
+                }
+            fi
+        done
+        return 1
+    }
+    return 0
+}
+# Initial validation — fail fast if bus is dead
+_dbus_validate_and_watch || true
 
 # Detect display server
 IS_WAYLAND=false

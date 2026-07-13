@@ -3893,7 +3893,7 @@ case "$arg" in
 --unit) SKIP_NEXT=true; continue ;;
 --property=DynamicUser=yes) DYNAMIC_USER=true; continue ;;
 --property=CacheDirectory=*) CACHE_DIR="${arg#--property=CacheDirectory=}"; continue ;;
---property=WorkingDirectory=*) WORK_DIR="${arg#--property=WorkingDirectory=}"; continue ;;
+--property=WorkingDirectory=*) WORK_DIR="$(_dsr_sanitize_val "${arg#--property=WorkingDirectory=}")"; continue ;;
 # Recognized properties in this fake systemd-run. Security-hardening properties
 # are enforced via seccomp-BPF, mount namespaces, and capability dropping.
 # Resource and metadata properties that have no sandboxing impact are silently
@@ -5412,7 +5412,7 @@ static void apply_filters(int mdwx, int lock_personality, int restrict_realtime,
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_clone3, 0, 1),
             BPF_STMT(BPF_RET|BPF_K, seccomp_ret_action),
             /* clone: block only when CLONE_NEW* flags are set */
-            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_clone, 0, 3),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, __NR_clone, 0, 4),
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data,args[0])),
             BPF_JUMP(BPF_JMP|BPF_JSET|BPF_K, DSR_CLONE_NEWNS_FLAGS, 1, 0),
             BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
@@ -5780,7 +5780,27 @@ _DSR_FUNCS_FILE="/tmp/.dsr-sandbox-funcs-$$.sh"
 cat > "$_DSR_FUNCS_FILE" << 'SANDBOX_FUNCS'
 # Populated by _write_sandbox_func_file() below
 SANDBOX_FUNCS
-# Write _apply_sandbox and _sandbox_verify to the file
+# SECURITY: Dump all sandbox variables into the file so they are in scope
+# when _apply_sandbox is sourced inside bash -c subprocesses. Without this,
+# non-exported shell variables (PROTECT_SYSTEM, etc.) resolve to empty,
+# making _apply_sandbox a no-op in bwrap/unshare code paths.
+for _dv in PROTECT_SYSTEM PROTECT_HOME PRIVATE_TMP PRIVATE_DEVICES PRIVATE_NETWORK \
+    MEMORY_DENY_WRITE_EXECUTE RESTRICT_SUID_SGID PROTECT_KERNEL_MODULES \
+    LOCK_PERSONALITY RESTRICT_REALTIME PROTECT_CLOCK PROTECT_HOSTNAME \
+    PROTECT_KERNEL_LOGS RESTRICT_NAMESPACES RESTRICT_ADDRESS_FAMILIES \
+    SYSTEM_CALL_FILTER RESTRICT_FILE_SYSTEMS CAP_BOUNDING_SET \
+    NO_NEW_PRIVS SECURE_BITS PERSONALITY PROTECT_PROC PROC_SUBSET \
+    PRIVATE_USERS DISABLE_EXTRA_FDS COREDUMP_RECEIVE \
+    IOSCHED_CLASS IOSCHED_PRIORITY CPUSCHED_POLICY CPUSCHED_PRIORITY \
+    NICE_LEVEL AMBIENT_CAPS GROUP_NAME MOUNT_FLAGS OOM_SCORE_ADJUST \
+    TIMEOUT_START BUILD_USER DSR_VERSION _DSR_LOG; do
+    declare -p "$_dv" >> "$_DSR_FUNCS_FILE" 2>/dev/null || true
+done
+for _da in READ_ONLY_PATHS INACCESSIBLE_PATHS STATE_DIRECTORIES LOGS_DIRECTORIES \
+    RUNTIME_DIRECTORIES BIND_PATHS BIND_RO_PATHS TMPFS_SPECS READ_WRITE_PATHS \
+    LIMITS_RLIMIT PASS_ENV UNSET_ENV CONFIG_DIRS; do
+    declare -p "$_da" >> "$_DSR_FUNCS_FILE" 2>/dev/null || true
+done
 declare -f _sandbox_verify >> "$_DSR_FUNCS_FILE" 2>/dev/null || true
 declare -f _apply_sandbox >> "$_DSR_FUNCS_FILE" 2>/dev/null || true
 chmod 600 "$_DSR_FUNCS_FILE" 2>/dev/null || true
@@ -5893,51 +5913,18 @@ _run_sandboxed_unshare() {
                 ${_NNP}${_CAP_PRIV}$_SECCOMP_HELPER $_seccomp_args -- exec \"\${@}\"
             " -- "${CMD_ARGS[@]}"
         elif [[ "${_DSR_SECCOMP_STRICT_FALLBACK:-}" == "true" ]]; then
-            # Apply SECCOMP_MODE_STRICT as a degraded fallback when gcc is
-            # unavailable. Strict mode allows only read, write, exit, and
-            # sigreturn — blocks ptrace, reboot, kexec, mount, etc.
-            # The strict helper exec's into the target so seccomp is inherited.
-            local _strict_src="${_dsr_tmp:-/tmp}/.dsr-strict-seccomp.c"
-            local _strict_bin="${_dsr_tmp:-/tmp}/.dsr-strict-seccomp"
-            if [[ ! -x "$_strict_bin" ]] || [[ "$(md5sum "$_strict_src" 2>/dev/null)" != "${_DSR_STRICT_SRC_HASH:-}" ]]; then
-                cat > "$_strict_src" << 'STRICT_SECCOMP_C'
-#include <sys/prctl.h>
-#include <linux/seccomp.h>
-#include <stdio.h>
-#include <unistd.h>
-int main(int argc, char *argv[]) {
-    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT) != 0) {
-        fprintf(stderr, "seccomp: strict mode failed\n");
-        return 1;
-    }
-    fprintf(stderr, "seccomp: SECCOMP_MODE_STRICT applied (read/write/exit/sigreturn only)\n");
-    /* exec the remaining command so seccomp applies to the target, not us */
-    if (argc > 1) {
-        execvp(argv[1], &argv[1]);
-        perror("execvp");
-    }
-    return 0;
-}
-STRICT_SECCOMP_C
-                if command -v gcc >/dev/null 2>&1; then
-                    gcc -O2 -o "$_strict_bin" "$_strict_src" 2>/dev/null
-                    _DSR_STRICT_SRC_HASH="$(md5sum "$_strict_src" 2>/dev/null)"
-                fi
-            fi
-            if [[ -x "$_strict_bin" ]]; then
-                unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
-                    source $_DSR_FUNCS_FILE 2>/dev/null
-                    _apply_sandbox
-                    ${_BUILD_WRAPPER:-}
-                    ${_NNP}${_CAP_PRIV}$_strict_bin bash -c '${_BUILD_WRAPPER:-}exec \"\${@}\"' -- \"\${@}\"
-                " -- "${CMD_ARGS[@]}"
-            else
-                _warn_dsr "Could not compile strict seccomp fallback — running without seccomp"
-                unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
-                    source $_DSR_FUNCS_FILE 2>/dev/null
-                    _apply_sandbox
-                    ${_NNP}${_CAP_PRIV}${_BUILD_WRAPPER:-}exec \"\${@}\"
-                " -- "${CMD_ARGS[@]}"
+            # SECCOMP_MODE_STRICT only allows read/write/exit/sigreturn — it
+            # blocks execve, so we cannot apply it and then run a build command.
+            # The mount namespace + PID namespace + capability dropping already
+            # provide substantial isolation. Log a warning and proceed without
+            # seccomp in this degraded path.
+            _warn_dsr "SECCOMP_MODE_STRICT cannot be applied (blocks execve)."
+            _warn_dsr "Proceeding with mount namespace + PID namespace + capability dropping."
+            unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
+                source $_DSR_FUNCS_FILE 2>/dev/null
+                _apply_sandbox
+                ${_NNP}${_CAP_PRIV}${_BUILD_WRAPPER:-}exec \"\${@}\"
+            " -- "${CMD_ARGS[@]}"
             fi
         else
             unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "

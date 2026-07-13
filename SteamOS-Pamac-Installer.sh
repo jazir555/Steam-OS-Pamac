@@ -3721,7 +3721,7 @@ _resolve_host_user() {
     fi
     for _h in /home/*; do
         local _u; _u=$(basename "$_h")
-        if id "$_u" >/dev/null 2>&1 && [[ "$(stat -c '%u' "$_h" 2>/dev/null||echo 0)" -ge 1000 ]]; then
+        if id "$_u" >/dev/null 2>&1 && [[ "$(ls -ldn "$_h" 2>/dev/null | awk '{print $3}' || echo 0)" -ge 1000 ]]; then
             echo "$_u"; return 0
         fi
     done
@@ -3768,7 +3768,7 @@ _cleanup_orphaned_buildusers() {
     fi
     for _dir in /var/tmp/builduser-home-*; do
         [[ -d "$_dir" ]] || continue
-        if [[ "$(stat -c '%U' "$_dir" 2>/dev/null || echo root)" == "root" ]]; then
+        if [[ "$(ls -ldn "$_dir" 2>/dev/null | awk '{print $3}' || echo 0)" -eq 0 ]]; then
             _warn_dsr "Removing orphaned build-user home: $_dir"
             rm -rf "$_dir" 2>/dev/null || true
         fi
@@ -3884,9 +3884,9 @@ fi
 case "$arg" in
 --service-type=*) continue ;;
 --service-type) SKIP_NEXT=true; continue ;;
---pipe) continue ;;
---wait) continue ;;
---pty|-q|--quiet|--no-block) continue ;;
+--pipe) _log_dsr "Flag --pipe ignored (not applicable to fake systemd-run)"; continue ;;
+--wait) _log_dsr "Flag --wait ignored (not applicable to fake systemd-run)"; continue ;;
+--pty|-q|--quiet|--no-block) _log_dsr "Flag $arg ignored (not applicable to fake systemd-run)"; continue ;;
 --description=*) continue ;;
 --description) SKIP_NEXT=true; continue ;;
 --unit=*) continue ;;
@@ -5784,6 +5784,8 @@ SANDBOX_FUNCS
 declare -f _sandbox_verify >> "$_DSR_FUNCS_FILE" 2>/dev/null || true
 declare -f _apply_sandbox >> "$_DSR_FUNCS_FILE" 2>/dev/null || true
 chmod 600 "$_DSR_FUNCS_FILE" 2>/dev/null || true
+# Clean up the sourceable functions file on exit
+trap 'rm -f "$_DSR_FUNCS_FILE" 2>/dev/null' EXIT
 
 # ── _prepare_cap_priv: shared capability/NoNewPrivileges preparation ──
 # Reads the PARSED variables (NO_NEW_PRIVS, CAP_BOUNDING_SET) directly,
@@ -5883,8 +5885,9 @@ _run_sandboxed_unshare() {
             unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
                 source $_DSR_FUNCS_FILE 2>/dev/null
                 _apply_sandbox
-                ${_NNP}${_CAP_PRIV}$_SECCOMP_HELPER $_seccomp_args -- exec \"\${@}\"
+                ${_NNP}${_CAP_PRIV}$_SECCOMP_HELPER $_seccomp_args -- ${_BUILD_WRAPPER:-}exec \"\${@}\"
             " -- "${CMD_ARGS[@]}"
+        elif [[ "${_DSR_SECCOMP_STRICT_FALLBACK:-}" == "true" ]]; then
         elif [[ "${_DSR_SECCOMP_STRICT_FALLBACK:-}" == "true" ]]; then
             # Apply SECCOMP_MODE_STRICT as a degraded fallback when gcc is
             # unavailable. Strict mode allows only read, write, exit, and
@@ -5916,14 +5919,14 @@ STRICT_SECCOMP_C
                     source $_DSR_FUNCS_FILE 2>/dev/null
                     _apply_sandbox
                     ${_NNP}${_CAP_PRIV}$_strict_bin
-                    exec \"\${@}\"
+                    ${_BUILD_WRAPPER:-}exec \"\${@}\"
                 " -- "${CMD_ARGS[@]}"
             else
                 _warn_dsr "Could not compile strict seccomp fallback — running without seccomp"
                 unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
                     source $_DSR_FUNCS_FILE 2>/dev/null
                     _apply_sandbox
-                    ${_NNP}${_CAP_PRIV}exec \"\${@}\"
+                    ${_NNP}${_CAP_PRIV}${_BUILD_WRAPPER:-}exec \"\${@}\"
                 " -- "${CMD_ARGS[@]}"
             fi
         else

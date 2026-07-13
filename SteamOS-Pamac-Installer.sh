@@ -129,6 +129,18 @@ ROLLING_RELEASE="${ROLLING_RELEASE:-false}"
 # ARCHLINUX_IMAGE is readonly; CONTAINER_IMAGE is the actual image used.
 CONTAINER_IMAGE="${ARCHLINUX_IMAGE}"
 
+# --security-opt: additional security profiles for the container runtime.
+# Accepts one or more values (colon-separated in env var, repeated --security-opt
+# flags on CLI). Each value is passed as --security-opt <value> to distrobox create.
+# Examples: seccomp:profile.json, apparmor:my-profile, seccomp=unconfined
+CONTAINER_SECURITY_OPT=()
+if [[ -n "${CONTAINER_SECURITY_OPT_ENV:-}" ]]; then
+    IFS=':' read -ra _opt_parts <<< "$CONTAINER_SECURITY_OPT_ENV"
+    for _opt in "${_opt_parts[@]}"; do
+        [[ -n "$_opt" ]] && CONTAINER_SECURITY_OPT+=("$_opt")
+    done
+fi
+
 # Global temp directory for all script temp files. Using a single directory
 # instead of tracking individual files in an array avoids race conditions where
 # temp files created inside subshells or piped commands never propagate back to
@@ -212,6 +224,18 @@ EXPORT_ONLY="${EXPORT_ONLY:-false}"
 LOG_LEVEL="${LOG_LEVEL:-normal}"
 PAMAC_VERSION="${PAMAC_VERSION:-}"
 NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
+# --force: skip user confirmations (e.g. container recreation low-battery
+# multi-user) WITHOUT implying full --non-interactive automation. Useful when
+# the user wants a headless run of a single operation but still wants the
+# battery/multi-user guard skips to behave normally. Defaults to false.
+FORCE_MODE="${FORCE_MODE:-false}"
+# --dedicated-builduser: create a dedicated pamac-builder account to run
+# AUR builds under, instead of reusing the host login user. This provides
+# an additional isolation layer between host account data and AUR PKGBUILD
+# execution. The dedicated user has no access to host home; sudoers scope
+# the NOPASSWD commands to pamac-builder only. A host-alias user with the
+# same UID is also created for distrobox integration. Defaults to false.
+DEDICATED_BUILDUSER="${DEDICATED_BUILDUSER:-false}"
 SKIP_COMPAT_CHECK="${SKIP_COMPAT_CHECK:-false}"
 NO_COLOR="${NO_COLOR:-false}"
 LOW_MEMORY="${LOW_MEMORY:-false}"
@@ -841,6 +865,15 @@ confirm_container_recreation() {
         return 0
     fi
 
+    # --force auto-approves the recreation prompt without enabling full
+    # non-interactive automation (it skips only this destructive-confirmation
+    # gate). Distinct from --non-interactive which suppresses ALL prompts.
+    if [[ "${FORCE_MODE:-false}" == "true" ]]; then
+        log_info "--force set — proceeding with container recreation without prompt."
+        _RECREATE_CONFIRMED="yes"
+        return 0
+    fi
+
     # DRY_RUN never touches the filesystem, so no prompt is needed.
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
         _RECREATE_CONFIRMED="yes"
@@ -875,7 +908,7 @@ confirm_container_recreation() {
         # Non-terminal stdin (e.g. piped input, cron) — refuse destructive
         # action rather than silently wiping data.
         log_error "Cannot prompt for container recreation (no terminal)."
-        log_error "Re-run with --non-interactive to auto-approve, or attach a terminal."
+        log_error "Re-run with --non-interactive or --force to auto-approve, or attach a terminal."
         _RECREATE_ABORTED="yes"
         return 1
     fi
@@ -2118,6 +2151,10 @@ OPTIONS:
                              AUR RPC dependency; for users who know their
                              pacman version is compatible)
   --non-interactive          Skip all interactive prompts (safe for automation)
+  --force                    Auto-approve destructive confirmations (container
+                             recreation prompts only) without suppressing ALL
+                             interactive prompts like --non-interactive does.
+                             Equivalent to FORCE_MODE=true.
   --quick-start          Apply a minimal, safe preset of defaults for less
                              experienced users (multilib+build-cache+extra-repos
                              ON, gaming OFF, compat-check ON). Any option passed
@@ -2128,6 +2165,16 @@ OPTIONS:
   --allow-wheel-nopasswd     Grant NOPASSWD to entire wheel group instead of
                              just the current user (INSECURE on multi-user
                              hosts; opt-in only, not auto-enabled)
+  --dedicated-builduser      Create a dedicated _pamac_builder user inside the
+                             container. AUR builds and pamac operations run
+                             under this user, not the host login user, providing
+                             an additional isolation layer between host home
+                             data and AUR PKGBUILD access. The host-alias user
+                             is still created for distrobox entry.
+  --security-opt OPT         Pass an additional --security-opt to the container
+                             runtime during creation. May be repeated.
+                             Examples: --security-opt seccomp:profile.json
+                                       --security-opt apparmor:my-profile
   --check                   Perform system checks and exit without installing
   --dry-run                 Show what would be done without making changes
   --dry-run-verbose         Like --dry-run, but also print the full script
@@ -2182,6 +2229,9 @@ ENVIRONMENT VARIABLES:
   PAMAC_VERSION            Specific pamac-aur version/commit to install (AUR fallback)
   NON_INTERACTIVE          Set to 'true' to skip all interactive prompts (safe for
                            background tools, automated installers, and cron jobs)
+  FORCE_MODE              Set to 'true' to auto-approve destructive confirmation
+                           (container recreation) without disabling other prompts
+                           as --non-interactive does. Same as --force flag.
   QUICK_START             Set to 'true' to apply the quick-start preset (same as
                            --quick-start). See --help for the preset values.
                            Explicit env vars / CLI flags still override the preset.
@@ -2216,6 +2266,13 @@ ENVIRONMENT VARIABLES:
   LOG_ROTATION_MAX_SIZE    Rotate the per-container log on startup when it
                            exceeds this many bytes. Default: 5242880 (5 MiB).
                            One backup (.1) is kept; older backups are overwritten.
+  DEDICATED_BUILDUSER      Set to 'true' to create a dedicated build user
+                           (--dedicated-builduser). Default 'false'.
+  FORCE_MODE               Set to 'true' to bypass destructive confirmation
+                           prompts (same as --force). Default 'false'.
+  CONTAINER_SECURITY_OPT_ENV  Colon-separated list of --security-opt values
+                           passed to container creation (same as --security-opt
+                           flag). E.g.: seccomp:profile.json:apparmor:my-profile
 
 SECURITY NOTE — fake systemd-run wrapper:
   This is a custom compatibility shim that fully emulates systemd-run for
@@ -2243,6 +2300,28 @@ SECURITY NOTE — --allow-wheel-nopasswd:
   user in the wheel group (and any AUR package built via makepkg) can
   perform administrative package operations without authentication.
   Default is per-user NOPASSWD (limits escalation to one user).
+
+SECURITY NOTE -- --dedicated-builduser:
+  Creates a dedicated _pamac_builder user for AUR builds. This isolates
+  AUR PKGBUILD execution from the host login user's home directory and
+  data. The host user retains no passwordless sudo for package commands.
+  The pamac GUI still runs as the host user via polkit/D-Bus; only the
+  AUR build/install path runs under the dedicated user.
+
+SECURITY NOTE — Sudoers permissions (inside container):
+  The following commands are granted passwordless sudo via
+  /etc/sudoers.d/99-pamac-nopasswd (scoped per-user or wheel, above):
+
+    /usr/bin/pacman            — Install/remove/upgrade packages
+    /usr/bin/pacman-key         — Initialize/verify package signatures
+    /usr/bin/paccache           — Clean old package caches
+    /usr/bin/pacscripts         — Inspect install scripts
+
+  These are deliberately EXCLUDED from PAMAC_CMDS:
+
+    /usr/bin/makepkg           — Runs via fake systemd-run (DynamicUser)
+    /usr/bin/yay               — Never run as root; invokes sudo pacman -U
+    /usr/bin/sudo              — Prevents escalation chain
 
 SECURITY NOTE — Polkit rules:
   The script sets allow_active=yes (local active sessions only) for
@@ -2426,9 +2505,16 @@ parse_arguments() {
             --update) UPDATE="true"; shift ;;
             --export-only) EXPORT_ONLY="true"; shift ;;
             --non-interactive) NON_INTERACTIVE="true"; shift ;;
+            --force) FORCE_MODE="true"; shift ;;
+            --dedicated-builduser) DEDICATED_BUILDUSER="true"; shift ;;
             --quick-start) QUICK_START="true"; shift ;;
             --disable-pin-alpm) PIN_ALPM="false"; shift ;;
             --allow-wheel-nopasswd) ALLOW_WHEEL_NOPASSWD="true"; shift ;;
+            --security-opt)
+                [[ -z "${2:-}" ]] && { log_error "--security-opt requires a value"; exit 1; }
+                CONTAINER_SECURITY_OPT+=("$2")
+                shift 2
+                ;;
             --upload-log) UPLOAD_LOG="true"; shift ;;
             --dry-run) DRY_RUN="true"; shift ;;
             --dry-run-verbose) DRY_RUN="true"; DRY_RUN_VERBOSE="true"; shift ;;
@@ -2841,6 +2927,14 @@ create_container() {
         mkdir -p "$cache_dir"
         create_args+=(--volume "${cache_dir}:/home/${CURRENT_USER}/.cache/yay:rw")
         log_info "Enabled persistent build cache: $cache_dir"
+    fi
+
+    # Apply additional security profiles (--security-opt).
+    if [[ ${#CONTAINER_SECURITY_OPT[@]} -gt 0 ]]; then
+        for _sopt in "${CONTAINER_SECURITY_OPT[@]}"; do
+            create_args+=(--security-opt "$_sopt")
+        done
+        log_info "Applied security-opt profiles: ${CONTAINER_SECURITY_OPT[*]}"
     fi
 
   if [[ -n "${_CREATE_RECREATION_GUARD:-}" ]]; then
@@ -6721,6 +6815,13 @@ _exec_handle_result() {
             echo "$_output" | tail -20 | while IFS= read -r line; do
                 log_error "  $line"
             done
+            log_error "Keyring recovery failed${STRICT_SECURITY:+ (--strict-security refused signature relaxation)}."
+            log_error "To recover, enter the container and reinitialize the keyring:"
+            log_error "  distrobox enter $CONTAINER_NAME --"
+            log_error "    sudo pacman-key --init"
+            log_error "    sudo pacman-key --populate archlinux"
+            log_error "    sudo pacman -Sy --noconfirm archlinux-keyring gnupg"
+            log_error "Then re-run the installer${STRICT_SECURITY:+, or retry WITHOUT --strict-security to allow the TrustAll fallback}."
         elif [[ $_rc -eq 137 ]]; then
             log_error "$_kind '$_desc' killed (OOM/signal). Last 20 lines of output:"
             echo "$_output" | tail -20 | while IFS= read -r line; do
@@ -7391,6 +7492,18 @@ fi
 if [[ "$keyring_ok" != "true" ]]; then
     echo "FATAL: Pacman keyring could not be repaired. The container is in an unsecure state."
     echo "FATAL: Aborting installation to prevent running without signature verification."
+    echo ""
+    echo "=== Remediation ==="
+    echo "  This script runs INSIDE the container. To recover, you can either:"
+    echo "    a. Run these commands now (already inside the container):"
+    echo "         pacman-key --init"
+    echo "         pacman-key --populate archlinux"
+    echo "         pacman -Sy --noconfirm archlinux-keyring gnupg"
+    echo "    b. From the HOST, target the container by name (e.g. arch-pamac):"
+    echo "         podman exec -u 0 <container-name> pacman-key --init"
+    echo "         podman exec -u 0 <container-name> pacman-key --populate archlinux"
+    echo "         podman exec -u 0 <container-name> pacman -Sy --noconfirm archlinux-keyring gnupg"
+    echo "  Then re-run the installer."
     _atomic_write_pacman_conf "Required DatabaseOptional" 2>/dev/null || \
         _atomic_sed_inplace /etc/pacman.conf 's/^[[:space:]]*SigLevel.*/SigLevel = Required DatabaseOptional/' 2>/dev/null || true
     exit 100
@@ -7735,9 +7848,28 @@ fi
 # Security: Determine sudoers scope.
 # Default: per-user NOPASSWD (limits AUR escalation to one user).
 # --allow-wheel-nopasswd: wheel group (INSECURE, opt-in only).
+# --dedicated-builduser: pamac-builder user (opt-in, further isolation).
 # SteamOS: still defaults to per-user (single-user device doesn't need wheel).
 _use_wheel_group=false
-if [[ "$ALLOW_WHEEL_NOPASSWD" == "true" ]]; then
+BUILD_SUDO_USER="$current_user"
+if [[ "__DEDICATED_BUILDUSER__" == "true" ]]; then
+    echo "SECURITY: --dedicated-builduser specified. Creating dedicated build user."
+    _builder_name="_pamac_builder"
+    if ! id "$_builder_name" >/dev/null 2>&1; then
+        useradd -r -m -d "/var/lib/${_builder_name}" -s /bin/bash -G wheel "$_builder_name" || {
+            echo "Error: failed to create dedicated build user '$_builder_name'"
+            exit 1
+        }
+        echo "Created dedicated AUR build user: $_builder_name"
+        echo "  Home: /var/lib/${_builder_name} (isolated from host /home mounts)"
+        echo "  Shell: /bin/bash (needed for makepkg/yay builds)"
+        echo "  Group: wheel (sudo access)"
+    else
+        echo "Dedicated build user '$_builder_name' already exists."
+    fi
+    BUILD_SUDO_USER="$_builder_name"
+    echo "Restricting NOPASSWD to dedicated build user '$BUILD_SUDO_USER'."
+elif [[ "$ALLOW_WHEEL_NOPASSWD" == "true" ]]; then
     echo "SECURITY: --allow-wheel-nopasswd specified. Granting NOPASSWD to entire wheel group."
     echo "          This is INSECURE on multi-user hosts. Consider using per-user scope."
     _use_wheel_group=true
@@ -7757,9 +7889,10 @@ _sudoers_lock="/etc/sudoers.d/.pamac-lock"
 # malicious or compromised AUR package can invoke the commands below and
 # effectively escalate to root inside this container.
 #
-# Scope: $(if [[ "\$_use_wheel_group" == "true" ]]; then echo "wheel group (all members)"; else echo "user $current_user only"; fi)
+# Scope: $(if [[ "\$_use_wheel_group" == "true" ]]; then echo "wheel group (all members)"; elif [[ "$BUILD_SUDO_USER" != "$current_user" ]]; then echo "user $BUILD_SUDO_USER (dedicated build user)"; else echo "user $current_user only"; fi)
 # To remove: sudo rm /etc/sudoers.d/99-pamac-nopasswd
 # To widen:   re-run with --allow-wheel-nopasswd
+# To isolate: re-run with --dedicated-builduser
 
 # makepkg and yay are deliberately EXCLUDED from PAMAC_CMDS.
 #
@@ -7783,7 +7916,7 @@ Cmnd_Alias PAMAC_CMDS = /usr/bin/pacman, \\
 $(if [[ "\$_use_wheel_group" == "true" ]]; then
     echo "%wheel ALL=(ALL:ALL) NOPASSWD: PAMAC_CMDS"
 else
-    echo "$current_user ALL=(ALL:ALL) NOPASSWD: PAMAC_CMDS"
+    echo "$BUILD_SUDO_USER ALL=(ALL:ALL) NOPASSWD: PAMAC_CMDS"
 fi)
 SUDOERS
 chmod 0440 /etc/sudoers.d/99-pamac-nopasswd
@@ -7819,6 +7952,14 @@ if [[ "\$_use_wheel_group" == "true" ]]; then
     echo "  This is acceptable ONLY on single-user personal devices."
     echo "  To remove: sudo rm /etc/sudoers.d/99-pamac-nopasswd"
     echo ""
+elif [[ "$BUILD_SUDO_USER" != "$current_user" ]]; then
+    echo ""
+    echo "*** SECURITY: Dedicated build-user NOPASSWD package management ***"
+    echo "  Sudo NOPASSWD is restricted to dedicated build user '$BUILD_SUDO_USER'."
+    echo "  AUR builds run under '$BUILD_SUDO_USER', not the host login user."
+    echo "  This isolates AUR PKGBUILD access from the host user's home directory."
+    echo "  Host user '$current_user' has NO passwordless sudo for package commands."
+    echo ""
 else
     echo ""
     echo "*** SECURITY NOTE: Per-user NOPASSWD package management ***"
@@ -7829,6 +7970,10 @@ else
     echo ""
 fi
 USER_EOF
+
+    # Template substitution: bake DEDICATED_BUILDUSER into the single-quoted
+    # heredoc content (__DEDICATED_BUILDUSER__ placeholder in user_script).
+    user_script="${user_script//__DEDICATED_BUILDUSER__/${DEDICATED_BUILDUSER:-false}}"
 
     exec_container_script "$user_script" "user-setup" "$CURRENT_USER" || return 1
 
@@ -11921,9 +12066,15 @@ touch "\$HOME/.local/share/applications" 2>/dev/null || true
 # distrobox 1.8.x does not support --env; pass env via prefix instead.
 # Explicitly forward WAYLAND_DISPLAY and XDG_SESSION_TYPE so GTK inside the
 # container announces the correct Wayland app_id for taskbar grouping.
+# Default XDG_SESSION_TYPE to "wayland" when WAYLAND_DISPLAY is present but
+# XDG_SESSION_TYPE was not set (some compositors omit it by default).
+_XDG_SESSION_TYPE="\${XDG_SESSION_TYPE:-}"
+if [[ -n "\${WAYLAND_DISPLAY:-}" && -z "\${_XDG_SESSION_TYPE}" ]]; then
+    _XDG_SESSION_TYPE="wayland"
+fi
 DBUS_SESSION_BUS_ADDRESS="\${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/\$(id -u)/bus}" \
 WAYLAND_DISPLAY="\${WAYLAND_DISPLAY:-}" \
-XDG_SESSION_TYPE="\${XDG_SESSION_TYPE:-}" \
+XDG_SESSION_TYPE="\${_XDG_SESSION_TYPE}" \
 XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}" \
 distrobox enter ${CONTAINER_NAME} -- pamac-manager-wrapper "\$@" &
 LAUNCHER_PID=\$!
@@ -12218,6 +12369,10 @@ export WAYLAND_DISPLAY="wayland-0"
 elif [[ -S /run/user/$(id -u)/wayland-0 ]]; then
 export WAYLAND_DISPLAY="wayland-0"
 fi
+fi
+
+if [[ -n "\$WAYLAND_DISPLAY" && -z "\$XDG_SESSION_TYPE" ]]; then
+export XDG_SESSION_TYPE="wayland"
 fi
 
 if [[ -n "\$XDG_RUNTIME_DIR" && ! -d "\$XDG_RUNTIME_DIR" ]]; then
@@ -12715,7 +12870,7 @@ pacman -Qeq > "\$EXPLICIT_FILE" 2>/dev/null || true
 PKG_HASH="\$(md5sum "\$EXPLICIT_FILE" 2>/dev/null | awk '{print \$1}')"
 MTIME_HASH=""
 if [[ -d /usr/share/applications ]]; then
-    MTIME_HASH="\$(find /usr/share/applications -maxdepth 1 -type f -name '*.desktop' \
+    MTIME_HASH="\$(find /usr/share/applications -type f -name '*.desktop' \
         -printf '%T@ %s\n' 2>/dev/null | sort | md5sum | awk '{print \$1}')"
 fi
 FAST_HASH="\${PKG_HASH}:\${MTIME_HASH}"
@@ -12727,7 +12882,7 @@ fi
 # Fast gate differs — compute full content hash to confirm change
 CURRENT_HASH="\$PKG_HASH"
 if [[ -d /usr/share/applications ]]; then
-    DESKTOP_SIG="\$(find /usr/share/applications -maxdepth 1 -type f -name '*.desktop' \
+    DESKTOP_SIG="\$(find /usr/share/applications -type f -name '*.desktop' \
         -exec md5sum {} + 2>/dev/null | sort -k2 | md5sum | awk '{print \$1}')"
     CURRENT_HASH="\${CURRENT_HASH}:\${DESKTOP_SIG}"
 fi

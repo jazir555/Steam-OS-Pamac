@@ -3741,11 +3741,14 @@ _cleanup_orphaned_buildusers() {
         userdel -r "$_ou" 2>/dev/null || userdel "$_ou" 2>/dev/null || true
         # Purge orphaned subuid/subgid entries so useradd won't fail with
         # "uid already in use" on the next transient user creation attempt.
+        # SECURITY: Use grep -F (fixed string) to avoid regex injection via username.
         if [[ -w /etc/subuid ]]; then
-            sed -i "/^${_ou}:/d" /etc/subuid 2>/dev/null || true
+            grep -vF "${_ou}:" /etc/subuid > /etc/subuid.tmp 2>/dev/null && \
+                mv /etc/subuid.tmp /etc/subuid 2>/dev/null || rm -f /etc/subuid.tmp 2>/dev/null
         fi
         if [[ -w /etc/subgid ]]; then
-            sed -i "/^${_ou}:/d" /etc/subgid 2>/dev/null || true
+            grep -vF "${_ou}:" /etc/subgid > /etc/subgid.tmp 2>/dev/null && \
+                mv /etc/subgid.tmp /etc/subgid 2>/dev/null || rm -f /etc/subgid.tmp 2>/dev/null
         fi
     done
     # Also clean up the _builduser system account if it exists but its home
@@ -3861,10 +3864,18 @@ CONFIG_DIRS=()
 # ── OOM ──
 OOM_SCORE_ADJUST=""
 TIMEOUT_START=""
+# SECURITY: Track previous --setenv value for two-arg form (--setenv KEY VALUE)
+_SETENV_NEXT_IS_VALUE=false
 for arg in "$@"; do
 if $SKIP_NEXT; then
 SKIP_NEXT=false
 continue
+fi
+# Handle --setenv KEY VALUE form: the next arg after --setenv is KEY=VALUE
+if [[ "${_SETENV_NEXT_IS_VALUE:-}" == "true" ]]; then
+    _SETENV_NEXT_IS_VALUE=false
+    EXTRA_ENV+=("-e" "$arg")
+    continue
 fi
 case "$arg" in
 --service-type=*) continue ;;
@@ -4184,7 +4195,7 @@ case "$arg" in
 --scope) SCOPE_MODE=true; continue ;;
 --uid=*|--gid=*) continue ;;
 --setenv=*) EXTRA_ENV+=("-e" "${arg#--setenv=}"); continue ;;
---setenv) SKIP_NEXT=true; continue ;;
+--setenv) _SETENV_NEXT_IS_VALUE=true; continue ;;
 --) shift; CMD_ARGS+=("$@"); break ;;
 *) CMD_ARGS+=("$arg") ;;
 esac
@@ -4206,17 +4217,31 @@ fi
 # ── Build environment setup string ──
 # Loads EnvironmentFile= files and exports Environment=/--setenv= vars
 # so builds see the same environment systemd-run would have provided.
+# SECURITY: EnvironmentFile paths are validated as existing regular files.
+# Environment values are sanitized to prevent shell injection via quoting
+# breakout in the assembled command string.
 _ENV_SETUP=""
 for _ef in "${ENV_FILES[@]}"; do
-    if [[ -f "$_ef" ]]; then
+    # SECURITY: Validate path exists, is a regular file, and contains no
+    # shell metacharacters that could break single-quote escaping.
+    if [[ -f "$_ef" && "$_ef" =~ ^[a-zA-Z0-9_/\.\-]+$ ]]; then
         _ENV_SETUP="${_ENV_SETUP}set -a; source '${_ef}' 2>/dev/null || true; set +a; "
         _log_dsr "Sourcing EnvironmentFile: $_ef"
+    elif [[ -f "$_ef" ]]; then
+        # Path exists but contains unusual chars — use printf %q for safe escaping
+        _ENV_SETUP="${_ENV_SETUP}set -a; source $(printf '%q' "$_ef") 2>/dev/null || true; set +a; "
+        _log_dsr "Sourcing EnvironmentFile: $_ef (quoted)"
     else
         _warn_dsr "EnvironmentFile not found: $_ef (continuing — may be created by the build)"
     fi
 done
 for _ee in "${EXTRA_ENV[@]}"; do
-    _ENV_SETUP="${_ENV_SETUP}export '${_ee}' 2>/dev/null || true; "
+    # SECURITY: Validate env entry is KEY=VALUE format with safe characters.
+    if [[ "$_ee" =~ ^[a-zA-Z_][a-zA-Z0-9_]*= ]]; then
+        _ENV_SETUP="${_ENV_SETUP}export '$(_dsr_sanitize_val "$_ee")' 2>/dev/null || true; "
+    else
+        _warn_dsr "Skipping malformed Environment entry: $_ee"
+    fi
     _log_dsr "Setting env: $_ee"
 done
 if [[ -n "$SET_UMASK" ]]; then
@@ -4367,15 +4392,16 @@ _build_bwrap_args() {
         fi
         _log_dsr "bwrap: ReadOnlyPaths: $_rop"
     done
-    # ── InaccessiblePaths: bind /dev/null over the path ──
+    # ── InaccessiblePaths: make path inaccessible in bwrap ──
     for _iap in "${INACCESSIBLE_PATHS[@]}"; do
         [[ -z "$_iap" ]] && continue
         if [[ -d "$_iap" ]]; then
-            _DSR_BWRAP_ARGS+=(--bind /var/empty "$_iap")
+            # Use --tmpfs to create an empty filesystem at the path (truly inaccessible)
+            _DSR_BWRAP_ARGS+=(--tmpfs "$_iap")
         else
+            # Bind /dev/null over files to make them appear as zero-length
             _DSR_BWRAP_ARGS+=(--bind /dev/null "$_iap")
         fi
-        mkdir -p /var/empty 2>/dev/null || true
         _log_dsr "bwrap: InaccessiblePaths: $_iap"
     done
     # ── StateDirectory/LogsDirectory/RuntimeDirectory ──
@@ -4977,11 +5003,19 @@ CLOSEFDS_C
     fi
 
     # ── Resource limits (Limit*=) via ulimit ──
-    # Process hard limits first (LimitXXX=), then soft limits (LimitXXXSoft=).
-    # ulimit -H sets hard limits, ulimit -S sets soft limits. Soft cannot exceed hard.
+    # SECURITY: Process hard limits (-H) BEFORE soft limits (-S).
+    # Soft limits cannot exceed hard limits, so hard must be set first.
     if [[ ${#LIMITS_RLIMIT[@]} -gt 0 ]]; then
         _log_dsr "Applying resource limits: ${LIMITS_RLIMIT[*]}"
+        # Sort: hard limits (no -soft suffix) first, soft limits second
+        local _sorted_limits=()
         for _rl in "${LIMITS_RLIMIT[@]}"; do
+            [[ "$_rl" != *-soft=* ]] && _sorted_limits+=("$_rl")
+        done
+        for _rl in "${LIMITS_RLIMIT[@]}"; do
+            [[ "$_rl" == *-soft=* ]] && _sorted_limits+=("$_rl")
+        done
+        for _rl in "${_sorted_limits[@]}"; do
             local _rl_name="${_rl%%=*}"
             local _rl_val="${_rl#*=}"
             local _ul_flag="" _ul_hard=false

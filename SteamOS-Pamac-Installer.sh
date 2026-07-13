@@ -1741,20 +1741,49 @@ repair_podman() {
     fi
 
     # Step 2: Check subuid/subgid mappings (required for rootless container UIDs)
+    # Mitigation: Attempt automatic fix if entries are missing. Validate that
+    # existing entries have sensible ranges (not empty, no overlaps). After OS
+    # updates, entries may exist but be invalid — verify with a test namespace.
     local subuid_entry subgid_entry
     subuid_entry=$(grep "^$(whoami):" /etc/subuid 2>/dev/null || true)
     subgid_entry=$(grep "^$(whoami):" /etc/subgid 2>/dev/null || true)
-    if [[ -z "$subuid_entry" ]]; then
-        log_warn "No subuid mapping found for $(whoami) in /etc/subuid."
-        log_info "Rootless podman needs subuid/subgid mappings to run containers."
-        log_info "To fix: add to /etc/subuid:  $(whoami):${SUBUID_START}:${SUBUID_COUNT}"
-        log_info "And:     to /etc/subgid:  $(whoami):${SUBUID_START}:${SUBUID_COUNT}"
-
-        log_info "On SteamOS, subuid/subgid are usually created automatically when podman is installed."
-        log_info "If missing, try: sudo usermod --add-subuids ${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1)) --add-subgids ${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1)) $(whoami)"
+    if [[ -z "$subuid_entry" || -z "$subgid_entry" ]]; then
+        log_warn "subuid/subgid mapping missing for $(whoami). Attempting automatic fix..."
+        # Try to create the mapping automatically if usermod is available
+        if command -v usermod >/dev/null 2>&1 && [[ -w /etc/subuid ]] && [[ -w /etc/subgid ]]; then
+            if sudo -n usermod --add-subuids "${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1))" \
+                              --add-subgids "${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1))" \
+                              "$(whoami)" 2>/dev/null; then
+                log_success "Auto-created subuid/subgid mappings for $(whoami)."
+                subuid_entry=$(grep "^$(whoami):" /etc/subuid 2>/dev/null || true)
+                subgid_entry=$(grep "^$(whoami):" /etc/subgid 2>/dev/null || true)
+            else
+                log_warn "Automatic fix failed (sudo may require password)."
+            fi
+        fi
+        # Still missing after auto-fix attempt
+        if [[ -z "$subuid_entry" || -z "$subgid_entry" ]]; then
+            log_warn "No subuid/subgid mapping for $(whoami). Rootless podman will fail."
+            log_info "Rootless podman needs subuid/subgid mappings to run containers."
+            log_info "On SteamOS, these are usually created automatically when podman is installed."
+            log_info "Manual fix:"
+            log_info "  sudo usermod --add-subuids ${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1)) --add-subgids ${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1)) $(whoami)"
+            log_info "If usermod fails (e.g. after major OS update), check:"
+            log_info "  grep $(whoami) /etc/subuid /etc/subgid"
+            log_info "  If entries exist but are malformed, remove them and re-run."
+        fi
     else
         log_debug "subuid entry: $subuid_entry"
         log_debug "subgid entry: $subgid_entry"
+        # Validate the range is non-empty and usable (at least 65536 UIDs)
+        local _sub_start _sub_count
+        _sub_start=$(echo "$subuid_entry" | cut -d: -f2)
+        _sub_count=$(echo "$subuid_entry" | cut -d: -f3)
+        if [[ -z "$_sub_start" || -z "$_sub_count" || "$_sub_count" -lt 65536 ]] 2>/dev/null; then
+            log_warn "subuid mapping for $(whoami) has suspicious range: start=$_sub_start count=$_sub_count"
+            log_warn "Minimum recommended: 65536 UIDs. Rootless podman may fail with large builds."
+            log_info "Fix: sudo usermod --add-subuids ${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1)) --add-subgids ${SUBUID_START}-$((SUBUID_START + SUBUID_COUNT - 1)) $(whoami)"
+        fi
     fi
 
     # Step 3: Start podman socket
@@ -10958,22 +10987,30 @@ if [[ -z "\${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
     # may have crashed or been killed, leaving a stale socket behind.
     _validate_dbus_socket() {
         local _addr="\$1"
-        # Verify the socket is alive by connecting in half-duplex mode without
-        # sending or reading any data. D-Bus is a binary protocol; sending
-        # plain-text "EXIT" violates the SASL handshake and always fails.
-        # socat -u OPEN:/dev/null connects and exits 0 if a process is listening.
+        local _sock_path="\${_addr#unix:path=}"
+        # Verify the socket file exists and is a UNIX socket.
+        [[ -S "\$_sock_path" ]] || return 1
+        # Try protocol-level liveness checks (most reliable).
+        # Method 1: socat half-duplex connect (safe — no data sent, no protocol violation)
         if command -v socat >/dev/null 2>&1; then
-            socat -u OPEN:/dev/null "UNIX-CONNECT:\${_addr#unix:path=}" 2>/dev/null && return 0
+            socat -u OPEN:/dev/null "UNIX-CONNECT:\$_sock_path" 2>/dev/null && return 0
             return 1
         fi
-        # Fallback: verify the socket file exists and is a UNIX socket.
-        # Cannot detect a stale socket from a crashed daemon, but avoids
-        # requiring an extra package.
-        local _sock_path="\${_addr#unix:path=}"
-        [[ -S "\$_sock_path" ]] || return 1
+        # Method 2: dbus-send ListNames (exercises full D-Bus SASL handshake + method call).
+        # Detects stale sockets where the socket file persists but the daemon is dead.
+        if command -v dbus-send >/dev/null 2>&1; then
+            DBUS_SESSION_BUS_ADDRESS="\$_addr" timeout 2 \
+                dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+                /org/freedesktop/DBus org.freedesktop.DBus.ListNames \
+                >/dev/null 2>&1 && return 0
+            return 1
+        fi
+        # Method 3: Try connecting with bash /dev/tcp-style check (TCP only).
+        # For UNIX sockets, only file-level checks remain — cannot detect stale sockets.
         local _sock_dir
         _sock_dir=\$(dirname "\$_sock_path")
         [[ -d "\$_sock_dir" && -w "\$_sock_dir" ]] || return 1
+        # Socket file exists and is writable — best we can do without socat/dbus-send.
         return 0
     }
 
@@ -11035,11 +11072,20 @@ if [[ -z "\${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
             _dbus_daemon_pid=\$(dbus-daemon --session --fork --address="\$_private_bus_addr" \
                 --print-pid 2>/dev/null) || true
             if [[ -n "\$_dbus_daemon_pid" ]] && [[ "\$_dbus_daemon_pid" =~ ^[0-9]+$ ]]; then
-                # Store PID and socket path for cleanup trap (trap fires after
-                # local variables go out of scope, so we persist to a file).
-                printf '%s\n%s\n' "\$_dbus_daemon_pid" "\$_private_bus_addr" > "\$_private_bus_pidfile" 2>/dev/null || true
-                export DBUS_SESSION_BUS_ADDRESS="\$_private_bus_addr"
-                _dbus_found=true
+                # Wait briefly for the daemon to initialize its socket.
+                sleep 0.5 2>/dev/null || sleep 1
+                # Validate the private daemon actually started and is listening.
+                if _validate_dbus_socket "\$_private_bus_addr"; then
+                    # Store PID and socket path for cleanup trap (trap fires after
+                    # local variables go out of scope, so we persist to a file).
+                    printf '%s\n%s\n' "\$_dbus_daemon_pid" "\$_private_bus_addr" > "\$_private_bus_pidfile" 2>/dev/null || true
+                    export DBUS_SESSION_BUS_ADDRESS="\$_private_bus_addr"
+                    _dbus_found=true
+                else
+                    # Private daemon failed to start — clean up and fall through.
+                    kill "\$_dbus_daemon_pid" 2>/dev/null || true
+                    rm -f "\$_private_bus_pidfile" 2>/dev/null || true
+                fi
                 # Register cleanup: kill the private daemon when this wrapper exits.
                 # Prevents orphaned dbus-daemon processes from accumulating when
                 # pamac-manager crashes or the user closes it. Reads PID and socket

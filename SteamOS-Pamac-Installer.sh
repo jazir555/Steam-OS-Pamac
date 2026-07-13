@@ -6062,7 +6062,10 @@ if ! id "$BUILD_USER" >/dev/null 2>&1; then
                         rm -rf "$_BL_TMP_HOME" 2>/dev/null || true
                     fi
                 }
-                trap _cleanup_builduser EXIT INT TERM
+                trap '
+                    rm -f "$_DSR_FUNCS_FILE" 2>/dev/null
+                    _cleanup_builduser
+                ' EXIT INT TERM
             fi
         fi
         if [[ -z "$BUILD_USER" ]] || ! id "$BUILD_USER" >/dev/null 2>&1; then

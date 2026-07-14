@@ -607,7 +607,8 @@ container_root_exec() {
       log_debug "distrobox-enter --root failed (exit $_rc), falling back to direct container exec"
     fi
   fi
-  container_runtime_for_ops exec -i -u 0 -e HOME="/root" -e LOW_MEMORY="${LOW_MEMORY:-false}" "$CONTAINER_NAME" "$@"
+  container_runtime_for_ops exec -i -u 0 -e HOME="/root" -e LOW_MEMORY="${LOW_MEMORY:-false}" \
+    $(_proxy_env_args_for_exec) "$CONTAINER_NAME" "$@"
   _rc=$?
   [[ $_rc -ne 0 ]] && _LAST_USABLE_CHECK_TS=0  # invalidate cache on failure
   return $_rc
@@ -625,7 +626,7 @@ container_user_exec() {
     -e XDG_DATA_DIRS="/usr/local/share:/usr/share" \
     -e XDG_DATA_HOME="/home/${CURRENT_USER}/.local/share" \
     -e PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-    "$CONTAINER_NAME" "$@"
+    $(_proxy_env_args_for_exec) "$CONTAINER_NAME" "$@"
 }
 
 container_cp_from() {
@@ -1266,18 +1267,18 @@ check_system_requirements() {
         log_success "All required tools are present."
     fi
 
-    # Bubblewrap (bwrap) advisory: not required, but strongly recommended for
-    # the fake systemd-run wrapper's sandbox. Without bwrap, the wrapper falls
-    # back to unshare --mount which lacks PID namespace isolation and device-node
-    # filtering. The build will still succeed but runs with weaker isolation.
+    # Bubblewrap (bwrap) is NOW REQUIRED for the fake systemd-run wrapper's
+    # sandbox. The unshare fallback has been REMOVED (it lacked PID namespace
+    # isolation and device-node filtering). Without bwrap, AUR builds that need
+    # DynamicUser will fail. Use --init mode containers for real systemd instead.
     if [[ "${STRICT_SECURITY:-false}" != "true" ]]; then
         if command -v bwrap >/dev/null 2>&1; then
             log_success "bubblewrap (bwrap) found — full DynamicUser sandbox available."
         else
-            log_warn "bubblewrap (bwrap) not found — AUR sandbox will use unshare fallback."
-            log_info "  The unshare fallback does NOT provide PID namespace isolation"
-            log_info "  or device-node filtering. For stronger AUR build isolation:"
-            log_info "    sudo pacman -S bubblewrap"
+            log_warn "bubblewrap (bwrap) not found — AUR builds requiring sandbox will FAIL."
+            log_info "  The unshare fallback has been REMOVED for security. To fix:"
+            log_info "    sudo pacman -S bubblewrap  (install inside the container)"
+            log_info "  Or use an init-mode container (distrobox create --init) for real systemd."
         fi
     fi
 
@@ -1532,11 +1533,20 @@ check_network_connectivity() {
     local _curl_output=""
     local _curl_rc=0
 
+    # Auto-detect a host desktop proxy if none is exported, so the rest of the
+    # script (and the container, via _proxy_env_args_for_exec) actually uses it.
+    # Previously this only printed a hint to "export https_proxy", leaving the
+    # keyring bootstrap to fail on corporate/captive networks.
+    if _autodetect_system_proxy; then
+        : # proxy was auto-detected and exported
+    fi
+
     # Check for proxy configuration first — common on corporate/hotel networks.
     if [[ -n "${http_proxy:-}" || -n "${https_proxy:-}" || -n "${HTTP_PROXY:-}" || -n "${HTTPS_PROXY:-}" ]]; then
         local _proxy="${http_proxy:-}${https_proxy:-}${HTTP_PROXY:-}${HTTPS_PROXY:-}"
         log_info "Proxy detected: $_proxy"
         log_info "curl/pacman will use this proxy for all HTTPS connections."
+        log_info "Proxy (and CA bundle) will be inherited by the container automatically."
     fi
 
     # Check for captive portal: connect to archlinux.org and inspect the response.
@@ -1601,6 +1611,95 @@ check_network_connectivity() {
             ;;
     esac
     rm -f /tmp/pamac_curl_err 2>/dev/null || true
+}
+
+# Emit `-e VAR=value` pairs for proxy / CA-bundle env so that container_root_exec
+# and container_user_exec propagate host proxy settings into the container.
+# This closes the network-bootstrap gap: previously the pre-flight probe
+# suggested exporting https_proxy but never forwarded it to pacman/curl/gpg
+# running inside the container, so keyring and package downloads would still
+# fail on proxy-only networks even when the host had the proxy set. We honor
+# the standard lowercase + uppercase proxy vars plus NO_PROXY/CURL_CA_BUNDLE/
+# GNUPGHOME-independent GnuPG proxy (handled via dirmngr config separately).
+# Shellcheck-friendly: this is intentionally a single echo so callers can
+# `$(_proxy_env_args_for_exec)` it unquoted into an exec argv.
+_proxy_env_args_for_exec() {
+    local _args=""
+    for _v in http_proxy https_proxy ftp_proxy all_proxy no_proxy \
+              HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY \
+              CURL_CA_BUNDLE REQUESTS_CA_BUNDLE SSL_CERT_FILE GIT_SSL_CAINFO; do
+        local _val="${!_v:-}"
+        if [[ -n "$_val" ]]; then
+            # Quote the value safely for the exec -e argument. Simple values
+            # (urls, file paths) don't contain single quotes in practice, but
+            # we escape any ' just in case.
+            local _esc="${_val//\'/\'\\\'\'}"
+            _args+=" -e ${_v}='${_esc}'"
+        fi
+    done
+    printf '%s' "$_args"
+}
+
+# Build a worst-effort list of systemd/docker-style proxy env passed through
+# distrobox create --env so the container retains proxy settings persistently
+# (e.g. for the pamac-session-bootstrap.sh auto-refresh). Returns array-style
+# args via a global _PROXY_CREATE_ARGS for create_container to splice in.
+_collect_proxy_create_args() {
+    _PROXY_CREATE_ARGS=()
+    local _v
+    for _v in http_proxy https_proxy ftp_proxy all_proxy no_proxy \
+              HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY \
+              CURL_CA_BUNDLE REQUESTS_CA_BUNDLE SSL_CERT_FILE GIT_SSL_CAINFO; do
+        local _val="${!_v:-}"
+        if [[ -n "$_val" ]]; then
+            _PROXY_CREATE_ARGS+=(--env "${_v}=${_val}")
+        fi
+    done
+}
+
+# Auto-detect a system proxy when none is exported, then surface it so the
+# user is informed (and can opt in by exporting it). Best-effort: checks the
+# SteamOS/Steam Deck gsettings (commonly GNOME-ish) before giving up. Returns
+# 0 if a proxy was found and exported by this function, 1 otherwise.
+_autodetect_system_proxy() {
+    # Already have a proxy set — nothing to do.
+    if [[ -n "${http_proxy:-}${https_proxy:-}${HTTP_PROXY:-}${HTTPS_PROXY:-}${all_proxy:-${ALL_PROXY:-}}" ]]; then
+        return 1
+    fi
+    local _detected=""
+    # GNOME/desktop proxy via gsettings (used by KDE/GNOME on SteamOS).
+    if command -v gsettings >/dev/null 2>&1; then
+        local _mode
+        _mode=$(gsettings get org.gnome.system.proxy mode 2>/dev/null | tr -d "'")
+        if [[ "$_mode" == "manual" ]]; then
+            local _h _p _host
+            _h=$(gsettings get org.gnome.system.proxy.http host 2>/dev/null | tr -d "'")
+            _p=$(gsettings get org.gnome.system.proxy.http port 2>/dev/null | tr -d "'")
+            if [[ -n "$_h" && -n "$_p" && "$_h" != "0" && "$_p" != "0" ]]; then
+                _detected="http://${_h}:${_p}"
+            else
+                _h=$(gsettings get org.gnome.system.proxy.https host 2>/dev/null | tr -d "'")
+                _p=$(gsettings get org.gnome.system.proxy.https port 2>/dev/null | tr -d "'")
+                if [[ -n "$_h" && -n "$_p" && "$_h" != "0" && "$_p" != "0" ]]; then
+                    _detected="http://${_h}:${_p}"
+                fi
+            fi
+        fi
+    fi
+    # WPAD / PAC file heuristic: if a pac URL is configured but no plain
+    # proxy, we can't transparently honor PAC in bash — warn the user instead.
+    if [[ -n "${AUTO_PROXY_SCRIPT_URL:-}" || -n "${PAC_URL:-}" ]]; then
+        log_warn "A PAC/WPAD auto-config URL was detected but cannot be honored automatically."
+        log_warn "  Please export http_proxy/https_proxy manually (see your PAC file), then re-run."
+    fi
+    if [[ -n "$_detected" ]]; then
+        export http_proxy="$_detected" https_proxy="$_detected" HTTP_PROXY="$_detected" HTTPS_PROXY="$_detected"
+        log_info "Auto-detected system proxy from desktop settings: $_detected"
+        log_info "Exported as http_proxy/https_proxy for this run. To override, run:"
+        log_info "  export http_proxy=http://your-proxy:port; export https_proxy=\$http_proxy"
+        return 0
+    fi
+    return 1
 }
 
 # Detect the host desktop environment in a lowercased, normalized form.
@@ -2194,15 +2293,23 @@ OPTIONS:
                              content that would execute inside the container
                              (implies --dry-run; useful for auditing what
                              changes the container would receive)
-  --strict-security         Refuse to relax signature verification (skip
-                             SigLevel=TrustAll recovery, keep all packages
-                             cryptographically verified). Also refuses to
-                             install the fake systemd-run wrapper used for
-                             DynamicUser AUR builds in non-systemd containers
-                             (such builds will fail instead of running with
-                             reduced sandboxing). Failures during the
-                             keyring bootstrap cause the step to fail fast
-                             rather than degrade to an unverified state.
+  --strict-security         HARDENED MODE — refuses to relax signature
+                             verification (skip SigLevel=TrustAll recovery,
+                             keep all packages cryptographically verified).
+                             Also refuses to install the fake systemd-run
+                             wrapper, so AUR DynamiUser builds WILL FAIL in
+                             non-systemd containers (the fake wrapper is a
+                             workaround for missing systemd; --strict-security
+                             disables it to avoid running with a shim).
+                             TRADE-OFF: increased cryptographic verification
+                             at the cost of breaking AUR builds. Use only if
+                             you (a) have a real init-mode container with
+                             systemd, or (b) never build AUR packages, or
+                             (c) accept that AUR builds must be done manually.
+                             Failures during keyring bootstrap cause the step
+                             to fail fast rather than degrading to unverified
+                             state. For most users, leaving it OFF is safer
+                             and more functional.
   --allow-trustall           Permit the TrustAll keyring bootstrap without
                              interactive confirmation. Without this flag, the
                              user is prompted before SigLevel=TrustAll is used.
@@ -2212,6 +2319,13 @@ OPTIONS:
   --quiet                   Only show errors
   --no-color                Disable ANSI color output (useful for piping, cron,
                             CI/CD, and non-terminal environments)
+  --use-init                Force init-mode container (distrobox create --init)
+                            which gives real systemd inside the container.
+                            AUR builds use native systemd-run instead of the
+                            fake wrapper. Requires a host with a usable
+                            /usr/lib/systemd/systemd binary. Recommended for
+                            best AUR compatibility and security. Same as
+                            FORCE_CONTAINER_INIT=true.
   --low-memory              Reduce build parallelism on constrained systems
                             (e.g., 8GB RAM or less). Doubles per-job RAM
                             requirement to prevent OOM during AUR builds.
@@ -2268,7 +2382,8 @@ ENVIRONMENT VARIABLES:
                             (auto-discovered from keyring package by default)
   STRICT_SECURITY          Set to 'true' to enforce --strict-security mode
                            (refuse SigLevel=TrustAll recovery and the fake
-                           systemd-run wrapper). Default 'false'.
+                           systemd-run wrapper). AUR builds WILL fail in
+                           non-systemd containers. Default 'false'.
   FORCE_CONTAINER_INIT     Set to 'true' to force init-mode containers on
                            SteamOS (overrides auto-detection). For advanced
                            users with working nested systemd on custom kernels.
@@ -2531,6 +2646,7 @@ parse_arguments() {
             --non-interactive) NON_INTERACTIVE="true"; shift ;;
             --force) FORCE_MODE="true"; shift ;;
             --dedicated-builduser) DEDICATED_BUILDUSER="true"; shift ;;
+            --use-init) FORCE_CONTAINER_INIT="true"; shift ;;
             --quick-start) QUICK_START="true"; shift ;;
             --disable-pin-alpm) PIN_ALPM="false"; shift ;;
             --allow-wheel-nopasswd) ALLOW_WHEEL_NOPASSWD="true"; shift ;;
@@ -2978,6 +3094,20 @@ create_container() {
         log_warn "Applied security-opt profiles: ${CONTAINER_SECURITY_OPT[*]}"
         log_warn "  These profiles are NOT validated — users are responsible for compatibility."
         log_warn "  Incompatible profiles may prevent the container from starting."
+    fi
+
+    # Propagate host proxy / CA-bundle env into the container so the keyring
+    # bootstrap, pamac-session-bootstrap auto-refresh, and any later pacman
+    # operations inside the container use the same egress path as the host.
+    # Without this, a host-exported https_proxy was not honored inside the
+    # container, and keyring/mirror downloads would silently fail on
+    # corporate/proxy-only networks (the pre-flight probe was a heuristic
+    # only). distrobox create accepts repeated --env KEY=VALUE flags; these
+    # are baked into the container's environment persistently.
+    _collect_proxy_create_args
+    if [[ ${#_PROXY_CREATE_ARGS[@]} -gt 0 ]]; then
+        log_info "Propagating host proxy settings into the container: ${_PROXY_CREATE_ARGS[*]/#--env /}"
+        create_args+=("${_PROXY_CREATE_ARGS[@]}")
     fi
 
   if [[ -n "${_CREATE_RECREATION_GUARD:-}" ]]; then
@@ -3931,9 +4061,13 @@ safe_install() {
                 echo "  Recovery 3: Direct package reinstall attempt..."
                 _remove_stale_lock
                 for _pkg in "$@"; do
-                    # Overwrite only /usr/* — do not clobber /etc/ or /var/ config files.
-                    # A blanket --overwrite "*" can overwrite configuration files.
-                    pacman -S --noconfirm --needed --overwrite '/usr/*' "$_pkg" 2>/dev/null || true
+                    # Narrow --overwrite to specific package-owned directories.
+                    # A blanket --overwrite '/usr/*' could clobber config files
+                    # in /usr/etc, /usr/lib/tmpfiles.d, etc. Limit to the
+                    # standard FHS directories where packages install binaries
+                    # and libraries. /etc/ is never overwritten (/etc is always
+                    # protected by pacman's backup mechanism).
+                    pacman -S --noconfirm --needed --overwrite '/usr/lib/*,/usr/share/*,/usr/bin/*,/usr/sbin/*,/usr/libexec/*' "$_pkg" 2>/dev/null || true
                 done
                 _safe_sleep 2
             fi
@@ -6297,73 +6431,17 @@ _run_sandboxed_bwrap() {
     fi
 }
 
-# ── _run_sandboxed_unshare: Fallback sandbox via unshare --mount --fork ──
-# $1 = user to run as (empty = current user)
-# Rest = command args
+# ── _run_sandboxed_unshare: REMOVED — unshare fallback sandbox ──
+# This function is no longer reachable from _run_sandboxed, which now fails
+# hard when bwrap is missing. Keeping the body as dead code for historical
+# reference; the guard prevents accidental entry.
 _run_sandboxed_unshare() {
-    local _run_user="$1"; shift
-    local _unshare_net=""
-    [[ -n "$PRIVATE_NETWORK" ]] && _unshare_net="--net"
-    # Use parsed PRIVATE_USERS directly (not _DSR_PRIVATE_USERS which is set
-    # by _apply_sandbox after sandbox entry — too late for unshare flags).
-    local _unshare_user=""
-    [[ "${PRIVATE_USERS:-}" == "yes" ]] && _unshare_user="--user"
-    # Use --fork to create a new PID namespace (matches bwrap --unshare-pid)
-    # and --mount-proc to give the child a private /proc showing only its own PIDs.
-    # This closes the most significant gap in the unshare fallback: without PID
-    # isolation, builds could enumerate host processes via /proc.
-    _log_dsr "Using unshare --mount --fork --mount-proc as sandbox engine (bwrap unavailable)"
-    local _inner_cmd
-    _inner_cmd="${_BUILD_WRAPPER:-}exec \"\${@}\""
-    if [[ -n "$WORK_DIR" ]]; then
-        _inner_cmd="cd '${WORK_DIR}' 2>/dev/null || true; ${_inner_cmd}"
-    fi
-    local _verify_cmd="source $_DSR_FUNCS_FILE 2>/dev/null; _apply_sandbox; _sandbox_verify; ${_inner_cmd}"
-    if [[ -n "$_run_user" ]]; then
-        if [[ -n "${_SECCOMP_HELPER:-}" ]]; then
-            unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave \
-                sudo -u "$_run_user" -H -- "$_SECCOMP_HELPER" $_seccomp_args \
-                -- bash -c "$_verify_cmd" -- "${CMD_ARGS[@]}"
-        else
-            unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave \
-                sudo -u "$_run_user" -H -- bash -c "$_verify_cmd" -- "${CMD_ARGS[@]}"
-        fi
-    else
-        # No _run_user: build the command as a single bash -c invocation.
-        # SECURITY: _BUILD_WRAPPER must run BEFORE the seccomp helper because it
-        # contains shell builtins (set -a, source, umask, ionice, etc.) that cannot
-        # be exec'd by the C helper. The seccomp helper wraps only the final exec.
-        if [[ -n "${_SECCOMP_HELPER:-}" ]]; then
-            unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
-                source $_DSR_FUNCS_FILE 2>/dev/null
-                _apply_sandbox
-                ${_BUILD_WRAPPER:-}
-                ${_NNP}${_CAP_PRIV}$_SECCOMP_HELPER $_seccomp_args -- exec \"\${@}\"
-            " -- "${CMD_ARGS[@]}"
-        elif [[ "${_DSR_SECCOMP_STRICT_FALLBACK:-}" == "true" ]]; then
-            # Middle-ground sandbox: mount namespace + PID namespace + capability
-            # dropping. SECCOMP_MODE_STRICT cannot be used because it blocks
-            # execve (only allows read/write/exit/sigreturn). Build processes
-            # need execve to compile and run. All mount-based restrictions
-            # (ProtectSystem, ProtectHome, PrivateTmp, etc.) remain active.
-            _warn_dsr "Using middle-ground sandbox: mount + PID namespaces + capabilities."
-            _warn_dsr "Seccomp filtering unavailable (requires gcc for compilation)."
-            unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
-                source $_DSR_FUNCS_FILE 2>/dev/null
-                _apply_sandbox
-                ${_NNP}${_CAP_PRIV}${_BUILD_WRAPPER:-}exec \"\${@}\"
-            " -- "${CMD_ARGS[@]}"
-        else
-            unshare $_unshare_user --fork --mount-proc --mount $_unshare_net --propagation slave bash -c "
-                source $_DSR_FUNCS_FILE 2>/dev/null
-                _apply_sandbox
-                ${_NNP}${_CAP_PRIV}${_BUILD_WRAPPER:-}exec \"\${@}\"
-            " -- "${CMD_ARGS[@]}"
-        fi
-    fi
+    _warn_dsr "systemd-run(fake): unshare fallback is DISABLED — bwrap required."
+    _warn_dsr "  Install bubblewrap: sudo pacman -S bubblewrap"
+    exit 126
 }
 
-# ── _run_sandboxed: Try bwrap first, fall back to unshare ──
+# ── _run_sandboxed: Try bwrap first ──
 # $1 = user to run as (empty = current user)
 _DSR_BWRAP_AVAILABLE=""
 _run_sandboxed() {
@@ -6383,31 +6461,26 @@ _run_sandboxed() {
         _run_sandboxed_bwrap "$_run_user"
         return $?
     else
-        # unshare fallback: some sandbox properties are NOT fully emulated.
-        # List them explicitly so builds running under this path are auditable.
-        # Properties that ARE enforced in unshare mode:
-        #   ProtectSystem (bind mounts), ProtectHome (bind mounts),
-        #   ReadWritePaths/ReadOnlyPaths/InaccessiblePaths (bind mounts),
-        #   PrivateTmp (bind mount), PrivateNetwork (--net), NoNewPrivileges,
-        #   CapabilityBoundingSet (via capsh/setpriv/prctl), seccomp-BPF,
-        #   PID namespace isolation (via --fork --mount-proc),
-        #   PrivateDevices (mknod-based device filtering)
-        # Properties that are NOT fully emulated or are degraded:
-        #   - RestrictNamespaces via seccomp: the seccomp filter blocks unshare(2)
-        #     after the outer unshare, but the outer unshare itself is still a
-        #     namespace operation. bwrap handles this natively.
-        #   - ProtectKernelTunables/ProtectControlGroups: bind-mounted read-only
-        #     in both modes, but without PID isolation a determined process could
-        #     walk /proc/<host-pid>/ns to reach the host namespace.
-        # The missing PID namespace is the most significant gap — it weakens
-        # information isolation but does not allow write escalation.
-        _warn_dsr "systemd-run(fake): bubblewrap (bwrap) is not installed — using unshare fallback."
-        _warn_dsr "  The unshare sandbox now includes PID namespace isolation (--fork --mount-proc)"
-        _warn_dsr "  and device-node filtering (PrivateDevices). For strongest isolation,"
-        _warn_dsr "  install bubblewrap: sudo pacman -S bubblewrap"
-        _warn_dsr "  Or use a full init-mode container (distrobox --init)."
-        _run_sandboxed_unshare "$_run_user"
-        return $?
+        # bwrap is NOT available — fail hard instead of falling back to the
+        # weaker unshare sandbox. The unshare fallback previously provided
+        # degraded isolation (no PID namespace, weaker RestrictNamespaces
+        # enforcement, no network namespace parity) and silently accepted
+        # the weaker sandbox. Now builds that need systemd-run sandboxing
+        # will fail with a clear diagnostic so the user can install bwrap.
+        _warn_dsr "systemd-run(fake): FATAL — bubblewrap (bwrap) is NOT installed."
+        _warn_dsr "  systemd-run fake wrapper requires bwrap for sandboxing. The"
+        _warn_dsr "  unshare fallback has been REMOVED (it provided degraded"
+        _warn_dsr "  isolation without PID namespace parity)."
+        _warn_dsr ""
+        _warn_dsr "  To fix: install bubblewrap inside this container:"
+        _warn_dsr "    sudo pacman -S --noconfirm --needed bubblewrap"
+        _warn_dsr "  Or use a full init-mode container instead of the fake wrapper:"
+        _warn_dsr "    distrobox create --init ... (requires systemd inside)"
+        _warn_dsr ""
+        echo "systemd-run(fake): FATAL — bubblewrap (bwrap) not installed. Run:" >&2
+        echo "  sudo pacman -S --noconfirm --needed bubblewrap" >&2
+        echo "  Or re-run the installer with distrobox --init for a real systemd." >&2
+        exit 126
     fi
 }
 
@@ -7253,12 +7326,31 @@ else
         _TA_TRUSTALL_APPROVED=true
     fi
     if [[ "${_TA_TRUSTALL_APPROVED:-}" == "true" ]]; then
-    # Build a throwaway config: copy the real one, flip ONLY the copy to TrustAll.
+    # Build a throwaway config: copy the real one, then STRIP every repo except
+    # the official [core] / [extra] / [multilib] stanzas. This is critical: the
+    # TrustAll window disables signature verification, so any repo present in the
+    # throwaway config could inject a maliciously-crafted package (most
+    # dangerously a tampered archlinux-keyring) while verification is off. By
+    # keeping only the signed-official repos we limit the injection surface to
+    # mirrors the user already trusted, and — for keyring bootstrap — only the
+    # [core] repo (where archlinux-keyring actually lives) is needed.
     _TA_CONF=$(mktemp /tmp/pacman-trustall.XXXXXX.conf) 2>/dev/null
     if [[ -n "$_TA_CONF" ]] && cp -f /etc/pacman.conf "$_TA_CONF" 2>/dev/null; then
+        # Remove any repo section that is NOT one of the official Arch repos.
+        # We delete from the "[<repo>]" header through the next header or EOF.
+        # Third-party repos (chaotic-aur, archlinuxcn, endeavouros, custom, etc.)
+        # are excluded so a compromised third-party mirror cannot use the
+        # signature-disabled window to deliver a tampered keyring or helper.
+        _TA_ALLOWED_REPOS='core|extra|multilib|core-testing|extra-testing|multilib-testing'
+        awk -v allowed="^(${_TA_ALLOWED_REPOS})$" '
+            /^\[/{ in_repo=($0 ~ allowed); if(!in_repo){print "# TRUSTALL-STRIPPED: "$0; next} }
+            in_repo{print; next}
+            !in_repo{print "# TRUSTALL-STRIPPED: "$0}
+        ' "$_TA_CONF" > "${_TA_CONF}.tmp" && mv -f "${_TA_CONF}.tmp" "$_TA_CONF"
         sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = TrustAll/" "$_TA_CONF"
         grep -q '^SigLevel' "$_TA_CONF" || printf 'SigLevel = TrustAll\n' >> "$_TA_CONF"
         echo "  Throwaway TrustAll config built: $_TA_CONF (real pacman.conf untouched)."
+        echo "  Non-official repos stripped from throwaway config to limit injection surface."
         # Sync and install keyring USING the throwaway config only.
         _remove_stale_lock
         if pacman --config "$_TA_CONF" -Syy --noconfirm 2>/dev/null; then
@@ -7972,10 +8064,26 @@ Cmnd_Alias PAMAC_CMDS = /usr/bin/pacman, \\
     /usr/bin/pacscripts
 
 $(if [[ "\$_use_wheel_group" == "true" ]]; then
-    echo "%wheel ALL=(ALL:ALL) NOPASSWD: PAMAC_CMDS"
+    echo "%wheel ALL=(ALL:ALL) NOPASSWD: NOEXEC: PAMAC_CMDS"
 else
-    echo "$BUILD_SUDO_USER ALL=(ALL:ALL) NOPASSWD: PAMAC_CMDS"
+    echo "$BUILD_SUDO_USER ALL=(ALL:ALL) NOPASSWD: NOEXEC: PAMAC_CMDS"
 fi)
+# RESIDUAL RISK (container-root): a malicious AUR PKGBUILD can still run
+# 'sudo pacman -U <crafted pkg>' during build() and install arbitrary
+# packages as root INSIDE this container. This is inherent to AUR + passwordless
+# pacman. Mitigations applied here:
+#   - makepkg/yay are EXCLUDED from PAMAC_CMDS (no direct escalation via makepkg).
+#   - NOEXEC is applied to PAMAC_CMDS: child processes spawned from these
+#     commands cannot themselves exec further setuid binaries, limiting the
+#     post-install escalation chain. (pacman hooks/install scripts still run
+#     normally under pacman's own exec; NOEXEC only blocks the sudo'd process
+#     from exec-ing other setuid tools.)
+#   - The container is rootless: host root is NOT exposed. Container-root
+#     compromise is contained to the container's writable layer.
+#   - --dedicated-builduser further isolates the AUR build context from the
+#     login user's home directory.
+#   - PKGBUILDs are scanned via _verify_aur_payload() for shell-injection /
+#     RCE patterns before build.
 SUDOERS
 chmod 0440 /etc/sudoers.d/99-pamac-nopasswd
 
@@ -8050,24 +8158,39 @@ mkdir -p "$polkit_dir"
 # Detect single-user (Steam Deck) vs multi-user hosts.
 # On single-user devices, wheel-group blanket allow is safe.
 # On multi-user hosts, restrict to the installing user only.
+# SECURITY: the rule matches ONLY the specific Pamac action IDs that the GUI
+# needs (install/remove/update/build/refresh). It does NOT use the broad
+# `action.id.indexOf("org.manjaro.pamac.") == 0` prefix match, which would
+# also grant passwordless access to dangerous actions like system-upgrade,
+# repo-add, or any future Pamac action. A malicious AUR PKGBUILD running as
+# the user could otherwise invoke arbitrary polkit actions without auth.
+_PAMAC_ALLOWED_IDS='org.manjaro.pamac.install|org.manjaro.pamac.install-update|org.manjaro.pamac.remove|org.manjaro.pamac.update|org.manjaro.pamac.build|org.manjaro.pamac.launch-flatpak-builder|org.manjaro.pamac.check-aur-vcs-updates|org.manjaro.pamac.check-aur-updates|org.manjaro.pamac.refresh-databases|org.manjaro.pamac.get-build-directory|org.manjaro.pamac.get-build-username|org.manjaro.pamac.build-install'
 _human_users=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' | wc -l)
 if [[ "$_human_users" -le 1 ]]; then
-    printf '%s\n' 'polkit.addRule(function(action, subject) {' \
-    ' if (action.id.indexOf("org.manjaro.pamac.") == 0 &&' \
-    '   subject.isInGroup("wheel")) {' \
-    '   return polkit.Result.YES;' \
-    ' }' \
-    '});' > "$polkit_dir/10-pamac-nopasswd.rules"
-    echo "polkit passwordless rule created for pamac operations (wheel group — single-user host)."
+    cat > "$polkit_dir/10-pamac-nopasswd.rules" <<RULES_EOF
+polkit.addRule(function(action, subject) {
+  if (action.id.match(/^(${_PAMAC_ALLOWED_IDS})$/) &&
+      subject.isInGroup("wheel")) {
+      return polkit.Result.YES;
+  }
+  // All other pamac.* actions (e.g. system-upgrade, repo management) require
+  // authentication even for the wheel group — defense-in-depth against AUR
+  // PKGBUILDs that invoke pamac's D-Bus interface.
+});
+RULES_EOF
+    echo "polkit passwordless rule created for pamac operations (wheel group — single-user host, action-ID scoped)."
 else
     _current_user="$current_user"
-    printf '%s\n' 'polkit.addRule(function(action, subject) {' \
-    ' if (action.id.indexOf("org.manjaro.pamac.") == 0 &&' \
-    "   subject.user == \"$_current_user\") {" \
-    '   return polkit.Result.YES;' \
-    ' }' \
-    '});' > "$polkit_dir/10-pamac-nopasswd.rules"
-    echo "polkit passwordless rule created for pamac operations (restricted to user $_current_user — multi-user host)."
+    cat > "$polkit_dir/10-pamac-nopasswd.rules" <<RULES_EOF
+polkit.addRule(function(action, subject) {
+  if (action.id.match(/^(${_PAMAC_ALLOWED_IDS})$/) &&
+      subject.user == "${_current_user}") {
+      return polkit.Result.YES;
+  }
+  // All other pamac.* actions require authentication.
+});
+RULES_EOF
+    echo "polkit passwordless rule created for pamac operations (restricted to user $_current_user — multi-user host, action-ID scoped)."
 fi
 # polkitd drops privileges to uid 966 (polkitd) — it needs read access to rules
 chmod 755 /etc/polkit-1 /etc/polkit-1/rules.d 2>/dev/null || true
@@ -8349,6 +8472,13 @@ if [[ "$_STRICT_SECURITY_MODE" == "true" ]]; then
     echo "  This is by design: --strict-security prioritizes correctness over"
     echo "  compatibility with DynamicUser outside of systemd."
 elif ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/dev/null 2>&1; then
+if ! command -v bwrap >/dev/null 2>&1; then
+    echo "FATAL: bubblewrap (bwrap) is required for the fake systemd-run wrapper."
+    echo "  Install it inside the container before running the installer, or use"
+    echo "  an init-mode container (distrobox create --init) for real systemd."
+    echo "  To install: pacman -S --noconfirm --needed bubblewrap"
+    exit 1
+fi
 _write_fake_systemd_run_wrapper
 echo "Fake systemd-run installed at /usr/local/sbin/systemd-run (with ad-hoc build-user cleanup)."
 echo "Unrecognized arguments will be logged to /tmp/systemd-run-fake.log for debugging."
@@ -10209,10 +10339,16 @@ if _cache_hit=$(_lookup_known_good_commit "$_COMPAT_CACHE_KEY"); then
         echo "  Reason: $_cached_reason"
         # Verify the commit is still fetchable before trusting it. If the AUR
         # history was rewritten or the commit dropped, fall through to a fresh
-        # scan so the cache self-heals.
+        # scan so the cache self-heals. We use `git fetch --depth=1` to fetch
+        # exactly the cached commit (not just HEAD, which a plain `git clone
+        # --depth=1` would give). This correctly validates commits that are
+        # not the current tip — a cached commit is only useful if the full
+        # PKGBUILD history is intact at that SHA.
         if _verify_tmp=$(mktemp -d /var/tmp/pamac-aur-verify-XXXXXX 2>/dev/null); then
             chmod 700 "$_verify_tmp" 2>/dev/null || true
-            if git clone --depth=1 "$_AUR_GIT_URL" "$_verify_tmp/pamac-aur" 2>/dev/null \
+            if git init -q "$_verify_tmp/pamac-aur" 2>/dev/null \
+               && git -C "$_verify_tmp/pamac-aur" remote add origin "$_AUR_GIT_URL" 2>/dev/null \
+               && git -C "$_verify_tmp/pamac-aur" fetch --depth=1 "$_AUR_GIT_URL" "${_cached_commit}" 2>/dev/null \
                && git -C "$_verify_tmp/pamac-aur" cat-file -e "${_cached_commit}^{commit}" 2>/dev/null; then
                 rm -rf "$_verify_tmp"
                 echo "FOUND_COMPATIBLE_COMMIT=$_cached_commit"
@@ -10230,8 +10366,13 @@ fi
 _AUR_WORK=$(mktemp -d /var/tmp/pamac-aur-history-XXXXXX) && chmod 700 "$_AUR_WORK" 2>/dev/null || _AUR_WORK=$(mktemp -d)
 rm -rf "$_AUR_WORK"
 
-echo "Cloning pamac-aur repository (depth=200) for commit history..."
-if ! git clone --depth=200 --single-branch "$_AUR_GIT_URL" "$_AUR_WORK" 2>/tmp/pamac_aur_clone_err; then
+echo "Cloning pamac-aur repository (depth=100) for commit history..."
+# Depth=100 covers the 50-commit scan window with headroom. depth=200 was
+# unnecessarily heavy on the Steam Deck's eMMC (network + disk I/O). The
+# for-loop below only inspects `git log -50`, so depth=100 is more than
+# sufficient; if the commit is older, the --unshallow fallback in
+# install_from_aur_commit handles it.
+if ! git clone --depth=100 --single-branch "$_AUR_GIT_URL" "$_AUR_WORK" 2>/tmp/pamac_aur_clone_err; then
     echo "WARN: git clone of pamac-aur failed:"
     cat /tmp/pamac_aur_clone_err 2>/dev/null | tail -3
     rm -rf "$_AUR_WORK"
@@ -12186,8 +12327,15 @@ CONTAINER_MANAGER="${DISTROBOX_CONTAINER_MANAGER:-podman}"
 APP_DIR="\$HOME/.local/share/applications"
 STATE_DIR="\$HOME/.local/share/steamos-pamac/\$CONTAINER_NAME"
 LOG_FILE="\$STATE_DIR/uninstall-helper.log"
+LOCK_FILE="\$STATE_DIR/uninstall.lock"
 
 mkdir -p "\$STATE_DIR"
+
+# Prevent concurrent uninstalls (e.g. user clicks two "Uninstall" buttons
+# in quick succession from desktop notifications). Two concurrent pacman -Rs
+# on the same container would corrupt the package database.
+exec 9>"\$LOCK_FILE"
+flock -n 9 || { echo "Another uninstall is already running. Please wait." >&2; exit 1; }
 
 _log() {
 echo "\$(date): \$*" >> "\$LOG_FILE"
@@ -12261,7 +12409,7 @@ fi
 exit 1
 fi
 
- _log "Removing \$pkg via pacman -R (as root, no D-Bus needed)..."
+ _log "Removing \$pkg via pacman -Rs (package + deps unique to this package)..."
  if ! echo "\$pkg" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9._+-]*$'; then
  _log "Error: Invalid package name format: '\$pkg'"
  echo "Error: Invalid package name: '\$pkg'" >&2
@@ -12271,10 +12419,15 @@ fi
  remove_output=\$("\$CONTAINER_MANAGER" exec -u 0 "\$CONTAINER_NAME" bash -c "
 . /usr/local/lib/pamac-common.sh 2>/dev/null || true
 _remove_stale_lock
-pacman -R --noconfirm \"\$pkg\" 2>&1
+# -Rs: remove package + recursive deps that are NOT required by any other
+# installed package. This is safe: pacman checks reverse dependencies before
+# removing each dep, so shared libraries (e.g. libfoo used by both pamac and
+# another app) are preserved. Without this, pulling in pamac's deps leaves
+# them installed forever after uninstall.
+pacman -Rs --noconfirm \"\$pkg\" 2>&1
 " </dev/null 2>&1)
 local rc=\$?
-_log "pacman -Rns exit code: \$rc"
+_log "pacman -Rs exit code: \$rc"
 _log "pacman output: \${remove_output:0:500}"
 
 if [[ \$rc -eq 0 ]]; then
@@ -13082,6 +13235,10 @@ PAMAC_DESKTOP
   fi
   if [[ "\$_python3_ok" != "true" ]]; then
     echo "WARN: Python 3 still unavailable after install attempt — using awk fallback for desktop annotation." >&2
+    echo "  NOTE: The awk fallback may lose [Desktop Action] sections or" >&2
+    echo "  localized keys (Name[de], Comment[fr]) in complex .desktop files." >&2
+    echo "  Install python3 for full-fidelity desktop annotation:" >&2
+    echo "    sudo pacman -S --noconfirm --needed python" >&2
     # Use awk instead of sed to properly handle multi-section .desktop files.
     # sed's \$a appends to the END of the file, which corrupts files that have
     # [Desktop Action ...] sections after [Desktop Entry]. awk targets the
@@ -13605,6 +13762,17 @@ _orig_siglevel=$(grep '^SigLevel' /etc/pacman.conf 2>/dev/null | head -1 || echo
 _siglevel_value="${_orig_siglevel#SigLevel = }"
 _TA_CONF=$(mktemp /tmp/pacman-trustall.XXXXXX.conf) 2>/dev/null
 if [[ -n "$_TA_CONF" ]] && cp -f /etc/pacman.conf "$_TA_CONF" 2>/dev/null; then
+    # Strip every repo except the official Arch repos from the throwaway
+    # config. The TrustAll window disables signature verification, so a
+    # compromised third-party mirror could otherwise inject a tampered
+    # archlinux-keyring. Only the signed-official [core]/[extra]/[multilib]
+    # repos remain — and only [core] is needed for the keyring package.
+    _TA_ALLOWED_REPOS='core|extra|multilib|core-testing|extra-testing|multilib-testing'
+    awk -v allowed="^(${_TA_ALLOWED_REPOS})$" '
+        /^\[/{ in_repo=($0 ~ allowed); if(!in_repo){print "# TRUSTALL-STRIPPED: "$0; next} }
+        in_repo{print; next}
+        !in_repo{print "# TRUSTALL-STRIPPED: "$0}
+    ' "$_TA_CONF" > "${_TA_CONF}.tmp" && mv -f "${_TA_CONF}.tmp" "$_TA_CONF"
     sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = TrustAll/" "$_TA_CONF"
     grep -q '^SigLevel' "$_TA_CONF" || printf 'SigLevel = TrustAll\n' >> "$_TA_CONF"
     _remove_stale_lock

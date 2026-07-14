@@ -2800,8 +2800,9 @@ ENVIRONMENT VARIABLES:
   DRY_RUN_VERBOSE          Set to 'true' to audit container scripts without
                            executing them (implies DRY_RUN=true). Default 'false'.
   LOG_ROTATION_MAX_SIZE    Rotate the per-container log on startup when it
-                           exceeds this many bytes. Default: 5242880 (5 MiB).
-                           One backup (.1) is kept; older backups are overwritten.
+                            exceeds this many bytes. Default: 5242880 (5 MiB).
+                            Up to 3 rotated backups (.1.gz through .3.gz) are
+                            maintained; older backups are overwritten.
   DEDICATED_BUILDUSER      Set to 'true' to create a dedicated build user
                             (--dedicated-builduser). This isolates AUR builds
                             from host /home. Default 'true'.
@@ -8021,7 +8022,11 @@ fi
 sanitize_version_component() {
     # Strip epoch (e.g. "6:5.2.0" -> "5.2.0"), then extract only leading digits.
     # Handles epochs, pre-release suffixes, and non-numeric characters.
-    local ver="$1"
+    # Accepts input via pipe (stdin) or first positional argument.
+    local ver="${1:-}"
+    if [[ -z "$ver" ]] && [[ ! -t 0 ]]; then
+        read -r ver
+    fi
     ver="${ver#*:}"
     echo "$ver" | grep -oP '^[0-9]+' || echo "0"
 }
@@ -8634,9 +8639,11 @@ echo "Cloning pamac-aur repository (depth=100) for commit history..."
 # for-loop below only inspects `git log -50`, so depth=100 is more than
 # sufficient; if the commit is older, the --unshallow fallback in
 # install_from_aur_commit handles it.
-if ! git clone --depth=100 --single-branch "$_AUR_GIT_URL" "$_AUR_WORK" 2>/tmp/pamac_aur_clone_err; then
+_aur_clone_err=\$(mktemp /tmp/pamac-aur-clone-err.XXXXXX 2>/dev/null || echo "/dev/null")
+if ! git clone --depth=100 --single-branch "\$_AUR_GIT_URL" "\$_AUR_WORK" 2>"\$_aur_clone_err"; then
     echo "WARN: git clone of pamac-aur failed:"
-    cat /tmp/pamac_aur_clone_err 2>/dev/null | tail -3
+    cat "\$_aur_clone_err" 2>/dev/null | tail -3
+    rm -f "\$_aur_clone_err" 2>/dev/null || true
     rm -rf "$_AUR_WORK"
     echo "WARN: Falling back to Strategy C (build latest regardless of compatibility)."
     echo "COMPATIBLE_COMMIT=latest_anyway"
@@ -8899,14 +8906,18 @@ _build_package() {
     # Check if devtools is available and requested
     if [[ "$_use_devtools" == "true" ]] && command -v archbuild >/dev/null 2>&1; then
         echo "Building $_desc with devtools (clean chroot)..."
+        local _devtools_err
+        _devtools_err=$(mktemp /tmp/pamac-devtools-err.XXXXXX 2>/dev/null || echo "/dev/null")
         # archbuild needs the PKGBUILD directory and creates a clean chroot
         # It installs the resulting packages automatically
-        if sudo -Hu "$current_user" bash -lc "cd '$_work_dir' && archbuild --noconfirm" 2>/tmp/pamac_devtools_build_err; then
+        if sudo -Hu "$current_user" bash -lc "cd '$_work_dir' && archbuild --noconfirm" 2>"$_devtools_err"; then
             echo "Devtools build succeeded for $_desc."
+            rm -f "$_devtools_err" 2>/dev/null || true
             return 0
         else
             echo "Devtools build failed for $_desc:"
-            cat /tmp/pamac_devtools_build_err 2>/dev/null | tail -15
+            cat "$_devtools_err" 2>/dev/null | tail -15
+            rm -f "$_devtools_err" 2>/dev/null || true
             echo "Falling back to makepkg..."
             # Fall through to makepkg below
         fi
@@ -8919,13 +8930,17 @@ _build_package() {
     _preflight_oom_check "$_desc build"
     _preflight_space_check "$_desc build" || return 1
     _set_makepkg_jobs
-    _spin "Building $_desc" sudo -Hu "$current_user" bash -lc "cd '$_work_dir' && makepkg -si --noconfirm --clean" 2>/tmp/pamac_build_err
+    local _build_err
+    _build_err=$(mktemp /tmp/pamac-build-err.XXXXXX 2>/dev/null || echo "/dev/null")
+    _spin "Building $_desc" sudo -Hu "$current_user" bash -lc "cd '$_work_dir' && makepkg -si --noconfirm --clean" 2>"$_build_err"
     local _rc=$?
     if [[ $_rc -ne 0 ]]; then
         echo "makepkg failed for $_desc (exit $_rc):"
-        cat /tmp/pamac_build_err 2>/dev/null | tail -15
+        cat "$_build_err" 2>/dev/null | tail -15
+        rm -f "$_build_err" 2>/dev/null || true
         return 1
     fi
+    rm -f "$_build_err" 2>/dev/null || true
     return 0
 }
 
@@ -8935,12 +8950,17 @@ install_from_aur_commit() {
     work_dir=$(mktemp -d /var/tmp/pamac-pkg-XXXXXX) && chmod 700 "$work_dir" 2>/dev/null || work_dir=$(mktemp -d)
     echo "Cloning pamac-aur at commit ${commit:0:12}..."
     rm -rf "$work_dir"
-    sudo -Hu "$current_user" bash -lc "git clone --depth=200 https://aur.archlinux.org/pamac-aur.git '$work_dir'" 2>/tmp/pamac_clone_err || {
+    local _clone_err _checkout_err
+    _clone_err=$(mktemp /tmp/pamac-clone-err.XXXXXX 2>/dev/null || echo "/dev/null")
+    sudo -Hu "$current_user" bash -lc "git clone --depth=200 https://aur.archlinux.org/pamac-aur.git '$work_dir'" 2>"$_clone_err" || {
         echo "Git clone failed:"
-        cat /tmp/pamac_clone_err 2>/dev/null | tail -5
+        cat "$_clone_err" 2>/dev/null | tail -5
+        rm -f "$_clone_err" 2>/dev/null || true
         return 1
     }
-    if ! sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git checkout '$commit'" 2>/tmp/pamac_checkout_err; then
+    rm -f "$_clone_err" 2>/dev/null || true
+    _checkout_err=$(mktemp /tmp/pamac-checkout-err.XXXXXX 2>/dev/null || echo "/dev/null")
+    if ! sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git checkout '$commit'" 2>"$_checkout_err"; then
         echo "Checkout failed at depth 200, attempting full unshallow fetch to reach commit ${commit:0:12}..."
         # Single round-trip 'git fetch --unshallow' is far more efficient than
         # iterating --deepen 100 (which used to do 3-4 round-trips for a commit
@@ -8963,11 +8983,13 @@ install_from_aur_commit() {
         fi
         if [[ "$_found" != "true" ]]; then
             echo "Checkout failed (commit ${commit:0:12}) after full fetch:"
-            cat /tmp/pamac_checkout_err 2>/dev/null | tail -5
+            cat "$_checkout_err" 2>/dev/null | tail -5
             sudo -Hu "$current_user" bash -lc "cd '$work_dir' && git log --oneline -5" 2>/dev/null || true
             rm -rf "$work_dir"
+            rm -f "$_checkout_err" 2>/dev/null || true
             return 1
         fi
+        rm -f "$_checkout_err" 2>/dev/null || true
     fi
     echo "Building pamac-aur from commit ${commit:0:12}..."
     # AUR payload verification: inspect PKGBUILD for suspicious patterns before building.

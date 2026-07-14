@@ -1698,7 +1698,7 @@ check_network_connectivity() {
     # Captive portals typically return HTTP 200/3xx with HTML content instead of
     # the expected Arch Linux page, or intercept HTTPS with a self-signed cert.
     local _curl_err_file
-    _curl_err_file=$(mktemp /tmp/pamac-curl-err.XXXXXX 2>/dev/null || echo "/dev/null")
+    _curl_err_file=$(mktemp "${_SCRIPT_TMPDIR:-/tmp}/pamac-curl-err.XXXXXX" 2>/dev/null || echo "/dev/null")
     _curl_output=$(timeout "${NETWORK_PROBE_TIMEOUT}" curl -sSf --connect-timeout "${NETWORK_PROBE_CONNECT_TIMEOUT}" \
         --max-time "${NETWORK_PROBE_TIMEOUT}" -o /dev/null -w "%{http_code}\n%{ssl_verify_result}" \
         "$_probe_url" 2>"$_curl_err_file") || _curl_rc=$?
@@ -2860,6 +2860,12 @@ ENVIRONMENT VARIABLES:
                             Same as --allow-trustall.
   DISTROBOX_CONTAINER_MANAGER  Container runtime to use: 'podman' or 'docker'.
                             Default 'podman'.
+  CONTAINER_START_TIMEOUT  Maximum number of probe attempts (each ~2s) when
+                            waiting for the container to become ready. Default
+                            '60' (~120 seconds). Increase on slow storage.
+  LOG_ROTATION_KEEP       Maximum number of compressed rotated log backups to
+                            maintain per container. Default '3'. Older backups
+                            are overwritten when this limit is reached.
   RELEASE_SIGNING_KEY_ID Override the release GPG signing key fingerprint
                             (default: D4B85A2AB5D6C3AE).
 

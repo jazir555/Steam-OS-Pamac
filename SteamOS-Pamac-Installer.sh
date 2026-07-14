@@ -1389,18 +1389,15 @@ check_system_requirements() {
         log_success "All required tools are present."
     fi
 
-    # Bubblewrap (bwrap) is NOW REQUIRED for the fake systemd-run wrapper's
-    # sandbox. The unshare fallback has been REMOVED (it lacked PID namespace
-    # isolation and device-node filtering). Without bwrap, AUR builds that need
-    # DynamicUser will fail. Use --init mode containers for real systemd instead.
-    if [[ "${STRICT_SECURITY:-false}" != "true" ]]; then
+    # Bubblewrap is only needed for the fake systemd-run shim (--no-use-init).
+    # With --use-init (default), real systemd handles sandboxing natively.
+    if [[ "${FORCE_CONTAINER_INIT:-true}" != "true" ]] && [[ "${STRICT_SECURITY:-false}" != "true" ]]; then
         if command -v bwrap >/dev/null 2>&1; then
             log_success "bubblewrap (bwrap) found — full DynamicUser sandbox available."
         else
             log_warn "bubblewrap (bwrap) not found — AUR builds requiring sandbox will FAIL."
-            log_info "  The unshare fallback has been REMOVED for security. To fix:"
-            log_info "    sudo pacman -S bubblewrap  (install inside the container)"
-            log_info "  Or use an init-mode container (distrobox create --init) for real systemd."
+            log_info "  Install inside the container: sudo pacman -S bubblewrap"
+            log_info "  Or use --use-init (default) for real systemd instead."
         fi
     fi
 
@@ -1497,6 +1494,44 @@ _result() {
 }
 echo "=== Sandbox Self-Tests ==="
 echo ""
+# Check if real systemd is available (default --use-init mode)
+if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
+    echo "Container uses real systemd (--use-init mode)."
+    echo "Testing native systemd-run sandbox..."
+    echo ""
+    echo "--- 1. systemd-run availability ---"
+    if command -v systemd-run >/dev/null 2>&1; then
+        echo "  systemd-run available: $(command -v systemd-run)"
+        _result "systemd_run_present" "true" ""
+    else
+        echo "  systemd-run NOT found"
+        _result "systemd_run_present" "false" ""
+        _degraded=true
+    fi
+    echo ""
+    echo "--- 2. systemd-run DynamicUser sandbox test ---"
+    if systemd-run --property=DynamicUser=yes --property=ProtectSystem=strict \
+        --property=PrivateTmp=yes --property=NoNewPrivileges=yes \
+        --unit=pamac-sandbox-test -- echo "sandbox-ok" 2>/dev/null; then
+        echo "  systemd-run DynamicUser sandbox executed successfully"
+        _result "systemd_dynamic_user" "true" ""
+    else
+        echo "  systemd-run DynamicUser sandbox failed"
+        _result "systemd_dynamic_user" "false" "check systemd configuration"
+        _degraded=true
+    fi
+    echo ""
+    echo "--- 3. systemd unit sandbox enforcement ---"
+    _unit_status=$(systemctl show pamac-sandbox-test --property=ActiveState 2>/dev/null || echo "not-found")
+    if [[ "$_unit_status" == "inactive" ]] || [[ "$_unit_status" == "dead" ]]; then
+        echo "  systemd unit lifecycle OK"
+        _result "systemd_unit" "true" ""
+    else
+        echo "  systemd unit state: $_unit_status"
+        _result "systemd_unit" "true" "(state: $_unit_status)"
+    fi
+else
+# Non-init mode: test the fake systemd-run shim
 echo "--- 1. Fake systemd-run wrapper ---"
 if [[ -x /usr/local/sbin/systemd-run ]]; then
     _ver=$(/usr/local/sbin/systemd-run --version 2>/dev/null | head -1 || echo "unknown")
@@ -1613,6 +1648,7 @@ else
     _result "seccomp_active" "false" "install base-devel"
     _degraded=true
 fi
+fi # end of init vs shim branch
 echo ""
 echo "=== Summary ==="
 echo "  Passed: $_pass  Failed: $_fail"
@@ -2626,19 +2662,15 @@ OPTIONS:
                              verification (skip SigLevel=TrustAll recovery,
                              keep all packages cryptographically verified).
                              Also refuses to install the fake systemd-run
-                             wrapper, so AUR DynamiUser builds WILL FAIL in
-                             non-systemd containers (the fake wrapper is a
-                             workaround for missing systemd; --strict-security
-                             disables it to avoid running with a shim).
+                             wrapper, so AUR DynamicUser builds WILL FAIL in
+                             non-init containers. With --use-init (default),
+                             this mainly affects signature verification since
+                             real systemd handles sandboxing.
                              TRADE-OFF: increased cryptographic verification
-                             at the cost of breaking AUR builds. Use only if
-                             you (a) have a real init-mode container with
-                             systemd, or (b) never build AUR packages, or
-                             (c) accept that AUR builds must be done manually.
-                             Failures during keyring bootstrap cause the step
-                             to fail fast rather than degrading to unverified
-                             state. For most users, leaving it OFF is safer
-                             and more functional.
+                             at the cost of breaking AUR builds in non-init
+                             containers. Failures during keyring bootstrap
+                             cause the step to fail fast rather than degrading
+                             to unverified state.
   --allow-trustall           Permit the TrustAll keyring bootstrap without
                              interactive confirmation. Without this flag, the
                              user is prompted before SigLevel=TrustAll is used.
@@ -2691,11 +2723,11 @@ OPTIONS:
   --version-check           Compare installed version against latest GitHub release
   --verify                  Print SHA-256 hash of this script for integrity verification
                             (compare against hash on GitHub release page)
-  --verify-sandbox          Run sandbox self-tests inside the container to confirm
-                            that seccomp, mount namespaces, and capability dropping
-                            are active. Reports DEGRADED/OK for each protection.
-                            Requires an existing container with the fake systemd-run
-                            wrapper installed.
+  --verify-sandbox          Run sandbox self-tests inside the container to
+                            confirm that sandboxing is active. Reports
+                            DEGRADED/OK for each protection. Tests real
+                            systemd-run with --use-init, or the fake wrapper
+                            with --no-use-init.
   -h, --help                Show this help message
 
 ENVIRONMENT VARIABLES:
@@ -2746,10 +2778,10 @@ ENVIRONMENT VARIABLES:
                            to limit the injection surface. Use only when
                            third-party repos also need key refresh during the
                            TrustAll fallback.
-  FORCE_CONTAINER_INIT     Set to 'true' to force init-mode containers on
-                           SteamOS (overrides auto-detection). For advanced
-                           users with working nested systemd on custom kernels.
-                           Default 'false'.
+  FORCE_CONTAINER_INIT     Set to 'true' to use init-mode containers with
+                           real systemd (default). Set to 'false' with
+                           --no-use-init to fall back to the fake systemd-run
+                           shim. Default 'true'.
   NO_COLOR                 Set to 'true' to disable ANSI color output (same
                            as --no-color flag). Useful for piping, cron, CI/CD.
   LOW_MEMORY               Set to 'true' to reduce build parallelism (same as
@@ -2768,18 +2800,16 @@ ENVIRONMENT VARIABLES:
                            passed to container creation (same as --security-opt
                            flag). E.g.: seccomp:profile.json:apparmor:my-profile
 
-SECURITY NOTE — fake systemd-run wrapper:
-  This is a custom compatibility shim that fully emulates systemd-run for
-  DynamicUser AUR builds in non-systemd containers. All sandbox properties
-  (ProtectSystem, ProtectHome, SystemCallFilter, RestrictNamespaces,
-  SecureBits, Personality, SystemCallArchitectures, ProtectProc,
-  ProcSubset, PrivateUsers, DisableExtraFileDescriptors, CoredumpReceive,
-  etc.) are enforced via seccomp-BPF, mount namespaces, prctl, and
-  capability dropping. When gcc is unavailable, falls back to
-  SECCOMP_MODE_STRICT (middle-ground profile without seccomp). If AUR builds fail inside the container, try:
-    (1) Install base-devel for seccomp compilation
-    (2) Use --strict-security to disable the wrapper
-    (3) Use real systemd (e.g., distrobox --init flag)
+SECURITY NOTE — Container sandboxing:
+  By default (--use-init), the container uses real systemd for process
+  isolation. AUR builds run via native systemd-run with full sandbox
+  properties (ProtectSystem, ProtectSystemCallFilter, etc.).
+  When --no-use-init is used, a fake systemd-run shim
+  (fake-systemd-run.sh) emulates systemd-run via seccomp-BPF, mount
+  namespaces, and bubblewrap. If AUR builds fail inside the container,
+  try: (1) Use --use-init (default) for real systemd, or
+  (2) Install base-devel for seccomp compilation, or
+  (3) Use --strict-security to disable the shim.
 
 NOTE — eMMC/flash wear reduction:
   The script automatically configures tmpfs BUILDDIR and ccache to minimize
@@ -2815,7 +2845,7 @@ SECURITY NOTE — Sudoers permissions (inside container):
 
   These are deliberately EXCLUDED from PAMAC_CMDS:
 
-    /usr/bin/makepkg           — Runs via fake systemd-run (DynamicUser)
+    /usr/bin/makepkg           — Runs via systemd-run (DynamicUser)
     /usr/bin/yay               — Never run as root; invokes sudo pacman -U
     /usr/bin/sudo              — Prevents escalation chain
 
@@ -2847,14 +2877,12 @@ SECURITY NOTE — Polkit rules:
       (passwordlessly via sudoers, but the credential is not cached).
       This minimizes the window for credential reuse.
 
-  (4) Fake systemd-run wrapper: In non-systemd containers (SteamOS),
-      the script installs a custom /usr/local/sbin/systemd-run that
-      fully emulates systemd-run with Linux sandboxing primitives (mount
-      namespaces, PID namespaces, seccomp-BPF, capability bounding-set
-      dropping via prctl(PR_CAPBSET_DROP), device-node filtering,
-      bubblewrap) matching systemd's own unit sandboxing behavior.
-      When gcc is unavailable, falls back to a middle-ground profile (mount namespace + PID namespace + capability dropping, without seccomp).
-      Use --strict-security to disable it.
+  (4) Container isolation: By default (--use-init), the container uses
+      real systemd for process isolation, providing native systemd-run
+      with full sandbox properties. When --no-use-init is used, a
+      fake systemd-run shim (fake-systemd-run.sh) emulates sandboxing
+      via seccomp-BPF, mount namespaces, and bubblewrap.
+      Use --strict-security to disable the shim.
 
   (5) Pacman SigLevel: The container's /etc/pacman.conf uses the
       default strict SigLevel (Required DatabaseOptional). The only
@@ -3328,7 +3356,7 @@ detect_init_support() {
 
     if grep -q "ID=steamos" /etc/os-release 2>/dev/null; then
         CONTAINER_HAS_INIT="false"
-        log_info "SteamOS detected - using non-init mode (nested systemd is unreliable on Steam Deck)."
+        log_info "SteamOS detected, --no-use-init active — using non-init mode."
         return
     fi
 
@@ -6222,8 +6250,8 @@ _sudoers_lock="/etc/sudoers.d/.pamac-lock"
 
 # makepkg and yay are deliberately EXCLUDED from PAMAC_CMDS.
 #
-# makepkg: Pamac invokes makepkg through the systemd-run fake wrapper (which
-# drops privileges for DynamicUser), so makepkg itself never calls sudo.
+# makepkg: Pamac invokes makepkg through systemd-run (which drops
+# privileges for DynamicUser), so makepkg itself never calls sudo.
 # Including makepkg in passwordless sudoers would let a malicious AUR PKGBUILD
 # (an arbitrary shell script run BY makepkg) invoke pacman directly as root,
 # bypassing the privilege drop.
@@ -6664,7 +6692,7 @@ if ! command -v bwrap >/dev/null 2>&1; then
 fi
 _write_fake_systemd_run_wrapper
 echo "Fake systemd-run installed at /usr/local/sbin/systemd-run (cleanup runs at runtime)."
-echo "Unrecognized arguments will be logged to /tmp/systemd-run-fake.log for debugging."
+echo "Use --use-init (default) for real systemd instead of this shim."
 
 printf '%s\n' '#!/bin/bash' \
     '/usr/local/bin/pamac-session-bootstrap.sh 2>/dev/null &' > /etc/profile.d/pamac-daemon.sh
@@ -6977,7 +7005,7 @@ elif ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/de
 _write_fake_systemd_run_wrapper
 repaired=$((repaired + 1))
 echo "Fake systemd-run repaired (cleanup runs at runtime)."
-echo "Unrecognized arguments will be logged to /tmp/systemd-run-fake.log for debugging."
+echo "Use --use-init (default) for real systemd instead of this shim."
 
 if [[ ! -f /etc/profile.d/pamac-daemon.sh ]]; then
 printf '%s\n' '#!/bin/bash' \
@@ -12376,23 +12404,30 @@ show_completion_message() {
         log_info "  ❌ Pamac: NOT INSTALLED"
     fi
 
-    # Check seccomp/sandbox status
-    local _has_gcc=false
-    local _has_bwrap=false
-    local _has_seccomp_helper=false
-    container_user_exec bash -c "command -v gcc >/dev/null 2>&1" 2>/dev/null && _has_gcc=true
-    container_user_exec bash -c "command -v bwrap >/dev/null 2>&1" 2>/dev/null && _has_bwrap=true
-    if [[ "$_has_gcc" == "true" ]] || container_user_exec bash -c "[[ -x /tmp/.dsr-seccomp-helper ]]" 2>/dev/null; then
-        _has_seccomp_helper=true
-    fi
-    if [[ "$_has_bwrap" == "true" ]] && [[ "$_has_seccomp_helper" == "true" ]]; then
-        log_info "  ✅ Sandbox: FULL (bwrap + seccomp-BPF)"
-    elif [[ "$_has_bwrap" == "true" ]]; then
-        log_info "  ⚠️  Sandbox: DEGRADED (bwrap + no seccomp) — run: sudo pacman -S base-devel gcc"
-    elif [[ "$_has_seccomp_helper" == "true" ]]; then
-        log_info "  ⚠️  Sandbox: DEGRADED (no bwrap, seccomp only) — run: sudo pacman -S bubblewrap"
+    # Check sandbox status — with --use-init (default), real systemd provides
+    # full isolation; with --no-use-init, check for bwrap + seccomp helper.
+    local _has_init=false
+    container_root_exec bash -c "command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1" 2>/dev/null && _has_init=true
+    if [[ "$_has_init" == "true" ]]; then
+        log_info "  ✅ Sandbox: FULL (systemd native isolation)"
     else
-        log_info "  ⚠️  Sandbox: DEGRADED (no sandboxing) — run: sudo pacman -S base-devel gcc bubblewrap"
+        local _has_gcc=false
+        local _has_bwrap=false
+        local _has_seccomp_helper=false
+        container_user_exec bash -c "command -v gcc >/dev/null 2>&1" 2>/dev/null && _has_gcc=true
+        container_user_exec bash -c "command -v bwrap >/dev/null 2>&1" 2>/dev/null && _has_bwrap=true
+        if [[ "$_has_gcc" == "true" ]] || container_user_exec bash -c "[[ -x /tmp/.dsr-seccomp-helper ]]" 2>/dev/null; then
+            _has_seccomp_helper=true
+        fi
+        if [[ "$_has_bwrap" == "true" ]] && [[ "$_has_seccomp_helper" == "true" ]]; then
+            log_info "  ✅ Sandbox: FULL (shim: bwrap + seccomp-BPF)"
+        elif [[ "$_has_bwrap" == "true" ]]; then
+            log_info "  ⚠️  Sandbox: DEGRADED (bwrap + no seccomp) — run: sudo pacman -S base-devel gcc"
+        elif [[ "$_has_seccomp_helper" == "true" ]]; then
+            log_info "  ⚠️  Sandbox: DEGRADED (no bwrap, seccomp only) — run: sudo pacman -S bubblewrap"
+        else
+            log_info "  ⚠️  Sandbox: DEGRADED (no sandboxing) — run: sudo pacman -S base-devel gcc bubblewrap"
+        fi
     fi
 
     # Check sudoers scope

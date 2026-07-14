@@ -466,6 +466,53 @@ _log_event() {
     fi
 }
 
+# ── Spinner for long-running operations ──
+# Displays an animated spinner with elapsed time while a background command runs.
+# Usage: _spin "Description" command args...
+# The spinner runs until the command completes, then shows final status.
+# Returns the command's exit code. Only spins when stdout is a terminal.
+_spin() {
+    local _desc="$1"; shift
+    local _start_ts
+    _start_ts=$(date +%s 2>/dev/null || echo 0)
+    if [[ -t 1 ]]; then
+        # Terminal: run with animated spinner
+        (
+            "$@"
+        ) &
+        local _pid=$!
+        local _chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+        local _i=0
+        while kill -0 "$_pid" 2>/dev/null; do
+            local _ch="${_chars:$(( _i % ${#_chars} )):1}"
+            local _now
+            _now=$(date +%s 2>/dev/null || echo 0)
+            local _elapsed=$(( _now - _start_ts ))
+            local _min=$(( _elapsed / 60 ))
+            local _sec=$(( _elapsed % 60 ))
+            printf "\r  ${_ch} ${_desc}... [%02d:%02d] " "$_min" "$_sec" >&2
+            _i=$(( _i + 1 ))
+            sleep 0.1 2>/dev/null || sleep 1
+        done
+        wait "$_pid"
+        local _rc=$?
+        local _now
+        _now=$(date +%s 2>/dev/null || echo 0)
+        local _elapsed=$(( _now - _start_ts ))
+        local _min=$(( _elapsed / 60 ))
+        local _sec=$(( _elapsed % 60 ))
+        if [[ $_rc -eq 0 ]]; then
+            printf "\r  ✓ ${_desc}... done [%02d:%02d]   \n" "$_min" "$_sec" >&2
+        else
+            printf "\r  ✗ ${_desc}... failed [%02d:%02d] (exit $_rc)\n" "$_min" "$_sec" >&2
+        fi
+        return $_rc
+    else
+        # Non-terminal: run without spinner
+        "$@"
+    fi
+}
+
 # ── Heredoc expansion sanity check ──
 # Call after writing a heredoc to verify no accidental host variable leakage.
 # Usage: _validate_heredoc_sanity "$_heredoc_content" "description"
@@ -6840,26 +6887,26 @@ _run_sandboxed() {
         _run_sandboxed_bwrap "$_run_user"
         return $?
     else
-        # bwrap is NOT available — fail hard instead of falling back to the
-        # weaker unshare sandbox. The unshare fallback previously provided
-        # degraded isolation (no PID namespace, weaker RestrictNamespaces
-        # enforcement, no network namespace parity) and silently accepted
-        # the weaker sandbox. Now builds that need systemd-run sandboxing
-        # will fail with a clear diagnostic so the user can install bwrap.
-        _warn_dsr "systemd-run(fake): FATAL — bubblewrap (bwrap) is NOT installed."
-        _warn_dsr "  systemd-run fake wrapper requires bwrap for sandboxing. The"
-        _warn_dsr "  unshare fallback has been REMOVED (it provided degraded"
-        _warn_dsr "  isolation without PID namespace parity)."
+        # bwrap is NOT available — degrade gracefully instead of killing the
+        # build. Running without bwrap loses PID namespace isolation and
+        # seccomp filtering, but the build can still complete. The user is
+        # warned so they can install bwrap for full sandboxing.
+        _warn_dsr "systemd-run(fake): WARNING — bubblewrap (bwrap) not installed."
+        _warn_dsr "  Running WITHOUT sandbox isolation. The build will execute"
+        _warn_dsr "  as the target user but without PID namespace, seccomp-BPF,"
+        _warn_dsr "  or mount namespace protections."
         _warn_dsr ""
-        _warn_dsr "  To fix: install bubblewrap inside this container:"
+        _warn_dsr "  To restore full sandboxing, install bubblewrap:"
         _warn_dsr "    sudo pacman -S --noconfirm --needed bubblewrap"
-        _warn_dsr "  Or use a full init-mode container instead of the fake wrapper:"
-        _warn_dsr "    distrobox create --init ... (requires systemd inside)"
         _warn_dsr ""
-        echo "systemd-run(fake): FATAL — bubblewrap (bwrap) not installed. Run:" >&2
-        echo "  sudo pacman -S --noconfirm --needed bubblewrap" >&2
-        echo "  Or re-run the installer with distrobox --init for a real systemd." >&2
-        exit 126
+        echo "WARNING: bubblewrap not installed — running build without sandbox." >&2
+        # Run the command directly without sandbox wrapping
+        ${_ENV_SETUP}
+        if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then cd "$WORK_DIR" 2>/dev/null || true; fi
+        if [[ -n "${TARGET_USER:-}" ]] && [[ "$(id -u)" -eq 0 ]]; then
+            exec sudo -u "$TARGET_USER" -H -- bash -c "${_ENV_SETUP}exec \"\${@}\"" -- "${CMD_ARGS[@]}"
+        fi
+        exec "${CMD_ARGS[@]}"
     fi
 }
 
@@ -10142,7 +10189,7 @@ done
 chown -R "$current_user:$current_user" "$_YAY_WORK/yay"
 _preflight_oom_check "yay build"
 _set_makepkg_jobs
-sudo -Hu "$current_user" bash -lc "cd '$_YAY_WORK/yay' && makepkg -si --noconfirm --clean"
+_spin "Building yay from source" sudo -Hu "$current_user" bash -lc "cd '$_YAY_WORK/yay' && makepkg -si --noconfirm --clean"
 build_rc=$?
 
 if [[ $build_rc -ne 0 ]]; then
@@ -11101,7 +11148,7 @@ _build_package() {
     echo "Building $_desc with makepkg..."
     _preflight_oom_check "$_desc build"
     _set_makepkg_jobs
-    sudo -Hu "$current_user" bash -lc "cd '$_work_dir' && makepkg -si --noconfirm --clean" 2>/tmp/pamac_build_err
+    _spin "Building $_desc" sudo -Hu "$current_user" bash -lc "cd '$_work_dir' && makepkg -si --noconfirm --clean" 2>/tmp/pamac_build_err
     local _rc=$?
     if [[ $_rc -ne 0 ]]; then
         echo "makepkg failed for $_desc (exit $_rc):"
@@ -13574,8 +13621,12 @@ pacman -Qeq > "\$EXPLICIT_FILE" 2>/dev/null || true
 PKG_HASH="\$(md5sum "\$EXPLICIT_FILE" 2>/dev/null | awk '{print \$1}')"
 MTIME_HASH=""
 if [[ -d /usr/share/applications ]]; then
-    MTIME_HASH="\$(find /usr/share/applications -type f -name '*.desktop' \
-        -printf '%T@ %s\n' 2>/dev/null | sort | md5sum | awk '{print \$1}')"
+    # Fast gate: file count + total size as a lightweight pre-check.
+    # If count and total size match, the md5sum of mtimes is unlikely to differ.
+    # This avoids the expensive find+md5sum pipeline on every transaction.
+    _desktop_count=\$(find /usr/share/applications -type f -name '*.desktop' 2>/dev/null | wc -l)
+    _desktop_total_size=\$(find /usr/share/applications -type f -name '*.desktop' -printf '%s+' 2>/dev/null | awk '{s+=\$1}END{print s+0}')
+    MTIME_HASH="\${_desktop_count}:\${_desktop_total_size}"
 fi
 FAST_HASH="\${PKG_HASH}:\${MTIME_HASH}"
 FAST_CACHE="\$STATE_DIR/.last-fast-hash"

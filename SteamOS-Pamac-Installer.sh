@@ -2808,8 +2808,61 @@ ENVIRONMENT VARIABLES:
                             (--dedicated-builduser). This isolates AUR builds
                             from host /home. Default 'true'.
   CONTAINER_SECURITY_OPT_ENV  Colon-separated list of --security-opt values
-                           passed to container creation (same as --security-opt
-                           flag). E.g.: seccomp:profile.json:apparmor:my-profile
+                            passed to container creation (same as --security-opt
+                            flag). E.g.: seccomp:profile.json:apparmor:my-profile
+  ENABLE_MULTILIB        Set to 'false' to disable multilib (32-bit libs for
+                            Steam/Games). Default 'true'. Same as
+                            --disable-multilib flag.
+  ENABLE_BUILD_CACHE     Set to 'false' to disable persistent yay build cache.
+                            Default 'true'. Same as --disable-build-cache flag.
+  ENABLE_EXTRA_REPOS     Set to 'false' to disable extra repos (chaotic-aur,
+                            endeavouros, etc.). Default 'true'. Same as
+                            --disable-extra-repos flag.
+  OPTIMIZE_MIRRORS       Set to 'false' to skip mirror optimization for fastest
+                            downloads. Default 'true'. Same as
+                            --no-optimize-mirrors flag.
+  ROLLING_RELEASE        Set to 'true' to use archlinux:latest base image
+                            (rolling release). Default 'false'. Same as
+                            --rolling-release flag.
+  DRY_RUN                Set to 'true' to show what would be done without
+                            making changes. Default 'false'. Same as --dry-run.
+  CHECK_ONLY             Set to 'true' to perform system checks and exit
+                            without installing. Default 'false'. Same as --check.
+  STATUS                 Set to 'true' to show installation status and exit.
+                            Default 'false'. Same as --status.
+  UNINSTALL              Set to 'true' to remove the container and all state.
+                            Default 'false'. Same as --uninstall.
+  UPDATE                 Set to 'true' to update the installation.
+                            Default 'false'. Same as --update.
+  EXPORT_ONLY            Set to 'true' to re-export desktop files without
+                            modifying the container. Default 'false'.
+                            Same as --export-only.
+  LOG_LEVEL              Controls log verbosity: 'quiet', 'normal', or
+                            'verbose'. Default 'normal'. Same as --verbose /
+                            --quiet flags.
+  ALLOW_HOME_MOUNT       Set to 'true' to re-enable host /home mount inside
+                            the container (INSECURE). Default 'false'. Same as
+                            --allow-home-mount flag.
+  SKIP_COMPAT_CHECK      Set to 'true' to skip pamac-aur AUR compatibility
+                            check. Default 'false'. Same as --skip-compat-check.
+  ALLOW_WHEEL_NOPASSWD   Set to 'true' to grant NOPASSWD to entire wheel group
+                            (INSECURE on multi-user hosts). Default 'false'. Same
+                            as --allow-wheel-nopasswd flag.
+  SELF_UPDATE            Set to 'true' to download and apply the latest version
+                            from GitHub. Default 'false'. Same as --self-update.
+  REPAIR                 Set to 'true' to run repair mode (check installation
+                            state and fix issues). Default 'false'. Same as
+                            --repair.
+  UPLOAD_LOG             Set to 'true' to sanitize and upload the setup log
+                            for debugging. Default 'false'. Same as
+                            --upload-log.
+  ALLOW_TRUSTALL         Set to 'true' to permit TrustAll keyring bootstrap
+                            without interactive confirmation. Default 'false'.
+                            Same as --allow-trustall.
+  DISTROBOX_CONTAINER_MANAGER  Container runtime to use: 'podman' or 'docker'.
+                            Default 'podman'.
+  RELEASE_SIGNING_KEY_ID Override the release GPG signing key fingerprint
+                            (default: D4B85A2AB5D6C3AE).
 
 SECURITY NOTE — Container sandboxing:
   By default (--use-init), the container uses real systemd for process

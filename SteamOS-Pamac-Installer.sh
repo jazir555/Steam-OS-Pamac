@@ -5656,7 +5656,8 @@ int main(int argc, char *argv[]) {
 }
 PERSONALITY_C
             if command -v gcc >/dev/null 2>&1; then
-                gcc -O2 -o "$_per_bin" "$_per_src" 2>/dev/null || true
+                gcc -O2 -o "$_per_bin" "$_per_src" 2>/dev/null || \
+                { command -v cc >/dev/null 2>&1 && cc -O2 -o "$_per_bin" "$_per_src" 2>/dev/null; } || true
             fi
             rm -f "$_per_src" 2>/dev/null || true
         fi
@@ -5768,7 +5769,8 @@ int main() {
 }
 CLOSEFDS_C
             if command -v gcc >/dev/null 2>&1; then
-                gcc -O2 -o "$_clex_bin" "$_clex_src" 2>/dev/null || true
+                gcc -O2 -o "$_clex_bin" "$_clex_src" 2>/dev/null || \
+                { command -v cc >/dev/null 2>&1 && cc -O2 -o "$_clex_bin" "$_clex_src" 2>/dev/null; } || true
             fi
         fi
         if [[ -x "$_clex_bin" ]]; then
@@ -6017,12 +6019,21 @@ _compile_seccomp_helper() {
         _warn_dsr "Cached seccomp helper is stale (version mismatch), recompiling..."
         rm -f "$_helper_bin" 2>/dev/null || true
     fi
-    if ! command -v gcc >/dev/null 2>&1; then
+    # Check for a C compiler: prefer gcc, fall back to cc (POSIX standard name).
+    # On some minimal systems only `cc` is available as a symlink to the real
+    # compiler. Checking both avoids a false "gcc not found" when cc works.
+    local _cc_cmd=""
+    if command -v gcc >/dev/null 2>&1; then
+        _cc_cmd="gcc"
+    elif command -v cc >/dev/null 2>&1; then
+        _cc_cmd="cc"
+    fi
+    if [[ -z "$_cc_cmd" ]]; then
         # Auto-repair: try to install the toolchain if it's missing after a
         # partial upgrade or fresh container where base-devel was removed.
         # Uses the same staged batched install as the main installer's
         # install_base_devel_batched() to avoid OOM on constrained devices.
-        _warn_dsr "gcc not available — attempting auto-repair..."
+        _warn_dsr "No C compiler found (gcc/cc) — attempting auto-repair..."
         if command -v pacman >/dev/null 2>&1; then
             # Remove stale pacman lock before installing
             local _lock="/var/lib/pacman/db.lck"
@@ -6046,7 +6057,15 @@ _compile_seccomp_helper() {
             done
         fi
         # Re-check after install attempt
-        command -v gcc >/dev/null 2>&1 || { _warn_dsr "gcc still not available after repair attempt."; return 1; }
+        if command -v gcc >/dev/null 2>&1; then
+            _cc_cmd="gcc"
+        elif command -v cc >/dev/null 2>&1; then
+            _cc_cmd="cc"
+        fi
+        if [[ -z "$_cc_cmd" ]]; then
+            _warn_dsr "No C compiler available after repair attempt (gcc/cc)."
+            return 1
+        fi
     fi
     local _helper_src="/tmp/.dsr-seccomp-helper-${$}.c"
     cat > "$_helper_src" << 'SECCOMP_C'
@@ -6501,7 +6520,7 @@ int main() {
     return 0;
 }
 TOOLCHAIN_TEST
-    if ! gcc -O2 -o "$_test_bin" "$_test_src" 2>"$_gcc_err"; then
+    if ! $_cc_cmd -O2 -o "$_test_bin" "$_test_src" 2>"$_gcc_err"; then
         local _gcc_output
         _gcc_output=$(cat "$_gcc_err" 2>/dev/null || echo "unknown error")
         _warn_dsr "Toolchain validation FAILED: gcc cannot compile a minimal seccomp test program."
@@ -6530,7 +6549,7 @@ TOOLCHAIN_TEST
             _remove_stale_lock 2>/dev/null || true
             if pacman -S --noconfirm --needed linux-api-headers glibc 2>/dev/null; then
                 _warn_dsr "Headers reinstalled. Retrying toolchain test..."
-                if gcc -O2 -o "$_test_bin" "$_test_src" 2>/dev/null; then
+                if $_cc_cmd -O2 -o "$_test_bin" "$_test_src" 2>/dev/null; then
                     _warn_dsr "Toolchain test passed after auto-repair."
                     rm -f "$_test_src" "$_test_bin" "$_gcc_err"
                     # Continue to full compilation below
@@ -6551,7 +6570,7 @@ TOOLCHAIN_TEST
 
     # Attempt full compilation. Capture error output for diagnostics.
     local _compile_err="/tmp/.dsr-compile-err.log"
-    if gcc -O2 -o "$_helper_bin" "$_helper_src" 2>"$_compile_err"; then
+    if $_cc_cmd -O2 -o "$_helper_bin" "$_helper_src" 2>"$_compile_err"; then
         rm -f "$_helper_src" "$_compile_err"
         chmod 755 "$_helper_bin"
         echo "$_helper_bin"
@@ -6559,7 +6578,7 @@ TOOLCHAIN_TEST
     else
         local _compile_output
         _compile_output=$(cat "$_compile_err" 2>/dev/null || echo "unknown error")
-        _warn_dsr "Failed to compile seccomp helper (gcc -O2). Full error:"
+        _warn_dsr "Failed to compile seccomp helper ($_cc_cmd -O2). Full error:"
         _warn_dsr "$_compile_output"
         _warn_dsr "Toolchain validation passed but full compilation failed — this suggests"
         _warn_dsr "a larger source file exposed a linker or optimization issue."
@@ -6584,7 +6603,7 @@ TOOLCHAIN_TEST
                 sleep 1 2>/dev/null || true
             done
             _warn_dsr "Toolchain reinstalled. Retrying compilation..."
-            if gcc -O2 -o "$_helper_bin" "$_helper_src" 2>/dev/null; then
+            if $_cc_cmd -O2 -o "$_helper_bin" "$_helper_src" 2>/dev/null; then
                 rm -f "$_helper_src" "$_compile_err"
                 chmod 755 "$_helper_bin"
                 echo "$_helper_bin"
@@ -6760,6 +6779,12 @@ _run_sandboxed_bwrap() {
     local _run_user="$1"; shift
     _build_bwrap_args || return 1
     _log_dsr "Using bwrap as sandbox engine"
+    # Log when seccomp is degraded so the user knows which protections are
+    # missing. The flag is set by _prepare_seccomp() when compilation fails.
+    if [[ "${_DSR_SECCOMP_STRICT_FALLBACK:-}" == "true" ]]; then
+        _warn_dsr "Seccomp helper unavailable — running WITHOUT seccomp-BPF filtering."
+        _warn_dsr "Mount namespace, PID namespace, and capability dropping remain active."
+    fi
     local _inner_cmd
     _inner_cmd="${_BUILD_WRAPPER:-}exec \"\${@}\""
     if [[ -n "$WORK_DIR" ]]; then
@@ -7367,6 +7392,23 @@ configure_container_base() {
     log_step "Configuring container base environment"
 
     local _ok=true
+
+    # ── Pre-keyring CA certificate propagation ──
+    # In corporate/proxy environments with SSL inspection, the host may trust a
+    # custom CA that the container's base image doesn't have. Without this,
+    # keyring downloads (Methods A-C) fail with SSL errors before
+    # ca-certificates-mozilla can be installed. Copy the host's CA bundle into
+    # the container first so HTTPS works during keyring bootstrap.
+    local _host_ca="${CURL_CA_BUNDLE:-}${SSL_CERT_FILE:-}"
+    if [[ -n "$_host_ca" && -f "$_host_ca" ]]; then
+        log_info "Propagating host CA certificate into container for keyring bootstrap..."
+        container_root_exec bash -c "
+            mkdir -p /etc/ssl/certs /usr/local/share/ca-certificates 2>/dev/null
+            cp -f '$_host_ca' /usr/local/share/ca-certificates/host-proxy-ca.crt 2>/dev/null && \
+                update-ca-certificates 2>/dev/null || \
+                cp -f '$_host_ca' /etc/ssl/certs/ca-certificates.crt 2>/dev/null || true
+        " 2>/dev/null || log_warn "Could not propagate host CA certificate (keyring bootstrap may fail)."
+    fi
 
     log_info "Stage 1/7: Initializing pacman keyring and signature verification..."
     local keyring_script

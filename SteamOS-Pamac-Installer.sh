@@ -1098,12 +1098,20 @@ _snapshot_container() {
     fi
     _CONTAINER_SNAPSHOT_DIR="${_SCRIPT_TMPDIR:-/tmp}/steamos-pamac-snapshots"
     mkdir -p "$_CONTAINER_SNAPSHOT_DIR" 2>/dev/null || return 1
-    local _snap_image
+    local _snap_image _snap_file
     _snap_image="localhost/steamos-pamac-snapshot-$(date +%s)"
+    _snap_file="${_CONTAINER_SNAPSHOT_DIR}/snapshot-$(date +%s).tar"
     # Use podman commit to create a point-in-time image of the container.
     # This captures the entire filesystem layer — packages, config, data.
     if container_runtime_for_ops commit "$_name" "$_snap_image" >/dev/null 2>&1; then
         _CONTAINER_SNAPSHOT="$_snap_image"
+        # Export the snapshot as a tarball in the directory for persistence.
+        # This provides a file-based backup that survives podman image pruning.
+        if container_runtime_for_ops save -o "$_snap_file" "$_snap_image" 2>/dev/null; then
+            log_debug "Container snapshot exported: $_snap_file"
+        else
+            log_debug "Container snapshot saved as image only (export failed)"
+        fi
         log_debug "Container snapshot created: $_snap_image"
         return 0
     else
@@ -1122,6 +1130,22 @@ _rollback_container() {
     # Stop the container, remove it, and re-create from the snapshot image.
     container_runtime_for_ops stop "$_name" >/dev/null 2>&1 || true
     container_runtime_for_ops rm -f "$_name" >/dev/null 2>&1 || true
+    # If the image is missing (e.g. after podman image prune), try importing
+    # from the tarball backup in _CONTAINER_SNAPSHOT_DIR.
+    if ! container_runtime_for_ops image exists "$_CONTAINER_SNAPSHOT" 2>/dev/null; then
+        local _latest_tar=""
+        if [[ -n "$_CONTAINER_SNAPSHOT_DIR" && -d "$_CONTAINER_SNAPSHOT_DIR" ]]; then
+            _latest_tar=$(find "$_CONTAINER_SNAPSHOT_DIR" -name 'snapshot-*.tar' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || echo "")
+        fi
+        if [[ -n "$_latest_tar" ]]; then
+            log_info "Snapshot image missing — importing from tarball backup..."
+            container_runtime_for_ops load -i "$_latest_tar" >/dev/null 2>&1 || true
+        else
+            log_error "No snapshot image or tarball backup found for rollback."
+            log_info "Try: podman rm -f $_name && distrobox rm -f $_name"
+            return 1
+        fi
+    fi
     if container_runtime_for_ops run -d --name "$_name" "$_CONTAINER_SNAPSHOT" >/dev/null 2>&1; then
         log_success "Container rolled back successfully from snapshot."
         # Clean up the snapshot image

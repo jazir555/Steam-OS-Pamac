@@ -293,7 +293,7 @@ LOG_ROTATION_MAX_SIZE="${LOG_ROTATION_MAX_SIZE:-5242880}"  # 5 MiB
 # thresholds, and UID ranges live in one place and can be overridden via
 # environment variables if needed.
 readonly CONTAINER_NAME_MAX_LEN="${CONTAINER_NAME_MAX_LEN:-63}"
-readonly DISK_SPACE_MIN_KB="${DISK_SPACE_MIN_KB:-2097152}"      # 2 GiB
+readonly DISK_SPACE_MIN_KB="${DISK_SPACE_MIN_KB:-10485760}"      # 10 GiB (container + build cushion)
 readonly MAKEPKG_RAM_PER_JOB_KB="${MAKEPKG_RAM_PER_JOB_KB:-768000}"
 readonly SUBUID_START="${SUBUID_START:-100000}"
 readonly SUBUID_COUNT="${SUBUID_COUNT:-65536}"
@@ -4283,12 +4283,16 @@ _preflight_oom_check() {
 
 # ── Pre-build disk space check ──
 # Called before every build/install invocation to ensure sufficient disk space.
-# AUR builds (makepkg) can consume 1-3 GB for source, build artifacts, and
-# installed packages. Running out mid-build corrupts partial artifacts and
-# wastes all prior compilation time. Returns 1 if critically low, 0 otherwise.
+# AUR builds (makepkg) consume significant space: Arch container base ~3 GB,
+# plus source trees, build artifacts, and installed packages. A safe cushion of
+# 10 GB beyond the container image is required to prevent running out mid-build,
+# which corrupts partial artifacts and wastes all prior compilation time.
+# Returns 1 if critically low, 0 otherwise.
 _preflight_space_check() {
     local _desc="${1:-build}"
-    local _min_kb="${DISK_SPACE_MIN_KB:-2097152}"  # 2 GiB default
+    # 10 GB minimum cushion — covers container image (~3 GB) + build artifacts
+    # + installed packages + pacman cache, with margin for safety.
+    local _min_kb="${DISK_SPACE_MIN_KB:-10485760}"  # 10 GiB default
     # Check /var (where container writes happen) and /tmp (where builds run)
     for _mount in /var /tmp; do
         local _avail_kb

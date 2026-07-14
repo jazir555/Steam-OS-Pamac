@@ -269,6 +269,10 @@ STRICT_SECURITY="${STRICT_SECURITY:-false}"
 # proper isolation, dependency resolution, and reproducibility. Requires
 # devtools package in the container. Falls back to yay if unavailable.
 USE_DEVTOOLS="${USE_DEVTOOLS:-false}"
+# Selected install drive (populated by _select_install_drive interactive menu).
+# When set, the script checks available space on the target drive and stores
+# container data there. Default: auto-detect ($HOME filesystem, typically eMMC).
+_SELECTED_INSTALL_DRIVE=""
 
 # SECURITY: --allow-trustall permits the last-resort TrustAll keyring bootstrap
 # (Method F) without an interactive confirmation prompt. When false (default),
@@ -1399,24 +1403,36 @@ check_system_requirements() {
         fi
     fi
 
+    # Interactive drive selector (if --install-drive or interactive terminal)
+    _select_install_drive
+
+    # Report disk space on all relevant mount points
     local available_space
     if available_space=$(df -kP "$HOME" 2>/dev/null | awk 'NR==2{print $4}'); then
-    if [[ -n "$available_space" ]] && [[ $available_space -lt ${DISK_SPACE_MIN_KB} ]]; then
-        log_warn "Low disk space detected on $HOME. At least $(( DISK_SPACE_MIN_KB / 1024 / 1024 ))GB is recommended."
-            log_info "Available space: $(( available_space / 1024 ))MB"
+        if [[ -n "$available_space" ]] && [[ $available_space -lt ${DISK_SPACE_MIN_KB} ]]; then
+            log_warn "Low disk space on \$HOME. At least $(( DISK_SPACE_MIN_KB / 1024 / 1024 ))GB recommended."
+            log_info "  Available: $(( available_space / 1024 ))MB on $(df -P "$HOME" 2>/dev/null | awk 'NR==2{print $6}')"
             all_ok=false
         elif [[ -n "$available_space" ]]; then
-            log_success "Sufficient disk space on $HOME: $(( available_space / 1024 / 1024 ))GB"
+            log_success "Disk space on \$HOME: $(( available_space / 1024 / 1024 ))GB on $(df -P "$HOME" 2>/dev/null | awk 'NR==2{print $6}')"
         fi
     else
-        log_warn "Could not check disk space on $HOME."
+        log_warn "Could not check disk space on \$HOME."
+    fi
+
+    # Show install target space if a different drive was selected
+    if [[ -n "${_SELECTED_INSTALL_DRIVE:-}" ]]; then
+        local _drive_dev _drive_avail_gb
+        _drive_dev=$(df -P "$_SELECTED_INSTALL_DRIVE" 2>/dev/null | awk 'NR==2{print $1}' || echo "unknown")
+        _drive_avail_gb=$(df -kP "$_SELECTED_INSTALL_DRIVE" 2>/dev/null | awk 'NR==2{int($4/1048576)}' || echo "?")
+        log_info "Install target: $_SELECTED_INSTALL_DRIVE ($_drive_dev, ~${_drive_avail_gb}GB free)"
     fi
 
     local var_space
     if var_space=$(df -kP /var 2>/dev/null | awk 'NR==2{print $4}'); then
         if [[ -n "$var_space" ]] && [[ "$var_space" -lt ${DISK_SPACE_MIN_KB} ]]; then
-            log_warn "Low disk space on /var (container write target). At least $(( DISK_SPACE_MIN_KB / 1024 / 1024 ))GB recommended."
-            log_info "Available on /var: $(( var_space / 1024 ))MB"
+            log_warn "Low disk space on /var. At least $(( DISK_SPACE_MIN_KB / 1024 / 1024 ))GB recommended."
+            log_info "  Available: $(( var_space / 1024 ))MB"
             all_ok=false
         elif [[ -n "$var_space" ]]; then
             log_debug "Disk space on /var: $(( var_space / 1024 / 1024 ))GB"
@@ -1426,8 +1442,8 @@ check_system_requirements() {
     local root_space
     if root_space=$(df -kP / 2>/dev/null | awk 'NR==2{print $4}'); then
         if [[ -n "$root_space" ]] && [[ "$root_space" -lt ${DISK_SPACE_MIN_KB} ]]; then
-            log_warn "Low disk space on / (root filesystem). At least $(( DISK_SPACE_MIN_KB / 1024 / 1024 ))GB recommended."
-            log_info "Available on /: $(( root_space / 1024 ))MB"
+            log_warn "Low disk space on /. At least $(( DISK_SPACE_MIN_KB / 1024 / 1024 ))GB recommended."
+            log_info "  Available: $(( root_space / 1024 ))MB"
             all_ok=false
         elif [[ -n "$root_space" ]]; then
             log_debug "Disk space on /: $(( root_space / 1024 / 1024 ))GB"
@@ -2455,7 +2471,6 @@ repair_podman() {
 
     # Step 6: Check for corrupted storage by examining the database
     log_info "Checking podman storage database integrity..."
-    local storage_conf="$podman_root/storage.conf"
     local bolt_db="$podman_root/db/sqlite/podman-true.db"
     if [[ -f "$bolt_db" ]]; then
         local db_size
@@ -2655,6 +2670,11 @@ OPTIONS:
                               container. Falls back to yay if unavailable.
                               TRADE-OFF: better isolation at the cost of
                               slower builds (full chroot recreation each time).
+  --install-drive           Auto-detect available drives and present an
+                              interactive menu to select install target (eMMC,
+                              SD card, USB). Shows available space on each drive.
+                              Useful for Steam Deck users with SD cards who want
+                              Pamac installed on secondary storage.
   --upload-log              Sanitize and upload the setup log for debugging
   --verbose                 Show detailed output, including command logs
   --quiet                   Only show errors
@@ -3008,6 +3028,7 @@ parse_arguments() {
             --dry-run-verbose) DRY_RUN="true"; DRY_RUN_VERBOSE="true"; shift ;;
             --strict-security) STRICT_SECURITY="true"; shift ;;
             --use-devtools) USE_DEVTOOLS="true"; shift ;;
+            --install-drive) _SELECTED_INSTALL_DRIVE="auto"; shift ;;
             --allow-trustall) ALLOW_TRUSTALL="true"; shift ;;
             --trustall-all-repos) TRUSTALL_ALL_REPOS="true"; shift ;;
             --check) CHECK_ONLY="true"; shift ;;
@@ -3059,9 +3080,7 @@ uninstall_setup() {
         log_warn "[DRY RUN] Uninstall simulation started."
     fi
 
-    local container_found=false
     if distrobox list --no-color 2>/dev/null | grep -qw "$CONTAINER_NAME"; then
-        container_found=true
         log_info "Container '$CONTAINER_NAME' found. Cleaning exported apps and removing container..."
 
         local container_accessible=false
@@ -4323,12 +4342,132 @@ _preflight_oom_check() {
     return 0
 }
 
+# ── Auto-detect installable drives ──
+# Scans /proc/mounts for real (non-virtual) filesystems with sufficient space.
+# Returns results as lines: "mount_point|device|avail_gb|fstype"
+# Filters out virtual/fs/root-only mounts (sysfs, proc, devtmpfs, etc.)
+_detect_install_drives() {
+    local _home_dev
+    _home_dev=$(df -P "$HOME" 2>/dev/null | awk 'NR==2{print $1}' || echo "")
+    local _home_mp
+    _home_mp=$(df -P "$HOME" 2>/dev/null | awk 'NR==2{print $6}' || echo "")
+    awk -v home_dev="$_home_dev" -v home_mp="$_home_mp" '
+    $1 !~ /^(sysfs|proc|devtmpfs|tmpfs|cgroup|overlay|shm|run\/user|run\/netns)/ &&
+    $2 !~ /^(\/run|\/sys|\/proc|\/dev|\/snap)/ &&
+    $4 !~ /ro,/ &&
+    $3 ~ /^[0-9]+$/ {
+        dev = $1; mp = $2; avail_kb = $3; fstype = $4
+        # Skip tiny partitions (< 1 GB)
+        if (avail_kb < 1048576) next
+        # Skip the root filesystem if it's also the home filesystem
+        if (mp == "/" && dev == home_dev) next
+        # Convert device short name for display
+        gsub(/\/dev\//, "", dev)
+        avail_gb = int(avail_kb / 1048576)
+        printf "%s|%s|%d GB|%s\n", mp, dev, avail_gb, fstype
+    }' /proc/mounts 2>/dev/null | sort -t'|' -k3 -rn
+}
+
+# ── Interactive drive selector ──
+# Presents auto-detected drives as a numbered menu. User presses a key to
+# select. Returns the selected mount point via _SELECTED_INSTALL_DRIVE.
+_select_install_drive() {
+    if [[ "${_SELECTED_INSTALL_DRIVE:-}" == "auto" ]]; then
+        # Already triggered via --install-drive flag
+        :
+    elif [[ -t 0 ]] && [[ -t 1 ]]; then
+        # Interactive terminal — ask if user wants to choose
+        printf "Multiple storage devices detected. Select install target? [y/N]: " >&2
+        read -r _choose </dev/tty 2>/dev/null || _choose=""
+        if [[ "$_choose" != "y" && "$_choose" != "Y" ]]; then
+            return 0
+        fi
+    else
+        return 0
+    fi
+
+    local _drives
+    _drives=$(_detect_install_drives)
+    if [[ -z "$_drives" ]]; then
+        log_info "No additional drives detected. Using default ($HOME filesystem)."
+        return 0
+    fi
+
+    # Build array of drives
+    local -a _drive_lines=()
+    local _i=0
+    while IFS= read -r _line; do
+        _drive_lines+=("$_line")
+        _i=$((_i + 1))
+    done <<< "$_drives"
+
+    if [[ ${#_drive_lines[@]} -eq 0 ]]; then
+        log_info "No installable drives found. Using default ($HOME filesystem)."
+        return 0
+    fi
+
+    # Show the menu
+    echo "" >&2
+    echo "╔══════════════════════════════════════════════════════════════╗" >&2
+    echo "║  SELECT INSTALL TARGET                                      ║" >&2
+    echo "╚══════════════════════════════════════════════════════════════╝" >&2
+    echo "" >&2
+
+    local _num=1
+    for _dl in "${_drive_lines[@]}"; do
+        local _mp _dev _size _fst
+        IFS='|' read -r _mp _dev _size _fst <<< "$_dl"
+        local _marker=" "
+        # Highlight the drive containing $HOME
+        local _home_mp
+        _home_mp=$(df -P "$HOME" 2>/dev/null | awk 'NR==2{print $6}' || echo "")
+        if [[ "$_mp" == "$_home_mp" ]]; then
+            _marker="*"
+        fi
+        printf "  [%d]%s %-20s  %-12s  %s\n" "$_num" "$_marker" "$_mp" "$_dev" "$_size" >&2
+        _num=$((_num + 1))
+    done
+    echo "" >&2
+    echo "  [*] = contains \$HOME (current)" >&2
+    echo "  [0] = keep default (no change)" >&2
+    echo "" >&2
+
+    # Prompt for selection
+    printf "  Select drive [0-%d]: " "$((_num - 1))" >&2
+    local _choice
+    read -r _choice </dev/tty 2>/dev/null || _choice="0"
+
+    # Validate input
+    if [[ ! "$_choice" =~ ^[0-9]+$ ]] || [[ "$_choice" -lt 0 ]] || [[ "$_choice" -ge "$_num" ]]; then
+        log_info "Invalid selection. Using default ($HOME filesystem)."
+        return 0
+    fi
+
+    if [[ "$_choice" -eq 0 ]]; then
+        log_info "Using default install target ($HOME filesystem)."
+        return 0
+    fi
+
+    local _selected="${_drive_lines[$((_choice - 1))]}"
+    local _sel_mp
+    _sel_mp=$(echo "$_selected" | cut -d'|' -f1)
+    local _sel_dev
+    _sel_dev=$(echo "$_selected" | cut -d'|' -f2)
+    local _sel_size
+    _sel_size=$(echo "$_selected" | cut -d'|' -f3)
+
+    _SELECTED_INSTALL_DRIVE="$_sel_mp"
+    log_info "Selected install target: $_sel_mp ($_sel_dev, $_sel_size free)"
+    _log_event "install_drive_selected" "mount=$_sel_mp" "device=$_sel_dev" "avail=$_sel_size"
+}
+
 # ── Pre-build disk space check ──
 # Called before every build/install invocation to ensure sufficient disk space.
 # AUR builds (makepkg) consume significant space: Arch container base ~3 GB,
 # plus source trees, build artifacts, and installed packages. A safe cushion of
 # 10 GB beyond the container image is required to prevent running out mid-build,
 # which corrupts partial artifacts and wastes all prior compilation time.
+# Checks both /var and /tmp, plus the install drive if --install-drive is set.
 # Returns 1 if critically low, 0 otherwise.
 _preflight_space_check() {
     local _desc="${1:-build}"
@@ -4348,6 +4487,19 @@ _preflight_space_check() {
             return 1
         fi
     done
+    # Check install drive if specified
+    if [[ -n "${_SELECTED_INSTALL_DRIVE:-}" ]]; then
+        local _drive_avail
+        _drive_avail=$(df -kP "$_SELECTED_INSTALL_DRIVE" 2>/dev/null | awk 'NR==2{print $4}' || echo "")
+        if [[ -n "$_drive_avail" && "$_drive_avail" -lt "$_min_kb" ]]; then
+            local _avail_mb=$(( _drive_avail / 1024 ))
+            local _min_mb=$(( _min_kb / 1024 ))
+            _log_event "space_low" "desc=$_desc" "mount=$_SELECTED_INSTALL_DRIVE" "avail_kb=$_drive_avail" "min_kb=$_min_kb"
+            log_error "CRITICAL: Only ${_avail_mb}MB free on install drive $_SELECTED_INSTALL_DRIVE before $_desc."
+            log_error "AUR builds require at least $(( _min_mb / 1024 ))GB free. Free space or add storage."
+            return 1
+        fi
+    fi
     return 0
 }
 
@@ -14645,7 +14797,6 @@ repair_installation() {
     local stages_dir="$state_dir/stages"
     mkdir -p "$stages_dir" 2>/dev/null || true
     local repair_ok=true
-    local already_repaired=false
 
     local stage_names=(
         "base_setup:configure_container_base"
@@ -14983,7 +15134,6 @@ show_status() {
 
     echo
     echo -e "${BOLD}--- Pamac Installation ---${NC}"
-    local pamac_ok=true
 
     if container_is_usable 2>/dev/null || container_root_exec bash -c "echo ok" 2>/dev/null | grep -q ok; then
         if container_root_exec bash -c "command -v pamac-manager >/dev/null 2>&1 && command -v pamac >/dev/null 2>&1" 2>/dev/null; then
@@ -14992,7 +15142,6 @@ show_status() {
             echo -e "  Pamac CLI:     ${GREEN}INSTALLED${NC} ($pamac_ver)"
         else
             echo -e "  Pamac CLI:     ${RED}NOT FOUND${NC}"
-            pamac_ok=false
             has_issues=true
         fi
 
@@ -15000,7 +15149,6 @@ show_status() {
             echo -e "  Pamac Manager: ${GREEN}INSTALLED${NC}"
         else
             echo -e "  Pamac Manager: ${RED}NOT FOUND${NC}"
-            pamac_ok=false
             has_issues=true
         fi
 

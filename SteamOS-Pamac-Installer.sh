@@ -1657,6 +1657,76 @@ _collect_proxy_create_args() {
     done
 }
 
+# Fetch a PAC file and extract a direct proxy URL from it. PAC files are
+# JavaScript; we do NOT run a JS interpreter. Instead we apply regex patterns
+# that cover the most common corporate PAC patterns:
+#   return "PROXY host:port"
+#   return "SOCKS host:port"
+#   return "DIRECT" (no proxy)
+# Sets _detected to the extracted URL on success, empty on failure.
+_fetch_and_parse_pac() {
+    local _pac_url="$1"
+    _detected=""
+    local _pac_content=""
+    log_info "Fetching PAC file: $_pac_url"
+    _pac_content=$(curl -sSf --connect-timeout 5 --max-time 10 "$_pac_url" 2>/dev/null || true)
+    if [[ -z "$_pac_content" ]]; then
+        log_debug "Could not fetch PAC file from $_pac_url"
+        return 1
+    fi
+    log_debug "PAC file fetched (${#_pac_content} bytes). Extracting proxy..."
+    # Strip comments (// and /* */) to clean the PAC content
+    _pac_content=$(printf '%s' "$_pac_content" | sed 's|//.*$||g; s|/\*.*\*/||g')
+    # Pattern 1: return "PROXY host:port" (most common in corporate PACs)
+    local _proxy_line
+    _proxy_line=$(printf '%s' "$_pac_content" | grep -oEi 'return\s+"PROXY\s+[^"]+' | head -1 || true)
+    if [[ -n "$_proxy_line" ]]; then
+        local _host_port
+        _host_port=$(echo "$_proxy_line" | sed 's/.*PROXY\s*//i' | tr -d '"' | tr -d "'" | xargs)
+        if [[ -n "$_host_port" ]]; then
+            _detected="http://$_host_port"
+            return 0
+        fi
+    fi
+    # Pattern 2: return "SOCKS host:port" (SOCKS proxy)
+    _proxy_line=$(printf '%s' "$_pac_content" | grep -oEi 'return\s+"SOCKS\s+[^"]+' | head -1 || true)
+    if [[ -n "$_proxy_line" ]]; then
+        local _host_port
+        _host_port=$(echo "$_proxy_line" | sed 's/.*SOCKS\s*//i' | tr -d '"' | tr -d "'" | xargs)
+        if [[ -n "$_host_port" ]]; then
+            # SOCKS is not directly usable by curl/pacman — map to HTTP CONNECT
+            # proxy. Most corporate SOCKS proxies also accept HTTP CONNECT on
+            # the same port. If this doesn't work, the user must export manually.
+            _detected="http://$_host_port"
+            log_debug "PAC returns SOCKS — mapped to HTTP CONNECT proxy ($_detected)"
+            return 0
+        fi
+    fi
+    # Pattern 3: Simple variable assignment like myProxy = "host:port"
+    _proxy_line=$(printf '%s' "$_pac_content" | grep -oEi '(myProxy|proxy)\s*=\s*"[^"]*:[0-9]+' | head -1 || true)
+    if [[ -n "$_proxy_line" ]]; then
+        local _host_port
+        _host_port=$(echo "$_proxy_line" | grep -oE '[0-9a-zA-Z._-]+:[0-9]+')
+        if [[ -n "$_host_port" ]]; then
+            _detected="http://$_host_port"
+            return 0
+        fi
+    fi
+    # Pattern 4: shExpMatch with a literal proxy in the same function
+    # e.g. if (shExpMatch(host, "*.corp.local")) return "PROXY proxy.corp.local:8080";
+    _proxy_line=$(printf '%s' "$_pac_content" | grep -oEi '"PROXY\s+[^"]+' | head -1 || true)
+    if [[ -n "$_proxy_line" ]]; then
+        local _host_port
+        _host_port=$(echo "$_proxy_line" | sed 's/.*PROXY\s*//i' | tr -d '"' | xargs)
+        if [[ -n "$_host_port" ]]; then
+            _detected="http://$_host_port"
+            return 0
+        fi
+    fi
+    log_debug "PAC file parsed but no extractable direct proxy found (may use per-domain rules)."
+    return 1
+}
+
 # Auto-detect a system proxy when none is exported, then surface it so the
 # user is informed (and can opt in by exporting it). Best-effort: checks the
 # SteamOS/Steam Deck gsettings (commonly GNOME-ish) before giving up. Returns
@@ -1686,11 +1756,32 @@ _autodetect_system_proxy() {
             fi
         fi
     fi
-    # WPAD / PAC file heuristic: if a pac URL is configured but no plain
-    # proxy, we can't transparently honor PAC in bash — warn the user instead.
-    if [[ -n "${AUTO_PROXY_SCRIPT_URL:-}" || -n "${PAC_URL:-}" ]]; then
-        log_warn "A PAC/WPAD auto-config URL was detected but cannot be honored automatically."
-        log_warn "  Please export http_proxy/https_proxy manually (see your PAC file), then re-run."
+    # WPAD / PAC auto-config: if a PAC URL is configured in desktop settings,
+    # fetch and parse it to extract the proxy host/port. PAC files are JavaScript
+    # that call FindProxyForURL(). Most corporate PACs use simple patterns like
+    # "return PROXY host:port" or "return SOCKS host:port". We do a best-effort
+    # regex extraction that handles the common cases without a JS interpreter.
+    local _pac_url="${AUTO_PROXY_SCRIPT_URL:-}${PAC_URL:-}"
+    # Also check gsettings for the autoconfig-url
+    if [[ -z "$_pac_url" ]] && command -v gsettings >/dev/null 2>&1; then
+        local _pac_gsettings
+        _pac_gsettings=$(gsettings get org.gnome.system.proxy autoconfig-url 2>/dev/null | tr -d "'")
+        if [[ -n "$_pac_gsettings" && "$_pac_gsettings" != "''" && "$_pac_gsettings" != '""' ]]; then
+            _pac_url="$_pac_gsettings"
+        fi
+    fi
+    if [[ -n "$_pac_url" ]]; then
+        _fetch_and_parse_pac "$_pac_url"
+        if [[ -n "${_detected:-}" ]]; then
+            export http_proxy="$_detected" https_proxy="$_detected" HTTP_PROXY="$_detected" HTTPS_PROXY="$_detected"
+            log_info "Extracted proxy from PAC file: $_detected"
+            log_info "Exported as http_proxy/https_proxy for this run."
+            return 0
+        fi
+        log_warn "PAC file detected ($_pac_url) but proxy could not be extracted automatically."
+        log_warn "  The PAC file may use complex logic (SOCKS, per-domain rules) that"
+        log_warn "  requires a JavaScript interpreter. Export proxy manually:"
+        log_warn "    export https_proxy=http://your-proxy:port"
     fi
     if [[ -n "$_detected" ]]; then
         export http_proxy="$_detected" https_proxy="$_detected" HTTP_PROXY="$_detected" HTTPS_PROXY="$_detected"

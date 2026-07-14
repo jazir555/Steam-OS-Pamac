@@ -1699,10 +1699,16 @@ _collect_proxy_create_args() {
 # Sets _detected to the extracted URL on success, empty on failure.
 _fetch_and_parse_pac() {
     local _pac_url="$1"
+    local _prefetched_content="${2:-}"
     _detected=""
     local _pac_content=""
-    log_info "Fetching PAC file: $_pac_url"
-    _pac_content=$(curl -sSf --connect-timeout 5 --max-time 10 "$_pac_url" 2>/dev/null || true)
+    if [[ -n "$_prefetched_content" ]]; then
+        _pac_content="$_prefetched_content"
+        log_debug "Using pre-fetched PAC content (${#_pac_content} bytes)."
+    else
+        log_info "Fetching PAC file: $_pac_url"
+        _pac_content=$(curl -sSf --connect-timeout 5 --max-time 10 "$_pac_url" 2>/dev/null || true)
+    fi
     if [[ -z "$_pac_content" ]]; then
         log_debug "Could not fetch PAC file from $_pac_url"
         return 1
@@ -1770,8 +1776,41 @@ _autodetect_system_proxy() {
         return 1
     fi
     local _detected=""
-    # GNOME/desktop proxy via gsettings (used by KDE/GNOME on SteamOS).
-    if command -v gsettings >/dev/null 2>&1; then
+
+    # ── Method 1: NetworkManager (nmcli) ──
+    # KDE Plasma on SteamOS/Steam Deck uses NetworkManager for proxy config.
+    # nmcli reports proxy settings per-connection and globally.
+    if [[ -z "$_detected" ]] && command -v nmcli >/dev/null 2>&1; then
+        local _nm_proxy
+        _nm_proxy=$(nmcli -t -f connection.proxy.method connection show --active 2>/dev/null | head -1 || echo "")
+        if [[ "$_nm_proxy" == "manual" ]]; then
+            local _nm_host _nm_port
+            _nm_host=$(nmcli -t -f connection.proxy.http connection show --active 2>/dev/null | head -1 || echo "")
+            _nm_port=$(nmcli -t -f connection.proxy.http-port connection show --active 2>/dev/null | head -1 || echo "")
+            if [[ -n "$_nm_host" && -n "$_nm_port" && "$_nm_host" != "" && "$_nm_port" != "0" ]]; then
+                _detected="http://${_nm_host}:${_nm_port}"
+            else
+                _nm_host=$(nmcli -t -f connection.proxy.https connection show --active 2>/dev/null | head -1 || echo "")
+                _nm_port=$(nmcli -t -f connection.proxy.https-port connection show --active 2>/dev/null | head -1 || echo "")
+                if [[ -n "$_nm_host" && -n "$_nm_port" && "$_nm_host" != "" && "$_nm_port" != "0" ]]; then
+                    _detected="http://${_nm_host}:${_nm_port}"
+                fi
+            fi
+        elif [[ "$_nm_proxy" == "auto" ]]; then
+            local _nm_pac
+            _nm_pac=$(nmcli -t -f connection.proxy.pac-url connection show --active 2>/dev/null | head -1 || echo "")
+            if [[ -n "$_nm_pac" && "$_nm_pac" != "" ]]; then
+                _fetch_and_parse_pac "$_nm_pac"
+                if [[ -n "${_detected:-}" ]]; then
+                    log_info "Auto-detected proxy from NetworkManager PAC: $_detected"
+                fi
+            fi
+        fi
+    fi
+
+    # ── Method 2: GNOME/desktop proxy via gsettings ──
+    # Used by KDE/GNOME on SteamOS for desktop proxy configuration.
+    if [[ -z "$_detected" ]] && command -v gsettings >/dev/null 2>&1; then
         local _mode
         _mode=$(gsettings get org.gnome.system.proxy mode 2>/dev/null | tr -d "'")
         if [[ "$_mode" == "manual" ]]; then
@@ -1789,9 +1828,83 @@ _autodetect_system_proxy() {
             fi
         fi
     fi
-    # WPAD / PAC auto-config: if a PAC URL is configured in desktop settings,
-    # fetch and parse it to extract the proxy host/port. PAC files are JavaScript
-    # that call FindProxyForURL(). Most corporate PACs use simple patterns like
+
+    # ── Method 3: KDE/kioslaverc ──
+    # KDE Plasma stores proxy settings in ~/.config/kioslaverc (or via
+    # kreadconfig5/kreadconfig6). This is the primary proxy config path on
+    # SteamOS/Steam Deck which uses KDE Plasma.
+    if [[ -z "$_detected" ]]; then
+        local _kioslaverc="${XDG_CONFIG_HOME:-$HOME/.config}/kioslaverc"
+        local _kreadconfig=""
+        if command -v kreadconfig6 >/dev/null 2>&1; then
+            _kreadconfig="kreadconfig6"
+        elif command -v kreadconfig5 >/dev/null 2>&1; then
+            _kreadconfig="kreadconfig5"
+        fi
+        local _kde_mode=""
+        if [[ -n "$_kreadconfig" ]]; then
+            _kde_mode=$($_kreadconfig --file kioslaverc --group "Proxy Settings" --key "ProxyType" 2>/dev/null || echo "")
+        elif [[ -f "$_kioslaverc" ]]; then
+            _kde_mode=$(grep -oP 'ProxyType=\K.*' "$_kioslaverc" 2>/dev/null | head -1 || echo "")
+        fi
+        if [[ "$_kde_mode" == "1" ]]; then
+            local _kh _kp
+            if [[ -n "$_kreadconfig" ]]; then
+                _kh=$($_kreadconfig --file kioslaverc --group "Proxy Settings" --key "HttpProxy" 2>/dev/null | grep -oP '^\S+' || echo "")
+                _kp=$($_kreadconfig --file kioslaverc --group "Proxy Settings" --key "HttpProxy" 2>/dev/null | grep -oP ':\K[0-9]+' || echo "")
+            elif [[ -f "$_kioslaverc" ]]; then
+                _kh=$(awk -F'[=:]' '/^HttpProxy=/{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$_kioslaverc" 2>/dev/null || echo "")
+                _kp=$(awk -F'[=:]' '/^HttpProxy=/{gsub(/^[ \t]+|[ \t]+$/,"",$3); print $3; exit}' "$_kioslaverc" 2>/dev/null || echo "")
+            fi
+            if [[ -n "$_kh" && -n "$_kp" && "$_kp" != "0" ]]; then
+                _detected="http://${_kh}:${_kp}"
+            fi
+        elif [[ "$_kde_mode" == "2" ]]; then
+            local _kde_pac=""
+            if [[ -n "$_kreadconfig" ]]; then
+                _kde_pac=$($_kreadconfig --file kioslaverc --group "Proxy Settings" --key "ProxyConfigScript" 2>/dev/null || echo "")
+            elif [[ -f "$_kioslaverc" ]]; then
+                _kde_pac=$(grep -oP 'ProxyConfigScript=\K.*' "$_kioslaverc" 2>/dev/null | head -1 || echo "")
+            fi
+            if [[ -n "$_kde_pac" && "$_kde_pac" != "" ]]; then
+                _fetch_and_parse_pac "$_kde_pac"
+                if [[ -n "${_detected:-}" ]]; then
+                    log_info "Auto-detected proxy from KDE PAC config: $_detected"
+                fi
+            fi
+        fi
+    fi
+
+    # ── Method 4: WPAD DNS discovery ──
+    # WPAD (Web Proxy Auto-Discovery) locates a PAC file via DNS. The client
+    # queries wpad.<domain>/wpad.dat over HTTP. This is common on corporate
+    # networks where DNS is configured to point wpad to the proxy server.
+    if [[ -z "$_detected" ]]; then
+        local _domain=""
+        # Extract domain from hostname (e.g., "deck.internal.corp" -> "internal.corp")
+        _domain=$(hostname -f 2>/dev/null | sed 's/^[^.]*\.//' || echo "")
+        if [[ -n "$_domain" && "$_domain" != *"."* ]]; then
+            _domain=""  # Not a FQDN, skip WPAD
+        fi
+        if [[ -n "$_domain" ]]; then
+            local _wpad_url="http://wpad.${_domain}/wpad.dat"
+            log_debug "Trying WPAD discovery: $_wpad_url"
+            local _wpad_resp=""
+            _wpad_resp=$(curl -sSf --connect-timeout 3 --max-time 5 "$_wpad_url" 2>/dev/null || echo "")
+            if [[ -n "$_wpad_resp" ]] && echo "$_wpad_resp" | grep -qi "FindProxyForURL\|PROXY\|SOCKS"; then
+                log_debug "WPAD response received (${#_wpad_resp} bytes), parsing..."
+                _fetch_and_parse_pac "$_wpad_url" "$_wpad_resp"
+                if [[ -n "${_detected:-}" ]]; then
+                    log_info "Auto-detected proxy from WPAD: $_detected"
+                fi
+            fi
+        fi
+    fi
+
+    # ── Method 5: PAC file auto-config ──
+    # If a PAC URL is configured in desktop settings, fetch and parse it to
+    # extract the proxy host/port. PAC files are JavaScript that call
+    # FindProxyForURL(). Most corporate PACs use simple patterns like
     # "return PROXY host:port" or "return SOCKS host:port". We do a best-effort
     # regex extraction that handles the common cases without a JS interpreter.
     local _pac_url="${AUTO_PROXY_SCRIPT_URL:-}${PAC_URL:-}"

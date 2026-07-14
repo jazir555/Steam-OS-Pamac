@@ -13,7 +13,6 @@ set -euo pipefail
 set -E
 
 # ERR trap for better error tracing in deeply nested calls (subshells, pipes, sub-functions)
-# shellcheck disable=SC2064 # $LINENO/$BASH_COMMAND MUST expand at trap execution, not definition
 _err_trap() {
     local _exit_code=$?
     local _line=$1
@@ -398,7 +397,6 @@ initialize_logging() {
     # Initialize the global temp directory now that logging is available.
     _init_script_tmpdir
 
-    # shellcheck disable=SC2064 # $exit_code/$date MUST expand at trap execution, not definition
     trap 'exit_code=$?; _cleanup_container_snapshot; _cleanup_temp_files; echo "=== Run finished: $(date) - Exit: $exit_code ===" >> "$LOG_FILE"; [[ "$UPLOAD_LOG" == "true" ]] && sanitize_and_upload_log || true' EXIT
 
     # Host-side signal handlers: forward INT/TERM to child processes and clean
@@ -2734,8 +2732,8 @@ OPTIONS:
                             host without modifying the container
   --enable-gaming        Enable gaming packages (Steam, Lutris, Heroic)
   --disable-gaming       Disable gaming packages (default)
-  --enable-extra-repos   Enable extra repos (chaotic-aur, endeavouros, etc.)
-  --disable-extra-repos  Disable extra repos (default)
+  --enable-extra-repos   Enable extra repos (chaotic-aur, endeavouros, etc.) (default)
+  --disable-extra-repos  Disable extra repos
   --enable-build-cache   Enable persistent yay build cache (default)
   --disable-build-cache  Disable persistent yay build cache
   --optimize-mirrors     Optimize pacman mirrors for fastest downloads (default)
@@ -4243,32 +4241,6 @@ _atomic_sed_inplace() {
     sync "$_parent" 2>/dev/null || true
 }
 
-# Escape all sed-special characters in a replacement string.
-# Use this when embedding user-supplied values into s/pattern/replacement/exprs.
-# Characters escaped: \ & / (the three that break s/// sed substitutions).
-# When the delimiter is |, only \ and & need escaping (not /).
-_sed_escape_replacement() {
-    local _s="$1"
-    _s="${_s//\\/\\\\}"
-    _s="${_s//&/\\&}"
-    _s="${_s//\//\\/}"
-    echo "$_s"
-}
-# Escape sed-special characters in a search pattern.
-# Characters escaped: \ / [ ] ^ $ . * (these are regex/sed metacharacters).
-# Use when embedding user-supplied values into the search side of s/pattern/replacement/.
-_sed_escape_pattern() {
-    local _s="$1"
-    _s="${_s//\\/\\\\}"
-    _s="${_s//\//\\/}"
-    _s="${_s//\[/\\[}"
-    _s="${_s//\]/\\]}"
-    _s="${_s//^/\\^}"
-    _s="${_s//\$/\\\$}"
-    _s="${_s//./\\.}"
-    _s="${_s//\*/\\*}"
-    echo "$_s"
-}
 _calc_makepkg_jobs() {
     local ram_per_job_kb=768000
     # In low-memory mode, double the per-job RAM requirement to reduce
@@ -7348,7 +7320,6 @@ _import_key_with_retry() {
                 local _verify_fp
                 _verify_fp=$(GNUPGHOME=/etc/pacman.d/gnupg gpg --with-colons --list-keys "$key_id" 2>/dev/null \
                     | grep '^fpr' | head -1 | cut -d: -f10 || echo "")
-                local _fp_len=${#_verify_fp}
                 local _kid_len=${#key_id}
                 local _verify_ok=false
                 if [[ -n "$_verify_fp" ]]; then

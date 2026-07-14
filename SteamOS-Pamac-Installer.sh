@@ -7871,6 +7871,22 @@ if ! safe_install sudo shadow gnupg jq python bubblewrap libcap pacman-contrib s
     exit 1
 fi
 echo "Core packages installed."
+# Verify critical packages actually landed. safe_install runs as a batch;
+# a partial failure (e.g. transient mirror error) could leave bubblewrap
+# missing, causing AUR DynamicUser builds to fail later with a confusing
+# error. Assert each critical package individually so the stage fails here
+# instead of silently propagating the gap downstream.
+for _critical_pkg in bubblewrap libcap socat; do
+    if ! pacman -Q "$_critical_pkg" >/dev/null 2>&1; then
+        echo "WARN: $_critical_pkg not installed after batch install. Retrying individually..."
+        safe_install "$_critical_pkg" 2>/dev/null || true
+        if ! pacman -Q "$_critical_pkg" >/dev/null 2>&1; then
+            echo "ERROR: Failed to install $_critical_pkg. AUR builds will be affected."
+            exit 1
+        fi
+    fi
+done
+echo "Core package assertions passed."
 CORE_EOF
 
     if ! exec_container_script "$core_script" "core-packages"; then
@@ -8473,11 +8489,18 @@ if [[ "$_STRICT_SECURITY_MODE" == "true" ]]; then
     echo "  compatibility with DynamicUser outside of systemd."
 elif ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/dev/null 2>&1; then
 if ! command -v bwrap >/dev/null 2>&1; then
-    echo "FATAL: bubblewrap (bwrap) is required for the fake systemd-run wrapper."
-    echo "  Install it inside the container before running the installer, or use"
-    echo "  an init-mode container (distrobox create --init) for real systemd."
-    echo "  To install: pacman -S --noconfirm --needed bubblewrap"
-    exit 1
+    echo "bubblewrap (bwrap) not found. Attempting automatic install..."
+    if pacman -S --noconfirm --needed bubblewrap 2>/dev/null; then
+        echo "  bubblewrap installed successfully."
+    elif safe_install bubblewrap 2>/dev/null; then
+        echo "  bubblewrap installed via safe_install."
+    fi
+    if ! command -v bwrap >/dev/null 2>&1; then
+        echo "FATAL: bubblewrap (bwrap) installation failed. AUR DynamicUser builds will not work."
+        echo "  Install manually: sudo pacman -S bubblewrap"
+        echo "  Or use an init-mode container: distrobox create --init"
+        exit 1
+    fi
 fi
 _write_fake_systemd_run_wrapper
 echo "Fake systemd-run installed at /usr/local/sbin/systemd-run (with ad-hoc build-user cleanup)."

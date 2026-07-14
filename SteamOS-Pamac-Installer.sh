@@ -264,6 +264,11 @@ _verify_sandbox_flag="${_verify_sandbox_flag:-false}"
 # This is intended for users who want every operation to be cryptographically
 # verified and verify that the container's init/pamac version are compatible.
 STRICT_SECURITY="${STRICT_SECURITY:-false}"
+# --use-devtools: Use Arch's official devtools (archbuild/systemd-nspawn) for
+# AUR package builds instead of yay. Devtools creates clean chroot builds with
+# proper isolation, dependency resolution, and reproducibility. Requires
+# devtools package in the container. Falls back to yay if unavailable.
+USE_DEVTOOLS="${USE_DEVTOOLS:-false}"
 
 # SECURITY: --allow-trustall permits the last-resort TrustAll keyring bootstrap
 # (Method F) without an interactive confirmation prompt. When false (default),
@@ -427,6 +432,39 @@ log_success(){ _log "SUCCESS" "$GREEN"  "✓ $1"; }
 log_warn()   { _log "WARN"    "$YELLOW" "⚠ $1"; }
 log_error()  { _log "ERROR"   "$RED"    "✗ $1"; }
 log_debug()  { _log "DEBUG"   ""        "$1"; }
+
+# ── Structured event logging (JSON Lines) ──
+# Writes machine-parseable events to EVENT_LOG_FILE for telemetry and failure
+# diagnosis. Each line is a JSON object with timestamp, event name, and
+# arbitrary key=value data. Separated from the human-readable LOG_FILE so it
+# can be consumed by jq, monitoring tools, or uploaded independently.
+EVENT_LOG_FILE=""
+_log_event() {
+    local _event="$1"; shift
+    local _ts
+    _ts=$(date -u +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "")
+    local _data="{"
+    local _first=true
+    for _kv in "$@"; do
+        local _k="${_kv%%=*}" _v="${_kv#*=}"
+        # Escape JSON special characters in value
+        _v="${_v//\\/\\\\}"
+        _v="${_v//\"/\\\"}"
+        _v="${_v//$'\n'/\\n}"
+        _v="${_v//$'\t'/\\t}"
+        if [[ "$_first" == "true" ]]; then
+            _first=false
+        else
+            _data+=","
+        fi
+        _data+="\"${_k}\":\"${_v}\""
+    done
+    _data+="}"
+    local _line="{\"ts\":\"${_ts}\",\"event\":\"${_event}\",\"data\":${_data}}"
+    if [[ -n "${EVENT_LOG_FILE:-}" ]]; then
+        printf '%s\n' "$_line" >> "$EVENT_LOG_FILE" 2>/dev/null || true
+    fi
+}
 
 # ── Heredoc expansion sanity check ──
 # Call after writing a heredoc to verify no accidental host variable leakage.
@@ -2559,9 +2597,17 @@ OPTIONS:
                              chaotic-aur, archlinuxcn, endeavouros) instead of
                              stripping them from the throwaway config. This is
                              needed when third-party repos also need their keys
-                             refreshed during the TrustAll bootstrap. Default:
-                             only official Arch repos (core/extra/multilib) are
-                             included in the throwaway config for safety.
+                              refreshed during the TrustAll bootstrap. Default:
+                              only official Arch repos (core/extra/multilib) are
+                              included in the throwaway config for safety.
+  --use-devtools            Use Arch's official devtools (archbuild) for AUR
+                              builds instead of yay. Devtools creates clean
+                              chroot builds via systemd-nspawn with proper
+                              isolation, dependency resolution, and
+                              reproducibility. Requires devtools in the
+                              container. Falls back to yay if unavailable.
+                              TRADE-OFF: better isolation at the cost of
+                              slower builds (full chroot recreation each time).
   --upload-log              Sanitize and upload the setup log for debugging
   --verbose                 Show detailed output, including command logs
   --quiet                   Only show errors
@@ -2629,9 +2675,13 @@ ENVIRONMENT VARIABLES:
   ENDEAVOUROS_KEY_ID       Override the EndeavourOS signing key fingerprint
                             (auto-discovered from keyring package by default)
   STRICT_SECURITY          Set to 'true' to enforce --strict-security mode
-                           (refuse SigLevel=TrustAll recovery and the fake
-                           systemd-run wrapper). AUR builds WILL fail in
-                           non-systemd containers. Default 'false'.
+                            (refuse SigLevel=TrustAll recovery and the fake
+                            systemd-run wrapper). AUR builds WILL fail in
+                            non-systemd containers. Default 'false'.
+  USE_DEVTOOLS             Set to 'true' to use Arch devtools (archbuild) for
+                            AUR builds instead of yay. Requires devtools in
+                            the container. Falls back to yay if unavailable.
+                            Default 'false'.
   TRUSTALL_ALL_REPOS       Set to 'true' to keep third-party repos (chaotic-aur,
                            archlinuxcn, etc.) in the TrustAll throwaway config
                            during keyring bootstrap. Default 'false' strips them
@@ -2910,6 +2960,7 @@ parse_arguments() {
             --dry-run) DRY_RUN="true"; shift ;;
             --dry-run-verbose) DRY_RUN="true"; DRY_RUN_VERBOSE="true"; shift ;;
             --strict-security) STRICT_SECURITY="true"; shift ;;
+            --use-devtools) USE_DEVTOOLS="true"; shift ;;
             --allow-trustall) ALLOW_TRUSTALL="true"; shift ;;
             --trustall-all-repos) TRUSTALL_ALL_REPOS="true"; shift ;;
             --check) CHECK_ONLY="true"; shift ;;
@@ -4129,6 +4180,9 @@ _set_makepkg_jobs() {
         fi
     fi
     echo "MAKEFLAGS set to -j${jobs} (RAM-constrained build parallelism)"
+    local _swap_kb
+    _swap_kb=$(awk '/^SwapFree:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    _log_event "build_parallelism_init" "jobs=$jobs" "swap_kb=$_swap_kb" "ram_kb=$_mem_avail_kb" "low_mem=${LOW_MEMORY:-false}"
 }
 
 # ── Pre-build OOM check: dynamically reduce parallelism if memory dropped ──
@@ -4151,6 +4205,7 @@ _preflight_oom_check() {
     # Critical threshold: <256MB — abort to prevent OOM corruption
     if [[ "$_total_kb" -lt 262144 ]]; then
         local _avail_mb=$(( _total_kb / 1024 ))
+        _log_event "oom_abort" "desc=$_desc" "avail_mb=$_avail_mb" "threshold_mb=256" "mem_avail_kb=$_mem_avail_kb" "swap_avail_kb=$_swap_avail_kb"
         log_error "CRITICAL: Only ${_avail_mb}MB RAM+swap available before $_desc."
         log_error "OOM kill during gcc/vala compilation would corrupt build artifacts."
         log_error "Close other applications or add swap, then retry."
@@ -4172,6 +4227,7 @@ _preflight_oom_check() {
     [[ "$_safe_jobs" -gt "$_ncpu" ]] && _safe_jobs="$_ncpu"
 
     if [[ "$_safe_jobs" -lt "$_current_jobs" ]]; then
+        _log_event "oom_parallelism_reduce" "desc=$_desc" "from_j=$_current_jobs" "to_j=$_safe_jobs" "avail_mb=$(( _total_kb / 1024 ))"
         log_warn "Memory dropped before $_desc: reducing MAKEFLAGS from -j${_current_jobs} to -j${_safe_jobs}"
         export MAKEFLAGS="-j${_safe_jobs}"
     fi
@@ -7215,6 +7271,7 @@ _exec_handle_result() {
             return 0
         fi
         if [[ $_rc -eq 137 ]]; then
+            _log_event "container_oom_kill" "desc=$_desc" "exit_code=$_rc" "kind=$_kind"
             log_warn "$_kind '$_desc' got exit 137 without completion marker. May be OOM or signal kill."
         else
             log_warn "$_kind '$_desc' got exit $_rc without completion marker in non-init container. May be premature container stop."
@@ -7649,8 +7706,14 @@ else
         else
             echo "  --trustall-all-repos: all repos (including third-party) kept in throwaway config."
         fi
-        sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = TrustAll/" "$_TA_CONF"
-        grep -q '^SigLevel' "$_TA_CONF" || printf 'SigLevel = TrustAll\n' >> "$_TA_CONF"
+        # Atomic SigLevel rewrite: sed to temp file + mv (POSIX rename is atomic)
+        # instead of non-atomic sed -i which can corrupt the config on kill.
+        local _ta_tmp="${_TA_CONF}.tmp"
+        sed "s|^[[:space:]]*SigLevel.*|SigLevel = TrustAll|" "$_TA_CONF" > "$_ta_tmp"
+        if ! grep -q '^SigLevel' "$_ta_tmp" 2>/dev/null; then
+            printf 'SigLevel = TrustAll\n' >> "$_ta_tmp"
+        fi
+        mv -f "$_ta_tmp" "$_TA_CONF"
         echo "  Throwaway TrustAll config built: $_TA_CONF (real pacman.conf untouched)."
         # Sync and install keyring USING the throwaway config only.
         _remove_stale_lock
@@ -10350,6 +10413,7 @@ _fetch_aur_pkgbuild() {
     done
 
     # All methods exhausted — signal failure so caller can use stale cache
+    _log_event "aur_fetch_exhausted" "methods=RPC,CGIT,git-clone" "clone_max=$_clone_max"
     echo "# WARN: All AUR fetch methods failed (tried: RPC v5, CGIT, git-clone x${_clone_max})." >&2
     echo "# WARN: AUR may be rate-limited, down, or network is unreachable." >&2
     echo "# WARN: Will attempt to use stale cached PKGBUILD if available." >&2
@@ -10963,6 +11027,48 @@ if ! sudo -n true 2>/dev/null; then
     echo "If build hangs, ensure NOPASSWD sudo is configured for the current user in the container."
 fi
 
+# Build a package from a directory containing a PKGBUILD.
+# Uses devtools (archbuild) when --use-devtools is set and devtools is
+# available, otherwise falls back to makepkg. This provides a clean chroot
+# build environment with proper dependency resolution when devtools is used.
+# Args: $1=work_dir, $2=description (for logging)
+# Returns: 0 on success, 1 on failure. Outputs built package path on success.
+_build_package() {
+    local _work_dir="$1" _desc="${2:-package}"
+    local _use_devtools="${USE_DEVTOOLS:-false}"
+
+    # Check if devtools is available and requested
+    if [[ "$_use_devtools" == "true" ]] && command -v archbuild >/dev/null 2>&1; then
+        echo "Building $_desc with devtools (clean chroot)..."
+        # archbuild needs the PKGBUILD directory and creates a clean chroot
+        # It installs the resulting packages automatically
+        if sudo -Hu "$current_user" bash -lc "cd '$_work_dir' && archbuild --noconfirm" 2>/tmp/pamac_devtools_build_err; then
+            echo "Devtools build succeeded for $_desc."
+            return 0
+        else
+            echo "Devtools build failed for $_desc:"
+            cat /tmp/pamac_devtools_build_err 2>/dev/null | tail -15
+            echo "Falling back to makepkg..."
+            # Fall through to makepkg below
+        fi
+    elif [[ "$_use_devtools" == "true" ]]; then
+        echo "WARNING: --use-devtools set but archbuild not found. Using makepkg."
+    fi
+
+    # Default: build with makepkg
+    echo "Building $_desc with makepkg..."
+    _preflight_oom_check "$_desc build"
+    _set_makepkg_jobs
+    sudo -Hu "$current_user" bash -lc "cd '$_work_dir' && makepkg -si --noconfirm --clean" 2>/tmp/pamac_build_err
+    local _rc=$?
+    if [[ $_rc -ne 0 ]]; then
+        echo "makepkg failed for $_desc (exit $_rc):"
+        cat /tmp/pamac_build_err 2>/dev/null | tail -15
+        return 1
+    fi
+    return 0
+}
+
 install_from_aur_commit() {
     local commit="$1"
     local work_dir
@@ -11009,17 +11115,10 @@ install_from_aur_commit() {
         rm -rf "$work_dir"
         return 1
     fi
-    _preflight_oom_check "pamac-aur commit build"
-    _set_makepkg_jobs
-    sudo -Hu "$current_user" bash -lc "cd '$work_dir' && makepkg -si --noconfirm --clean" 2>/tmp/pamac_build_err
+    _build_package "$work_dir" "pamac-aur commit ${commit:0:12}"
     local build_rc=$?
     rm -rf "$work_dir"
-    if [[ $build_rc -eq 0 ]]; then
-        return 0
-    fi
-    echo "Build from commit failed (exit $build_rc):"
-    cat /tmp/pamac_build_err 2>/dev/null | tail -15
-    return 1
+    return $build_rc
 }
 
 install_from_yay() {
@@ -11334,6 +11433,8 @@ case "$compat_strategy" in
 esac
 
 if [[ "$pamac_installed" != "true" ]]; then
+    _pacman_ver=$(pacman -Q pacman 2>/dev/null | awk '{print $2}' || echo "unknown")
+    _log_event "pamac_install_failed" "pacman_version=$_pacman_ver" "strategies=A,B,C"
     echo "Error: pamac-aur install failed with all strategies."
     echo ""
     echo "DIAGNOSIS: The pamac-aur AUR package may be incompatible with the current container."
@@ -14120,8 +14221,13 @@ if [[ -n "$_TA_CONF" ]] && cp -f /etc/pacman.conf "$_TA_CONF" 2>/dev/null; then
     else
         echo "  --trustall-all-repos: all repos (including third-party) kept in throwaway config."
     fi
-    sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = TrustAll/" "$_TA_CONF"
-    grep -q '^SigLevel' "$_TA_CONF" || printf 'SigLevel = TrustAll\n' >> "$_TA_CONF"
+    # Atomic SigLevel rewrite: sed to temp file + mv (POSIX rename is atomic)
+    local _ta_tmp="${_TA_CONF}.tmp"
+    sed "s|^[[:space:]]*SigLevel.*|SigLevel = TrustAll|" "$_TA_CONF" > "$_ta_tmp"
+    if ! grep -q '^SigLevel' "$_ta_tmp" 2>/dev/null; then
+        printf 'SigLevel = TrustAll\n' >> "$_ta_tmp"
+    fi
+    mv -f "$_ta_tmp" "$_TA_CONF"
     _remove_stale_lock
     if pacman --config "$_TA_CONF" -Syy --noconfirm 2>/dev/null && \
        pacman --config "$_TA_CONF" -S --noconfirm --needed archlinux-keyring 2>/dev/null; then
@@ -14854,6 +14960,7 @@ main() {
     # Without this, runs with different --container-name overwrite one shared
     # log (issue: log-file collision across container names).
     LOG_FILE="$HOME/distrobox-pamac-setup-${CONTAINER_NAME}.log"
+    EVENT_LOG_FILE="$HOME/distrobox-pamac-events-${CONTAINER_NAME}.jsonl"
 
     if [[ "$EUID" -eq 0 ]]; then
         echo -e "\e[91mThis script should not be run as root.\e[0m" >&2

@@ -181,6 +181,7 @@ _cleanup_container_snapshot() {
     fi
     # Also clean up any stale snapshots from previous failed runs
     # (images matching the naming pattern that are dangling/unreferenced).
+    # shellcheck disable=SC2046 # Intentional word splitting for multiple image IDs
     container_runtime_for_ops rmi $(container_runtime_for_ops images -q --filter "reference=localhost/steamos-pamac-snapshot-*" 2>/dev/null) >/dev/null 2>&1 || true
 }
 # Track individual temp files for backward compatibility with code that
@@ -338,8 +339,9 @@ initialize_logging() {
             local _i
             for (( _i = _max_rotations; _i >= 2; _i-- )); do
                 rm -f "${LOG_FILE}.${_i}.gz" 2>/dev/null || true
-                [[ -f "${LOG_FILE}.$(( _i - 1 )).gz" ]] && \
+                if [[ -f "${LOG_FILE}.$(( _i - 1 )).gz" ]]; then
                     mv -f "${LOG_FILE}.$(( _i - 1 )).gz" "${LOG_FILE}.${_i}.gz" 2>/dev/null || true
+                fi
             done
             # Compress the oldest rotation (.1) if it exists
             if [[ -f "${LOG_FILE}.1" ]]; then
@@ -421,6 +423,7 @@ _validate_heredoc_sanity() {
     local _content="$1" _desc="${2:-heredoc}"
     # Check for bare $HOME, $USER, $CONTAINER_NAME that look like they
     # should have been escaped (appear in a context suggesting container code)
+    # shellcheck disable=SC2016 # Intentional: matching literal $HOME in content
     if echo "$_content" | grep -q 'export HOME=/home/$HOME\|export HOME=$HOME'; then
         log_warn "Heredoc '$_desc' may have unescaped \$HOME (should be \$\\\$HOME or baked value)."
     fi
@@ -495,13 +498,13 @@ sanitize_and_upload_log() {
 
     local upload_url=""
     log_info "Uploading sanitized log to transfer.sh..."
-    upload_url=$(curl -sf --connect-timeout ${UPLOAD_CONNECT_TIMEOUT} --max-time ${UPLOAD_MAX_TIME} \
+    upload_url=$(curl -sf --connect-timeout "${UPLOAD_CONNECT_TIMEOUT}" --max-time "${UPLOAD_MAX_TIME}" \
         --data-binary "@${sanitized_log}" \
         "https://transfer.sh/steamos-pamac-$(date +%Y%m%d-%H%M%S).log" 2>/dev/null || echo "")
 
     if [[ -z "$upload_url" ]]; then
         log_info "transfer.sh unavailable, trying 0x0.st..."
-        upload_url=$(curl -sf --connect-timeout ${UPLOAD_CONNECT_TIMEOUT} --max-time ${UPLOAD_MAX_TIME} \
+        upload_url=$(curl -sf --connect-timeout "${UPLOAD_CONNECT_TIMEOUT}" --max-time "${UPLOAD_MAX_TIME}" \
             -F "file=@${sanitized_log}" \
             "https://0x0.st" 2>/dev/null || echo "")
     fi
@@ -616,6 +619,7 @@ container_root_exec() {
       log_debug "distrobox-enter --root failed (exit $_rc), falling back to direct container exec"
     fi
   fi
+  # shellcheck disable=SC2046 # Intentional word splitting: _proxy_env_args_for_exec returns multiple -e args
   container_runtime_for_ops exec -i -u 0 -e HOME="/root" -e LOW_MEMORY="${LOW_MEMORY:-false}" \
     $(_proxy_env_args_for_exec) "$CONTAINER_NAME" "$@"
   _rc=$?
@@ -630,6 +634,7 @@ container_user_exec() {
       log_warn "Container not usable before user exec. Attempting anyway..."
     fi
   fi
+  # shellcheck disable=SC2046 # Intentional word splitting: _proxy_env_args_for_exec returns multiple -e args
   container_runtime_for_ops exec -i -u "$CURRENT_USER" \
     -e HOME="/home/${CURRENT_USER}" \
     -e XDG_DATA_DIRS="/usr/local/share:/usr/share" \
@@ -684,7 +689,7 @@ container_is_usable() {
   fi
   container_start 2>/dev/null || true
   local _output
-  _output=$(timeout ${CONTAINER_PROBE_TIMEOUT} container_runtime_for_ops exec -i -e HOME="/home/${CURRENT_USER}" "$CONTAINER_NAME" bash -c "echo ok" </dev/null 2>/dev/null || echo "")
+  _output=$(timeout "${CONTAINER_PROBE_TIMEOUT}" container_runtime_for_ops exec -i -e HOME="/home/${CURRENT_USER}" "$CONTAINER_NAME" bash -c "echo ok" </dev/null 2>/dev/null || echo "")
   if [[ "$_output" == *"ok"* ]]; then
     _LAST_USABLE_CHECK_TS=$_now
     return 0
@@ -982,6 +987,7 @@ _ensure_healthy_or_recreate() {
 # last known-good snapshot so the user can retry without manual cleanup.
 _CONTAINER_SNAPSHOT=""
 _CONTAINER_SNAPSHOT_DIR=""
+# shellcheck disable=SC2120 # Functions use ${1:-$CONTAINER_NAME} default
 _snapshot_container() {
     local _name="${1:-$CONTAINER_NAME}"
     if ! container_runtime_for_ops inspect "$_name" >/dev/null 2>&1; then
@@ -989,7 +995,8 @@ _snapshot_container() {
     fi
     _CONTAINER_SNAPSHOT_DIR="${_SCRIPT_TMPDIR:-/tmp}/steamos-pamac-snapshots"
     mkdir -p "$_CONTAINER_SNAPSHOT_DIR" 2>/dev/null || return 1
-    local _snap_image="localhost/steamos-pamac-snapshot-$(date +%s)"
+    local _snap_image
+    _snap_image="localhost/steamos-pamac-snapshot-$(date +%s)"
     # Use podman commit to create a point-in-time image of the container.
     # This captures the entire filesystem layer — packages, config, data.
     if container_runtime_for_ops commit "$_name" "$_snap_image" >/dev/null 2>&1; then
@@ -1001,6 +1008,7 @@ _snapshot_container() {
         return 1
     fi
 }
+# shellcheck disable=SC2120 # Function uses ${1:-$CONTAINER_NAME} default
 _rollback_container() {
     local _name="${1:-$CONTAINER_NAME}"
     if [[ -z "$_CONTAINER_SNAPSHOT" ]]; then
@@ -1029,6 +1037,7 @@ _rollback_on_fatal() {
     local _line=$1
     if [[ $_exit_code -ne 0 ]]; then
         log_error "Fatal error at line $_line (exit $_exit_code). Attempting rollback..."
+        # shellcheck disable=SC2119 # Uses ${1:-$CONTAINER_NAME} default
         _rollback_container
     fi
 }
@@ -1561,11 +1570,12 @@ check_network_connectivity() {
     # Check for captive portal: connect to archlinux.org and inspect the response.
     # Captive portals typically return HTTP 200/3xx with HTML content instead of
     # the expected Arch Linux page, or intercept HTTPS with a self-signed cert.
-    _curl_output=$(timeout ${NETWORK_PROBE_TIMEOUT} curl -sSf --connect-timeout ${NETWORK_PROBE_CONNECT_TIMEOUT} \
-        --max-time ${NETWORK_PROBE_TIMEOUT} -o /dev/null -w "%{http_code}\n%{ssl_verify_result}" \
+    _curl_output=$(timeout "${NETWORK_PROBE_TIMEOUT}" curl -sSf --connect-timeout "${NETWORK_PROBE_CONNECT_TIMEOUT}" \
+        --max-time "${NETWORK_PROBE_TIMEOUT}" -o /dev/null -w "%{http_code}\n%{ssl_verify_result}" \
         "$_probe_url" 2>/tmp/pamac_curl_err) || _curl_rc=$?
     _http_code=$(echo "$_curl_output" | head -1 || echo "000")
-    local _ssl_verify=$(echo "$_curl_output" | tail -1 || echo "")
+    local _ssl_verify
+    _ssl_verify=$(echo "$_curl_output" | tail -1 || echo "")
 
     # SSL verification result: 0 = valid, non-zero = cert issue (captive portal
     # or corporate proxy intercepting HTTPS with self-signed cert).
@@ -2087,8 +2097,8 @@ self_update() {
         return 1
     fi
 
-    cp "$_tmp_script" "$_atomic_tmp" && chmod +x "$_atomic_tmp" && sync "$_atomic_tmp" 2>/dev/null || true
-    local _cp_rc=$?
+    local _cp_rc=0
+    cp "$_tmp_script" "$_atomic_tmp" && chmod +x "$_atomic_tmp" && sync "$_atomic_tmp" 2>/dev/null || _cp_rc=$?
     rm -f "$_tmp_script"
     if [[ $_cp_rc -ne 0 ]]; then
         rm -f "$_atomic_tmp"
@@ -3321,8 +3331,10 @@ create_container() {
   unset _CREATE_RECREATION_GUARD
 }
 
+# shellcheck disable=SC2120
 repair_pacman_db() {
     log_info "Checking and repairing pacman database (if needed)..."
+    # shellcheck disable=all # Inner script runs inside container via bash -c
     container_root_exec bash -c '
 set +e
 export LC_ALL=C
@@ -7066,6 +7078,7 @@ _exec_handle_result() {
         # unnecessary repair runs that waste time and risk data loss.
         if echo "$_output" | grep -qiE "database.*(corrupt|incomplete|missing|not found|damaged|broken|failed to init)|corrupt(ed)? (database|package)|invalid.*(signature|database)|signature.*(invalid|missing|corrupt)|could not open|unable to lock database|failed to init.*database"; then
             log_info "DB corruption indicators detected in output — running repair..."
+            # shellcheck disable=SC2119
             repair_pacman_db
         fi
     fi
@@ -7101,6 +7114,7 @@ _exec_handle_result() {
         fi
         # ── Pre-repair: aggressive cleanup before calling full DB repair ──
         # Kill any stale pacman/yay processes that may hold locks
+    # shellcheck disable=all # Inner script runs inside container via bash -c
     container_root_exec bash -c '
 set +e
 export LC_ALL=C
@@ -7136,6 +7150,7 @@ if [[ "$_avail_kb" -gt 0 ]] && [[ "$_avail_kb" -lt 5120 ]]; then
 fi
 ' 2>/dev/null || true
         container_start 2>/dev/null || true
+        # shellcheck disable=SC2119
         repair_pacman_db
         return "$_rc"
     fi
@@ -12096,6 +12111,7 @@ CONTAINER_WRAPPER_EOF
     container_root_exec chmod +x /usr/local/bin/pamac-manager-wrapper
     log_info "pamac-manager-wrapper created inside container."
 
+    # shellcheck disable=SC2016 # Intentional: writing bash script content via single-quoted strings
     printf '%s\n' '#!/bin/bash' \
         'set +e' \
         'if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then' \
@@ -14420,6 +14436,7 @@ run_update() {
     fi
 
     log_info "Running post-upgrade verification..."
+    # shellcheck disable=all # Inner script runs inside container via bash -c
     container_root_exec bash -c '
 set +e
 # Check for database inconsistencies
@@ -14882,12 +14899,14 @@ main() {
     # This captures the container state so we can restore it if configure_container_base
     # or subsequent stages fail irrecoverably.
     if [[ "$DRY_RUN" != "true" ]]; then
+        # shellcheck disable=SC2119
         _snapshot_container
     fi
 
 	if ! configure_container_base; then
 		log_error "Container base setup failed permanently. Aborting installation."
         if [[ "$DRY_RUN" != "true" ]]; then
+            # shellcheck disable=SC2119
             _rollback_container
         fi
 		exit 1
@@ -14923,10 +14942,12 @@ main() {
 			log_info "Retrying AUR helper install..."
 			install_aur_helper || {
                 log_error "AUR helper install failed after recovery. Rolling back."
+                # shellcheck disable=SC2119
                 if [[ "$DRY_RUN" != "true" ]]; then _rollback_container; fi
                 exit 1
             }
 		else
+            # shellcheck disable=SC2119
             if [[ "$DRY_RUN" != "true" ]]; then _rollback_container; fi
 			exit 1
 		fi
@@ -14940,10 +14961,12 @@ main() {
 			log_info "Retrying Pamac install..."
 			install_pamac || {
                 log_error "Pamac install failed after recovery. Rolling back."
+                # shellcheck disable=SC2119
                 if [[ "$DRY_RUN" != "true" ]]; then _rollback_container; fi
                 exit 1
             }
 		else
+            # shellcheck disable=SC2119
             if [[ "$DRY_RUN" != "true" ]]; then _rollback_container; fi
 			exit 1
 		fi

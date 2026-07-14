@@ -237,6 +237,12 @@ FORCE_MODE="${FORCE_MODE:-false}"
 # the NOPASSWD commands to pamac-builder only. A host-alias user with the
 # same UID is also created for distrobox integration. Defaults to false.
 DEDICATED_BUILDUSER="${DEDICATED_BUILDUSER:-false}"
+# SECURITY: --allow-home-mount: By default, the container uses --no-home-mount
+# to prevent host /home exposure. This flag re-enables the host /home mount
+# for users who need it (e.g., accessing host files from inside the container).
+# Using this flag exposes host SSH keys, browser profiles, GPG keys, and any
+# other sensitive data in /home to all container processes.
+ALLOW_HOME_MOUNT="${ALLOW_HOME_MOUNT:-false}"
 SKIP_COMPAT_CHECK="${SKIP_COMPAT_CHECK:-false}"
 NO_COLOR="${NO_COLOR:-false}"
 LOW_MEMORY="${LOW_MEMORY:-false}"
@@ -2395,12 +2401,15 @@ OPTIONS:
   --dedicated-builduser      Create a dedicated _pamac_builder user inside the
                              container. AUR builds run under this user with NO
                              passwordless sudo, preventing privilege escalation
-                             via malicious PKGBUILDs. Automatically applies
-                             --no-home-mount so the build user CANNOT read host
-                             /home files (SSH keys, browser profiles, etc.).
+                             via malicious PKGBUILDs. The build user's home is
+                             /var/lib/_pamac_builder (isolated from host).
                              Source trees are accessed via 'distrobox enter' as
-                             the login user, not the build user. The build
-                             user's home is /var/lib/_pamac_builder.
+                             the login user, not the build user.
+  --allow-home-mount         Re-enable host /home mount inside the container
+                             (INSECURE: exposes SSH keys, browser profiles, GPG
+                             keys to all container processes). By default, the
+                             container uses --no-home-mount and only mounts the
+                             specific paths needed for builds.
   --security-opt OPT         Pass an additional --security-opt to the container
                              runtime during creation. May be repeated.
                              Examples: --security-opt seccomp:profile.json
@@ -2568,15 +2577,11 @@ SECURITY NOTE — --allow-wheel-nopasswd:
 SECURITY NOTE -- --dedicated-builduser:
   Creates a dedicated _pamac_builder user for AUR builds. This provides
   privilege separation: the build user has NO passwordless sudo, so a
-  malicious AUR PKGBUILD cannot escalate via pacman. However, Distrobox
-  mounts the host /home into the container by default, so the build user
-  retains READ access to host user files. This is an inherent trade-off
-  of Distrobox's design — the isolation is privilege-based, not filesystem-
-  based. For full filesystem isolation, configure distrobox with
-    --no-home-mount
-  in the container creation. The pamac GUI still runs as the host user
-  via polkit/D-Bus; only the AUR build/install path runs under the
-  dedicated user.
+  malicious AUR PKGBUILD cannot escalate via pacman. By default, the
+  container uses --no-home-mount to prevent host /home exposure. The
+  build user's home is isolated at /var/lib/_pamac_builder. The pamac
+  GUI still runs as the host user via polkit/D-Bus; only the AUR
+  build/install path runs under the dedicated user.
 
 SECURITY NOTE — Sudoers permissions (inside container):
   The following commands are granted passwordless sudo via
@@ -2778,6 +2783,7 @@ parse_arguments() {
             --non-interactive) NON_INTERACTIVE="true"; shift ;;
             --force) FORCE_MODE="true"; shift ;;
             --dedicated-builduser) DEDICATED_BUILDUSER="true"; shift ;;
+            --allow-home-mount) ALLOW_HOME_MOUNT="true"; shift ;;
             --use-init) FORCE_CONTAINER_INIT="true"; shift ;;
             --quick-start) QUICK_START="true"; shift ;;
             --disable-pin-alpm) PIN_ALPM="false"; shift ;;
@@ -3195,33 +3201,42 @@ create_container() {
         log_info "Creating container without init (systemd not available in this environment)."
     fi
 
+    # SECURITY: Always apply --no-home-mount by default to prevent host /home
+    # exposure. Without this, all container processes (including AUR PKGBUILDs)
+    # can read/write host SSH keys, browser profiles, GPG keys, and other
+    # sensitive data in /home. Only the specific paths needed for builds are
+    # mounted via explicit --volume flags below.
+    if [[ "$ALLOW_HOME_MOUNT" != "true" ]]; then
+        create_args+=(--no-home-mount)
+        log_info "Security: --no-home-mount applied (host /home not exposed)."
+    else
+        log_warn "Security: --allow-home-mount: host /home mounted read/write (INSECURE)."
+        log_warn "  All container processes can access host SSH keys, browser profiles, etc."
+        log_warn "  Remove --allow-home-mount for better isolation."
+    fi
+
+    # Mount build cache into the correct location based on user mode.
+    # When --no-home-mount is active, the container has no host /home, so we
+    # must explicitly mount the cache into the user's home inside the container.
     if [[ "$ENABLE_BUILD_CACHE" == "true" ]]; then
         local cache_dir="$HOME/.cache/yay-${CONTAINER_NAME}"
         mkdir -p "$cache_dir"
-        create_args+=(--volume "${cache_dir}:/home/${CURRENT_USER}/.cache/yay:rw")
-        log_info "Enabled persistent build cache: $cache_dir"
+        if [[ "$DEDICATED_BUILDUSER" == "true" ]]; then
+            create_args+=(--volume "${cache_dir}:/var/lib/_pamac_builder/.cache/yay:rw")
+            log_info "Persistent build cache: $cache_dir -> /var/lib/_pamac_builder/.cache/yay"
+        else
+            create_args+=(--volume "${cache_dir}:/home/${CURRENT_USER}/.cache/yay:rw")
+            log_info "Persistent build cache: $cache_dir -> /home/${CURRENT_USER}/.cache/yay"
+        fi
     fi
 
-    # --dedicated-builduser: mitigate /home mount information leak.
-    # Distrobox mounts the host's /home into the container by default, which
-    # means the dedicated build user (running AUR PKGBUILDs) can read the host
-    # user's SSH keys, browser profiles, GPG keys, and any other sensitive data
-    # in /home. --no-home-mount prevents this by not bind-mounting /home at all.
-    # The build user gets its own isolated home at /var/lib/_pamac_builder.
-    # The login user's working files (source trees, PKGBUILDs) are accessed via
-    # explicit volume mounts or `distrobox enter` (which uses the login user,
-    # not the build user).
+    # --dedicated-builduser: additional isolation for the build user.
+    # The build user gets its own home at /var/lib/_pamac_builder and cannot
+    # access host files. Source trees are accessed via 'distrobox enter' as
+    # the login user, not the build user.
     if [[ "$DEDICATED_BUILDUSER" == "true" ]]; then
-        create_args+=(--no-home-mount)
-        log_info "Applied --no-home-mount: build user cannot read host /home."
-        log_info "  The build user's home is isolated at /var/lib/_pamac_builder."
-        log_info "  Access source trees via 'distrobox enter $CONTAINER_NAME' as the login user."
-        # Remount build cache into the build user's isolated home instead
-        if [[ "$ENABLE_BUILD_CACHE" == "true" ]]; then
-            local cache_dir="$HOME/.cache/yay-${CONTAINER_NAME}"
-            create_args+=(--volume "${cache_dir}:/var/lib/_pamac_builder/.cache/yay:rw")
-            log_info "  Persistent build cache redirected to build user home."
-        fi
+        log_info "Build user home isolated at /var/lib/_pamac_builder."
+        log_info "Access source trees via 'distrobox enter $CONTAINER_NAME' as the login user."
     fi
 
     # Apply additional security profiles (--security-opt).
@@ -3334,6 +3349,20 @@ create_container() {
     log_error "Container created but is not functional."
     return 1
   fi
+
+  # ── Security posture summary ──
+  # Emit remaining risk notes so the user is aware of the container's isolation
+  # boundaries. These are printed once per creation, not on every entry.
+  if [[ "$ALLOW_HOME_MOUNT" != "true" ]]; then
+      log_info "Security: host /home is NOT mounted (--no-home-mount active)."
+  fi
+  log_info "Security: host networking is shared (container can reach host services)."
+  log_info "Security: kernel-level exploits (e.g. CVE-2022-0492, CVE-2024-21626) could"
+  log_info "  bypass container isolation. Keep your kernel updated for best protection."
+  log_info "Security: D-Bus session and display server (X11/Wayland) are accessible from"
+  log_info "  the container. A malicious application could send D-Bus messages or capture"
+  log_info "  input via X11. This is inherent to desktop container usage."
+
   # Success path: clear the recursion lock so a later (re)creation isn't
   # falsely rejected as nested recursion.
   unset _CREATE_RECREATION_GUARD
@@ -8181,14 +8210,14 @@ if [[ "__DEDICATED_BUILDUSER__" == "true" ]]; then
             exit 1
         }
         echo "Created dedicated AUR build user: $_builder_name"
-        echo "  Home: /var/lib/${_builder_name} (isolated from host /home mounts)"
+        echo "  Home: /var/lib/${_builder_name} (isolated from host)"
         echo "  Shell: /bin/bash (needed for makepkg/yay builds)"
         echo "  Group: wheel (sudo access)"
         echo ""
-        echo "  SECURITY: --no-home-mount is applied automatically with"
-        echo "  --dedicated-builduser. The build user CANNOT read host /home."
-        echo "  Source trees are accessed via 'distrobox enter' as the login user,"
-        echo "  not the build user. The build user only sees /var/lib/${_builder_name}."
+        echo "  SECURITY: --no-home-mount is active by default. The build user"
+        echo "  CANNOT read host /home. Source trees are accessed via"
+        echo "  'distrobox enter' as the login user, not the build user."
+        echo "  The build user only sees /var/lib/${_builder_name}."
         echo ""
     else
         echo "Dedicated build user '$_builder_name' already exists."

@@ -310,6 +310,9 @@ readonly CONTAINER_PROBE_TIMEOUT="${CONTAINER_PROBE_TIMEOUT:-15}"
 # 130 is the conventional shell exit for "terminated by SIGINT" — distinct from a
 # genuine success (0) so wrapper scripts can tell an abort from a clean run.
 readonly EXIT_USER_ABORT=130
+# 132 = preflight check failed (disk space, battery, OOM) — distinct from
+# user-initiated abort (130) so wrapper scripts can differentiate.
+readonly EXIT_PREFLIGHT_FAIL=132
 
 setup_colors() {
     [[ -n "${GREEN:-}" ]] && return 0
@@ -12938,8 +12941,8 @@ main() {
 
     _interactive_setup_menu
 
-    check_battery_power || exit "$EXIT_USER_ABORT"
-    _preflight_space_check "installation" || exit "$EXIT_USER_ABORT"
+    check_battery_power || exit "$EXIT_PREFLIGHT_FAIL"
+    _preflight_space_check "installation" || exit "$EXIT_PREFLIGHT_FAIL"
 
     if [[ "$ALLOW_WHEEL_NOPASSWD" == "true" ]]; then
         check_multi_user_warning

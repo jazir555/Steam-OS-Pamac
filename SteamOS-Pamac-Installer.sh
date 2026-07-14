@@ -230,13 +230,10 @@ NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
 # the user wants a headless run of a single operation but still wants the
 # battery/multi-user guard skips to behave normally. Defaults to false.
 FORCE_MODE="${FORCE_MODE:-false}"
-# --dedicated-builduser: create a dedicated pamac-builder account to run
-# AUR builds under, instead of reusing the host login user. This provides
-# an additional isolation layer between host account data and AUR PKGBUILD
-# execution. The dedicated user has no access to host home; sudoers scope
-# the NOPASSWD commands to pamac-builder only. A host-alias user with the
-# same UID is also created for distrobox integration. Defaults to false.
-DEDICATED_BUILDUSER="${DEDICATED_BUILDUSER:-false}"
+# SECURITY: --dedicated-builduser is ON by default. This is a critical
+# security measure that isolates AUR builds from the host user's home.
+# Only disable with --no-dedicated-builduser if you understand the risk.
+DEDICATED_BUILDUSER="${DEDICATED_BUILDUSER:-true}"
 # SECURITY: --allow-home-mount: By default, the container uses --no-home-mount
 # to prevent host /home exposure. This flag re-enables the host /home mount
 # for users who need it (e.g., accessing host files from inside the container).
@@ -3013,6 +3010,7 @@ parse_arguments() {
             --non-interactive) NON_INTERACTIVE="true"; shift ;;
             --force) FORCE_MODE="true"; shift ;;
             --dedicated-builduser) DEDICATED_BUILDUSER="true"; shift ;;
+            --no-dedicated-builduser) DEDICATED_BUILDUSER="false"; shift ;;
             --allow-home-mount) ALLOW_HOME_MOUNT="true"; shift ;;
             --use-init) FORCE_CONTAINER_INIT="true"; shift ;;
             --quick-start) QUICK_START="true"; shift ;;
@@ -4366,6 +4364,83 @@ _detect_install_drives() {
         avail_gb = int(avail_kb / 1048576)
         printf "%s|%s|%d GB|%s\n", mp, dev, avail_gb, fstype
     }' /proc/mounts 2>/dev/null | sort -t'|' -k3 -rn
+}
+
+# ── Interactive setup menu ──
+# Presents key options as a toggle menu before installation. Users press
+# letter keys to toggle options, then press Enter to confirm. Runs once
+# at the start of an interactive terminal session.
+_interactive_setup_menu() {
+    [[ -t 0 && -t 1 ]] || return 0
+    [[ "${NON_INTERACTIVE:-false}" == "true" ]] && return 0
+    [[ "${DRY_RUN:-false}" == "true" ]] && return 0
+    [[ "${UPDATE:-false}" == "true" ]] && return 0
+    [[ "${STATUS:-false}" == "true" ]] && return 0
+    [[ "${UNINSTALL:-false}" == "true" ]] && return 0
+
+    # Local copies to toggle (start with current defaults)
+    local _opt_build_cache="${ENABLE_BUILD_CACHE:-true}"
+    local _opt_low_mem="${LOW_MEMORY:-false}"
+    local _opt_strict="${STRICT_SECURITY:-false}"
+    local _opt_dedbuild="${DEDICATED_BUILDUSER:-true}"
+    local _opt_multi="${ENABLE_MULTILIB:-true}"
+    local _opt_flatpak="${ENABLE_FLATPAK:-false}"
+
+    while true; do
+        local _bc=" "; [[ "$_opt_build_cache" == "true" ]] && _bc="x"
+        local _lm=" "; [[ "$_opt_low_mem" == "true" ]] && _lm="x"
+        local _ss=" "; [[ "$_opt_strict" == "true" ]] && _ss="x"
+        local _db=" "; [[ "$_opt_dedbuild" == "true" ]] && _db="x"
+        local _ml=" "; [[ "$_opt_multi" == "true" ]] && _ml="x"
+        local _fp=" "; [[ "$_opt_flatpak" == "true" ]] && _fp="x"
+
+        echo "" >&2
+        echo "╔══════════════════════════════════════════════════════════════╗" >&2
+        echo "║  INSTALL OPTIONS (press key to toggle, Enter to confirm)   ║" >&2
+        echo "╚══════════════════════════════════════════════════════════════╝" >&2
+        echo "" >&2
+        echo "  [B]uild cache (persistent yay cache)    [${_bc}]" >&2
+        echo "  [M]ultilib (32-bit libs for Steam/Games) [${_ml}]" >&2
+        echo "  [L]ow-memory mode (safe for 8GB RAM)    [${_lm}]" >&2
+        echo "  [S]trict security (no TrustAll relax)    [${_ss}]" >&2
+        echo "  [D]edicated build user (AUR isolation)   [${_db}]" >&2
+        echo "  [F]latpak support (Pamac GUI)            [${_fp}]" >&2
+        echo "" >&2
+        echo "  [I]nstall target drive" >&2
+        echo "  [P]roceed with install" >&2
+        echo "" >&2
+        printf "  Toggle: " >&2
+        local _key
+        read -rsn1 _key </dev/tty 2>/dev/null || _key=""
+        echo "" >&2
+
+        case "${_key,,}" in
+            b) _opt_build_cache=$( [[ "$_opt_build_cache" == "true" ]] && echo false || echo true ) ;;
+            m) _opt_multi=$( [[ "$_opt_multi" == "true" ]] && echo false || echo true ) ;;
+            l) _opt_low_mem=$( [[ "$_opt_low_mem" == "true" ]] && echo false || echo true ) ;;
+            s) _opt_strict=$( [[ "$_opt_strict" == "true" ]] && echo false || echo true ) ;;
+            d) _opt_dedbuild=$( [[ "$_opt_dedbuild" == "true" ]] && echo false || echo true ) ;;
+            f) _opt_flatpak=$( [[ "$_opt_flatpak" == "true" ]] && echo false || echo true ) ;;
+            i) _select_install_drive ;;
+            p|"")
+                # Confirm selections
+                ENABLE_BUILD_CACHE="$_opt_build_cache"
+                LOW_MEMORY="$_opt_low_mem"
+                STRICT_SECURITY="$_opt_strict"
+                DEDICATED_BUILDUSER="$_opt_dedbuild"
+                ENABLE_MULTILIB="$_opt_multi"
+                ENABLE_FLATPAK="$_opt_flatpak"
+                log_info "Selected options:"
+                log_info "  Build cache: $ENABLE_BUILD_CACHE"
+                log_info "  Multilib: $ENABLE_MULTILIB"
+                log_info "  Low-memory: $LOW_MEMORY"
+                log_info "  Strict security: $STRICT_SECURITY"
+                log_info "  Dedicated build user: $DEDICATED_BUILDUSER"
+                log_info "  Flatpak: $ENABLE_FLATPAK"
+                return 0
+                ;;
+        esac
+    done
 }
 
 # ── Interactive drive selector ──
@@ -15388,6 +15463,8 @@ main() {
   run_pre_flight_checks || exit 1
   ensure_podman
   detect_init_support
+
+    _interactive_setup_menu
 
     check_battery_power || exit "$EXIT_USER_ABORT"
     _preflight_space_check "installation" || exit "$EXIT_USER_ABORT"

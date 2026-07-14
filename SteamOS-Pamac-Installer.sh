@@ -264,6 +264,15 @@ STRICT_SECURITY="${STRICT_SECURITY:-false}"
 # users have explicit control over signature verification relaxation.
 ALLOW_TRUSTALL="${ALLOW_TRUSTALL:-false}"
 
+# SECURITY: --trustall-all-repos allows the TrustAll throwaway config to
+# include ALL repos (including third-party: chaotic-aur, archlinuxcn, etc.)
+# when doing the temporary SigLevel=TrustAll keyring bootstrap. By default
+# (false), non-official repos are stripped from the throwaway config so a
+# compromised third-party mirror cannot inject a tampered package during
+# the signature-disabled window. Set to true only if you need to bootstrap
+# keys from third-party repos during the TrustAll fallback.
+TRUSTALL_ALL_REPOS="${TRUSTALL_ALL_REPOS:-false}"
+
 # Maximum per-container log file size in bytes before rotate-on-startup.
 # Rotated logs are compressed and maintained as a ring of up to 3 backups.
 LOG_ROTATION_MAX_SIZE="${LOG_ROTATION_MAX_SIZE:-5242880}"  # 5 MiB
@@ -2405,6 +2414,14 @@ OPTIONS:
                              interactive confirmation. Without this flag, the
                              user is prompted before SigLevel=TrustAll is used.
                              Only effective when --strict-security is NOT set.
+  --trustall-all-repos       When using the TrustAll fallback, include ALL
+                             configured repos (including third-party repos like
+                             chaotic-aur, archlinuxcn, endeavouros) instead of
+                             stripping them from the throwaway config. This is
+                             needed when third-party repos also need their keys
+                             refreshed during the TrustAll bootstrap. Default:
+                             only official Arch repos (core/extra/multilib) are
+                             included in the throwaway config for safety.
   --upload-log              Sanitize and upload the setup log for debugging
   --verbose                 Show detailed output, including command logs
   --quiet                   Only show errors
@@ -2475,6 +2492,12 @@ ENVIRONMENT VARIABLES:
                            (refuse SigLevel=TrustAll recovery and the fake
                            systemd-run wrapper). AUR builds WILL fail in
                            non-systemd containers. Default 'false'.
+  TRUSTALL_ALL_REPOS       Set to 'true' to keep third-party repos (chaotic-aur,
+                           archlinuxcn, etc.) in the TrustAll throwaway config
+                           during keyring bootstrap. Default 'false' strips them
+                           to limit the injection surface. Use only when
+                           third-party repos also need key refresh during the
+                           TrustAll fallback.
   FORCE_CONTAINER_INIT     Set to 'true' to force init-mode containers on
                            SteamOS (overrides auto-detection). For advanced
                            users with working nested systemd on custom kernels.
@@ -2751,6 +2774,7 @@ parse_arguments() {
             --dry-run-verbose) DRY_RUN="true"; DRY_RUN_VERBOSE="true"; shift ;;
             --strict-security) STRICT_SECURITY="true"; shift ;;
             --allow-trustall) ALLOW_TRUSTALL="true"; shift ;;
+            --trustall-all-repos) TRUSTALL_ALL_REPOS="true"; shift ;;
             --check) CHECK_ONLY="true"; shift ;;
             --verbose) LOG_LEVEL="verbose"; shift ;;
             --quiet) LOG_LEVEL="quiet"; shift ;;
@@ -7131,8 +7155,10 @@ export LC_ALL=C
 
 # Arg 1: STRICT_SECURITY flag ("true" disables TrustAll relaxation recovery).
 # Arg 2: ALLOW_TRUSTALL flag ("true" permits TrustAll without interactive prompt).
+# Arg 3: TRUSTALL_ALL_REPOS flag ("true" keeps third-party repos in throwaway config).
 _STRICT_SECURITY_MODE="${1:-}"
 _ALLOW_TRUSTALL="${2:-false}"
+_TRUSTALL_ALL_REPOS="${3:-false}"
 
 _remove_stale_lock
 
@@ -7439,31 +7465,29 @@ else
         _TA_TRUSTALL_APPROVED=true
     fi
     if [[ "${_TA_TRUSTALL_APPROVED:-}" == "true" ]]; then
-    # Build a throwaway config: copy the real one, then STRIP every repo except
-    # the official [core] / [extra] / [multilib] stanzas. This is critical: the
-    # TrustAll window disables signature verification, so any repo present in the
-    # throwaway config could inject a maliciously-crafted package (most
-    # dangerously a tampered archlinux-keyring) while verification is off. By
-    # keeping only the signed-official repos we limit the injection surface to
-    # mirrors the user already trusted, and — for keyring bootstrap — only the
-    # [core] repo (where archlinux-keyring actually lives) is needed.
+    # Build a throwaway config: copy the real one, then optionally STRIP every
+    # repo except the official [core] / [extra] / [multilib] stanzas. By default
+    # (--trustall-all-repos=false), non-official repos are stripped so a
+    # compromised third-party mirror cannot inject a tampered package during the
+    # signature-disabled window. With --trustall-all-repos, all repos are kept
+    # so third-party repos can also have their keys refreshed.
     _TA_CONF=$(mktemp /tmp/pacman-trustall.XXXXXX.conf) 2>/dev/null
     if [[ -n "$_TA_CONF" ]] && cp -f /etc/pacman.conf "$_TA_CONF" 2>/dev/null; then
-        # Remove any repo section that is NOT one of the official Arch repos.
-        # We delete from the "[<repo>]" header through the next header or EOF.
-        # Third-party repos (chaotic-aur, archlinuxcn, endeavouros, custom, etc.)
-        # are excluded so a compromised third-party mirror cannot use the
-        # signature-disabled window to deliver a tampered keyring or helper.
-        _TA_ALLOWED_REPOS='core|extra|multilib|core-testing|extra-testing|multilib-testing'
-        awk -v allowed="^(${_TA_ALLOWED_REPOS})$" '
-            /^\[/{ in_repo=($0 ~ allowed); if(!in_repo){print "# TRUSTALL-STRIPPED: "$0; next} }
-            in_repo{print; next}
-            !in_repo{print "# TRUSTALL-STRIPPED: "$0}
-        ' "$_TA_CONF" > "${_TA_CONF}.tmp" && mv -f "${_TA_CONF}.tmp" "$_TA_CONF"
+        if [[ "${_TRUSTALL_ALL_REPOS:-false}" != "true" ]]; then
+            # Remove any repo section that is NOT one of the official Arch repos.
+            _TA_ALLOWED_REPOS='core|extra|multilib|core-testing|extra-testing|multilib-testing'
+            awk -v allowed="^(${_TA_ALLOWED_REPOS})$" '
+                /^\[/{ in_repo=($0 ~ allowed); if(!in_repo){print "# TRUSTALL-STRIPPED: "$0; next} }
+                in_repo{print; next}
+                !in_repo{print "# TRUSTALL-STRIPPED: "$0}
+            ' "$_TA_CONF" > "${_TA_CONF}.tmp" && mv -f "${_TA_CONF}.tmp" "$_TA_CONF"
+            echo "  Non-official repos stripped from throwaway config to limit injection surface."
+        else
+            echo "  --trustall-all-repos: all repos (including third-party) kept in throwaway config."
+        fi
         sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = TrustAll/" "$_TA_CONF"
         grep -q '^SigLevel' "$_TA_CONF" || printf 'SigLevel = TrustAll\n' >> "$_TA_CONF"
         echo "  Throwaway TrustAll config built: $_TA_CONF (real pacman.conf untouched)."
-        echo "  Non-official repos stripped from throwaway config to limit injection surface."
         # Sync and install keyring USING the throwaway config only.
         _remove_stale_lock
         if pacman --config "$_TA_CONF" -Syy --noconfirm 2>/dev/null; then
@@ -7778,7 +7802,7 @@ echo "Keyring initialization and self-healing complete."
 rm -f "$_KEYRING_SENTINEL" 2>/dev/null || true
 KEYRING_EOF
 
-    if ! exec_container_script "$keyring_script" "keyring-init" "${STRICT_SECURITY:-false}" "${ALLOW_TRUSTALL:-false}"; then
+    if ! exec_container_script "$keyring_script" "keyring-init" "${STRICT_SECURITY:-false}" "${ALLOW_TRUSTALL:-false}" "${TRUSTALL_ALL_REPOS:-false}"; then
         log_error "Keyring initialization and self-healing failed permanently."
         log_error "The container cannot operate securely without valid package signatures."
         log_error "This usually indicates a broken base image, missing network connectivity, or corrupted keyring."
@@ -13814,6 +13838,10 @@ set +e
 # installer. When "true", Strategy 4 (SigLevel=TrustAll recovery) is skipped.
 _STRICT_SECURITY_MODE=_STRICT_SECURITY_BAKED_IN_
 
+# TrustAll-all-repos flag, baked into this script at install time.
+# When "true", Strategy 4 keeps third-party repos in the throwaway config.
+_TRUSTALL_ALL_REPOS=_TRUSTALL_ALL_REPOS_BAKED_IN_
+
 _remove_stale_lock() {
     local _lock="/var/lib/pacman/db.lck"
     if [[ ! -f "$_lock" ]]; then return 0; fi
@@ -13898,17 +13926,22 @@ _orig_siglevel=$(grep '^SigLevel' /etc/pacman.conf 2>/dev/null | head -1 || echo
 _siglevel_value="${_orig_siglevel#SigLevel = }"
 _TA_CONF=$(mktemp /tmp/pacman-trustall.XXXXXX.conf) 2>/dev/null
 if [[ -n "$_TA_CONF" ]] && cp -f /etc/pacman.conf "$_TA_CONF" 2>/dev/null; then
-    # Strip every repo except the official Arch repos from the throwaway
-    # config. The TrustAll window disables signature verification, so a
-    # compromised third-party mirror could otherwise inject a tampered
-    # archlinux-keyring. Only the signed-official [core]/[extra]/[multilib]
-    # repos remain — and only [core] is needed for the keyring package.
-    _TA_ALLOWED_REPOS='core|extra|multilib|core-testing|extra-testing|multilib-testing'
-    awk -v allowed="^(${_TA_ALLOWED_REPOS})$" '
-        /^\[/{ in_repo=($0 ~ allowed); if(!in_repo){print "# TRUSTALL-STRIPPED: "$0; next} }
-        in_repo{print; next}
-        !in_repo{print "# TRUSTALL-STRIPPED: "$0}
-    ' "$_TA_CONF" > "${_TA_CONF}.tmp" && mv -f "${_TA_CONF}.tmp" "$_TA_CONF"
+    if [[ "${_TRUSTALL_ALL_REPOS:-false}" != "true" ]]; then
+        # Strip every repo except the official Arch repos from the throwaway
+        # config. The TrustAll window disables signature verification, so a
+        # compromised third-party mirror could otherwise inject a tampered
+        # archlinux-keyring. Only the signed-official [core]/[extra]/[multilib]
+        # repos remain — and only [core] is needed for the keyring package.
+        _TA_ALLOWED_REPOS='core|extra|multilib|core-testing|extra-testing|multilib-testing'
+        awk -v allowed="^(${_TA_ALLOWED_REPOS})$" '
+            /^\[/{ in_repo=($0 ~ allowed); if(!in_repo){print "# TRUSTALL-STRIPPED: "$0; next} }
+            in_repo{print; next}
+            !in_repo{print "# TRUSTALL-STRIPPED: "$0}
+        ' "$_TA_CONF" > "${_TA_CONF}.tmp" && mv -f "${_TA_CONF}.tmp" "$_TA_CONF"
+        echo "  Non-official repos stripped from throwaway config."
+    else
+        echo "  --trustall-all-repos: all repos (including third-party) kept in throwaway config."
+    fi
     sed -i "s/^[[:space:]]*SigLevel.*/SigLevel = TrustAll/" "$_TA_CONF"
     grep -q '^SigLevel' "$_TA_CONF" || printf 'SigLevel = TrustAll\n' >> "$_TA_CONF"
     _remove_stale_lock
@@ -14084,6 +14117,10 @@ KEYRING_REFRESH_EOF
     # later (via timer/hook) without the installer's variables, so the flag
     # must be embedded now rather than read at refresh time.
     keyring_script="${keyring_script//_STRICT_SECURITY_BAKED_IN_/${STRICT_SECURITY:-false}}"
+    # Bake the current TRUSTALL_ALL_REPOS setting into the generated
+    # pamac-keyring-refresh.sh so Strategy 4 can decide whether to strip
+    # third-party repos from the throwaway TrustAll config.
+    keyring_script="${keyring_script//_TRUSTALL_ALL_REPOS_BAKED_IN_/${TRUSTALL_ALL_REPOS:-false}}"
     # Bake the container name into the generated cleanup-desktops hook script
     # (same sentinel-substitution approach as setup_post_install_hooks) so the
     # per-container scoping works when the file runs later as a pacman hook.

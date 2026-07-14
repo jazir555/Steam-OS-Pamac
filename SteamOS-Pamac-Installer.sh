@@ -3356,7 +3356,6 @@ create_container() {
   if [[ "$ALLOW_HOME_MOUNT" != "true" ]]; then
       log_info "Security: host /home is NOT mounted (--no-home-mount active)."
   fi
-  log_info "Security: host networking is shared (container can reach host services)."
   log_info "Security: kernel-level exploits (e.g. CVE-2022-0492, CVE-2024-21626) could"
   log_info "  bypass container isolation. Keep your kernel updated for best protection."
   log_info "Security: D-Bus session and display server (X11/Wayland) are accessible from"

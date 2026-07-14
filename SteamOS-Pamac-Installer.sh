@@ -1512,7 +1512,7 @@ if command -v bwrap >/dev/null 2>&1; then
     echo "  bwrap available: $(command -v bwrap)"
     _result "bwrap_present" "true" ""
 else
-    echo "  bwrap NOT found — falling back to unshare"
+    echo "  bwrap NOT found — sandbox will be DEGRADED (no PID/mount namespace isolation)"
     _result "bwrap_present" "false" "install bubblewrap for full isolation"
     _degraded=true
 fi
@@ -1541,20 +1541,7 @@ else
     _degraded=true
 fi
 echo ""
-echo "--- 5. Live sandbox test (bwrap or unshare) ---"
-_test_sandbox_restrictions() {
-    local _engine="$1"
-    local _args="$2"
-    local _test_ro=true
-    local _test_pid_ns=true
-    local _test_seccomp=true
-    if ! eval "$_engine $_args touch /.sandbox-write-test 2>/dev/null"; then
-        _test_ro=false
-    fi
-    if [[ "$_test_ro" == "true" ]]; then
-        echo "    / is writable inside sandbox — PROTECT_SYSTEM not enforced"
-    fi
-}
+echo "--- 5. Live sandbox test (bwrap) ---"
 if command -v bwrap >/dev/null 2>&1; then
     if timeout 5 bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
         --unshare-pid --die-with-parent true 2>/dev/null; then
@@ -1566,7 +1553,8 @@ if command -v bwrap >/dev/null 2>&1; then
         _degraded=true
     fi
 else
-    echo "  bwrap not available — testing unshare fallback"
+    echo "  bwrap not available — sandbox will be DEGRADED"
+    echo "  (unshare fallback was removed; install bubblewrap for full isolation)"
     if timeout 5 unshare --mount -- /bin/true 2>/dev/null; then
         echo "  unshare sandbox executed successfully"
         _result "unshare_exec" "true" "(no PID namespace isolation)"
@@ -4830,25 +4818,10 @@ install_base_devel_batched() {
         echo "Warning: base-devel group meta-package could not be installed (individual packages verified above)."
     fi
 }
-# Write the fake systemd-run wrapper script. Shared between install and
-# repair paths. The heredoc body is at column 0 (no leading whitespace)
-# because the kernel requires the shebang to be byte 0 of the file.
-#
-# SECURITY MODEL v4.0: Dynamic, layered sandbox engine that prefers bubblewrap
-# (bwrap) for its mature user-namespace and mount-namespace support, falling
-# back to unshare --mount + bind mounts when bwrap is unavailable. ALL sandbox
-# properties are fully enforced with systemd parity: ProtectSystem, ProtectHome,
-# PrivateTmp, PrivateDevices, ReadWritePaths, ReadOnlyPaths, InaccessiblePaths,
-# NoNewPrivileges, CapabilityBoundingSet, MemoryDenyWriteExecute (mprotect W+X
-# blocked), RestrictSUIDSGID, ProtectKernelModules, LockPersonality,
-# RestrictRealtime, ProtectClock, ProtectHostname, ProtectKernelLogs,
-# RestrictNamespaces, RestrictAddressFamilies, SystemCallFilter,
-# RestrictFileSystems, ProtectKernelTunables, ProtectControlGroups.
-# Seccomp-BPF is compiled in-container via gcc with versioned caching so updates
-# retrigger compilation. DynamicUser detection accepts all valid systemd boolean
-# forms (yes/true/1/on). --user and --scope modes are supported for non-root
-# invocations. HOST_USER is resolved dynamically at runtime from $PAMAC_HOST_USER,
-# $SUDO_USER, or /etc/passwd, eliminating the install-time sed placeholder.
+# Install the fake systemd-run shim from the extracted file. Used when
+# --no-use-init is set and real systemd is not available. The full shim
+# lives in fake-systemd-run.sh (~2600 lines, bwrap+seccomp sandbox).
+# Use --use-init (default) for real systemd instead.
 # Runtime verification confirms the sandbox actually applied after entry.
 # Use --strict-security to disable this wrapper entirely.
 # The shim has been extracted to fake-systemd-run.sh to keep this script
@@ -6690,7 +6663,7 @@ if ! command -v bwrap >/dev/null 2>&1; then
     fi
 fi
 _write_fake_systemd_run_wrapper
-echo "Fake systemd-run installed at /usr/local/sbin/systemd-run (with ad-hoc build-user cleanup)."
+echo "Fake systemd-run installed at /usr/local/sbin/systemd-run (cleanup runs at runtime)."
 echo "Unrecognized arguments will be logged to /tmp/systemd-run-fake.log for debugging."
 
 printf '%s\n' '#!/bin/bash' \
@@ -7003,7 +6976,7 @@ if [[ "$_STRICT_SECURITY_MODE" == "true" ]]; then
 elif ! command -v systemctl >/dev/null 2>&1 || ! systemctl show-environment >/dev/null 2>&1; then
 _write_fake_systemd_run_wrapper
 repaired=$((repaired + 1))
-echo "Fake systemd-run repaired (with ad-hoc build-user cleanup)."
+echo "Fake systemd-run repaired (cleanup runs at runtime)."
 echo "Unrecognized arguments will be logged to /tmp/systemd-run-fake.log for debugging."
 
 if [[ ! -f /etc/profile.d/pamac-daemon.sh ]]; then
@@ -12419,7 +12392,7 @@ show_completion_message() {
     elif [[ "$_has_seccomp_helper" == "true" ]]; then
         log_info "  ⚠️  Sandbox: DEGRADED (no bwrap, seccomp only) — run: sudo pacman -S bubblewrap"
     else
-        log_info "  ⚠️  Sandbox: DEGRADED (unshare only) — run: sudo pacman -S base-devel gcc bubblewrap"
+        log_info "  ⚠️  Sandbox: DEGRADED (no sandboxing) — run: sudo pacman -S base-devel gcc bubblewrap"
     fi
 
     # Check sudoers scope

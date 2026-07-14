@@ -1136,15 +1136,6 @@ _rollback_container() {
         return 1
     fi
 }
-_rollback_on_fatal() {
-    local _exit_code=$?
-    local _line=$1
-    if [[ $_exit_code -ne 0 ]]; then
-        log_error "Fatal error at line $_line (exit $_exit_code). Attempting rollback..."
-        # shellcheck disable=SC2119 # Uses ${1:-$CONTAINER_NAME} default
-        _rollback_container
-    fi
-}
 
 force_remove_container() {
   local name="$1"
@@ -1710,9 +1701,11 @@ check_network_connectivity() {
     # Check for captive portal: connect to archlinux.org and inspect the response.
     # Captive portals typically return HTTP 200/3xx with HTML content instead of
     # the expected Arch Linux page, or intercept HTTPS with a self-signed cert.
+    local _curl_err_file
+    _curl_err_file=$(mktemp /tmp/pamac-curl-err.XXXXXX 2>/dev/null || echo "/dev/null")
     _curl_output=$(timeout "${NETWORK_PROBE_TIMEOUT}" curl -sSf --connect-timeout "${NETWORK_PROBE_CONNECT_TIMEOUT}" \
         --max-time "${NETWORK_PROBE_TIMEOUT}" -o /dev/null -w "%{http_code}\n%{ssl_verify_result}" \
-        "$_probe_url" 2>/tmp/pamac_curl_err) || _curl_rc=$?
+        "$_probe_url" 2>"$_curl_err_file") || _curl_rc=$?
     _http_code=$(echo "$_curl_output" | head -1 || echo "000")
     local _ssl_verify
     _ssl_verify=$(echo "$_curl_output" | tail -1 || echo "")
@@ -1740,7 +1733,7 @@ check_network_connectivity() {
     case "$_http_code" in
         000)
             local _curl_err=""
-            _curl_err=$(cat /tmp/pamac_curl_err 2>/dev/null || echo "")
+            _curl_err=$(cat "$_curl_err_file" 2>/dev/null || echo "")
             if echo "$_curl_err" | grep -qi "SSL\|certificate\|cert\|verify"; then
                 log_warn "SSL/TLS error connecting to $_probe_url:"
                 log_warn "  $_curl_err"
@@ -1769,7 +1762,7 @@ check_network_connectivity() {
             log_debug "Reachable probe (HTTP $_http_code) — common redirect/maintenance code, treating as reachable."
             ;;
     esac
-    rm -f /tmp/pamac_curl_err 2>/dev/null || true
+    rm -f "$_curl_err_file" 2>/dev/null || true
 }
 
 # Emit `-e VAR=value` pairs for proxy / CA-bundle env so that container_root_exec
@@ -2732,6 +2725,21 @@ OPTIONS:
                             DEGRADED/OK for each protection. Tests real
                             systemd-run with --use-init, or the fake wrapper
                             with --no-use-init.
+  --status               Show installation status and health check
+  --update               Update the installation (re-run setup with current
+                            settings and update container packages)
+  --uninstall            Remove the container, exported desktop files, and
+                            all associated state
+  --export-only          Re-export desktop files from the container to the
+                            host without modifying the container
+  --enable-gaming        Enable gaming packages (Steam, Lutris, Heroic)
+  --disable-gaming       Disable gaming packages (default)
+  --enable-extra-repos   Enable extra repos (chaotic-aur, endeavouros, etc.)
+  --disable-extra-repos  Disable extra repos (default)
+  --enable-build-cache   Enable persistent yay build cache (default)
+  --disable-build-cache  Disable persistent yay build cache
+  --optimize-mirrors     Optimize pacman mirrors for fastest downloads (default)
+  --no-optimize-mirrors  Skip mirror optimization
   -h, --help                Show this help message
 
 ENVIRONMENT VARIABLES:
@@ -2751,6 +2759,7 @@ ENVIRONMENT VARIABLES:
   FORCE_MODE              Set to 'true' to auto-approve destructive confirmation
                            (container recreation) without disabling other prompts
                            as --non-interactive does. Same as --force flag.
+                           Default 'false'.
   QUICK_START             Set to 'true' to apply the quick-start preset (same as
                            --quick-start). See --help for the preset values.
                            Explicit env vars / CLI flags still override the preset.
@@ -2800,8 +2809,6 @@ ENVIRONMENT VARIABLES:
   DEDICATED_BUILDUSER      Set to 'true' to create a dedicated build user
                             (--dedicated-builduser). This isolates AUR builds
                             from host /home. Default 'true'.
-  FORCE_MODE               Set to 'true' to bypass destructive confirmation
-                           prompts (same as --force). Default 'false'.
   CONTAINER_SECURITY_OPT_ENV  Colon-separated list of --security-opt values
                            passed to container creation (same as --security-opt
                            flag). E.g.: seccomp:profile.json:apparmor:my-profile
@@ -3083,7 +3090,7 @@ parse_arguments() {
                 fi
                 if [[ -n "$_latest" ]]; then
                     echo "Latest release:    v${_latest#v}"
-                    if [[ "$_latest#v" == "$SCRIPT_VERSION" ]]; then
+                    if [[ "${_latest#v}" == "$SCRIPT_VERSION" ]]; then
                         echo "Status: Up to date."
                     else
                         echo "Status: Update available. Download the latest from:"

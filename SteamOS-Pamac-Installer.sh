@@ -1400,7 +1400,7 @@ check_system_requirements() {
     fi
 
     local available_space
-    if available_space=$(df -k "$HOME" 2>/dev/null | awk 'NR==2{print $4}'); then
+    if available_space=$(df -kP "$HOME" 2>/dev/null | awk 'NR==2{print $4}'); then
     if [[ -n "$available_space" ]] && [[ $available_space -lt ${DISK_SPACE_MIN_KB} ]]; then
         log_warn "Low disk space detected on $HOME. At least $(( DISK_SPACE_MIN_KB / 1024 / 1024 ))GB is recommended."
             log_info "Available space: $(( available_space / 1024 ))MB"
@@ -1413,7 +1413,7 @@ check_system_requirements() {
     fi
 
     local var_space
-    if var_space=$(df -k /var 2>/dev/null | awk 'NR==2{print $4}'); then
+    if var_space=$(df -kP /var 2>/dev/null | awk 'NR==2{print $4}'); then
         if [[ -n "$var_space" ]] && [[ "$var_space" -lt ${DISK_SPACE_MIN_KB} ]]; then
             log_warn "Low disk space on /var (container write target). At least $(( DISK_SPACE_MIN_KB / 1024 / 1024 ))GB recommended."
             log_info "Available on /var: $(( var_space / 1024 ))MB"
@@ -1424,7 +1424,7 @@ check_system_requirements() {
     fi
 
     local root_space
-    if root_space=$(df -k / 2>/dev/null | awk 'NR==2{print $4}'); then
+    if root_space=$(df -kP / 2>/dev/null | awk 'NR==2{print $4}'); then
         if [[ -n "$root_space" ]] && [[ "$root_space" -lt ${DISK_SPACE_MIN_KB} ]]; then
             log_warn "Low disk space on / (root filesystem). At least $(( DISK_SPACE_MIN_KB / 1024 / 1024 ))GB recommended."
             log_info "Available on /: $(( root_space / 1024 ))MB"
@@ -3625,7 +3625,7 @@ fi
 echo "Database inconsistencies detected. Starting multi-strategy repair..."
 
 # ── Pre-flight: disk space check ──
-_db_avail_kb=$(df -k /var/lib/pacman 2>/dev/null | awk "NR==2{print \$4}" || echo "0")
+_db_avail_kb=$(df -kP /var/lib/pacman 2>/dev/null | awk "NR==2{print \$4}" || echo "0")
 if [[ "$_db_avail_kb" -gt 0 ]] && [[ "$_db_avail_kb" -lt 10240 ]]; then
     echo "WARNING: Low disk space (${_db_avail_kb}KB) in /var/lib/pacman partition."
     echo "  DB repair may fail due to insufficient space for backup/rebuild operations."
@@ -4167,7 +4167,10 @@ _cleanup_stale_build_env() {
         fi
     done
 }
-_cleanup_stale_build_env
+# Only run heavy cleanup as root (userdel, subuid edits require it anyway)
+if [[ "$(id -u)" -eq 0 ]]; then
+    _cleanup_stale_build_env
+fi
 _atomic_sed_inplace() {
     local _target="$1"; shift
     local _tmp; _tmp=$(mktemp "${_target}.atomic.XXXXXX") || { echo "FATAL: mktemp failed for atomic sed on $_target"; return 1; }
@@ -4335,7 +4338,7 @@ _preflight_space_check() {
     # Check /var (where container writes happen) and /tmp (where builds run)
     for _mount in /var /tmp; do
         local _avail_kb
-        _avail_kb=$(df -k "$_mount" 2>/dev/null | awk 'NR==2{print $4}' || echo "")
+        _avail_kb=$(df -kP "$_mount" 2>/dev/null | awk 'NR==2{print $4}' || echo "")
         if [[ -n "$_avail_kb" && "$_avail_kb" -lt "$_min_kb" ]]; then
             local _avail_mb=$(( _avail_kb / 1024 ))
             local _min_mb=$(( _min_kb / 1024 ))
@@ -7524,7 +7527,7 @@ pkill -9 gpg-agent 2>/dev/null || true
 pkill -9 dirmngr 2>/dev/null || true
 sleep 1
 # Quick disk space check — if /var is full, DB repair will fail
-_avail_kb=$(df -k /var/lib/pacman 2>/dev/null | awk "NR==2{print \$4}" || echo "0")
+_avail_kb=$(df -kP /var/lib/pacman 2>/dev/null | awk "NR==2{print \$4}" || echo "0")
 if [[ "$_avail_kb" -gt 0 ]] && [[ "$_avail_kb" -lt 5120 ]]; then
     echo "WARNING: Critically low disk space (${_avail_kb}KB) in /var/lib/pacman."
     echo "  DB repair may fail. Consider freeing space: docker system prune / podman system prune"
@@ -8261,7 +8264,7 @@ verify_core_tools() {
 verify_core_tools || { echo "Core tools missing before upgrade. Cannot proceed."; exit 2; }
 
 echo "Checking for disk space before upgrade..."
-df_home_kb=$(df -k / 2>/dev/null | awk 'NR==2{print $4}' || echo "0")
+df_home_kb=$(df -kP / 2>/dev/null | awk 'NR==2{print $4}' || echo "0")
 if [[ "$df_home_kb" -lt 512000 ]] && [[ "$df_home_kb" -gt 0 ]]; then
     echo "Warning: Low disk space (${df_home_kb}KB). Upgrade may fail."
 fi

@@ -4129,6 +4129,45 @@ _remove_stale_lock() {
     fi
     rm -f "$_lock" 2>/dev/null || true
 }
+# ── Stale build environment cleanup ──
+# Runs at the start of every container script to clean up resources left behind
+# by hard-killed (SIGKILL, OOM, host crash) prior builds. Without this,
+# orphaned _brecover* users, /var/tmp/builduser-home-* directories, and stale
+# /var/tmp/pamac-* work directories accumulate over time.
+_cleanup_stale_build_env() {
+    # 1. Remove orphaned _brecover* users and their temp homes
+    local _orphan_users=""
+    _orphan_users=$(getent passwd 2>/dev/null | awk -F: '$1 ~ /^_brecover/ { print $1 }' || true)
+    for _ou in $_orphan_users; do
+        echo "Cleaning up orphaned build user: $_ou" >&2
+        userdel -r "$_ou" 2>/dev/null || userdel "$_ou" 2>/dev/null || true
+        # Purge stale subuid/subgid entries
+        if [[ -w /etc/subuid ]]; then
+            grep -vF "${_ou}:" /etc/subuid > /etc/subuid.tmp 2>/dev/null && \
+                mv /etc/subuid.tmp /etc/subuid 2>/dev/null || rm -f /etc/subuid.tmp 2>/dev/null
+        fi
+        if [[ -w /etc/subgid ]]; then
+            grep -vF "${_ou}:" /etc/subgid > /etc/subgid.tmp 2>/dev/null && \
+                mv /etc/subgid.tmp /etc/subgid 2>/dev/null || rm -f /etc/subgid.tmp 2>/dev/null
+        fi
+    done
+    # 2. Remove orphaned builduser home directories (any owner, not just root)
+    for _dir in /var/tmp/builduser-home-*; do
+        [[ -d "$_dir" ]] || continue
+        echo "Removing orphaned build-user home: $_dir" >&2
+        rm -rf "$_dir" 2>/dev/null || true
+    done
+    # 3. Remove stale pamac work directories (older than 1 day)
+    for _dir in /var/tmp/pamac-*; do
+        [[ -d "$_dir" ]] || continue
+        # Only remove if older than 24h to avoid removing active work dirs
+        if [[ -n "$(find "$_dir" -maxdepth 0 -mmin +1440 2>/dev/null)" ]]; then
+            echo "Removing stale work directory: $_dir" >&2
+            rm -rf "$_dir" 2>/dev/null || true
+        fi
+    done
+}
+_cleanup_stale_build_env
 _atomic_sed_inplace() {
     local _target="$1"; shift
     local _tmp; _tmp=$(mktemp "${_target}.atomic.XXXXXX") || { echo "FATAL: mktemp failed for atomic sed on $_target"; return 1; }
@@ -6776,6 +6815,22 @@ _prepare_seccomp() {
             _warn_dsr "The build will run with mount namespace + PID namespace + capabilities."
             _warn_dsr "To restore full sandboxing, install base-devel inside the container:"
             _warn_dsr "  pacman -S --noconfirm --needed base-devel gcc linux-api-headers glibc"
+            echo "" >&2
+            echo "╔══════════════════════════════════════════════════════════════╗" >&2
+            echo "║  WARNING: Seccomp-BPF filtering unavailable                ║" >&2
+            echo "╚══════════════════════════════════════════════════════════════╝" >&2
+            # Prompt for confirmation unless non-interactive or --strict-security
+            if [[ "${_DSR_STRICT_SECURITY:-}" != "true" ]] && [[ -t 0 ]] && [[ -t 1 ]]; then
+                printf "  Continue with reduced sandbox? (y/N): " >&2
+                read -r _confirm </dev/tty 2>/dev/null || _confirm=""
+                if [[ "$_confirm" != "y" && "$_confirm" != "Y" ]]; then
+                    _warn_dsr "Build aborted by user (seccomp required)."
+                    echo "Aborted. Install toolchain for full sandboxing:" >&2
+                    echo "  pacman -S --noconfirm --needed base-devel gcc linux-api-headers glibc" >&2
+                    exit 1
+                fi
+                _warn_dsr "User approved reduced sandbox. Continuing..."
+            fi
         fi
     fi
 }
@@ -6919,15 +6974,35 @@ _run_sandboxed() {
         # build. Running without bwrap loses PID namespace isolation and
         # seccomp filtering, but the build can still complete. The user is
         # warned so they can install bwrap for full sandboxing.
-        _warn_dsr "systemd-run(fake): WARNING — bubblewrap (bwrap) not installed."
-        _warn_dsr "  Running WITHOUT sandbox isolation. The build will execute"
-        _warn_dsr "  as the target user but without PID namespace, seccomp-BPF,"
-        _warn_dsr "  or mount namespace protections."
         _warn_dsr ""
-        _warn_dsr "  To restore full sandboxing, install bubblewrap:"
-        _warn_dsr "    sudo pacman -S --noconfirm --needed bubblewrap"
+        _warn_dsr "╔══════════════════════════════════════════════════════════════╗"
+        _warn_dsr "║  SANDBOX DEGRADED — bubblewrap (bwrap) not installed       ║"
+        _warn_dsr "╚══════════════════════════════════════════════════════════════╝"
+        _warn_dsr "Running WITHOUT sandbox isolation. The build will execute"
+        _warn_dsr "as the target user but without:"
+        _warn_dsr "  - PID namespace isolation"
+        _warn_dsr "  - seccomp-BPF syscall filtering"
+        _warn_dsr "  - Mount namespace protections"
         _warn_dsr ""
-        echo "WARNING: bubblewrap not installed — running build without sandbox." >&2
+        _warn_dsr "To restore full sandboxing, install bubblewrap:"
+        _warn_dsr "  sudo pacman -S --noconfirm --needed bubblewrap"
+        _warn_dsr ""
+        echo "" >&2
+        echo "╔══════════════════════════════════════════════════════════════╗" >&2
+        echo "║  WARNING: Running WITHOUT sandbox (bubblewrap missing)     ║" >&2
+        echo "╚══════════════════════════════════════════════════════════════╝" >&2
+        # Prompt for confirmation unless non-interactive or --strict-security
+        if [[ "${_DSR_STRICT_SECURITY:-}" != "true" ]] && [[ -t 0 ]] && [[ -t 1 ]]; then
+            printf "  Continue without sandbox? (y/N): " >&2
+            read -r _confirm </dev/tty 2>/dev/null || _confirm=""
+            if [[ "$_confirm" != "y" && "$_confirm" != "Y" ]]; then
+                _warn_dsr "Build aborted by user (sandbox required)."
+                echo "Aborted. Install bubblewrap for full sandboxing:" >&2
+                echo "  sudo pacman -S --noconfirm --needed bubblewrap" >&2
+                exit 1
+            fi
+            _warn_dsr "User approved degraded sandbox. Continuing..."
+        fi
         # Run the command directly without sandbox wrapping
         ${_ENV_SETUP}
         if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then cd "$WORK_DIR" 2>/dev/null || true; fi

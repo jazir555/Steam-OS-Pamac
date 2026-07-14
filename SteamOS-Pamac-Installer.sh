@@ -384,6 +384,14 @@ initialize_logging() {
 
     # shellcheck disable=SC2064 # $exit_code/$date MUST expand at trap execution, not definition
     trap 'exit_code=$?; _cleanup_container_snapshot; _cleanup_temp_files; echo "=== Run finished: $(date) - Exit: $exit_code ===" >> "$LOG_FILE"; [[ "$UPLOAD_LOG" == "true" ]] && sanitize_and_upload_log || true' EXIT
+
+    # Host-side signal handlers: forward INT/TERM to child processes and clean
+    # up the container before exiting. Without these, the default signal action
+    # (immediate termination) orphans running container processes and skips the
+    # EXIT trap cleanup. We use `exit $((128+signum))` to propagate the
+    # conventional exit code through the EXIT trap above.
+    trap 'log_warn "Received SIGINT, cleaning up..."; _cleanup_container_snapshot; exit $((128 + 2))' INT
+    trap 'log_warn "Received SIGTERM, cleaning up..."; _cleanup_container_snapshot; exit $((128 + 15))' TERM
 }
 
 _log() {
@@ -10016,14 +10024,27 @@ _fetch_aur_pkgbuild() {
     # Resilient HTTP fetch with retry and exponential backoff.
     # Usage: _aur_fetch_with_retry <url> <max_retries>
     # Outputs: raw response body to stdout, HTTP status code to fd 3.
+    # A realistic User-Agent header avoids Cloudflare bot detection that
+    # would otherwise return challenge pages instead of the actual content.
     _aur_fetch_with_retry() {
         local _url="$1" _max_retries="${2:-2}" _attempt=0 _resp="" _code="" _delay=2
         while (( _attempt <= _max_retries )); do
-            _resp=$(curl -sSf --connect-timeout 10 --max-time 30 -w "\n%{http_code}" "$_url" 2>/dev/null) || true
+            _resp=$(curl -sSf --connect-timeout 10 --max-time 30 \
+                -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+                -w "\n%{http_code}" "$_url" 2>/dev/null) || true
             _code=$(echo "$_resp" | tail -1)
             _resp=$(echo "$_resp" | sed '$d')
-            # Success or client error (not retryable): return immediately
-            if [[ "$_code" =~ ^2[0-9][0-9]$ ]] || [[ "$_code" =~ ^4[0-9][0-9]$ && "$_code" != "429" ]]; then
+            # Success or client error (not retryable): return immediately.
+            # Cloudflare challenge pages return HTTP 200 with HTML content;
+            # detect and retry these like server errors to fail fast.
+            if [[ "$_code" =~ ^2[0-9][0-9]$ ]]; then
+                if echo "$_resp" | grep -qiE '<!DOCTYPE|<html|challenge-platform|cf-browser|Attention Required|Just a moment'; then
+                    echo "# WARN: Received Cloudflare challenge page (HTTP $_code), retrying..." >&2
+                else
+                    echo "$_resp"
+                    return 0
+                fi
+            elif [[ "$_code" =~ ^4[0-9][0-9]$ && "$_code" != "429" ]]; then
                 echo "$_resp"
                 return 0
             fi
@@ -10113,8 +10134,10 @@ _fetch_aur_pkgbuild() {
         fi
     fi
 
-    # Method 2: CGIT web endpoint (may be rate-limited by Cloudflare)
-    # Mitigation: Use retry wrapper, validate response is PKGBUILD (not HTML).
+    # Method 2: CGIT web endpoint (may be blocked by Cloudflare).
+    # Cloudflare detection is handled in _aur_fetch_with_retry which retries
+    # challenge pages like server errors, so this section only sees clean
+    # responses or empty strings on failure.
     _method_tried="CGIT"
     local _cgit_resp=""
     _cgit_resp=$(_aur_fetch_with_retry "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=pamac-aur" 2) || {
@@ -10868,6 +10891,7 @@ install_from_yay() {
         if [[ -n "$_pf_dir" ]]; then
             chmod 700 "$_pf_dir" 2>/dev/null || true
             if curl -sSf --connect-timeout 10 --max-time 30 \
+                -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
                 "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=pamac-aur" \
                 -o "$_pf_dir/PKGBUILD" 2>/dev/null; then
                 if ! _verify_aur_payload "$_pf_dir"; then
@@ -10891,6 +10915,24 @@ install_from_yay() {
         sudo -Hu "$current_user" bash -lc "yay -Y --gendb" 2>/dev/null || true
         _remove_stale_lock
     done
+    return 1
+}
+
+# Detect the system libalpm.so ABI version number (e.g., 14, 15) by querying
+# ldconfig. Returns the numeric SONAME suffix via stdout, or empty string if
+# not found. Works for any ABI version — no hardcoded thresholds.
+_detect_system_libalpm_abi() {
+    local _so_path
+    _so_path=$(ldconfig -p 2>/dev/null \
+        | awk '/libalpm\.so\.[0-9]+/ { print $NF; exit }' || echo "")
+    if [[ -n "$_so_path" ]]; then
+        local _so_name
+        _so_name=$(basename "$_so_path" 2>/dev/null || echo "")
+        if [[ "$_so_name" =~ ^libalpm\.so\.([0-9]+)$ ]]; then
+            echo "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    fi
     return 1
 }
 
@@ -10930,29 +10972,18 @@ validate_pamac_build_deps() {
         echo "  WARNING: pkg-config not found. Cannot verify libalpm compatibility."
     fi
 
-    # Detect the actual libalpm.so ABI version number (e.g., .so.14, .so.15).
-    # During major pacman upgrades (e.g., 6.x -> 7.1), the .so version bumps
-    # (e.g., .so.14 -> .so.15) and pamac-aur may not have been rebuilt against
-    # the new ABI yet. This check detects the transition early.
+    # Detect the actual libalpm.so ABI version number dynamically.
+    # During major pacman upgrades the .so version bumps and pamac-aur may not
+    # have been rebuilt against the new ABI yet. This check detects any ABI
+    # transition early — it works for any version, not just specific thresholds.
     local _libalpm_so_ver=""
-    local _libalpm_so_name=""
-    for _candidate in libalpm.so libalpm.so.*; do
-        _libalpm_so_name=$(readlink -f "/usr/lib/$_candidate" 2>/dev/null | xargs basename 2>/dev/null || echo "")
-        if [[ "$_libalpm_so_name" =~ ^libalpm\.so\.([0-9]+)$ ]]; then
-            _libalpm_so_ver="${BASH_REMATCH[1]}"
-            break
-        fi
-    done
+    _libalpm_so_ver=$(_detect_system_libalpm_abi) || true
     if [[ -n "$_libalpm_so_ver" ]]; then
         echo "  libalpm ABI version: .so.$_libalpm_so_ver"
         # Track the ABI version for the caller (used by Strategy B to select commits)
         echo "LIBALPM_SO_VERSION=$_libalpm_so_ver"
-        # Warn about known transition periods
-        if [[ "$_libalpm_so_ver" -ge 15 ]]; then
-            echo "  NOTE: libalpm.so.$_libalpm_so_ver detected (pacman 7.x ABI)."
-            echo "  pamac-aur may need a recent commit that supports this ABI."
-            echo "  If build fails, Strategy B will scan git history for a compatible revision."
-        fi
+    else
+        echo "  WARNING: Could not detect libalpm ABI version."
     fi
 
     # Check for vala compiler version (pamac requires recent vala)
@@ -11035,10 +11066,10 @@ verify_pamac_libalpm_compat() {
             _lib_path=$(echo "$_alpm_link" | awk '{print $3}' | head -1 || echo "")
             if [[ -n "$_lib_path" && -f "$_lib_path" ]]; then
                 echo "  libalpm library found: $_lib_path"
-                # Detect ABI version mismatch: pamac compiled against .so.14
-                # but system has .so.15 (pacman 7.x transition). The dynamic
-                # linker resolves SONAME, so if pamac links libalpm.so.14 but
-                # only .so.15 exists, ldd would show "not found" (caught above).
+                # Detect ABI version mismatch: pamac compiled against one .so.N
+                # but system provides a different version. The dynamic linker
+                # resolves SONAME, so if pamac links libalpm.so.N but only
+                # .so.M exists, ldd would show "not found" (caught above).
                 # However, if both exist (multi-version install), verify the
                 # running binary uses the system version.
                 local _lib_soname
@@ -11046,19 +11077,10 @@ verify_pamac_libalpm_compat() {
                 if [[ "$_lib_soname" =~ ^libalpm\.so\.([0-9]+)$ ]]; then
                     local _linked_abi="${BASH_REMATCH[1]}"
                     local _system_abi=""
-                    local _alpm_so_path
-                    _alpm_so_path=$(ldconfig -p 2>/dev/null | grep "libalpm\.so" | head -1 | awk '{print $NF}' || echo "")
-                    if [[ -n "$_alpm_so_path" ]]; then
-                        local _so_name
-                        _so_name=$(basename "$_alpm_so_path" 2>/dev/null || echo "")
-                        if [[ "$_so_name" =~ ^libalpm\.so\.([0-9]+)$ ]]; then
-                            _system_abi="${BASH_REMATCH[1]}"
-                        fi
-                    fi
+                    _system_abi=$(_detect_system_libalpm_abi) || true
                     if [[ -n "$_system_abi" && "$_linked_abi" != "$_system_abi" ]]; then
                         echo "  WARNING: libalpm ABI mismatch — binary links .so.$_linked_abi but system has .so.$_system_abi"
-                        echo "  This is the pacman 7.1/libalpm.so.15 transition. pamac-aur was compiled"
-                        echo "  against an older ABI and may fail at runtime."
+                        echo "  pamac-aur was compiled against an older ABI and may fail at runtime."
                         echo "  Fix: yay -S --rebuild pamac-aur (recompile against current libalpm)"
                         echo "  Or:  wait for upstream pamac-aur to support libalpm.so.$_system_abi"
                         _issues=$((_issues + 1))
@@ -11067,23 +11089,13 @@ verify_pamac_libalpm_compat() {
             elif [[ -n "$_lib_path" ]]; then
                 echo "  ERROR: libalpm library NOT FOUND at: $_lib_path"
                 echo "  This indicates a library mismatch — pamac was compiled against a different libalpm version."
-                # Provide specific guidance for the .so.15 transition
                 if [[ "$_lib_path" =~ libalpm\.so\.([0-9]+) ]]; then
                     local _expected_abi="${BASH_REMATCH[1]}"
                     local _system_abi=""
-                    local _alpm_so_path2
-                    _alpm_so_path2=$(ldconfig -p 2>/dev/null | grep "libalpm\.so" | head -1 | awk '{print $NF}' || echo "")
-                    if [[ -n "$_alpm_so_path2" ]]; then
-                        local _so_name
-                        _so_name=$(basename "$_alpm_so_path2" 2>/dev/null || echo "")
-                        if [[ "$_so_name" =~ ^libalpm\.so\.([0-9]+)$ ]]; then
-                            _system_abi="${BASH_REMATCH[1]}"
-                        fi
-                    fi
+                    _system_abi=$(_detect_system_libalpm_abi) || true
                     if [[ -n "$_system_abi" ]]; then
                         echo "  Expected libalpm.so.$_expected_abi, system has libalpm.so.$_system_abi"
-                        echo "  This is the pacman 7.1 transition. Try:"
-                        echo "    yay -S --rebuild pamac-aur  (recompile against current ABI)"
+                        echo "  Try: yay -S --rebuild pamac-aur  (recompile against current ABI)"
                     fi
                 fi
                 _issues=$((_issues + 1))
@@ -11702,7 +11714,11 @@ export_pamac_to_host() {
         sync "$_parent" 2>/dev/null || true
     }
 
-    # Rollback trap: tracks created files and cleans up on failure
+    # Rollback trap: tracks created files and cleans up on failure.
+    # Save the current EXIT trap so we can restore it on success (instead of
+    # leaving the process with no EXIT trap after our trap runs).
+    local _prev_exit_trap
+    _prev_exit_trap=$(trap -p EXIT 2>/dev/null | sed -e "s/^trap -- //" -e "s/ EXIT$//") || true
     local _created_files=()
     _export_cleanup_on_error() {
         local _exit_code=$?
@@ -11714,6 +11730,10 @@ export_pamac_to_host() {
                     log_info "  Removed: $_f"
                 fi
             done
+        fi
+        # Chain to the previous EXIT trap (master cleanup) so it is not lost.
+        if [[ -n "$_prev_exit_trap" ]]; then
+            eval "$_prev_exit_trap"
         fi
     }
     trap '_export_cleanup_on_error' EXIT
@@ -13087,8 +13107,9 @@ XDGCONF
         log_warn "Host wrapper script not found at ~/.local/bin/pamac-manager-wrapper-host"
     fi
 
-    # Clear the rollback trap (success path)
-    trap - EXIT
+    # Success path: the EXIT trap (_export_cleanup_on_error) will chain to
+    # the master EXIT trap on exit, so no cleanup or trap restoration needed
+    # here. The chained handler skips rollback when exit code is 0.
 
     if [[ "$_export_ok" == "true" ]]; then
         log_success "Pamac export to host completed successfully."

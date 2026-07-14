@@ -1589,7 +1589,7 @@ if command -v bwrap >/dev/null 2>&1; then
     fi
 else
     echo "  bwrap not available — sandbox will be DEGRADED"
-    echo "  (unshare fallback was removed; install bubblewrap for full isolation)"
+    echo "  (install bubblewrap for full PID/mount namespace isolation)"
     if timeout 5 unshare --mount -- /bin/true 2>/dev/null; then
         echo "  unshare sandbox executed successfully"
         _result "unshare_exec" "true" "(no PID namespace isolation)"
@@ -2642,7 +2642,11 @@ OPTIONS:
                              via malicious PKGBUILDs. The build user's home is
                              /var/lib/_pamac_builder (isolated from host).
                              Source trees are accessed via 'distrobox enter' as
-                             the login user, not the build user.
+                             the login user, not the build user. Default: ON.
+  --no-dedicated-builduser  Disable dedicated build user. AUR builds run as the
+                             container's login user (same UID as host user).
+                             INSECURE: a malicious AUR PKGBUILD could access
+                             host files if --allow-home-mount is also set.
   --allow-home-mount         Re-enable host /home mount inside the container
                              (INSECURE: exposes SSH keys, browser profiles, GPG
                              keys to all container processes). By default, the
@@ -2765,9 +2769,10 @@ ENVIRONMENT VARIABLES:
   ENDEAVOUROS_KEY_ID       Override the EndeavourOS signing key fingerprint
                             (auto-discovered from keyring package by default)
   STRICT_SECURITY          Set to 'true' to enforce --strict-security mode
-                            (refuse SigLevel=TrustAll recovery and the fake
-                            systemd-run wrapper). AUR builds WILL fail in
-                            non-systemd containers. Default 'false'.
+                            (refuse SigLevel=TrustAll recovery and refuse to
+                            install the fake systemd-run shim). With --use-init
+                            (default), real systemd handles sandboxing.
+                            Default 'false'.
   USE_DEVTOOLS             Set to 'true' to use Arch devtools (archbuild) for
                             AUR builds instead of yay. Requires devtools in
                             the container. Falls back to yay if unavailable.
@@ -2793,7 +2798,8 @@ ENVIRONMENT VARIABLES:
                            exceeds this many bytes. Default: 5242880 (5 MiB).
                            One backup (.1) is kept; older backups are overwritten.
   DEDICATED_BUILDUSER      Set to 'true' to create a dedicated build user
-                           (--dedicated-builduser). Default 'false'.
+                            (--dedicated-builduser). This isolates AUR builds
+                            from host /home. Default 'true'.
   FORCE_MODE               Set to 'true' to bypass destructive confirmation
                            prompts (same as --force). Default 'false'.
   CONTAINER_SECURITY_OPT_ENV  Colon-separated list of --security-opt values

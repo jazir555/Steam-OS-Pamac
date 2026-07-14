@@ -4281,6 +4281,30 @@ _preflight_oom_check() {
     return 0
 }
 
+# ── Pre-build disk space check ──
+# Called before every build/install invocation to ensure sufficient disk space.
+# AUR builds (makepkg) can consume 1-3 GB for source, build artifacts, and
+# installed packages. Running out mid-build corrupts partial artifacts and
+# wastes all prior compilation time. Returns 1 if critically low, 0 otherwise.
+_preflight_space_check() {
+    local _desc="${1:-build}"
+    local _min_kb="${DISK_SPACE_MIN_KB:-2097152}"  # 2 GiB default
+    # Check /var (where container writes happen) and /tmp (where builds run)
+    for _mount in /var /tmp; do
+        local _avail_kb
+        _avail_kb=$(df -k "$_mount" 2>/dev/null | awk 'NR==2{print $4}' || echo "")
+        if [[ -n "$_avail_kb" && "$_avail_kb" -lt "$_min_kb" ]]; then
+            local _avail_mb=$(( _avail_kb / 1024 ))
+            local _min_mb=$(( _min_kb / 1024 ))
+            _log_event "space_low" "desc=$_desc" "mount=$_mount" "avail_kb=$_avail_kb" "min_kb=$_min_kb"
+            log_error "CRITICAL: Only ${_avail_mb}MB free on $_mount before $_desc."
+            log_error "AUR builds require at least $(( _min_mb / 1024 ))GB free. Free space or add storage."
+            return 1
+        fi
+    done
+    return 0
+}
+
 # ── eMMC/flash wear reduction: tmpfs build directory + ccache ──
 # Large C++/Vala AUR builds (yay, pamac-aur) generate massive write cycles
 # that degrade eMMC/SD flash memory. This function mitigates wear by:
@@ -11147,6 +11171,7 @@ _build_package() {
     # Default: build with makepkg
     echo "Building $_desc with makepkg..."
     _preflight_oom_check "$_desc build"
+    _preflight_space_check "$_desc build" || return 1
     _set_makepkg_jobs
     _spin "Building $_desc" sudo -Hu "$current_user" bash -lc "cd '$_work_dir' && makepkg -si --noconfirm --clean" 2>/tmp/pamac_build_err
     local _rc=$?
@@ -15135,6 +15160,7 @@ main() {
   detect_init_support
 
     check_battery_power || exit "$EXIT_USER_ABORT"
+    _preflight_space_check "installation" || exit "$EXIT_USER_ABORT"
 
     if [[ "$ALLOW_WHEEL_NOPASSWD" == "true" ]]; then
         check_multi_user_warning
@@ -15295,6 +15321,10 @@ main() {
 
 	check_memory_ok 524288 "AUR helper build" 262144 || {
 		log_error "Insufficient memory for AUR helper build (need at least 256MB). Aborting."
+		exit 1
+	}
+	_preflight_space_check "AUR helper build" || {
+		log_error "Insufficient disk space for AUR helper build. Aborting."
 		exit 1
 	}
 	check_battery_power || log_warn "Battery low, but continuing AUR helper build..."
